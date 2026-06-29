@@ -33,6 +33,7 @@ pub use codex_core::NewThread;
 pub use codex_core::StartThreadOptions;
 pub use codex_core::StateDbHandle;
 pub use codex_core::ThreadManager;
+pub use codex_core::ThreadManagerRuntimeOptions;
 pub use codex_core::ThreadShutdownReport;
 pub use codex_core::config::Config;
 pub use codex_core::config::Constrained;

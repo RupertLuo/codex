@@ -21,6 +21,14 @@ pub struct HttpTransportHandle {
     stream: Arc<StreamFn>,
 }
 
+impl std::fmt::Debug for HttpTransportHandle {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("HttpTransportHandle")
+            .finish_non_exhaustive()
+    }
+}
+
 impl HttpTransportHandle {
     pub fn new<Execute, ExecuteFuture, Stream, StreamFuture>(
         execute: Execute,

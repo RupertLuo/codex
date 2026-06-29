@@ -36,6 +36,7 @@ use codex_api::AuthProvider;
 use codex_api::CompactClient as ApiCompactClient;
 use codex_api::CompactionInput as ApiCompactionInput;
 use codex_api::Compression;
+use codex_api::HttpTransportHandle;
 use codex_api::MemoriesClient as ApiMemoriesClient;
 use codex_api::MemorySummarizeInput as ApiMemorySummarizeInput;
 use codex_api::MemorySummarizeOutput as ApiMemorySummarizeOutput;
@@ -195,6 +196,7 @@ fn session_telemetry_for_request(
 struct ModelClientState {
     thread_id: ThreadId,
     provider: SharedModelProvider,
+    http_transport: Option<HttpTransportHandle>,
     auth_env_telemetry: AuthEnvTelemetry,
     session_source: SessionSource,
     originator: String,
@@ -423,6 +425,7 @@ impl ModelClient {
             state: Arc::new(ModelClientState {
                 thread_id,
                 provider: model_provider,
+                http_transport: None,
                 auth_env_telemetry,
                 session_source,
                 originator,
@@ -448,6 +451,23 @@ impl ModelClient {
     ) -> Self {
         self.prompt_cache_key_override = prompt_cache_key_override;
         self
+    }
+
+    pub(crate) fn with_http_transport(mut self, http_transport: HttpTransportHandle) -> Self {
+        let state = Arc::get_mut(&mut self.state)
+            .expect("transport override must be configured before ModelClient is cloned");
+        state.http_transport = Some(http_transport);
+        self
+    }
+
+    fn http_transport(&self) -> HttpTransportHandle {
+        self.state.http_transport.clone().unwrap_or_else(|| {
+            HttpTransportHandle::from_transport(ReqwestTransport::new(build_reqwest_client()))
+        })
+    }
+
+    pub(crate) fn http_transport_override(&self) -> Option<HttpTransportHandle> {
+        self.state.http_transport.clone()
     }
 
     fn prompt_cache_key(&self) -> String {
@@ -1366,7 +1386,7 @@ impl ModelClientSession {
         let mut pending_retry = PendingUnauthorizedRetry::default();
         loop {
             let client_setup = self.client.current_client_setup().await?;
-            let transport = ReqwestTransport::new(build_reqwest_client());
+            let transport = self.client.http_transport();
             let request_auth_context = AuthRequestTelemetryContext::new(
                 client_setup.auth.as_ref().map(CodexAuth::auth_mode),
                 client_setup.api_auth.as_ref(),

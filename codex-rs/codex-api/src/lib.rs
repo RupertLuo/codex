@@ -14,8 +14,12 @@ pub(crate) mod sse;
 pub(crate) mod telemetry;
 
 pub use crate::requests::headers::build_session_headers;
+pub use codex_client::HttpTransportHandle;
+pub use codex_client::Request;
 pub use codex_client::RequestTelemetry;
 pub use codex_client::ReqwestTransport;
+pub use codex_client::Response;
+pub use codex_client::StreamResponse;
 pub use codex_client::TransportError;
 
 pub use crate::api_bridge::map_api_error;

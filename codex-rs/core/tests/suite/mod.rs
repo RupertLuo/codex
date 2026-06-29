@@ -123,6 +123,7 @@ mod token_budget;
 mod tool_harness;
 mod tool_parallelism;
 mod tools;
+mod transport_injection;
 mod truncation;
 mod turn_state;
 mod unified_exec;

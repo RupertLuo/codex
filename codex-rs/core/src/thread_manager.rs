@@ -19,6 +19,7 @@ use crate::tasks::interrupted_turn_history_marker;
 use codex_agent_graph_store::AgentGraphStore;
 use codex_agent_graph_store::LocalAgentGraphStore;
 use codex_analytics::AnalyticsEventsClient;
+use codex_api::HttpTransportHandle;
 use codex_app_server_protocol::ThreadHistoryBuilder;
 use codex_app_server_protocol::TurnStatus;
 use codex_code_mode::CodeModeSessionProvider;
@@ -184,6 +185,22 @@ pub struct ThreadManager {
     _test_codex_home_guard: Option<TempCodexHomeGuard>,
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct ThreadManagerRuntimeOptions {
+    http_transport: Option<HttpTransportHandle>,
+}
+
+impl ThreadManagerRuntimeOptions {
+    pub fn with_http_transport(mut self, http_transport: HttpTransportHandle) -> Self {
+        self.http_transport = Some(http_transport);
+        self
+    }
+
+    pub(crate) fn http_transport(&self) -> Option<HttpTransportHandle> {
+        self.http_transport.clone()
+    }
+}
+
 pub struct StartThreadOptions {
     pub config: Config,
     pub allow_provider_model_fallback: bool,
@@ -255,6 +272,8 @@ pub(crate) struct ThreadManagerState {
     session_source: SessionSource,
     installation_id: String,
     analytics_events_client: Option<AnalyticsEventsClient>,
+    state_db: Option<StateDbHandle>,
+    runtime_options: ThreadManagerRuntimeOptions,
     // Captures submitted ops for testing purpose when test mode is enabled.
     ops_log: Option<SharedCapturedOps>,
 }
@@ -316,6 +335,39 @@ impl ThreadManager {
         attestation_provider: Option<Arc<dyn AttestationProvider>>,
         external_time_provider: Option<Arc<dyn TimeProvider>>,
     ) -> Self {
+        Self::new_with_runtime_options(
+            config,
+            auth_manager,
+            session_source,
+            environment_manager,
+            extensions,
+            user_instructions_provider,
+            analytics_events_client,
+            thread_store,
+            state_db,
+            installation_id,
+            attestation_provider,
+            external_time_provider,
+            ThreadManagerRuntimeOptions::default(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_runtime_options(
+        config: &Config,
+        auth_manager: Arc<AuthManager>,
+        session_source: SessionSource,
+        environment_manager: Arc<EnvironmentManager>,
+        extensions: Arc<ExtensionRegistry<Config>>,
+        user_instructions_provider: Arc<dyn UserInstructionsProvider>,
+        analytics_events_client: Option<AnalyticsEventsClient>,
+        thread_store: Arc<dyn ThreadStore>,
+        state_db: Option<StateDbHandle>,
+        installation_id: String,
+        attestation_provider: Option<Arc<dyn AttestationProvider>>,
+        external_time_provider: Option<Arc<dyn TimeProvider>>,
+        runtime_options: ThreadManagerRuntimeOptions,
+    ) -> Self {
         let codex_home = config.codex_home.clone();
         let restriction_product = session_source.restriction_product();
         let (thread_created_tx, _) = broadcast::channel(THREAD_CREATED_CHANNEL_CAPACITY);
@@ -357,6 +409,8 @@ impl ThreadManager {
                 session_source,
                 installation_id,
                 analytics_events_client,
+                state_db,
+                runtime_options,
                 ops_log: should_use_test_thread_manager_behavior()
                     .then(|| Arc::new(std::sync::Mutex::new(Vec::new()))),
             }),
@@ -465,6 +519,8 @@ impl ThreadManager {
                 session_source: SessionSource::Exec,
                 installation_id,
                 analytics_events_client: None,
+                state_db,
+                runtime_options: ThreadManagerRuntimeOptions::default(),
                 ops_log: should_use_test_thread_manager_behavior()
                     .then(|| Arc::new(std::sync::Mutex::new(Vec::new()))),
             }),
@@ -1605,6 +1661,7 @@ impl ThreadManagerState {
             supports_openai_form_elicitation,
             analytics_events_client: self.analytics_events_client.clone(),
             thread_store: Arc::clone(&self.thread_store),
+            http_transport: self.runtime_options.http_transport(),
             attestation_provider: self.attestation_provider.clone(),
             external_time_provider: self.external_time_provider.clone(),
             inherited_multi_agent_version: multi_agent_version,

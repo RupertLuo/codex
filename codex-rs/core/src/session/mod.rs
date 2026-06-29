@@ -53,6 +53,9 @@ use chrono::Utc;
 use codex_analytics::AnalyticsEventsClient;
 use codex_analytics::SubAgentThreadStartedInput;
 use codex_analytics::TurnCodexErrorFact;
+use codex_api::HttpTransportHandle;
+use codex_app_server_protocol::McpServerElicitationRequest;
+use codex_app_server_protocol::McpServerElicitationRequestParams;
 use codex_config::types::AuthKeyringBackendKind;
 use codex_config::types::OAuthCredentialsStoreMode;
 use codex_exec_server::Environment;
@@ -443,6 +446,7 @@ pub(crate) struct CodexSpawnArgs {
     pub(crate) supports_openai_form_elicitation: bool,
     pub(crate) analytics_events_client: Option<AnalyticsEventsClient>,
     pub(crate) thread_store: Arc<dyn ThreadStore>,
+    pub(crate) http_transport: Option<HttpTransportHandle>,
     pub(crate) attestation_provider: Option<Arc<dyn AttestationProvider>>,
     pub(crate) external_time_provider: Option<Arc<dyn TimeProvider>>,
     pub(crate) inherited_multi_agent_version: Option<MultiAgentVersion>,
@@ -531,6 +535,7 @@ impl Codex {
             supports_openai_form_elicitation,
             analytics_events_client,
             thread_store,
+            http_transport,
             attestation_provider,
             external_time_provider,
             inherited_multi_agent_version,
@@ -699,6 +704,7 @@ impl Codex {
             analytics_events_client,
             thread_store,
             parent_rollout_thread_trace,
+            http_transport,
             attestation_provider,
             external_time_provider,
             multi_agent_version,
