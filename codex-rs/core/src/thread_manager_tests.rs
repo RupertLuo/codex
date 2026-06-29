@@ -8,7 +8,10 @@ use crate::session::tests::build_world_state_from_turn_context;
 use crate::session::tests::make_session_and_context;
 use crate::tasks::InterruptedTurnHistoryMarker;
 use crate::tasks::interrupted_turn_history_marker;
+use codex_api::HttpTransportHandle;
+use codex_api::ReqwestTransport;
 use codex_extension_api::empty_extension_registry;
+use codex_login::default_client::build_reqwest_client;
 use codex_models_manager::manager::RefreshStrategy;
 use codex_protocol::capabilities::CapabilityRootLocation;
 use codex_protocol::capabilities::SelectedCapabilityRoot;
@@ -78,6 +81,18 @@ impl codex_agent_graph_store::AgentGraphStore for FakeAgentGraphStore {
         let descendant_thread_ids = self.descendant_thread_ids.clone();
         Box::pin(async move { Ok(descendant_thread_ids) })
     }
+}
+
+#[test]
+fn runtime_options_report_http_transport_override() {
+    let default_options = ThreadManagerRuntimeOptions::default();
+    assert!(!default_options.has_http_transport_override());
+
+    let transport = HttpTransportHandle::from_transport(ReqwestTransport::new(
+        build_reqwest_client(),
+    ));
+    let configured_options = default_options.with_http_transport(transport);
+    assert!(configured_options.has_http_transport_override());
 }
 
 fn user_msg(text: &str) -> ResponseItem {
