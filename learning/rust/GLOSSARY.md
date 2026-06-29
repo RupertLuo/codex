@@ -5,4 +5,6 @@ Terms are added here only after the learner has explained or used them correctly
 
 ## Demonstrated terms
 
-No terms recorded yet.
+**Clap**:
+A Rust command-line parser that converts argument strings into typed Rust data and can generate command help from declarations such as documentation comments.
+_Avoid_: Command executor, Rust compiler

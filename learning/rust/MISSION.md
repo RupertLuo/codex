@@ -20,4 +20,4 @@ The immediate product direction is moving Catalyst runtime responsibilities towa
 
 ## Current focus
 
-Lesson 2 begins with one disposable edit to the real Codex CLI. The learner first runs a command, changes one documentation comment, rebuilds, observes the result, and restores the change. Rust syntax is explained only after it appears in that loop. The production transport patch starts immediately afterward.
+Lesson 3 begins the production transport patch by running one existing `codex-client` test, then adding one failing test for a concrete transport handle. New Rust syntax is introduced only when that test requires it.
