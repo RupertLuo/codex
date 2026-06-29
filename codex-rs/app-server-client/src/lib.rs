@@ -51,8 +51,8 @@ use codex_config::NoopThreadConfigLoader;
 use codex_config::RemoteThreadConfigLoader;
 use codex_config::ThreadConfigLoader;
 use codex_config::config_toml::ConfigToml;
-use codex_core::config::Config;
 pub use codex_core::ThreadManagerRuntimeOptions;
+use codex_core::config::Config;
 pub use codex_core::otel_init::build_provider as build_otel_provider;
 use codex_core::personality_migration::PersonalityMigrationStatus;
 use codex_core::personality_migration::maybe_migrate_personality;
@@ -2233,12 +2233,8 @@ mod tests {
             .await,
         );
         let transport = HttpTransportHandle::new(
-            |_request| async {
-                Err(TransportError::Build("execute test sentinel".to_string()))
-            },
-            |_request| async {
-                Err(TransportError::Build("stream test sentinel".to_string()))
-            },
+            |_request| async { Err(TransportError::Build("execute test sentinel".to_string())) },
+            |_request| async { Err(TransportError::Build("stream test sentinel".to_string())) },
         );
         let thread_manager_runtime_options =
             ThreadManagerRuntimeOptions::default().with_http_transport(transport);

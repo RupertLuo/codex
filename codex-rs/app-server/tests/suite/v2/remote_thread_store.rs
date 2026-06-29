@@ -305,6 +305,7 @@ async fn start_in_process_client(
         log_db: None,
         state_db: None,
         environment_manager: Arc::new(EnvironmentManager::default_for_tests()),
+        thread_manager_runtime_options: codex_core::ThreadManagerRuntimeOptions::default(),
         config_warnings: Vec::new(),
         session_source: SessionSource::Cli,
         enable_codex_api_key_env: false,

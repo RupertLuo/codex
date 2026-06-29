@@ -30,7 +30,7 @@ use codex_app_server_client::InProcessClientStartArgs;
 use codex_app_server_client::RemoteAppServerClient;
 use codex_app_server_client::RemoteAppServerConnectArgs;
 pub use codex_app_server_client::RemoteAppServerEndpoint;
-use codex_app_server_client::ThreadManagerRuntimeOptions;
+pub use codex_app_server_client::ThreadManagerRuntimeOptions;
 use codex_app_server_protocol::Account as AppServerAccount;
 use codex_app_server_protocol::AskForApproval;
 use codex_app_server_protocol::AuthMode as AppServerAuthMode;
@@ -225,6 +225,38 @@ pub use public_widgets::composer_input::ComposerInput;
 
 const TUI_LOG_FILE_NAME: &str = "codex-tui.log";
 
+#[derive(Clone, Debug, Default)]
+pub struct TuiRuntimeOptions {
+    thread_manager: ThreadManagerRuntimeOptions,
+}
+
+impl TuiRuntimeOptions {
+    pub fn with_thread_manager_options(
+        mut self,
+        thread_manager: ThreadManagerRuntimeOptions,
+    ) -> Self {
+        self.thread_manager = thread_manager;
+        self
+    }
+
+    fn requires_embedded_app_server(&self) -> bool {
+        self.thread_manager.has_http_transport_override()
+    }
+}
+
+fn validate_runtime_target(
+    runtime_options: &TuiRuntimeOptions,
+    has_explicit_remote_endpoint: bool,
+) -> std::io::Result<()> {
+    if has_explicit_remote_endpoint && runtime_options.requires_embedded_app_server() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "process-local TUI runtime options require the embedded app-server",
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(unix)]
 const AUTO_CONNECT_DAEMON_CONNECT_TIMEOUT: std::time::Duration =
     std::time::Duration::from_millis(50);
@@ -241,6 +273,7 @@ async fn start_embedded_app_server(
     log_db: Option<log_db::LogDbLayer>,
     state_db: Option<StateDbHandle>,
     environment_manager: Arc<EnvironmentManager>,
+    runtime_options: TuiRuntimeOptions,
 ) -> color_eyre::Result<InProcessAppServerClient> {
     start_embedded_app_server_with(
         arg0_paths,
@@ -253,6 +286,7 @@ async fn start_embedded_app_server(
         log_db,
         state_db,
         environment_manager,
+        runtime_options,
         InProcessAppServerClient::start,
     )
     .await
@@ -456,6 +490,7 @@ async fn start_app_server(
     log_db: Option<log_db::LogDbLayer>,
     state_db: Option<StateDbHandle>,
     environment_manager: Arc<EnvironmentManager>,
+    runtime_options: TuiRuntimeOptions,
 ) -> color_eyre::Result<AppServerClient> {
     match target {
         AppServerTarget::Embedded => start_embedded_app_server(
@@ -469,6 +504,7 @@ async fn start_app_server(
             log_db,
             state_db,
             environment_manager,
+            runtime_options,
         )
         .await
         .map(AppServerClient::InProcess),
@@ -496,6 +532,7 @@ pub(crate) async fn start_app_server_for_picker(
         /*log_db*/ None,
         state_db,
         environment_manager,
+        TuiRuntimeOptions::default(),
     )
     .await?;
     Ok(AppServerSession::new(
@@ -530,6 +567,7 @@ async fn start_embedded_app_server_with<F, Fut>(
     log_db: Option<log_db::LogDbLayer>,
     state_db: Option<StateDbHandle>,
     environment_manager: Arc<EnvironmentManager>,
+    runtime_options: TuiRuntimeOptions,
     start_client: F,
 ) -> color_eyre::Result<InProcessAppServerClient>
 where
@@ -557,7 +595,7 @@ where
         log_db,
         state_db,
         environment_manager,
-        thread_manager_runtime_options: ThreadManagerRuntimeOptions::default(),
+        thread_manager_runtime_options: runtime_options.thread_manager,
         config_warnings,
         session_source: serde_json::from_value(serde_json::json!("cli"))
             .unwrap_or_else(|err| panic!("cli session source should deserialize: {err}")),
@@ -846,11 +884,29 @@ fn can_reuse_implicit_local_daemon(
 }
 
 pub async fn run_main(
-    mut cli: Cli,
+    cli: Cli,
     arg0_paths: Arg0DispatchPaths,
     loader_overrides: LoaderOverrides,
     explicit_remote_endpoint: Option<RemoteAppServerEndpoint>,
 ) -> std::io::Result<AppExitInfo> {
+    run_main_with_runtime_options(
+        cli,
+        arg0_paths,
+        loader_overrides,
+        explicit_remote_endpoint,
+        TuiRuntimeOptions::default(),
+    )
+    .await
+}
+
+pub async fn run_main_with_runtime_options(
+    mut cli: Cli,
+    arg0_paths: Arg0DispatchPaths,
+    loader_overrides: LoaderOverrides,
+    explicit_remote_endpoint: Option<RemoteAppServerEndpoint>,
+    runtime_options: TuiRuntimeOptions,
+) -> std::io::Result<AppExitInfo> {
+    validate_runtime_target(&runtime_options, explicit_remote_endpoint.is_some())?;
     let strict_config = cli.strict_config;
     let (sandbox_mode, approval_policy) = if cli.dangerously_bypass_approvals_and_sandbox {
         (
@@ -906,7 +962,7 @@ pub async fn run_main(
         &cli_kv_overrides,
         &launch_loader_overrides,
         strict_config,
-        cli.bypass_hook_trust,
+        cli.bypass_hook_trust || runtime_options.requires_embedded_app_server(),
     );
     let default_daemon = if explicit_remote_endpoint.is_none() && reuse_implicit_local_daemon {
         maybe_probe_default_daemon_socket(&codex_home).await
@@ -1271,6 +1327,7 @@ pub async fn run_main(
         log_db,
         state_db,
         environment_manager,
+        runtime_options,
     )
     .await
     .map_err(|err| std::io::Error::other(err.to_string()))
@@ -1293,6 +1350,7 @@ async fn run_ratatui_app(
     log_db: Option<log_db::LogDbLayer>,
     state_db: Option<StateDbHandle>,
     environment_manager: Arc<EnvironmentManager>,
+    runtime_options: TuiRuntimeOptions,
 ) -> color_eyre::Result<AppExitInfo> {
     let uses_remote_workspace = app_server_target.uses_remote_workspace();
     color_eyre::install()?;
@@ -1355,6 +1413,7 @@ async fn run_ratatui_app(
         log_db.clone(),
         state_db.clone(),
         environment_manager.clone(),
+        runtime_options.clone(),
     )
     .await
     {
@@ -1735,6 +1794,7 @@ async fn run_ratatui_app(
             log_db.clone(),
             state_db.clone(),
             environment_manager.clone(),
+            runtime_options,
         )
         .await
         {
@@ -2012,6 +2072,8 @@ mod tests {
     use super::*;
     use crate::legacy_core::config::ConfigBuilder;
     use crate::legacy_core::config::ConfigOverrides;
+    use codex_api::HttpTransportHandle;
+    use codex_api::TransportError;
     use codex_app_server_protocol::AskForApproval;
     use codex_app_server_protocol::ClientRequest;
     use codex_app_server_protocol::RequestId;
@@ -2021,6 +2083,16 @@ mod tests {
     use pretty_assertions::assert_eq;
     use serial_test::serial;
     use tempfile::TempDir;
+
+    fn custom_tui_runtime_options() -> TuiRuntimeOptions {
+        let transport = HttpTransportHandle::new(
+            |_request| async { Err(TransportError::Build("execute test sentinel".to_string())) },
+            |_request| async { Err(TransportError::Build("stream test sentinel".to_string())) },
+        );
+        TuiRuntimeOptions::default().with_thread_manager_options(
+            ThreadManagerRuntimeOptions::default().with_http_transport(transport),
+        )
+    }
 
     async fn build_config(temp_dir: &TempDir) -> std::io::Result<Config> {
         ConfigBuilder::default()
@@ -2139,6 +2211,7 @@ mod tests {
             /*log_db*/ None,
             state_db,
             Arc::new(EnvironmentManager::default_for_tests()),
+            TuiRuntimeOptions::default(),
         )
         .await
     }
@@ -2368,6 +2441,31 @@ mod tests {
             /*has_non_replayable_launch_overrides*/ true,
         ));
         Ok(())
+    }
+
+    #[test]
+    fn custom_runtime_options_disable_implicit_daemon_reuse() {
+        let runtime_options = custom_tui_runtime_options();
+        assert!(runtime_options.requires_embedded_app_server());
+        assert!(!can_reuse_implicit_local_daemon(
+            &[],
+            &LoaderOverrides::default(),
+            /*strict_config*/ false,
+            runtime_options.requires_embedded_app_server(),
+        ));
+    }
+
+    #[test]
+    fn custom_runtime_options_reject_explicit_remote_app_server() {
+        let runtime_options = custom_tui_runtime_options();
+        let result =
+            validate_runtime_target(&runtime_options, /*has_explicit_remote_endpoint*/ true);
+        assert_eq!(
+            result
+                .expect_err("process-local transport must reject remote app-server")
+                .kind(),
+            std::io::ErrorKind::InvalidInput,
+        );
     }
 
     #[test]
@@ -2870,6 +2968,7 @@ mod tests {
     async fn embedded_app_server_start_failure_is_returned() -> color_eyre::Result<()> {
         let temp_dir = TempDir::new()?;
         let config = build_config(&temp_dir).await?;
+        let runtime_options = custom_tui_runtime_options();
         let result = start_embedded_app_server_with(
             Arg0DispatchPaths::default(),
             config,
@@ -2881,7 +2980,14 @@ mod tests {
             /*log_db*/ None,
             /*state_db*/ None,
             Arc::new(EnvironmentManager::default_for_tests()),
-            |_args| async { Err(std::io::Error::other("boom")) },
+            runtime_options,
+            |args| async move {
+                assert!(
+                    args.thread_manager_runtime_options
+                        .has_http_transport_override()
+                );
+                Err(std::io::Error::other("boom"))
+            },
         )
         .await;
         let err = match result {

@@ -42,9 +42,8 @@ fn runtime_options_report_http_transport_override() {
     let default_options = ThreadManagerRuntimeOptions::default();
     assert!(!default_options.has_http_transport_override());
 
-    let transport = HttpTransportHandle::from_transport(ReqwestTransport::new(
-        build_reqwest_client(),
-    ));
+    let transport =
+        HttpTransportHandle::from_transport(ReqwestTransport::new(build_reqwest_client()));
     let configured_options = default_options.with_http_transport(transport);
     assert!(configured_options.has_http_transport_override());
 }

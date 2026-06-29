@@ -33,11 +33,15 @@ fn tui_runtime_source_does_not_depend_on_manager_escape_hatches() {
         "auth_manager(",
         "thread_manager(",
     ];
+    let allowed_manager_types = ["ThreadManagerRuntimeOptions"];
 
     let violations: Vec<String> = sources
         .iter()
         .flat_map(|path| {
             let contents = fs::read_to_string(path).expect("Rust source file should be readable");
+            let contents = allowed_manager_types
+                .iter()
+                .fold(contents, |contents, allowed| contents.replace(allowed, ""));
             let path_display = path.display().to_string();
             forbidden
                 .iter()
