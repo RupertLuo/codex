@@ -20,3 +20,7 @@ _Avoid_: Import, automatic test discovery
 **`#[derive(Clone)]`**:
 An attribute that asks the Rust compiler to generate the standard `Clone` implementation, making explicit duplication available through `.clone()`.
 _Avoid_: Automatic copying, constructor
+
+**`Arc<T>`**:
+An atomically reference-counted pointer that gives multiple threads shared ownership of one value; cloning an `Arc` shares the value rather than duplicating it.
+_Avoid_: Deep copy, global variable
