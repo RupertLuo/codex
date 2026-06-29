@@ -1,0 +1,215 @@
+<!doctype html>
+<!-- Boundary: Hands-on Rust workbook for a first Codex source edit; it does not execute or modify Codex. -->
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>第一次修改 Codex · Rust 实战 01</title>
+  <style>
+    :root {
+      --ink:#17211b;
+      --muted:#657168;
+      --paper:#f5f0e5;
+      --card:#fffdf7;
+      --line:#d8cfbd;
+      --rust:#b54b2a;
+      --green:#21684f;
+      --navy:#253c54;
+      --amber:#9d6919;
+      --code:#17221e;
+      --codeink:#edf5ef;
+    }
+    *{box-sizing:border-box}
+    html{scroll-behavior:smooth}
+    body{margin:0;color:var(--ink);background:radial-gradient(circle at 15% 4%,#efd8ca 0,transparent 25rem),radial-gradient(circle at 88% 18%,#d8e7df 0,transparent 28rem),var(--paper);font:16px/1.65 ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+    header,main{max-width:1020px;margin:auto;padding-left:26px;padding-right:26px}
+    header{padding-top:64px;padding-bottom:30px}
+    .eyebrow{font-weight:850;color:var(--rust);letter-spacing:.12em;text-transform:uppercase}
+    h1{font:800 clamp(2.5rem,7vw,5rem)/.98 Georgia,serif;letter-spacing:-.05em;margin:10px 0 18px;max-width:880px}
+    .lead{font-size:1.12rem;color:var(--muted);max-width:800px}
+    h2{font:750 2rem/1.2 Georgia,serif;margin:0 0 8px}
+    h3{margin-top:24px}
+    code,pre{font-family:"SFMono-Regular",Consolas,monospace}
+    :not(pre)>code{color:#8d351e;background:#f2e2d5;padding:.1em .35em;border-radius:5px}
+    pre{background:var(--code);color:var(--codeink);padding:17px;border-radius:12px;overflow:auto;font-size:.88rem;line-height:1.55}
+    a{color:var(--green)}
+    footer{color:var(--muted);padding:10px 0 70px}
+    .lesson-status{display:flex;flex-wrap:wrap;gap:8px;margin-top:20px}
+    .lesson-status span,.badge{display:inline-block;padding:5px 10px;border:1px solid var(--line);border-radius:999px;background:#fff;font-size:.85rem;font-weight:750}
+    .workbook{counter-reset:lab-step}
+    .lab-step,.optional-reference{position:relative;margin:20px 0;padding:28px;border:1px solid var(--line);border-radius:20px;background:rgba(255,253,247,.9);box-shadow:0 15px 40px rgba(48,40,25,.09)}
+    .lab-step{padding-left:88px}
+    .lab-step::before{counter-increment:lab-step;content:counter(lab-step);position:absolute;left:28px;top:28px;width:42px;height:42px;border-radius:50%;display:grid;place-content:center;background:var(--rust);color:#fff;font-weight:900}
+    .instruction-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;margin-top:16px}
+    .instruction{padding:14px;border:1px solid var(--line);border-radius:12px;background:#fff}
+    .instruction h3{margin:0 0 6px;font-size:.78rem;text-transform:uppercase;letter-spacing:.08em;color:var(--muted)}
+    .instruction p:last-child{margin-bottom:0}
+    .expected{border-left:4px solid var(--green)}
+    .trouble{border-left:4px solid var(--amber);background:#fff9e9}
+    .checkpoint{border:2px solid var(--navy);background:#f2f6fa}
+    .before-after{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+    .label{font-size:.75rem;text-transform:uppercase;letter-spacing:.1em;color:var(--muted);font-weight:850}
+    .quiz{display:grid;gap:8px;margin-top:16px}
+    .quiz button{border:1px solid var(--line);background:#fff;padding:10px 13px;border-radius:9px;cursor:pointer;color:var(--ink);font:inherit;text-align:left}
+    .quiz button:hover{border-color:var(--rust)}
+    .feedback{min-height:30px;font-weight:750}
+    .optional-reference{margin-top:34px}
+    .optional-reference summary{cursor:pointer;font-size:1.2rem;font-weight:850}
+    .optional-reference details{padding:15px;border:1px solid var(--line);border-radius:12px;background:#fff}
+    .route{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:18px 0}
+    .route span{padding:8px 10px;border-radius:9px;background:#eee7d8;font-weight:750}
+    .route b{color:var(--muted)}
+    @media(max-width:780px){
+      .lab-step{padding-left:20px;padding-top:88px}
+      .lab-step::before{left:20px}
+      .instruction-grid,.before-after{grid-template-columns:1fr}
+    }
+  </style>
+</head>
+<body>
+<header>
+  <div class="eyebrow">Rust 实战 01 · 不要求预习语法</div>
+  <h1>先改一行真正的 Codex，再解释 Rust</h1>
+  <p class="lead">这一课只有一个目标：让你亲手完成“运行源码 → 找到一行 → 修改 → 重新编译 → 看见变化 → 恢复现场”。遇到什么语法，我们就只学什么语法。</p>
+  <div class="lesson-status">
+    <span>预计 10–15 分钟</span>
+    <span>修改 1 行</span>
+    <span>最终不保留源码改动</span>
+  </div>
+</header>
+<main class="workbook">
+  <section class="lab-step">
+    <span class="badge">只读，不会改文件</span>
+    <h2>确认你正在源码仓库里</h2>
+    <p>先让终端告诉我们当前分支、Rust 和构建工具版本。</p>
+    <pre><code>cd /Users/luoruipu/projects/other_projects/codex
+git status --short --branch
+cd codex-rs
+rustc --version
+cargo --version
+just --version</code></pre>
+    <div class="instruction-grid">
+      <div class="instruction expected"><h3>Expect · 预期</h3><p>分支是 <code>codex/catalyst-transport-v0.142.4</code>，并看到 Rust 1.95.0、Cargo 1.95.0、Just 1.54.0。</p></div>
+      <div class="instruction"><h3>Learn · 只学这一点</h3><p><code>cd</code> 切换目录；Rust workspace 的构建入口在 <code>codex-rs</code>。</p></div>
+      <div class="instruction trouble"><h3>If it fails · 出错</h3><p>如果提示目录不存在，先运行 <code>pwd</code>，把输出发给我；不要猜路径。</p></div>
+      <div class="instruction checkpoint"><h3>Checkpoint · 检查点</h3><p>确认 Git 输出里没有以 <code>M</code>、<code>A</code> 或 <code>D</code> 开头的源码文件。</p></div>
+    </div>
+  </section>
+
+  <section class="lab-step">
+    <span class="badge">第一次从源码运行</span>
+    <h2>看修改前的帮助文字</h2>
+    <pre><code>just codex --help | rg -n "debug|Debugging"</code></pre>
+    <div class="instruction-grid">
+      <div class="instruction expected"><h3>Expect · 预期</h3><p>输出包含 <code>debug</code> 和 <code>Debugging tools</code>。第一次构建可能需要几分钟。</p></div>
+      <div class="instruction"><h3>Learn · 只学这一点</h3><p><code>just codex</code> 会构建并运行当前源码，不是系统里已安装的旧二进制。</p></div>
+      <div class="instruction trouble"><h3>If it fails · 出错</h3><p>如果出现编译错误，只看第一条 <code>error:</code>；把它和上方十行一起发给我。这个发布标签首次构建也可能只改写 <code>Cargo.lock</code> 中的 workspace 版本；运行 <code>git diff -- Cargo.lock</code> 后先停下，我会帮你只恢复这个生成差异。</p></div>
+      <div class="instruction checkpoint"><h3>Checkpoint · 检查点</h3><p>记住原文 <code>Debugging tools</code>，后面要用同一条命令比较。</p></div>
+    </div>
+  </section>
+
+  <section class="lab-step">
+    <span class="badge">仍然只读</span>
+    <h2>找到这行文字来自哪里</h2>
+    <pre><code>rg -n -C 3 "Debugging tools" cli/src/main.rs</code></pre>
+    <div class="instruction-grid">
+      <div class="instruction expected"><h3>Expect · 预期</h3><p>你会看到 <code>/// Debugging tools.</code>，下面紧跟 <code>Debug(DebugCommand),</code>。</p></div>
+      <div class="instruction"><h3>Learn · 只学这一点</h3><p><code>rg</code> 是代码搜索工具；<code>-n</code> 显示行号，<code>-C 3</code> 同时显示上下三行。</p></div>
+      <div class="instruction trouble"><h3>If it fails · 出错</h3><p>先运行 <code>pwd</code>。这里应该以 <code>/codex/codex-rs</code> 结尾。</p></div>
+      <div class="instruction checkpoint"><h3>Checkpoint · 检查点</h3><p>此时我们已经从“屏幕上的文字”追到了“生成它的源码”。</p></div>
+    </div>
+  </section>
+
+  <section class="lab-step">
+    <span class="badge">本课唯一一次源码修改</span>
+    <h2>亲手改一行</h2>
+    <p>在编辑器中打开 <code>/Users/luoruipu/projects/other_projects/codex/codex-rs/cli/src/main.rs</code>，只做下面这个替换：</p>
+    <div class="before-after">
+      <div><p class="label">Before</p><pre><code>/// Debugging tools.
+Debug(DebugCommand),</code></pre></div>
+      <div><p class="label">After</p><pre><code>/// Developer diagnostics and debugging tools.
+Debug(DebugCommand),</code></pre></div>
+    </div>
+    <div class="instruction-grid">
+      <div class="instruction expected"><h3>Expect · 预期</h3><p><code>git diff -- cli/src/main.rs</code> 只显示一行删除和一行新增。</p></div>
+      <div class="instruction"><h3>Learn · 只学这一点</h3><p><code>///</code> 是文档注释，会附着到它下面的 Rust 项目；这里 Clap 用它生成 CLI 帮助。</p></div>
+      <div class="instruction trouble"><h3>If it fails · 出错</h3><p>如果 diff 里还有别的变化，先不要继续，把 diff 发给我。</p></div>
+      <div class="instruction checkpoint"><h3>Checkpoint · 检查点</h3><p>不要修改 <code>Debug(DebugCommand),</code>；这一轮只改注释。</p></div>
+    </div>
+  </section>
+
+  <section class="lab-step">
+    <span class="badge">编译并观察</span>
+    <h2>运行同一条命令</h2>
+    <pre><code>just codex --help | rg -n "debug|Developer diagnostics"</code></pre>
+    <div class="instruction-grid">
+      <div class="instruction expected"><h3>Expect · 预期</h3><p>帮助文字变成 <code>Developer diagnostics and debugging tools</code>。</p></div>
+      <div class="instruction"><h3>Learn · 只学这一点</h3><p>Rust 先把源码编译成二进制。Just 检测到一行变化后只重建受影响部分。</p></div>
+      <div class="instruction trouble"><h3>If it fails · 出错</h3><p>先运行 <code>git diff -- cli/src/main.rs</code>，确认改动和上一步完全一致。</p></div>
+      <div class="instruction checkpoint"><h3>Checkpoint · 检查点</h3><p>到这里，你已经完成第一次真实的 Rust 修改和运行。</p></div>
+    </div>
+  </section>
+
+  <section class="lab-step">
+    <span class="badge">现在才读两行 Rust</span>
+    <h2>理解刚才碰到的语法</h2>
+    <pre><code>enum Subcommand {
+    /// Developer diagnostics and debugging tools.
+    Debug(DebugCommand),
+}</code></pre>
+    <p><code>enum Subcommand</code> 表示“Codex 子命令只能是列出来的这些选择之一”。<code>Debug(...)</code> 是其中一个选择，括号里的 <code>DebugCommand</code> 是这个选择携带的数据。现在不需要理解它内部是什么。</p>
+    <div class="instruction checkpoint quiz" data-quiz-answer="b">
+      <h3>Checkpoint · 一道题</h3>
+      <p>如果把 <code>///</code> 改成普通的 <code>//</code>，帮助文字还会出现吗？</p>
+      <button data-choice="a">A. 会，所有注释都能生成帮助</button>
+      <button data-choice="b">B. 不会，Clap 使用的是文档注释</button>
+      <div class="feedback"></div>
+    </div>
+  </section>
+
+  <section class="lab-step">
+    <span class="badge">恢复现场</span>
+    <h2>把练习改动还原</h2>
+    <p>在编辑器里把文档注释改回：</p>
+    <pre><code>/// Debugging tools.</code></pre>
+    <p>然后检查：</p>
+    <pre><code>git diff --check
+git status --short</code></pre>
+    <div class="instruction-grid">
+      <div class="instruction expected"><h3>Expect · 预期</h3><p>两个命令都不显示 Codex 源码改动。</p></div>
+      <div class="instruction"><h3>Learn · 只学这一点</h3><p><code>git diff</code> 是修改前后的安全网。练习代码不混进正式 transport patch。</p></div>
+      <div class="instruction trouble"><h3>If it fails · 出错</h3><p>不要使用 <code>git reset --hard</code>。把 <code>git diff -- cli/src/main.rs</code> 发给我，我们只恢复这一行。</p></div>
+      <div class="instruction checkpoint"><h3>Checkpoint · 检查点</h3><p>下一步开始真正的 transport 测试；新代码会按可审查的提交保留。</p></div>
+    </div>
+  </section>
+
+  <section class="optional-reference">
+    <details>
+      <summary>可选参考：最终为什么要注入 HttpTransport？</summary>
+      <p>我们的长期目标是在不替换 Codex agent loop 的前提下，让 Catalyst 的 Rust runtime 接管模型 HTTP 请求。现在只需要知道目标，不需要读懂实现。</p>
+      <div class="route">
+        <span>ThreadManager</span><b>→</b><span>Session</span><b>→</b><span>ModelClient</span><b>→</b><span>HttpTransport</span><b>→</b><span>Agent loop</span>
+      </div>
+      <p><code>BoxFuture</code>、<code>Arc</code>、trait 和 async 会在真实 patch 第一次需要它们时分别学习。</p>
+      <p>想提前查资料时再打开：<a href="https://github.com/openai/codex/blob/rust-v0.142.4/codex-rs/codex-client/src/transport.rs">Codex 0.142.4 transport 源码</a>。</p>
+    </details>
+  </section>
+
+  <footer>本课完成后，正式 Codex 源码应恢复干净；教程和学习记录保留在同仓的 learning/rust。</footer>
+</main>
+<script>
+  document.querySelectorAll('[data-quiz-answer]').forEach((quiz) => {
+    quiz.querySelectorAll('button').forEach((button) => {
+      button.addEventListener('click', () => {
+        const correct = button.dataset.choice === quiz.dataset.quizAnswer;
+        const feedback = quiz.querySelector('.feedback');
+        feedback.textContent = correct
+          ? '正确：Clap 读取文档注释生成帮助文字。'
+          : '再想想：普通 // 注释只给读源码的人看。';
+        feedback.style.color = correct ? '#21684f' : '#b54b2a';
+      });
+    });
+  });
+</script>
+</body>
+</html>

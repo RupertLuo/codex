@@ -1,0 +1,341 @@
+<!doctype html>
+<!-- Boundary: Interactive Rust syntax lesson for Python developers; it does not execute product code or load external scripts. -->
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Python → Rust：为读懂 Codex 而学</title>
+  <style>
+    :root {
+      --ink:#17211b; --muted:#607065; --paper:#f7f3e8; --card:rgba(255,255,255,.8);
+      --line:#d7d0bf; --rust:#b54b2a; --green:#1f6b4f; --code:#18221e;
+      --code-ink:#ebf3ed; --shadow:0 18px 45px rgba(49,42,28,.12);
+    }
+    *{box-sizing:border-box} html{scroll-behavior:smooth}
+    body{margin:0;color:var(--ink);background:radial-gradient(circle at 12% 8%,rgba(181,75,42,.13),transparent 28rem),radial-gradient(circle at 90% 22%,rgba(31,107,79,.12),transparent 26rem),var(--paper);font-family:ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;line-height:1.65}
+    a{color:var(--green)} code,pre{font-family:"SFMono-Regular",Consolas,monospace}
+    header{max-width:1120px;margin:0 auto;padding:72px 28px 36px}
+    .eyebrow{color:var(--rust);font-weight:800;letter-spacing:.12em;text-transform:uppercase}
+    h1{margin:8px 0 16px;max-width:900px;font:800 clamp(2.6rem,8vw,5.6rem)/.98 Georgia,serif;letter-spacing:-.055em}
+    .lead{max-width:790px;color:var(--muted);font-size:1.14rem}
+    .route{display:flex;flex-wrap:wrap;gap:8px;margin-top:26px}
+    .route a{padding:7px 11px;border:1px solid var(--line);border-radius:99px;background:rgba(255,255,255,.5);text-decoration:none;font-size:.9rem}
+    main{max-width:1120px;margin:0 auto;padding:0 28px 90px}
+    section{margin-top:22px;padding:30px;border:1px solid var(--line);border-radius:22px;background:var(--card);box-shadow:var(--shadow);backdrop-filter:blur(12px)}
+    h2{margin:0 0 8px;font:750 2rem/1.15 Georgia,serif} h3{margin-top:24px}
+    .note{border-left:4px solid var(--rust);padding:10px 14px;background:#fff8f1}
+    .good{border-left-color:var(--green);background:#f1faf5}
+    .compare{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+    .label{margin:0 0 6px;color:var(--muted);font-size:.78rem;font-weight:800;letter-spacing:.08em;text-transform:uppercase}
+    pre{overflow:auto;margin:0;padding:18px;color:var(--code-ink);background:var(--code);border-radius:13px;font-size:.88rem;line-height:1.55}
+    :not(pre)>code{padding:.1em .35em;color:#8c3219;background:#f4e6db;border-radius:5px}
+    table{width:100%;border-collapse:collapse;margin-top:14px}
+    th,td{padding:10px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}
+    th{color:var(--muted);font-size:.8rem;text-transform:uppercase;letter-spacing:.06em}
+    details{margin-top:12px;padding:13px 15px;border:1px solid var(--line);border-radius:12px;background:rgba(255,255,255,.55)}
+    summary{cursor:pointer;font-weight:750}
+    .quiz{display:grid;gap:9px;margin-top:14px}
+    button{padding:11px 14px;border:1px solid var(--line);border-radius:10px;color:var(--ink);background:#fff;text-align:left;cursor:pointer;font:inherit}
+    button:hover{border-color:var(--rust)}
+    .feedback{min-height:2rem;margin-top:10px;font-weight:700}
+    .map{display:grid;grid-template-columns:repeat(4,1fr);gap:9px;margin:18px 0}
+    .map div{padding:14px;border-radius:12px;background:#f1ece0}
+    .map strong{display:block;color:var(--rust)}
+    footer{color:var(--muted);font-size:.9rem}
+    @media(max-width:760px){.compare,.map{grid-template-columns:1fr}section{padding:20px}header{padding-top:45px}}
+  </style>
+</head>
+<body>
+  <header>
+    <div class="eyebrow">Lesson 01 · Rust for Codex</div>
+    <h1>别把 Rust 当成“难一点的 Python”</h1>
+    <p class="lead">Rust 的表面语法并不难。真正的新东西是：每个值由谁负责释放、函数到底拿走了值还是只借来看一下，以及失败是否被类型明确写出来。掌握这三件事，Codex 源码会从“符号墙”变成可以顺着读的程序。</p>
+    <nav class="route">
+      <a href="#surface">表面语法</a><a href="#ownership">所有权</a><a href="#types">数据建模</a><a href="#errors">错误处理</a><a href="#traits">Trait</a><a href="#async">异步</a><a href="#codex">解码 Codex</a><a href="#quiz">小测</a>
+    </nav>
+  </header>
+  <main>
+    <section id="surface">
+      <h2>1. 先把表面语法扫清</h2>
+      <p>Rust 是静态类型语言，但局部变量通常能推断类型。变量默认不可变；语句做动作，表达式产生值。</p>
+      <div class="compare">
+        <div><p class="label">Python</p><pre><code>model = "deepseek-chat"
+retries = 3
+retries += 1
+
+def score(x: int) -> int:
+    if x > 0:
+        return x * 2
+    return 0</code></pre></div>
+        <div><p class="label">Rust</p><pre><code>let model = "deepseek-chat";
+let mut retries: u32 = 3;
+retries += 1;
+
+fn score(x: i32) -> i32 {
+    if x > 0 {
+        x * 2
+    } else {
+        0
+    }
+}</code></pre></div>
+      </div>
+      <p class="note"><strong>分号规则：</strong>块末尾没有分号的表达式就是返回值。写成 <code>x * 2;</code> 后它变成语句，值被丢弃，块的值是 <code>()</code>，类似 Python 的 <code>None</code>，但它是一个真实的零大小类型。</p>
+      <table>
+        <tr><th>Rust</th><th>含义</th><th>Python 联想</th></tr>
+        <tr><td><code>let x = 1;</code></td><td>不可变绑定</td><td>普通赋值，但禁止再次赋值</td></tr>
+        <tr><td><code>let mut x = 1;</code></td><td>可变绑定</td><td>普通可变变量</td></tr>
+        <tr><td><code>const LIMIT: usize = 8;</code></td><td>编译期常量，必须标类型</td><td>大写模块常量，但 Rust 会强制规则</td></tr>
+        <tr><td><code>let x = x.trim();</code></td><td>遮蔽：创建同名新绑定</td><td>名字复用；新值甚至可换类型</td></tr>
+        <tr><td><code>fn f(x: i32) -&gt; bool</code></td><td>参数类型和返回类型</td><td>类型标注，但编译器强制</td></tr>
+      </table>
+      <details><summary>常见标量与容器</summary><p><code>i32/u32/i64/u64/usize</code> 是整数，<code>f32/f64</code> 是浮点，另有 <code>bool</code>、<code>char</code>。固定数组是 <code>[T; N]</code>，可增长数组是 <code>Vec&lt;T&gt;</code>，哈希表是 <code>HashMap&lt;K, V&gt;</code>，元组是 <code>(A, B)</code>。安全索引常写 <code>items.get(0)</code>，返回 <code>Option&lt;&amp;T&gt;</code>。</p></details>
+      <details><summary>控制流和循环</summary><pre><code>for item in &amp;items { /* 借用每一项 */ }
+for (index, item) in items.iter().enumerate() { /* ... */ }
+while ready { /* ... */ }
+
+let answer = loop {
+    if done { break 42; }
+};
+
+let label = if ok { "ready" } else { "blocked" };</code></pre></details>
+    </section>
+
+    <section id="ownership">
+      <h2>2. 所有权：Rust 真正的主线</h2>
+      <p>Python 对象通常由垃圾回收器追踪。Rust 没有运行时 GC：一个值有一个 owner；owner 离开作用域时，值自动释放。把拥有堆数据的值赋给另一个变量，默认发生 <em>move</em>，不是浅拷贝。</p>
+      <pre><code>let a = String::from("hello");
+let b = a;                 // String 的所有权移动给 b
+// println!("{a}");       // 编译错误：a 已失效
+println!("{b}");</code></pre>
+      <p>整数这类固定大小、实现了 <code>Copy</code> 的类型会复制，不会 move。<code>String</code>、<code>Vec&lt;T&gt;</code>、文件句柄等通常不是 <code>Copy</code>。</p>
+      <h3>借用：函数看看，不拿走</h3>
+      <div class="compare">
+        <div><p class="label">拿走所有权</p><pre><code>fn send(request: Request) { /* ... */ }
+
+send(request);
+// request 此后不能用</code></pre></div>
+        <div><p class="label">只借用</p><pre><code>fn validate(request: &amp;Request) { /* ... */ }
+
+validate(&amp;request);
+// request 仍然属于调用者</code></pre></div>
+      </div>
+      <p>借用的核心规则：同一时间可以有多个 <code>&amp;T</code> 只读借用；或者只有一个 <code>&amp;mut T</code> 可变借用，二者不能重叠。直觉是“很多读者”与“一个写者”二选一。</p>
+      <pre><code>fn append_system_prompt(prompt: &amp;mut String) {
+    prompt.push_str("\nFollow the tool protocol.");
+}
+
+let mut prompt = String::from("Research NVDA");
+append_system_prompt(&amp;mut prompt);</code></pre>
+      <h3><code>String</code> 与 <code>&amp;str</code></h3>
+      <p><code>String</code> 是拥有、可增长的 UTF-8 字符串；<code>&amp;str</code> 是借来的一段 UTF-8 文本视图。函数只读文本时优先接收 <code>&amp;str</code>。</p>
+      <pre><code>fn is_deepseek(model: &amp;str) -> bool {
+    model.starts_with("deepseek")
+}
+
+let owned = String::from("deepseek-chat");
+assert!(is_deepseek(&amp;owned));
+assert!(is_deepseek("deepseek-reasoner"));</code></pre>
+      <p class="note good"><strong>读函数签名的第一问：</strong>参数是 <code>T</code>、<code>&amp;T</code> 还是 <code>&amp;mut T</code>？它分别表示“拿走”“只读借用”“独占可变借用”。</p>
+      <details><summary>生命周期 <code>'a</code> 到底是什么？</summary><p>引用不能比它指向的数据活得更久。大多数情况编译器会自动推断；当返回引用且来源可能不明确时，生命周期参数描述引用之间的关系。它不会延长任何值的寿命。</p><pre><code>fn choose_longer&lt;'a&gt;(a: &amp;'a str, b: &amp;'a str) -> &amp;'a str {
+    if a.len() >= b.len() { a } else { b }
+}</code></pre></details>
+    </section>
+
+    <section id="types">
+      <h2>3. 用类型表达业务状态</h2>
+      <h3><code>struct</code>：数据；<code>impl</code>：行为</h3>
+      <pre><code>#[derive(Debug, Clone)]
+struct ModelRequest {
+    model: String,
+    prompt: String,
+    stream: bool,
+}
+
+impl ModelRequest {
+    fn new(model: impl Into&lt;String&gt;, prompt: impl Into&lt;String&gt;) -> Self {
+        Self { model: model.into(), prompt: prompt.into(), stream: true }
+    }
+
+    fn is_streaming(&amp;self) -> bool {
+        self.stream
+    }
+}</code></pre>
+      <p><code>Self</code> 指当前 <code>impl</code> 的类型。<code>self</code>、<code>&amp;self</code>、<code>&amp;mut self</code> 分别表示方法拿走实例、只读借用实例、可变借用实例。Rust 没有类继承；组合、enum 和 trait 承担建模工作。</p>
+      <h3><code>enum + match</code>：比 Python 枚举更强</h3>
+      <pre><code>enum StreamEvent {
+    TextDelta(String),
+    ToolCall { name: String, arguments: String },
+    Completed,
+    Failed(String),
+}
+
+fn render(event: StreamEvent) {
+    match event {
+        StreamEvent::TextDelta(text) => println!("{text}"),
+        StreamEvent::ToolCall { name, arguments } => {
+            println!("tool={name} args={arguments}")
+        }
+        StreamEvent::Completed => println!("done"),
+        StreamEvent::Failed(error) => eprintln!("{error}"),
+    }
+}</code></pre>
+      <p><code>match</code> 必须穷尽所有 variant，所以增加协议事件时，遗漏的处理点会变成编译错误。这对 agent event loop 特别有价值。</p>
+      <h3><code>Option&lt;T&gt;</code>：把“可能没有”写进类型</h3>
+      <pre><code>let temperature: Option&lt;f32&gt; = Some(0.2);
+
+let label = match temperature {
+    Some(value) => format!("temperature={value}"),
+    None => "temperature=default".to_owned(),
+};
+
+if let Some(value) = temperature {
+    println!("{value}");
+}</code></pre>
+      <p>Rust 没有可随处使用的 <code>null</code>。<code>Option&lt;T&gt;</code> 迫使调用方处理 <code>Some(T)</code> 或 <code>None</code>。</p>
+    </section>
+
+    <section id="errors">
+      <h2>4. <code>Result</code>：失败也是普通数据</h2>
+      <p>可恢复错误通常不靠异常，而靠 <code>Result&lt;T, E&gt;</code>：成功是 <code>Ok(T)</code>，失败是 <code>Err(E)</code>。</p>
+      <pre><code>fn load_config(path: &amp;str) -> Result&lt;String, std::io::Error&gt; {
+    let text = std::fs::read_to_string(path)?;
+    Ok(text)
+}</code></pre>
+      <p><code>?</code> 的语义是：若为 <code>Ok(value)</code>，取出 value 继续；若为 <code>Err(error)</code>，立刻从当前函数返回一个兼容的 error。它不是“忽略错误”。</p>
+      <table>
+        <tr><th>写法</th><th>用途</th></tr>
+        <tr><td><code>result?</code></td><td>向上传播错误，生产代码最常见</td></tr>
+        <tr><td><code>result.unwrap()</code></td><td>错误时 panic；测试、原型或逻辑上不可能失败时使用</td></tr>
+        <tr><td><code>result.expect("reason")</code></td><td>和 unwrap 类似，但 panic 信息更清晰</td></tr>
+        <tr><td><code>result.unwrap_or(default)</code></td><td>失败时使用默认值</td></tr>
+        <tr><td><code>result.map(f)</code></td><td>只变换成功值</td></tr>
+        <tr><td><code>result.map_err(f)</code></td><td>只变换错误值</td></tr>
+      </table>
+    </section>
+
+    <section id="traits">
+      <h2>5. Trait、泛型与 Codex patch seam</h2>
+      <p>trait 类似 Python 的 Protocol/ABC：描述某种行为。struct 通过 <code>impl Trait for Type</code> 实现它。</p>
+      <pre><code>trait Transport {
+    fn name(&amp;self) -> &amp;str;
+    fn send(&amp;self, body: &amp;str) -> Result&lt;String, TransportError&gt;;
+}
+
+struct DeepSeekTransport { endpoint: String }
+
+impl Transport for DeepSeekTransport {
+    fn name(&amp;self) -> &amp;str { "deepseek" }
+
+    fn send(&amp;self, body: &amp;str) -> Result&lt;String, TransportError&gt; {
+        todo!()
+    }
+}</code></pre>
+      <h3>静态分派与动态分派</h3>
+      <pre><code>// 泛型：编译器为具体 T 生成专用代码
+fn call&lt;T: Transport&gt;(transport: &amp;T) { /* ... */ }
+
+// impl Trait：上面的简写风格
+fn call(transport: &amp;impl Transport) { /* ... */ }
+
+// trait object：运行时可以装入不同 Transport 实现
+fn call(transport: &amp;dyn Transport) { /* ... */ }</code></pre>
+      <p><code>Box&lt;dyn Transport&gt;</code> 表示堆上拥有一个动态 transport；<code>Arc&lt;dyn Transport + Send + Sync&gt;</code> 表示多个线程/异步任务共享拥有它，而且实现必须能安全跨线程移动与共享。这正是可注入 model transport 常见的形状。</p>
+      <details><summary>常见智能指针速查</summary><table><tr><th>类型</th><th>用途</th></tr><tr><td><code>Box&lt;T&gt;</code></td><td>单一 owner，把值放到堆上；也常用于 trait object</td></tr><tr><td><code>Rc&lt;T&gt;</code></td><td>单线程引用计数的共享所有权</td></tr><tr><td><code>Arc&lt;T&gt;</code></td><td>原子引用计数，可跨线程共享所有权</td></tr><tr><td><code>Mutex&lt;T&gt;</code></td><td>独占锁保护可变数据</td></tr><tr><td><code>RwLock&lt;T&gt;</code></td><td>多个读者或一个写者</td></tr></table></details>
+    </section>
+
+    <section id="async">
+      <h2>6. Async：语法短，模型要正确</h2>
+      <pre><code>async fn send_request(client: &amp;Client) -> Result&lt;Response, Error&gt; {
+    let response = client.send().await?;
+    Ok(response)
+}</code></pre>
+      <p>调用 <code>async fn</code> 不会立即跑完整函数，而是得到一个 <code>Future</code>；<code>.await</code> 允许执行器在等待 I/O 时去推进其他任务。Codex 这类程序通常由 Tokio 提供执行器、异步网络、channel 和 task。</p>
+      <pre><code>let handle = tokio::spawn(async move {
+    run_turn(session).await
+});
+
+let result = handle.await??;</code></pre>
+      <p><code>async move</code> 会把闭包使用到的值移动进异步任务，确保任务可以比当前函数活得更久。两个 <code>?</code> 常表示外层 task join 可能失败，内层业务本身也可能返回错误。</p>
+      <details><summary>Stream 是什么？</summary><p>Future 最终产生一个值；Stream 随时间产生多个值。模型 SSE 响应天然是 stream：文本 delta、tool call、completed 等事件逐个到达。常见代码会写 <code>while let Some(event) = stream.next().await</code>，逐项处理。</p></details>
+    </section>
+
+    <section id="codex">
+      <h2>7. 解码一个 Codex 风格类型</h2>
+      <pre><code>Arc&lt;dyn HttpTransport + Send + Sync&gt;</code></pre>
+      <div class="map">
+        <div><strong>HttpTransport</strong>行为合同：能发 HTTP/流式请求</div>
+        <div><strong>dyn</strong>运行时可替换具体实现</div>
+        <div><strong>Send + Sync</strong>允许安全跨任务/线程使用</div>
+        <div><strong>Arc</strong>多个组件共享所有权</div>
+      </div>
+      <p>合起来就是：“一个可以被多个并发组件共享的、运行时可替换的 HTTP transport”。如果让原生 Codex response 经过自维护协议转换层，这比改写整个 turn loop 更像一个稳定注入点。</p>
+      <h3>模块与可见性</h3>
+      <pre><code>mod transport;              // 声明子模块
+pub mod protocol;           // 其他 crate 可见
+pub(crate) fn build() {}    // 仅当前 crate 可见
+
+use crate::transport::HttpTransport;
+use std::sync::Arc;</code></pre>
+      <p>Cargo package 可以包含多个 crate；crate 是 Rust 的编译单元。<code>src/lib.rs</code> 通常是 library crate 根，<code>src/main.rs</code> 是 binary crate 根。Codex workspace 有很多 crate，所以读源码时先看当前文件属于哪个 <code>Cargo.toml</code>。</p>
+      <h3>宏与属性</h3>
+      <pre><code>#[derive(Debug, Clone, serde::Serialize)]
+struct Request { /* ... */ }
+
+println!("request={request:?}");  // ! 表示宏
+let items = vec![1, 2, 3];
+let label = format!("model={model}");</code></pre>
+      <p>宏在编译阶段展开语法。第一次读源码时先把 <code>#[derive(...)]</code> 理解成“请编译器或过程宏替我生成这些能力”即可。</p>
+    </section>
+
+    <section id="quiz">
+      <h2>8. 三分钟检查</h2>
+      <p><strong>题 1：</strong><code>fn validate(x: &amp;Request)</code> 会拿走 Request 的所有权吗？</p>
+      <div class="quiz" data-answer="b" data-good="对。&amp;Request 是不可变借用，调用结束后 owner 仍可使用 Request。">
+        <button data-choice="a">A. 会，所有函数调用都会 move</button>
+        <button data-choice="b">B. 不会，它只是只读借用</button>
+        <button data-choice="c">C. 取决于 Request 是否可变</button>
+        <div class="feedback" aria-live="polite"></div>
+      </div>
+      <p><strong>题 2：</strong><code>let value = parse()?;</code> 中的 <code>?</code> 是什么？</p>
+      <div class="quiz" data-answer="c" data-good="对。成功时解包，失败时提前返回；当前函数必须能返回兼容的错误。">
+        <button data-choice="a">A. 忽略 parse 的错误</button>
+        <button data-choice="b">B. 把错误变成 None</button>
+        <button data-choice="c">C. 成功则取值，失败则从当前函数返回错误</button>
+        <div class="feedback" aria-live="polite"></div>
+      </div>
+      <p><strong>题 3：</strong><code>Arc&lt;dyn Transport + Send + Sync&gt;</code> 最贴近哪种解释？</p>
+      <div class="quiz" data-answer="a" data-good="对。这种类型很适合 Codex 的可注入、并发共享 transport。">
+        <button data-choice="a">A. 并发组件共享的、运行时可替换 transport</button>
+        <button data-choice="b">B. 编译期固定且只能有一个 owner 的 transport</button>
+        <button data-choice="c">C. 一个自动加锁的可变全局变量</button>
+        <div class="feedback" aria-live="polite"></div>
+      </div>
+    </section>
+
+    <section>
+      <h2>9. 接下来怎么练</h2>
+      <ol>
+        <li>先口头解释：<code>T</code>、<code>&amp;T</code>、<code>&amp;mut T</code> 分别意味着什么。</li>
+        <li>安装 Rust 后运行本地 <code>01-foundations</code> exercise。</li>
+        <li>完成 move → borrow、<code>Option</code>、自定义 error 三个改动。</li>
+        <li>下一课拿 Codex 的真实 <code>run_turn</code> 周边签名逐段解码。</li>
+      </ol>
+      <p class="note"><strong>暂时不用死磕：</strong>复杂生命周期、Pin、unsafe、宏实现、类型级编程。等真实 Codex 代码遇到它们，再按调用链学习。</p>
+    </section>
+
+    <footer><p>资料依据：Rust 官方 Book、Rust By Example 与 Rustlings。此页面完全离线，不加载第三方脚本。</p></footer>
+  </main>
+  <script>
+    document.querySelectorAll('.quiz').forEach((quiz) => {
+      quiz.querySelectorAll('button').forEach((button) => {
+        button.addEventListener('click', () => {
+          const correct = button.dataset.choice === quiz.dataset.answer;
+          const feedback = quiz.querySelector('.feedback');
+          feedback.textContent = correct ? quiz.dataset.good : '再想一下：先从函数签名或外层类型逐层向内读。';
+          feedback.style.color = correct ? '#1f6b4f' : '#b54b2a';
+        });
+      });
+    });
+  </script>
+</body>
+</html>
