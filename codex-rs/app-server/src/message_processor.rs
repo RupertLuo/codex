@@ -68,6 +68,7 @@ use codex_app_server_protocol::experimental_required_message;
 use codex_arg0::Arg0DispatchPaths;
 use codex_chatgpt::workspace_settings;
 use codex_core::ThreadManager;
+use codex_core::ThreadManagerRuntimeOptions;
 use codex_core::config::Config;
 use codex_exec_server::EnvironmentManager;
 use codex_feedback::CodexFeedback;
@@ -293,6 +294,7 @@ pub(crate) struct MessageProcessorArgs {
     pub(crate) config: Arc<Config>,
     pub(crate) config_manager: ConfigManager,
     pub(crate) environment_manager: Arc<EnvironmentManager>,
+    pub(crate) thread_manager_runtime_options: ThreadManagerRuntimeOptions,
     pub(crate) feedback: CodexFeedback,
     pub(crate) log_db: Option<LogDbLayer>,
     pub(crate) state_db: Option<StateDbHandle>,
@@ -316,6 +318,7 @@ impl MessageProcessor {
             config,
             config_manager,
             environment_manager,
+            thread_manager_runtime_options,
             feedback,
             log_db,
             state_db,
@@ -346,7 +349,7 @@ impl MessageProcessor {
         );
         let goal_service = Arc::new(GoalService::new());
         let thread_manager = Arc::new_cyclic(|thread_manager| {
-            ThreadManager::new(
+            ThreadManager::new_with_runtime_options(
                 config.as_ref(),
                 auth_manager.clone(),
                 session_source,
@@ -383,6 +386,7 @@ impl MessageProcessor {
                     outgoing.clone(),
                     thread_state_manager.clone(),
                 )),
+                thread_manager_runtime_options,
             )
         });
         let models_manager = thread_manager.get_models_manager();

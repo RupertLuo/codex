@@ -82,6 +82,7 @@ use codex_config::LoaderOverrides;
 use codex_config::ThreadConfigLoader;
 use codex_core::config::Config;
 use codex_core::resolve_installation_id;
+use codex_core::ThreadManagerRuntimeOptions;
 use codex_exec_server::EnvironmentManager;
 use codex_feedback::CodexFeedback;
 use codex_login::AuthManager;
@@ -138,6 +139,8 @@ pub struct InProcessStartArgs {
     pub state_db: Option<StateDbHandle>,
     /// Environment manager used by core execution and filesystem operations.
     pub environment_manager: Arc<EnvironmentManager>,
+    /// Process-local overrides applied to threads created by this runtime.
+    pub thread_manager_runtime_options: ThreadManagerRuntimeOptions,
     /// Startup warnings emitted after initialize succeeds.
     pub config_warnings: Vec<ConfigWarningNotification>,
     /// Session source stamped into thread/session metadata.
@@ -430,6 +433,7 @@ async fn start_uninitialized(args: InProcessStartArgs) -> IoResult<InProcessClie
                 config: args.config,
                 config_manager,
                 environment_manager: args.environment_manager,
+                thread_manager_runtime_options: args.thread_manager_runtime_options,
                 feedback: args.feedback,
                 log_db: args.log_db,
                 state_db: args.state_db,
@@ -781,6 +785,7 @@ mod tests {
             log_db: None,
             state_db: Some(state_db),
             environment_manager: Arc::new(EnvironmentManager::default_for_tests()),
+            thread_manager_runtime_options: ThreadManagerRuntimeOptions::default(),
             config_warnings: Vec::new(),
             session_source,
             enable_codex_api_key_env: false,
