@@ -17,6 +17,7 @@ use codex_config::CloudConfigBundleLoader;
 use codex_core::CodexThread;
 use codex_core::StartThreadOptions;
 use codex_core::ThreadManager;
+use codex_core::ThreadManagerRuntimeOptions;
 use codex_core::TimeProvider;
 use codex_core::config::Config;
 use codex_core::resolve_installation_id;
@@ -277,9 +278,15 @@ pub struct TestCodexBuilder {
     user_instructions_provider: Option<Arc<dyn UserInstructionsProvider>>,
     supports_openai_form_elicitation: bool,
     external_time_provider: Option<Arc<dyn TimeProvider>>,
+    runtime_options: ThreadManagerRuntimeOptions,
 }
 
 impl TestCodexBuilder {
+    pub fn with_runtime_options(mut self, runtime_options: ThreadManagerRuntimeOptions) -> Self {
+        self.runtime_options = runtime_options;
+        self
+    }
+
     pub fn with_config<T>(mut self, mutator: T) -> Self
     where
         T: FnOnce(&mut Config) + Send + 'static,
@@ -577,7 +584,7 @@ impl TestCodexBuilder {
                     config.codex_home.clone(),
                 ))
             });
-        let thread_manager = ThreadManager::new(
+        let thread_manager = ThreadManager::new_with_runtime_options(
             &config,
             codex_core::test_support::auth_manager_from_auth(auth.clone()),
             SessionSource::Exec,
@@ -590,6 +597,7 @@ impl TestCodexBuilder {
             installation_id,
             /*attestation_provider*/ None,
             /*external_time_provider*/ self.external_time_provider.clone(),
+            self.runtime_options.clone(),
         );
         let thread_manager = Arc::new(thread_manager);
         let user_shell_override = self.user_shell_override.clone();
@@ -1195,6 +1203,7 @@ pub fn test_codex() -> TestCodexBuilder {
         user_instructions_provider: None,
         supports_openai_form_elicitation: false,
         external_time_provider: None,
+        runtime_options: ThreadManagerRuntimeOptions::default(),
     }
 }
 

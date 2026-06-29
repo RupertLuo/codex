@@ -7,6 +7,7 @@ use super::X_CODEX_PARENT_THREAD_ID_HEADER;
 use super::X_CODEX_TURN_METADATA_HEADER;
 use super::X_CODEX_WINDOW_ID_HEADER;
 use super::X_OPENAI_SUBAGENT_HEADER;
+use super::build_reqwest_client;
 use crate::AttestationContext;
 use crate::AttestationProvider;
 use crate::GenerateAttestationFuture;
@@ -14,7 +15,12 @@ use crate::responses_metadata::CodexResponsesMetadata;
 use crate::test_support::TestCodexResponsesRequestKind;
 use crate::test_support::responses_metadata as test_responses_metadata;
 use codex_api::ApiError;
+use codex_api::HttpTransportHandle;
+use codex_api::Request;
+use codex_api::ReqwestTransport;
+use codex_api::Response;
 use codex_api::ResponseEvent;
+use codex_api::StreamResponse;
 use codex_api::TransportError;
 use codex_app_server_protocol::AuthMode;
 use codex_login::AuthManager;
@@ -28,6 +34,7 @@ use codex_model_provider_info::WireApi;
 use codex_model_provider_info::create_oss_provider_with_base_url;
 use codex_otel::SessionTelemetry;
 use codex_protocol::ThreadId;
+use codex_protocol::config_types::ReasoningSummary as ReasoningSummaryConfig;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ModelInfo;
@@ -43,6 +50,8 @@ use codex_rollout_trace::RolloutTrace;
 use codex_rollout_trace::TraceWriter;
 use codex_rollout_trace::replay_bundle;
 use futures::StreamExt;
+use http::HeaderMap;
+use http::StatusCode;
 use pretty_assertions::assert_eq;
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -57,6 +66,7 @@ use std::task::Poll;
 use std::time::Duration;
 use tempfile::TempDir;
 use tokio::sync::Notify;
+use tokio_util::bytes::Bytes;
 use tracing::Event;
 use tracing::Subscriber;
 use tracing::field::Visit;
@@ -83,6 +93,16 @@ fn test_model_client(session_source: SessionSource) -> ModelClient {
         /*item_ids_enabled*/ false,
         /*attestation_provider*/ None,
     )
+}
+
+#[test]
+fn model_client_accepts_http_transport_override() {
+    let transport =
+        HttpTransportHandle::from_transport(ReqwestTransport::new(build_reqwest_client()));
+
+    let client = test_model_client(SessionSource::Cli).with_http_transport(transport);
+
+    assert!(client.state.http_transport.is_some());
 }
 
 fn test_model_provider() -> SharedModelProvider {
@@ -394,6 +414,82 @@ async fn summarize_memories_returns_empty_for_empty_input() {
         .await
         .expect("empty summarize request should succeed");
     assert_eq!(output.len(), 0);
+}
+
+#[tokio::test]
+async fn model_client_uses_injected_http_transport() -> anyhow::Result<()> {
+    let request_urls = Arc::new(Mutex::new(Vec::new()));
+    let sse_body = concat!(
+        "event: response.created\n",
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-injected\"}}\n\n",
+        "event: response.completed\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-injected\"}}\n\n",
+    );
+
+    let transport = HttpTransportHandle::new(
+        |_request: Request| async {
+            Err::<Response, TransportError>(TransportError::Build(
+                "execute should not be called".to_string(),
+            ))
+        },
+        {
+            let request_urls = Arc::clone(&request_urls);
+            move |request: Request| {
+                let request_urls = Arc::clone(&request_urls);
+                async move {
+                    request_urls
+                        .lock()
+                        .expect("request URL lock")
+                        .push(request.url);
+                    Ok(StreamResponse {
+                        status: StatusCode::OK,
+                        headers: HeaderMap::new(),
+                        bytes: Box::pin(futures::stream::iter([Ok(Bytes::from_static(
+                            sse_body.as_bytes(),
+                        ))])),
+                    })
+                }
+            }
+        },
+    );
+
+    let client = test_model_client(SessionSource::Cli).with_http_transport(transport);
+    let model_info = test_model_info();
+    let session_telemetry = test_session_telemetry();
+    let responses_metadata = test_responses_metadata_for_client(
+        &client,
+        Some("turn-injected"),
+        format!("{}:0", client.state.thread_id),
+        /*parent_thread_id*/ None,
+        TestCodexResponsesRequestKind::Turn,
+    );
+    let client_session = client.new_session();
+    let mut stream = client_session
+        .stream_responses_api(
+            &crate::Prompt::default(),
+            &model_info,
+            &session_telemetry,
+            /*effort*/ None,
+            ReasoningSummaryConfig::Auto,
+            /*service_tier*/ None,
+            &responses_metadata,
+            &InferenceTraceContext::disabled(),
+        )
+        .await?;
+
+    let mut completed_response_id = None;
+    while let Some(event) = stream.next().await {
+        if let ResponseEvent::Completed { response_id, .. } = event? {
+            completed_response_id = Some(response_id);
+        }
+    }
+
+    assert_eq!(completed_response_id.as_deref(), Some("resp-injected"));
+    assert_eq!(
+        request_urls.lock().expect("request URL lock").as_slice(),
+        ["https://example.com/v1/responses"]
+    );
+    Ok(())
 }
 
 #[tokio::test]
