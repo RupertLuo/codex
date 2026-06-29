@@ -189,6 +189,10 @@ impl ThreadManagerRuntimeOptions {
         self
     }
 
+    pub fn has_http_transport_override(&self) -> bool {
+        self.http_transport.is_some()
+    }
+
     pub(crate) fn http_transport(&self) -> Option<HttpTransportHandle> {
         self.http_transport.clone()
     }
