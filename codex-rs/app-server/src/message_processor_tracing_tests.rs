@@ -27,6 +27,7 @@ use codex_config::CloudConfigBundleLoader;
 use codex_config::LoaderOverrides;
 use codex_core::config::Config;
 use codex_core::config::ConfigBuilder;
+use codex_core::ThreadManagerRuntimeOptions;
 use codex_exec_server::EnvironmentManager;
 use codex_feedback::CodexFeedback;
 use codex_login::AuthManager;
@@ -257,6 +258,7 @@ async fn build_test_processor(
         config,
         config_manager,
         environment_manager: Arc::new(EnvironmentManager::default_for_tests()),
+        thread_manager_runtime_options: ThreadManagerRuntimeOptions::default(),
         feedback: CodexFeedback::new(),
         log_db: None,
         state_db: None,

@@ -9,6 +9,7 @@ use codex_config::RemoteThreadConfigLoader;
 use codex_config::ThreadConfigLoader;
 use codex_core::config::Config;
 use codex_core::resolve_installation_id;
+use codex_core::ThreadManagerRuntimeOptions;
 use codex_login::AuthManager;
 #[cfg(debug_assertions)]
 use codex_utils_absolute_path::AbsolutePathBuf;
@@ -888,6 +889,7 @@ pub async fn run_main_with_transport_options(
             config: Arc::new(config),
             config_manager,
             environment_manager,
+            thread_manager_runtime_options: ThreadManagerRuntimeOptions::default(),
             feedback: feedback.clone(),
             log_db,
             state_db: state_db.clone(),

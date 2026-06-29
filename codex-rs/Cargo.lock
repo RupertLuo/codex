@@ -2053,6 +2053,7 @@ dependencies = [
 name = "codex-app-server-client"
 version = "0.0.0"
 dependencies = [
+ "codex-api",
  "codex-app-server",
  "codex-app-server-protocol",
  "codex-arg0",
