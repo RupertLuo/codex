@@ -16,3 +16,7 @@ _Avoid_: Exception, nullable return value
 **Module declaration (`mod`)**:
 A Rust declaration that adds a module to the module tree; `mod tests;` makes the compiler load the corresponding test module instead of discovering the file automatically.
 _Avoid_: Import, automatic test discovery
+
+**`#[derive(Clone)]`**:
+An attribute that asks the Rust compiler to generate the standard `Clone` implementation, making explicit duplication available through `.clone()`.
+_Avoid_: Automatic copying, constructor
