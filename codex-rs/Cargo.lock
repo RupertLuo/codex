@@ -4087,6 +4087,7 @@ dependencies = [
  "chrono",
  "clap",
  "codex-ansi-escape",
+ "codex-api",
  "codex-app-server-client",
  "codex-app-server-protocol",
  "codex-arg0",
