@@ -12,3 +12,7 @@ _Avoid_: Command executor, Rust compiler
 **`Result<T, E>`**:
 A Rust type that represents either success as `Ok(T)` or failure as `Err(E)`.
 _Avoid_: Exception, nullable return value
+
+**Module declaration (`mod`)**:
+A Rust declaration that adds a module to the module tree; `mod tests;` makes the compiler load the corresponding test module instead of discovering the file automatically.
+_Avoid_: Import, automatic test discovery
