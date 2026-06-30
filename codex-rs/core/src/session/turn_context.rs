@@ -170,7 +170,7 @@ impl TurnContext {
     }
 
     pub(crate) fn effective_reasoning_effort(&self) -> Option<ReasoningEffortConfig> {
-        if self.model_info.supports_reasoning_summaries {
+        if self.model_info.supports_reasoning_effort() {
             self.reasoning_effort
                 .clone()
                 .or_else(|| self.model_info.default_reasoning_level.clone())
