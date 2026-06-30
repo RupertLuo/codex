@@ -10,6 +10,7 @@ use crate::app_event::AppEvent;
 use crate::app_event::ExitMode;
 use crate::app_event::FeedbackCategory;
 use crate::app_event::HistoryLookupResponse;
+use crate::app_event::PendingModelSelection;
 use crate::app_event::PermissionProfileSelection;
 use crate::app_event::PluginLocation;
 use crate::app_event::PluginRemoteSectionError;
@@ -517,6 +518,7 @@ pub(crate) struct App {
     cloud_config_bundle: CloudConfigBundleLoader,
     runtime_approval_policy_override: Option<AskForApproval>,
     runtime_permission_profile_override: Option<RuntimePermissionProfileOverride>,
+    model_selection_apply_pending: bool,
 
     pub(crate) file_search: FileSearchManager,
 
@@ -1036,6 +1038,7 @@ See the Codex keymap documentation for supported actions and examples."
             cloud_config_bundle,
             runtime_approval_policy_override: None,
             runtime_permission_profile_override: None,
+            model_selection_apply_pending: false,
             file_search,
             enhanced_keys_supported,
             keymap: runtime_keymap,

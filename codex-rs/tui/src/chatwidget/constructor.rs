@@ -119,6 +119,7 @@ impl ChatWidget {
             model_catalog,
             model_runtime_enabled: model_runtime.is_some(),
             model_runtime,
+            pending_model_selection_for_credential: None,
             session_telemetry,
             session_header: SessionHeader::new(header_model),
             initial_user_message,

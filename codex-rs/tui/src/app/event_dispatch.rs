@@ -7,6 +7,7 @@ use super::resize_reflow::trailing_run_start;
 use super::*;
 use crate::config_update::format_config_error;
 use crate::external_agent_config_migration_flow::ExternalAgentConfigMigrationFlowOutcome;
+use crate::model_runtime::ModelReadiness;
 #[cfg(target_os = "windows")]
 use codex_config::types::WindowsSandboxModeToml;
 
@@ -989,6 +990,17 @@ impl App {
             AppEvent::ConnectorsLoaded { result, is_final } => {
                 self.chat_widget.on_connectors_loaded(result, is_final);
             }
+            AppEvent::RequestModelSelection(selection) => {
+                self.request_model_selection(selection).await;
+            }
+            AppEvent::ApplyModelSelection(selection) => {
+                for event in Self::native_model_selection_events(selection) {
+                    let control = Box::pin(self.handle_event(tui, app_server, event)).await?;
+                    debug_assert!(matches!(control, AppRunControl::Continue));
+                }
+                self.model_selection_apply_pending = false;
+                self.app_event_tx.send(AppEvent::SettingsSelectionSettled);
+            }
             AppEvent::UpdateReasoningEffort(effort) => {
                 self.on_update_reasoning_effort(effort.clone());
                 self.sync_active_thread_reasoning_setting(app_server, effort)
@@ -1010,6 +1022,9 @@ impl App {
                 self.app_event_tx.send(AppEvent::SettingsSelectionSettled);
             }
             AppEvent::SettingsSelectionSettled => {
+                if self.model_selection_apply_pending {
+                    return Ok(AppRunControl::Continue);
+                }
                 if self.chat_widget.no_modal_or_popup_active() {
                     self.chat_widget
                         .set_queue_autosend_suppressed(/*suppressed*/ false);
@@ -2361,6 +2376,51 @@ impl App {
                     .add_error_message(format!("Failed to remove shortcut: {err}"));
             }
         }
+    }
+
+    pub(super) async fn request_model_selection(&mut self, selection: PendingModelSelection) {
+        self.model_selection_apply_pending = true;
+        let Some(runtime) = self.model_runtime.clone() else {
+            self.app_event_tx
+                .send(AppEvent::ApplyModelSelection(selection));
+            return;
+        };
+
+        match runtime.model_readiness(selection.model.clone()).await {
+            Ok(ModelReadiness::Ready) => {
+                self.app_event_tx
+                    .send(AppEvent::ApplyModelSelection(selection));
+            }
+            Ok(ModelReadiness::MissingCredential(entry)) => {
+                self.chat_widget
+                    .defer_model_selection_for_credential(entry, selection);
+            }
+            Err(error) => {
+                self.model_selection_apply_pending = false;
+                self.chat_widget.add_error_message(error.to_string());
+                self.app_event_tx.send(AppEvent::SettingsSelectionSettled);
+            }
+        }
+    }
+
+    pub(super) fn native_model_selection_events(selection: PendingModelSelection) -> Vec<AppEvent> {
+        let mut events = vec![
+            AppEvent::UpdateModel(selection.model.clone()),
+            AppEvent::UpdateReasoningEffort(selection.effort.clone()),
+        ];
+        if selection.update_plan_mode_effort {
+            events.push(AppEvent::UpdatePlanModeReasoningEffort(
+                selection.effort.clone(),
+            ));
+            events.push(AppEvent::PersistPlanModeReasoningEffort(
+                selection.effort.clone(),
+            ));
+        }
+        events.push(AppEvent::PersistModelSelection {
+            model: selection.model,
+            effort: selection.effort,
+        });
+        events
     }
 
     pub(super) async fn handle_exit_mode(

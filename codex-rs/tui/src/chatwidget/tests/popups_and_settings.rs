@@ -14,6 +14,30 @@ use codex_connectors::AppInfo;
 use codex_features::Stage;
 use pretty_assertions::assert_eq;
 
+fn model_preset(slug: &str, display_name: &str, description: &str) -> ModelPreset {
+    ModelPreset {
+        id: slug.to_string(),
+        model: slug.to_string(),
+        display_name: display_name.to_string(),
+        description: description.to_string(),
+        default_reasoning_effort: ReasoningEffortConfig::Medium,
+        supported_reasoning_efforts: vec![ReasoningEffortPreset {
+            effort: ReasoningEffortConfig::Medium,
+            description: "Balanced reasoning".to_string(),
+        }],
+        supports_personality: false,
+        additional_speed_tiers: Vec::new(),
+        service_tiers: Vec::new(),
+        default_service_tier: None,
+        is_default: false,
+        upgrade: None,
+        show_in_picker: true,
+        availability_nux: None,
+        supported_in_api: true,
+        input_modalities: default_input_modalities(),
+    }
+}
+
 #[tokio::test]
 async fn experimental_mode_plan_is_ignored_on_startup() {
     let codex_home = tempdir().expect("tempdir");
@@ -3150,6 +3174,58 @@ async fn model_picker_hides_show_in_picker_false_models_from_cache() {
 }
 
 #[tokio::test]
+async fn model_picker_is_flat_searchable_and_searches_description() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("glm/glm-4")).await;
+    chat.thread_id = Some(ThreadId::new());
+    chat.open_model_popup_with_presets(vec![
+        model_preset("glm/glm-4", "GLM 4", "Zhipu · balanced coding model"),
+        model_preset(
+            "deepseek/deepseek-chat",
+            "DeepSeek Chat",
+            "DeepSeek · efficient chat model",
+        ),
+    ]);
+
+    let initial = render_bottom_popup(&chat, /*width*/ 80);
+    assert!(initial.contains("GLM 4"));
+    assert!(initial.contains("DeepSeek Chat"));
+
+    for character in "deepseek".chars() {
+        chat.handle_key_event(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
+    }
+    let filtered = render_bottom_popup(&chat, /*width*/ 80);
+    assert!(!filtered.contains("GLM 4"));
+    assert!(filtered.contains("DeepSeek Chat"));
+}
+
+#[tokio::test]
+async fn model_selection_waits_for_readiness() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(Some("glm/glm-4")).await;
+    chat.open_reasoning_popup(model_preset(
+        "deepseek/deepseek-chat",
+        "DeepSeek Chat",
+        "DeepSeek · efficient chat model",
+    ));
+
+    let events = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+    assert!(
+        events
+            .iter()
+            .all(|event| !matches!(event, AppEvent::UpdateModel(_)))
+    );
+    assert!(
+        events
+            .iter()
+            .all(|event| !matches!(event, AppEvent::PersistModelSelection { .. }))
+    );
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AppEvent::RequestModelSelection(selection)
+            if selection.model == "deepseek/deepseek-chat"
+    )));
+}
+
+#[tokio::test]
 async fn server_overloaded_error_does_not_switch_models() {
     let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(Some("gpt-5.3-codex")).await;
     chat.set_model("gpt-5.3-codex");
@@ -3221,20 +3297,14 @@ async fn model_reasoning_selection_popup_applies_custom_effort() {
     chat.handle_key_event(KeyEvent::from(KeyCode::Down));
     chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
 
-    let selected_effort_events = std::iter::from_fn(|| rx.try_recv().ok())
-        .filter_map(|event| match event {
-            AppEvent::UpdateReasoningEffort(effort) => Some((None, effort)),
-            AppEvent::PersistModelSelection { model, effort } => Some((Some(model), effort)),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(
-        selected_effort_events,
-        vec![
-            (None, Some(custom_effort.clone())),
-            (Some("gpt-5.4".to_string()), Some(custom_effort)),
-        ]
-    );
+    let events = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+    assert!(matches!(
+        events.as_slice(),
+        [AppEvent::RequestModelSelection(selection)]
+            if selection.model == "gpt-5.4"
+                && selection.effort == Some(custom_effort)
+                && !selection.update_plan_mode_effort
+    ));
 }
 
 #[tokio::test]
@@ -3418,12 +3488,13 @@ async fn single_reasoning_option_skips_selection() {
         events.push(ev);
     }
 
-    assert!(
-        events
-            .iter()
-            .any(|ev| matches!(ev, AppEvent::UpdateReasoningEffort(Some(effort)) if *effort == ReasoningEffortConfig::High)),
-        "expected reasoning effort to be applied automatically; events: {events:?}"
-    );
+    assert!(matches!(
+        events.as_slice(),
+        [AppEvent::RequestModelSelection(selection)]
+            if selection.model == "model-with-single-reasoning"
+                && selection.effort == Some(ReasoningEffortConfig::High)
+                && !selection.update_plan_mode_effort
+    ));
 }
 
 #[tokio::test]

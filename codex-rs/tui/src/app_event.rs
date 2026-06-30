@@ -53,6 +53,13 @@ use codex_protocol::openai_models::ReasoningEffort;
 
 use crate::history_cell::HistoryCell;
 
+#[derive(Debug, Clone)]
+pub(crate) struct PendingModelSelection {
+    pub(crate) model: String,
+    pub(crate) effort: Option<ReasoningEffort>,
+    pub(crate) update_plan_mode_effort: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ThreadGoalSetMode {
     ConfirmIfExists,
@@ -709,6 +716,9 @@ pub(crate) enum AppEvent {
 
     /// Update the current reasoning effort in the running app and widget.
     UpdateReasoningEffort(Option<ReasoningEffort>),
+
+    RequestModelSelection(PendingModelSelection),
+    ApplyModelSelection(PendingModelSelection),
 
     /// Update the current model slug in the running app and widget.
     UpdateModel(String),

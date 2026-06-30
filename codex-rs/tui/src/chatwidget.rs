@@ -60,6 +60,7 @@ use crate::legacy_core::config::PermissionProfileSnapshot;
 use crate::mention_codec::LinkedMention;
 use crate::mention_codec::encode_history_mentions;
 use crate::model_catalog::ModelCatalog;
+use crate::model_runtime::CredentialEntry;
 use crate::model_runtime::TuiModelRuntime;
 use crate::multi_agents;
 use crate::multi_agents::AgentMetadata;
@@ -259,6 +260,7 @@ fn normalize_thread_name(name: &str) -> Option<String> {
 
 use crate::app_event::AppEvent;
 use crate::app_event::ExitMode;
+use crate::app_event::PendingModelSelection;
 use crate::app_event::PermissionProfileSelection;
 use crate::app_event::RateLimitRefreshOrigin;
 #[cfg(target_os = "windows")]
@@ -547,6 +549,7 @@ pub(crate) struct ChatWidget {
     model_catalog: Arc<ModelCatalog>,
     model_runtime_enabled: bool,
     model_runtime: Option<Arc<dyn TuiModelRuntime>>,
+    pending_model_selection_for_credential: Option<(CredentialEntry, PendingModelSelection)>,
     session_telemetry: SessionTelemetry,
     session_header: SessionHeader,
     initial_user_message: Option<UserMessage>,

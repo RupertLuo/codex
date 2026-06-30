@@ -190,10 +190,14 @@ impl ChatWidget {
                 });
             })];
             items.push(SelectionItem {
-                name: preset.model.clone(),
+                name: preset.display_name.clone(),
                 description,
                 is_current,
                 is_default: preset.is_default,
+                search_value: Some(format!(
+                    "{} {} {}",
+                    preset.model, preset.display_name, preset.description
+                )),
                 actions,
                 dismiss_on_select: single_supported_effort,
                 dismiss_parent_on_child_accept: !single_supported_effort,
@@ -209,6 +213,8 @@ impl ChatWidget {
             footer_hint: Some(self.bottom_pane.standard_popup_hint_line()),
             items,
             header,
+            is_searchable: true,
+            search_placeholder: Some("Search models or providers".to_string()),
             ..Default::default()
         });
     }
@@ -227,12 +233,11 @@ impl ChatWidget {
                 return;
             }
 
-            tx.send(AppEvent::UpdateModel(model_for_action.clone()));
-            tx.send(AppEvent::UpdateReasoningEffort(effort_for_action.clone()));
-            tx.send(AppEvent::PersistModelSelection {
+            tx.send(AppEvent::RequestModelSelection(PendingModelSelection {
                 model: model_for_action.clone(),
                 effort: effort_for_action.clone(),
-            });
+                update_plan_mode_effort: false,
+            }));
         })]
     }
 
@@ -310,14 +315,11 @@ impl ChatWidget {
             }
         })];
         let all_modes_actions: Vec<SelectionAction> = vec![Box::new(move |tx| {
-            tx.send(AppEvent::UpdateModel(model.clone()));
-            tx.send(AppEvent::UpdateReasoningEffort(effort.clone()));
-            tx.send(AppEvent::UpdatePlanModeReasoningEffort(effort.clone()));
-            tx.send(AppEvent::PersistPlanModeReasoningEffort(effort.clone()));
-            tx.send(AppEvent::PersistModelSelection {
+            tx.send(AppEvent::RequestModelSelection(PendingModelSelection {
                 model: model.clone(),
                 effort: effort.clone(),
-            });
+                update_plan_mode_effort: true,
+            }));
         })];
 
         self.bottom_pane.show_selection_view(SelectionViewParams {
@@ -463,12 +465,11 @@ impl ChatWidget {
                         effort: choice_effort.clone(),
                     });
                 } else {
-                    tx.send(AppEvent::UpdateModel(model_for_action.clone()));
-                    tx.send(AppEvent::UpdateReasoningEffort(choice_effort.clone()));
-                    tx.send(AppEvent::PersistModelSelection {
+                    tx.send(AppEvent::RequestModelSelection(PendingModelSelection {
                         model: model_for_action.clone(),
                         effort: choice_effort.clone(),
-                    });
+                        update_plan_mode_effort: false,
+                    }));
                 }
             })];
 
@@ -528,8 +529,23 @@ impl ChatWidget {
     }
 
     fn apply_model_and_effort(&self, model: String, effort: Option<ReasoningEffortConfig>) {
-        self.apply_model_and_effort_without_persist(model.clone(), effort.clone());
         self.app_event_tx
-            .send(AppEvent::PersistModelSelection { model, effort });
+            .send(AppEvent::RequestModelSelection(PendingModelSelection {
+                model,
+                effort,
+                update_plan_mode_effort: false,
+            }));
+    }
+
+    pub(crate) fn defer_model_selection_for_credential(
+        &mut self,
+        entry: CredentialEntry,
+        selection: PendingModelSelection,
+    ) {
+        self.pending_model_selection_for_credential = Some((entry, selection));
+        self.add_info_message(
+            "A credential is required. Open /credentials to continue.".to_string(),
+            /*hint*/ None,
+        );
     }
 }

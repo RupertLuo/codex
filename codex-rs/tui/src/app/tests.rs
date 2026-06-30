@@ -24,6 +24,14 @@ use crate::history_cell::HistoryCell;
 use crate::history_cell::PlainHistoryCell;
 use crate::history_cell::UserHistoryCell;
 use crate::history_cell::new_session_info;
+use crate::model_runtime::CredentialEntry;
+use crate::model_runtime::CredentialMutation;
+use crate::model_runtime::CredentialStatus;
+use crate::model_runtime::ModelReadiness;
+use crate::model_runtime::ModelRuntimeError;
+use crate::model_runtime::ModelRuntimeFuture;
+use crate::model_runtime::SensitiveInput;
+use crate::model_runtime::TuiModelRuntime;
 use crate::multi_agents::AgentPickerThreadEntry;
 use crate::multi_agents::SubAgentActivityDisplay;
 use assert_matches::assert_matches;
@@ -94,6 +102,7 @@ use codex_protocol::models::ActivePermissionProfile;
 use codex_protocol::models::FileSystemPermissions;
 use codex_protocol::models::NetworkPermissions;
 use codex_protocol::models::PermissionProfile;
+use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::MAX_THREAD_GOAL_OBJECTIVE_CHARS;
 use codex_protocol::request_permissions::RequestPermissionProfile;
 use codex_protocol::user_input::TextElement;
@@ -105,7 +114,56 @@ use ratatui::prelude::Line;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
+
+#[derive(Debug)]
+struct ReadinessRuntime {
+    readiness: ModelReadiness,
+    calls: Arc<Mutex<Vec<String>>>,
+}
+
+impl TuiModelRuntime for ReadinessRuntime {
+    fn list_credentials(
+        &self,
+    ) -> ModelRuntimeFuture<Result<Vec<CredentialEntry>, ModelRuntimeError>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+
+    fn model_readiness(
+        &self,
+        model_id: String,
+    ) -> ModelRuntimeFuture<Result<ModelReadiness, ModelRuntimeError>> {
+        self.calls
+            .lock()
+            .expect("readiness calls lock")
+            .push(model_id);
+        let readiness = self.readiness.clone();
+        Box::pin(async move { Ok(readiness) })
+    }
+
+    fn store_credential(
+        &self,
+        _credential_id: String,
+        _value: SensitiveInput,
+    ) -> ModelRuntimeFuture<Result<CredentialMutation, ModelRuntimeError>> {
+        Box::pin(async { Ok(CredentialMutation::Verified) })
+    }
+
+    fn revalidate_credential(
+        &self,
+        _credential_id: String,
+    ) -> ModelRuntimeFuture<Result<CredentialMutation, ModelRuntimeError>> {
+        Box::pin(async { Ok(CredentialMutation::Verified) })
+    }
+
+    fn delete_credential(
+        &self,
+        _credential_id: String,
+    ) -> ModelRuntimeFuture<Result<(), ModelRuntimeError>> {
+        Box::pin(async { Ok(()) })
+    }
+}
 use tempfile::tempdir;
 use tokio::time;
 
@@ -194,6 +252,82 @@ fn bypass_hook_trust_startup_warning_snapshot() {
 
     assert_app_snapshot!("bypass_hook_trust_startup_warning", rendered);
 }
+
+#[tokio::test]
+async fn missing_model_credential_emits_no_native_selection_events() {
+    let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
+    while app_event_rx.try_recv().is_ok() {}
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    app.model_runtime = Some(Arc::new(ReadinessRuntime {
+        readiness: ModelReadiness::MissingCredential(CredentialEntry {
+            id: "test-credential".to_string(),
+            display_name: "Test credential".to_string(),
+            environment_variable: "TEST_MODEL_API_KEY".to_string(),
+            status: CredentialStatus::Missing,
+        }),
+        calls: calls.clone(),
+    }));
+
+    app.request_model_selection(PendingModelSelection {
+        model: "provider/product-model".to_string(),
+        effort: Some(ReasoningEffort::Medium),
+        update_plan_mode_effort: false,
+    })
+    .await;
+
+    assert_eq!(
+        calls.lock().expect("readiness calls lock").as_slice(),
+        &["provider/product-model".to_string()]
+    );
+    let events = std::iter::from_fn(|| app_event_rx.try_recv().ok()).collect::<Vec<_>>();
+    assert!(events.iter().all(|event| !matches!(
+        event,
+        AppEvent::UpdateModel(_)
+            | AppEvent::UpdateReasoningEffort(_)
+            | AppEvent::PersistModelSelection { .. }
+            | AppEvent::ApplyModelSelection(_)
+    )));
+}
+
+#[tokio::test]
+async fn ready_model_selection_preserves_native_update_and_persistence_order() {
+    let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
+    while app_event_rx.try_recv().is_ok() {}
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    app.model_runtime = Some(Arc::new(ReadinessRuntime {
+        readiness: ModelReadiness::Ready,
+        calls: calls.clone(),
+    }));
+
+    app.request_model_selection(PendingModelSelection {
+        model: "provider/product-model".to_string(),
+        effort: Some(ReasoningEffort::High),
+        update_plan_mode_effort: false,
+    })
+    .await;
+
+    let selection = match app_event_rx.try_recv() {
+        Ok(AppEvent::ApplyModelSelection(selection)) => selection,
+        other => panic!("expected ready selection to be applied, got {other:?}"),
+    };
+    let events = App::native_model_selection_events(selection);
+    assert!(matches!(
+        events.as_slice(),
+        [
+            AppEvent::UpdateModel(model),
+            AppEvent::UpdateReasoningEffort(Some(ReasoningEffort::High)),
+            AppEvent::PersistModelSelection {
+                model: persisted_model,
+                effort: Some(ReasoningEffort::High),
+            }
+        ] if model == "provider/product-model" && persisted_model == "provider/product-model"
+    ));
+    assert_eq!(
+        calls.lock().expect("readiness calls lock").as_slice(),
+        &["provider/product-model".to_string()]
+    );
+}
+
 #[tokio::test]
 async fn enqueue_primary_thread_session_replays_buffered_approval_after_attach() -> Result<()> {
     let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
@@ -4069,6 +4203,7 @@ async fn make_test_app() -> App {
         cloud_config_bundle: CloudConfigBundleLoader::default(),
         runtime_approval_policy_override: None,
         runtime_permission_profile_override: None,
+        model_selection_apply_pending: false,
         file_search,
         transcript_cells: Vec::new(),
         overlay: None,
@@ -4135,6 +4270,7 @@ async fn make_test_app_with_channels() -> (
             cloud_config_bundle: CloudConfigBundleLoader::default(),
             runtime_approval_policy_override: None,
             runtime_permission_profile_override: None,
+            model_selection_apply_pending: false,
             file_search,
             transcript_cells: Vec::new(),
             overlay: None,

@@ -31,6 +31,7 @@ pub(super) async fn make_test_app() -> App {
         cloud_config_bundle: CloudConfigBundleLoader::default(),
         runtime_approval_policy_override: None,
         runtime_permission_profile_override: None,
+        model_selection_apply_pending: false,
         file_search,
         transcript_cells: Vec::new(),
         overlay: None,
