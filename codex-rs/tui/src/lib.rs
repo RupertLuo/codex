@@ -242,7 +242,7 @@ impl TuiRuntimeOptions {
     }
 
     fn requires_embedded_app_server(&self) -> bool {
-        self.thread_manager.has_http_transport_override()
+        self.thread_manager.has_process_local_overrides()
     }
 }
 
@@ -2084,6 +2084,7 @@ mod tests {
     use codex_app_server_protocol::ThreadStartParams;
     use codex_app_server_protocol::ThreadStartResponse;
     use codex_config::config_toml::ProjectConfig;
+    use codex_protocol::openai_models::ModelsResponse;
     use pretty_assertions::assert_eq;
     use serial_test::serial;
     use tempfile::TempDir;
@@ -2095,6 +2096,12 @@ mod tests {
         );
         TuiRuntimeOptions::default().with_thread_manager_options(
             ThreadManagerRuntimeOptions::default().with_http_transport(transport),
+        )
+    }
+
+    fn catalog_only_tui_runtime_options() -> TuiRuntimeOptions {
+        TuiRuntimeOptions::default().with_thread_manager_options(
+            ThreadManagerRuntimeOptions::default().with_model_catalog(ModelsResponse::default()),
         )
     }
 
@@ -2470,6 +2477,29 @@ mod tests {
                 .kind(),
             std::io::ErrorKind::InvalidInput,
         );
+    }
+
+    #[test]
+    fn catalog_override_disables_implicit_daemon_reuse() {
+        let runtime_options = catalog_only_tui_runtime_options();
+        assert!(runtime_options.requires_embedded_app_server());
+        assert!(!can_reuse_implicit_local_daemon(
+            &[],
+            &LoaderOverrides::default(),
+            /*strict_config*/ false,
+            runtime_options.requires_embedded_app_server(),
+        ));
+    }
+
+    #[test]
+    fn catalog_override_rejects_explicit_remote_app_server() {
+        let error = validate_runtime_target(
+            &catalog_only_tui_runtime_options(),
+            /*has_explicit_remote_endpoint*/ true,
+        )
+        .expect_err("catalog override must stay process-local");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
     }
 
     #[test]

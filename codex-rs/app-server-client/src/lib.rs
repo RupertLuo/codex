@@ -965,6 +965,7 @@ mod tests {
     use codex_app_server_protocol::ToolRequestUserInputQuestion;
     use codex_core::config::ConfigBuilder;
     use codex_core::init_state_db;
+    use codex_protocol::openai_models::ModelsResponse;
     use codex_uds::UnixListener;
     use codex_utils_absolute_path::AbsolutePathBuf;
     use futures::SinkExt;
@@ -2236,8 +2237,9 @@ mod tests {
             |_request| async { Err(TransportError::Build("execute test sentinel".to_string())) },
             |_request| async { Err(TransportError::Build("stream test sentinel".to_string())) },
         );
-        let thread_manager_runtime_options =
-            ThreadManagerRuntimeOptions::default().with_http_transport(transport);
+        let thread_manager_runtime_options = ThreadManagerRuntimeOptions::default()
+            .with_http_transport(transport)
+            .with_model_catalog(ModelsResponse::default());
 
         let runtime_args = InProcessClientStartArgs {
             arg0_paths: Arg0DispatchPaths::default(),
@@ -2279,6 +2281,11 @@ mod tests {
             runtime_args
                 .thread_manager_runtime_options
                 .has_http_transport_override()
+        );
+        assert!(
+            runtime_args
+                .thread_manager_runtime_options
+                .has_model_catalog_override()
         );
         assert!(
             runtime_args
