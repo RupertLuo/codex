@@ -900,19 +900,31 @@ impl ModelClient {
         model_info: &ModelInfo,
         effort: Option<ReasoningEffortConfig>,
         summary: ReasoningSummaryConfig,
-    ) -> Reasoning {
-        Reasoning {
-            effort: effort
-                .or_else(|| model_info.default_reasoning_level.clone())
-                .map(|effort| reasoning_effort_for_request(model_info, effort)),
-            summary: (model_info.supports_reasoning_summary_parameter
-                && summary != ReasoningSummaryConfig::None)
-                .then_some(summary),
-            // When Responses Lite is disabled, omit context so Responses uses the default,
-            // which is currently `current_turn`.
-            context: model_info
-                .use_responses_lite
-                .then_some(ReasoningContext::AllTurns),
+    ) -> Option<Reasoning> {
+        if model_info.supports_reasoning_effort() || model_info.supports_reasoning_summaries {
+            Some(Reasoning {
+                effort: if model_info.supports_reasoning_effort() {
+                    effort
+                        .or_else(|| model_info.default_reasoning_level.clone())
+                        .map(|effort| reasoning_effort_for_request(model_info, effort))
+                } else {
+                    None
+                },
+                summary: if model_info.supports_reasoning_summaries
+                    && summary != ReasoningSummaryConfig::None
+                {
+                    Some(summary)
+                } else {
+                    None
+                },
+                // When Responses Lite is disabled, omit context so Responses uses the default,
+                // which is currently `current_turn`.
+                context: model_info
+                    .use_responses_lite
+                    .then_some(ReasoningContext::AllTurns),
+            })
+        } else {
+                None
         }
     }
 

@@ -499,6 +499,21 @@ fn reasoning_effort_for_requests_preserves_non_ultra_and_persistent_behavior() {
     );
 }
 
+#[test]
+fn reasoning_effort_is_sent_without_reasoning_summary_support() {
+    let model = test_model_info();
+
+    let reasoning = ModelClient::build_reasoning(
+        &model,
+        Some(ReasoningEffort::High),
+        ReasoningSummaryConfig::Detailed,
+    )
+    .expect("advertised reasoning effort should produce a request object");
+
+    assert_eq!(reasoning.effort, Some(ReasoningEffort::High));
+    assert_eq!(reasoning.summary, None);
+}
+
 fn write_chatgpt_auth_json(codex_home: &std::path::Path) {
     let auth_json = json!({
         "tokens": {

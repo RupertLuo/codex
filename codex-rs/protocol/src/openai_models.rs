@@ -485,6 +485,11 @@ pub struct ModelInfo {
 }
 
 impl ModelInfo {
+    /// Whether this model accepts a reasoning effort independently of summary support.
+    pub fn supports_reasoning_effort(&self) -> bool {
+        self.default_reasoning_level.is_some() || !self.supported_reasoning_levels.is_empty()
+    }
+
     pub fn resolved_context_window(&self) -> Option<i64> {
         self.context_window.or(self.max_context_window)
     }
@@ -1202,6 +1207,19 @@ mod tests {
                 "future".to_string(),
             )
         );
+    }
+
+    #[test]
+    fn supports_reasoning_effort_without_reasoning_summaries() {
+        let mut model = test_model(None);
+        model.default_reasoning_level = Some(ReasoningEffort::High);
+        model.supported_reasoning_levels = vec![ReasoningEffortPreset {
+            effort: ReasoningEffort::High,
+            description: "High".to_string(),
+        }];
+        model.supports_reasoning_summaries = false;
+
+        assert!(model.supports_reasoning_effort());
     }
 
     #[test]
