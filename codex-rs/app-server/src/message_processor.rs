@@ -370,6 +370,7 @@ impl MessageProcessor {
                         executor_skill_provider: Arc::clone(&executor_skill_provider),
                         thread_store: Arc::clone(&thread_store),
                     },
+                    thread_manager_runtime_options.runtime_extensions(),
                 ),
                 Arc::new(CodexHomeUserInstructionsProvider::new(
                     config.codex_home.clone(),

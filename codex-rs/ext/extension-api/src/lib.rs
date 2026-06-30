@@ -69,6 +69,7 @@ pub use contributors::WorldStateContributionInput;
 pub use contributors::WorldStateSectionContribution;
 pub use registry::ExtensionRegistry;
 pub use registry::ExtensionRegistryBuilder;
+pub use registry::RuntimeExtension;
 pub use registry::empty_extension_registry;
 pub use state::ExtensionData;
 pub use state::ExtensionDataInit;

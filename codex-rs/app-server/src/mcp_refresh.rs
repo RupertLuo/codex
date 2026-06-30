@@ -241,6 +241,7 @@ mod tests {
                         executor_skill_provider: Arc::clone(&executor_skill_provider),
                         thread_store: Arc::clone(&thread_store),
                     },
+                    &[],
                 ),
                 Arc::new(CodexHomeUserInstructionsProvider::new(
                     good_config.codex_home.clone(),

@@ -17,6 +17,14 @@ use crate::TurnInputContributor;
 use crate::TurnItemContributor;
 use crate::TurnLifecycleContributor;
 
+/// Installs process-local contributions into a thread extension registry.
+///
+/// Runtime extensions are supplied by an embedding host and are intentionally
+/// kept out of serialized configuration.
+pub trait RuntimeExtension<C: Sync>: std::fmt::Debug + Send + Sync {
+    fn install(&self, builder: &mut ExtensionRegistryBuilder<C>);
+}
+
 /// Mutable registry used while hosts register typed runtime contributions.
 pub struct ExtensionRegistryBuilder<C: Sync> {
     event_sink: Arc<dyn ExtensionEventSink>,

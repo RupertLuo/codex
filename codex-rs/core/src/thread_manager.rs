@@ -30,6 +30,7 @@ use codex_exec_server::EnvironmentManager;
 use codex_extension_api::ExtensionDataInit;
 use codex_extension_api::ExtensionRegistry;
 use codex_extension_api::LoadedUserInstructions;
+use codex_extension_api::RuntimeExtension;
 use codex_extension_api::UserInstructionsProvider;
 use codex_extension_api::empty_extension_registry;
 use codex_features::Feature;
@@ -191,6 +192,7 @@ pub struct ThreadManager {
 pub struct ThreadManagerRuntimeOptions {
     http_transport: Option<HttpTransportHandle>,
     model_catalog: Option<ModelsResponse>,
+    runtime_extensions: Vec<Arc<dyn RuntimeExtension<Config>>>,
 }
 
 impl ThreadManagerRuntimeOptions {
@@ -204,6 +206,14 @@ impl ThreadManagerRuntimeOptions {
         self
     }
 
+    pub fn with_runtime_extension(
+        mut self,
+        runtime_extension: Arc<dyn RuntimeExtension<Config>>,
+    ) -> Self {
+        self.runtime_extensions.push(runtime_extension);
+        self
+    }
+
     pub fn has_http_transport_override(&self) -> bool {
         self.http_transport.is_some()
     }
@@ -212,8 +222,18 @@ impl ThreadManagerRuntimeOptions {
         self.model_catalog.is_some()
     }
 
+    pub fn has_runtime_extension_override(&self) -> bool {
+        !self.runtime_extensions.is_empty()
+    }
+
     pub fn has_process_local_overrides(&self) -> bool {
-        self.has_http_transport_override() || self.has_model_catalog_override()
+        self.has_http_transport_override()
+            || self.has_model_catalog_override()
+            || self.has_runtime_extension_override()
+    }
+
+    pub fn runtime_extensions(&self) -> &[Arc<dyn RuntimeExtension<Config>>] {
+        &self.runtime_extensions
     }
 
     pub(crate) fn http_transport(&self) -> Option<HttpTransportHandle> {

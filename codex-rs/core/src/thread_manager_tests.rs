@@ -40,6 +40,17 @@ use wiremock::MockServer;
 
 const TEST_INSTALLATION_ID: &str = "11111111-1111-4111-8111-111111111111";
 
+#[derive(Debug)]
+struct ProbeRuntimeExtension;
+
+impl codex_extension_api::RuntimeExtension<crate::config::Config> for ProbeRuntimeExtension {
+    fn install(
+        &self,
+        _builder: &mut codex_extension_api::ExtensionRegistryBuilder<crate::config::Config>,
+    ) {
+    }
+}
+
 struct FakeAgentGraphStore {
     root_thread_id: ThreadId,
     descendant_thread_ids: Vec<ThreadId>,
@@ -92,6 +103,19 @@ fn runtime_options_report_http_transport_override() {
         HttpTransportHandle::from_transport(ReqwestTransport::new(build_reqwest_client()));
     let configured_options = default_options.with_http_transport(transport);
     assert!(configured_options.has_http_transport_override());
+}
+
+#[test]
+fn runtime_options_report_runtime_extension_override() {
+    let default_options = ThreadManagerRuntimeOptions::default();
+    assert!(default_options.runtime_extensions().is_empty());
+    assert!(!default_options.has_runtime_extension_override());
+
+    let options = default_options.with_runtime_extension(Arc::new(ProbeRuntimeExtension));
+
+    assert_eq!(options.runtime_extensions().len(), 1);
+    assert!(options.has_runtime_extension_override());
+    assert!(options.has_process_local_overrides());
 }
 
 fn injected_model(slug: &str) -> codex_protocol::openai_models::ModelInfo {
