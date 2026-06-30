@@ -84,6 +84,59 @@ fn submission_session(model: &str) -> crate::session_state::ThreadSessionState {
 }
 
 #[tokio::test]
+async fn custom_runtime_startup_requests_provider_onboarding_before_model_picker() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(Some("test-model")).await;
+    chat.startup_model_picker_pending = true;
+
+    chat.handle_thread_session(submission_session("test-model"));
+
+    assert!(
+        std::iter::from_fn(|| rx.try_recv().ok())
+            .any(|event| { matches!(event, AppEvent::BeginModelRuntimeOnboarding) })
+    );
+}
+
+#[tokio::test]
+async fn custom_runtime_startup_does_not_submit_initial_prompt_before_onboarding() {
+    let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(Some("test-model")).await;
+    chat.startup_model_picker_pending = true;
+    chat.initial_user_message =
+        create_initial_user_message(Some("wait for setup".to_string()), Vec::new(), Vec::new());
+
+    chat.handle_thread_session(submission_session("test-model"));
+
+    assert_no_submit_op(&mut op_rx);
+    assert!(chat.initial_user_message.is_some());
+}
+
+#[tokio::test]
+async fn completing_custom_runtime_onboarding_releases_initial_prompt() {
+    let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(Some("test-model")).await;
+    chat.startup_model_picker_pending = true;
+    chat.initial_user_message =
+        create_initial_user_message(Some("send after setup".to_string()), Vec::new(), Vec::new());
+    chat.handle_thread_session(submission_session("test-model"));
+    assert_no_submit_op(&mut op_rx);
+
+    chat.complete_model_runtime_onboarding();
+
+    assert!(matches!(next_submit_op(&mut op_rx), Op::UserTurn { .. }));
+}
+
+#[tokio::test]
+async fn completing_inactive_model_runtime_onboarding_preserves_other_suppression() {
+    let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(Some("test-model")).await;
+    chat.initial_user_message =
+        create_initial_user_message(Some("keep waiting".to_string()), Vec::new(), Vec::new());
+    chat.set_initial_user_message_submit_suppressed(true);
+
+    chat.complete_model_runtime_onboarding();
+
+    assert_no_submit_op(&mut op_rx);
+    assert!(chat.initial_user_message.is_some());
+}
+
+#[tokio::test]
 async fn turn_submission_waits_for_model_readiness() {
     let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(Some("test-model")).await;
     chat.handle_thread_session(submission_session("test-model"));

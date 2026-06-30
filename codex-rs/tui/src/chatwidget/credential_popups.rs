@@ -1,8 +1,65 @@
 use super::*;
 use crate::bottom_pane::sensitive_prompt_view::SensitivePromptView;
 use crate::model_runtime::CredentialStatus;
+use crate::model_runtime::OnboardingProvider;
 
 impl ChatWidget {
+    pub(crate) fn open_onboarding_provider_popup(&mut self, providers: Vec<OnboardingProvider>) {
+        let items = providers
+            .into_iter()
+            .map(|provider| {
+                let selected = provider.clone();
+                let description = match provider.credential.status {
+                    CredentialStatus::Missing => "API key required",
+                    CredentialStatus::EnvironmentOverride => "Environment API key ready",
+                    CredentialStatus::Verified => "Verified API key ready",
+                    CredentialStatus::Unverified => "Saved API key ready",
+                };
+                SelectionItem {
+                    name: provider.display_name,
+                    description: Some(description.to_string()),
+                    actions: vec![Box::new(move |tx| {
+                        tx.send(AppEvent::SelectOnboardingProvider(selected.clone()));
+                    })],
+                    dismiss_on_select: true,
+                    ..Default::default()
+                }
+            })
+            .collect();
+
+        self.bottom_pane.show_selection_view(SelectionViewParams {
+            title: Some("Select Service Provider".to_string()),
+            subtitle: Some("Choose a provider before entering its API key and models.".to_string()),
+            footer_hint: Some(standard_popup_hint_line()),
+            items,
+            allow_cancel: false,
+            ..Default::default()
+        });
+    }
+
+    pub(crate) fn open_onboarding_credential_prompt(&mut self, provider: OnboardingProvider) {
+        let provider_for_submit = provider.clone();
+        let app_event_tx = self.app_event_tx.clone();
+        let view = SensitivePromptView::new(
+            format!("Enter {} API key", provider.display_name),
+            "Paste an API key and press Enter".to_string(),
+            Some(provider.credential.environment_variable.clone()),
+            Box::new(move |value| {
+                app_event_tx.send(AppEvent::StoreOnboardingCredential {
+                    provider: provider_for_submit.clone(),
+                    value,
+                });
+            }),
+        )
+        .with_cancel({
+            let app_event_tx = self.app_event_tx.clone();
+            Box::new(move || {
+                app_event_tx.send(AppEvent::BeginModelRuntimeOnboarding);
+            })
+        });
+        self.bottom_pane.show_view(Box::new(view));
+    }
+
     pub(crate) fn open_credentials_popup_with_entries(&mut self, entries: Vec<CredentialEntry>) {
         if entries.is_empty() {
             self.add_info_message(

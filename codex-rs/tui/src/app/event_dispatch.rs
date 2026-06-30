@@ -1002,11 +1002,24 @@ impl App {
                     debug_assert!(matches!(control, AppRunControl::Continue));
                 }
                 self.model_selection_apply_pending = false;
+                self.chat_widget.complete_model_runtime_onboarding();
                 self.app_event_tx.send(AppEvent::SettingsSelectionSettled);
             }
             AppEvent::CancelModelSelection => {
                 self.model_selection_apply_pending = false;
                 self.app_event_tx.send(AppEvent::SettingsSelectionSettled);
+            }
+            AppEvent::BeginModelRuntimeOnboarding => {
+                self.begin_model_runtime_onboarding().await;
+            }
+            AppEvent::SelectOnboardingProvider(provider) => {
+                self.select_onboarding_provider(provider).await;
+            }
+            AppEvent::OpenOnboardingModels(provider) => {
+                self.open_onboarding_models(provider).await;
+            }
+            AppEvent::StoreOnboardingCredential { provider, value } => {
+                self.store_onboarding_credential(provider, value).await;
             }
             AppEvent::RefreshCredentialsPopup => {
                 let Some(runtime) = self.model_runtime.clone() else {
@@ -2509,6 +2522,90 @@ impl App {
                 self.model_selection_apply_pending = false;
                 self.chat_widget.add_error_message(error.to_string());
                 self.app_event_tx.send(AppEvent::SettingsSelectionSettled);
+            }
+        }
+    }
+
+    pub(super) async fn begin_model_runtime_onboarding(&mut self) {
+        let Some(runtime) = self.model_runtime.clone() else {
+            self.chat_widget.open_model_popup();
+            return;
+        };
+        match runtime.list_onboarding_providers().await {
+            Ok(providers) if providers.is_empty() => self.chat_widget.open_model_popup(),
+            Ok(providers) => self.chat_widget.open_onboarding_provider_popup(providers),
+            Err(error) => self.chat_widget.add_error_message(error.to_string()),
+        }
+    }
+
+    pub(super) async fn select_onboarding_provider(
+        &mut self,
+        provider: crate::model_runtime::OnboardingProvider,
+    ) {
+        match provider.credential.status {
+            crate::model_runtime::CredentialStatus::Missing => {
+                self.chat_widget.open_onboarding_credential_prompt(provider)
+            }
+            crate::model_runtime::CredentialStatus::EnvironmentOverride
+            | crate::model_runtime::CredentialStatus::Verified
+            | crate::model_runtime::CredentialStatus::Unverified => {
+                self.app_event_tx
+                    .send(AppEvent::OpenOnboardingModels(provider));
+            }
+        }
+    }
+
+    pub(super) async fn store_onboarding_credential(
+        &mut self,
+        provider: crate::model_runtime::OnboardingProvider,
+        value: SensitiveInput,
+    ) {
+        let Some(runtime) = self.model_runtime.clone() else {
+            self.chat_widget
+                .add_error_message("Model provider runtime is unavailable.".to_string());
+            return;
+        };
+        match runtime
+            .store_credential(provider.credential.id.clone(), value)
+            .await
+        {
+            Ok(CredentialMutation::Verified) => {
+                self.chat_widget.add_info_message(
+                    format!(
+                        "Credential for {} verified and saved",
+                        provider.display_name
+                    ),
+                    /*hint*/ None,
+                );
+                self.app_event_tx
+                    .send(AppEvent::OpenOnboardingModels(provider));
+            }
+            Ok(CredentialMutation::SavedUnverified { warning }) => {
+                self.chat_widget.add_info_message(warning, /*hint*/ None);
+                self.app_event_tx
+                    .send(AppEvent::OpenOnboardingModels(provider));
+            }
+            Err(error) => {
+                self.chat_widget.add_error_message(error.to_string());
+                self.chat_widget.open_onboarding_credential_prompt(provider);
+            }
+        }
+    }
+
+    pub(super) async fn open_onboarding_models(
+        &mut self,
+        provider: crate::model_runtime::OnboardingProvider,
+    ) {
+        match self.chat_widget.model_catalog().try_list_models() {
+            Ok(models) => self
+                .chat_widget
+                .open_onboarding_model_popup_with_presets(provider, models),
+            Err(_) => {
+                self.chat_widget.add_error_message(
+                    "Models are being updated; restart provider setup in a moment.".to_string(),
+                );
+                self.app_event_tx
+                    .send(AppEvent::BeginModelRuntimeOnboarding);
             }
         }
     }

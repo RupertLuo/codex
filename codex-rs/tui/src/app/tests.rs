@@ -30,6 +30,7 @@ use crate::model_runtime::CredentialStatus;
 use crate::model_runtime::ModelReadiness;
 use crate::model_runtime::ModelRuntimeError;
 use crate::model_runtime::ModelRuntimeFuture;
+use crate::model_runtime::OnboardingProvider;
 use crate::model_runtime::SensitiveInput;
 use crate::model_runtime::TuiModelRuntime;
 use crate::multi_agents::AgentPickerThreadEntry;
@@ -169,6 +170,137 @@ impl TuiModelRuntime for ReadinessRuntime {
 struct CredentialWorkflowRuntime {
     store_result: CredentialMutation,
     store_calls: Arc<Mutex<Vec<String>>>,
+}
+
+#[derive(Debug)]
+struct OnboardingRuntime {
+    providers: Vec<OnboardingProvider>,
+}
+
+impl TuiModelRuntime for OnboardingRuntime {
+    fn list_onboarding_providers(
+        &self,
+    ) -> ModelRuntimeFuture<Result<Vec<OnboardingProvider>, ModelRuntimeError>> {
+        let providers = self.providers.clone();
+        Box::pin(async move { Ok(providers) })
+    }
+
+    fn list_credentials(
+        &self,
+    ) -> ModelRuntimeFuture<Result<Vec<CredentialEntry>, ModelRuntimeError>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+
+    fn model_readiness(
+        &self,
+        _model_id: String,
+    ) -> ModelRuntimeFuture<Result<ModelReadiness, ModelRuntimeError>> {
+        Box::pin(async { Ok(ModelReadiness::Ready) })
+    }
+
+    fn store_credential(
+        &self,
+        _credential_id: String,
+        _value: SensitiveInput,
+    ) -> ModelRuntimeFuture<Result<CredentialMutation, ModelRuntimeError>> {
+        Box::pin(async { Ok(CredentialMutation::Verified) })
+    }
+
+    fn revalidate_credential(
+        &self,
+        _credential_id: String,
+    ) -> ModelRuntimeFuture<Result<CredentialMutation, ModelRuntimeError>> {
+        Box::pin(async { Ok(CredentialMutation::Verified) })
+    }
+
+    fn delete_credential(
+        &self,
+        _credential_id: String,
+    ) -> ModelRuntimeFuture<Result<(), ModelRuntimeError>> {
+        Box::pin(async { Ok(()) })
+    }
+}
+
+fn onboarding_provider_with_status(status: CredentialStatus) -> OnboardingProvider {
+    OnboardingProvider {
+        id: "deepseek".to_string(),
+        display_name: "DeepSeek".to_string(),
+        credential: CredentialEntry {
+            id: "deepseek".to_string(),
+            display_name: "DeepSeek".to_string(),
+            environment_variable: "CATALYST_DEEPSEEK_API_KEY".to_string(),
+            status,
+        },
+        model_ids: vec!["deepseek/deepseek-v4-pro".to_string()],
+    }
+}
+
+#[tokio::test]
+async fn custom_runtime_onboarding_begins_with_provider_selection() {
+    let (mut app, _app_event_rx, _op_rx) = make_test_app_with_channels().await;
+    app.model_runtime = Some(Arc::new(OnboardingRuntime {
+        providers: vec![onboarding_provider_with_status(CredentialStatus::Missing)],
+    }));
+
+    app.begin_model_runtime_onboarding().await;
+
+    let popup = render_bottom_popup(&app.chat_widget, /*width*/ 80);
+    assert!(popup.contains("Select Service Provider"), "{popup}");
+    assert!(popup.contains("DeepSeek"), "{popup}");
+}
+
+#[tokio::test]
+async fn custom_runtime_onboarding_requires_missing_credential_before_models() {
+    let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
+    while app_event_rx.try_recv().is_ok() {}
+    let provider = onboarding_provider_with_status(CredentialStatus::Missing);
+
+    app.select_onboarding_provider(provider).await;
+
+    let popup = render_bottom_popup(&app.chat_widget, /*width*/ 80);
+    assert!(popup.contains("Enter DeepSeek API key"), "{popup}");
+    assert!(
+        std::iter::from_fn(|| app_event_rx.try_recv().ok())
+            .all(|event| !matches!(event, AppEvent::OpenOnboardingModels(_)))
+    );
+}
+
+#[tokio::test]
+async fn verified_onboarding_credential_advances_to_provider_models() {
+    let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
+    while app_event_rx.try_recv().is_ok() {}
+    let provider = onboarding_provider_with_status(CredentialStatus::Missing);
+    app.model_runtime = Some(Arc::new(OnboardingRuntime {
+        providers: vec![provider.clone()],
+    }));
+
+    app.store_onboarding_credential(
+        provider.clone(),
+        SensitiveInput::new("seeded-secret-marker".to_string()),
+    )
+    .await;
+
+    let selected =
+        std::iter::from_fn(|| app_event_rx.try_recv().ok()).find_map(|event| match event {
+            AppEvent::OpenOnboardingModels(selected) => Some(selected),
+            _ => None,
+        });
+    assert_eq!(selected, Some(provider));
+}
+
+#[tokio::test]
+async fn custom_runtime_onboarding_opens_only_selected_provider_models() {
+    let (mut app, _app_event_rx, _op_rx) = make_test_app_with_channels().await;
+    set_fast_mode_test_catalog(&mut app.chat_widget);
+    let mut provider = onboarding_provider_with_status(CredentialStatus::Verified);
+    provider.model_ids = vec!["gpt-5.4".to_string()];
+
+    app.open_onboarding_models(provider).await;
+
+    let popup = render_bottom_popup(&app.chat_widget, /*width*/ 80);
+    assert!(popup.contains("Select DeepSeek Model"), "{popup}");
+    assert!(popup.contains("gpt-5.4"), "{popup}");
+    assert!(!popup.contains("gpt-5.3-codex"), "{popup}");
 }
 
 impl TuiModelRuntime for CredentialWorkflowRuntime {

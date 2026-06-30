@@ -2,6 +2,7 @@ use super::*;
 use crate::bottom_pane::slash_commands::ServiceTierCommand;
 use crate::model_runtime::CredentialEntry;
 use crate::model_runtime::CredentialStatus;
+use crate::model_runtime::OnboardingProvider;
 use pretty_assertions::assert_eq;
 use serial_test::serial;
 
@@ -48,6 +49,72 @@ fn credential_entry(
         display_name: display_name.to_string(),
         environment_variable: environment_variable.to_string(),
         status,
+    }
+}
+
+fn onboarding_provider(
+    id: &str,
+    display_name: &str,
+    status: CredentialStatus,
+    model_ids: &[&str],
+) -> OnboardingProvider {
+    OnboardingProvider {
+        id: id.to_string(),
+        display_name: display_name.to_string(),
+        credential: credential_entry(
+            id,
+            display_name,
+            &format!("{}_API_KEY", id.to_ascii_uppercase()),
+            status,
+        ),
+        model_ids: model_ids.iter().map(|model| (*model).to_string()).collect(),
+    }
+}
+
+#[tokio::test]
+async fn provider_onboarding_lists_active_service_providers_first() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+
+    chat.open_onboarding_provider_popup(vec![onboarding_provider(
+        "deepseek",
+        "DeepSeek",
+        CredentialStatus::Missing,
+        &["deepseek/deepseek-v4-pro"],
+    )]);
+
+    let popup = render_bottom_popup(&chat, /*width*/ 100);
+    assert!(popup.contains("Select Service Provider"), "{popup}");
+    assert!(popup.contains("DeepSeek"), "{popup}");
+    assert!(popup.contains("API key required"), "{popup}");
+}
+
+#[tokio::test]
+async fn provider_onboarding_collects_masked_credential_before_models() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    while rx.try_recv().is_ok() {}
+    let provider = onboarding_provider(
+        "deepseek",
+        "DeepSeek",
+        CredentialStatus::Missing,
+        &["deepseek/deepseek-v4-pro"],
+    );
+
+    chat.open_onboarding_credential_prompt(provider.clone());
+    chat.handle_paste("seeded-secret-marker".to_string());
+    let popup = render_bottom_popup(&chat, /*width*/ 100);
+    assert!(popup.contains("Enter DeepSeek API key"), "{popup}");
+    assert!(!popup.contains("seeded-secret-marker"), "{popup}");
+    chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
+
+    match rx.try_recv() {
+        Ok(AppEvent::StoreOnboardingCredential {
+            provider: selected,
+            value,
+        }) => {
+            assert_eq!(selected, provider);
+            assert_eq!(value.expose_secret(), "seeded-secret-marker");
+        }
+        other => panic!("expected onboarding credential submission, got {other:?}"),
     }
 }
 

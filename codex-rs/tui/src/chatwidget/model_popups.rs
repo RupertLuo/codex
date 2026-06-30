@@ -4,6 +4,7 @@
 //! into another, especially while Plan mode is active.
 
 use super::*;
+use crate::model_runtime::OnboardingProvider;
 
 impl ChatWidget {
     /// Open a popup to choose a quick auto model. Selecting "All models"
@@ -168,6 +169,37 @@ impl ChatWidget {
     }
 
     pub(crate) fn open_all_models_popup(&mut self, presets: Vec<ModelPreset>) {
+        self.open_all_models_popup_with_context(
+            presets,
+            "Select Model and Effort".to_string(),
+            /*on_cancel*/ None,
+        );
+    }
+
+    pub(crate) fn open_onboarding_model_popup_with_presets(
+        &mut self,
+        provider: OnboardingProvider,
+        presets: Vec<ModelPreset>,
+    ) {
+        let presets = presets
+            .into_iter()
+            .filter(|preset| provider.model_ids.contains(&preset.model))
+            .collect();
+        self.open_all_models_popup_with_context(
+            presets,
+            format!("Select {} Model", provider.display_name),
+            Some(Box::new(|tx| {
+                tx.send(AppEvent::BeginModelRuntimeOnboarding);
+            })),
+        );
+    }
+
+    fn open_all_models_popup_with_context(
+        &mut self,
+        presets: Vec<ModelPreset>,
+        title: String,
+        on_cancel: Option<Box<dyn Fn(&AppEventSender) + Send + Sync>>,
+    ) {
         if presets.is_empty() {
             self.add_info_message(
                 "No additional models are available right now.".to_string(),
@@ -206,7 +238,7 @@ impl ChatWidget {
         }
 
         let header = self.model_menu_header(
-            "Select Model and Effort",
+            &title,
             "Access legacy models by running codex -m <model_name> or in your config.toml",
         );
         self.bottom_pane.show_selection_view(SelectionViewParams {
@@ -215,6 +247,7 @@ impl ChatWidget {
             header,
             is_searchable: true,
             search_placeholder: Some("Search models or providers".to_string()),
+            on_cancel,
             ..Default::default()
         });
     }

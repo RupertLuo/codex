@@ -141,7 +141,10 @@ impl ChatWidget {
                 self.add_info_message(warning, /*hint*/ None);
             }
             if std::mem::take(&mut self.startup_model_picker_pending) {
-                self.open_model_popup();
+                self.model_runtime_onboarding_active = true;
+                self.set_initial_user_message_submit_suppressed(true);
+                self.app_event_tx
+                    .send(AppEvent::BeginModelRuntimeOnboarding);
             }
         }
         self.submit_initial_user_message_if_pending();

@@ -42,6 +42,14 @@ impl ChatWidget {
         self.suppress_initial_user_message_submit = suppressed;
     }
 
+    pub(crate) fn complete_model_runtime_onboarding(&mut self) {
+        if !std::mem::take(&mut self.model_runtime_onboarding_active) {
+            return;
+        }
+        self.set_initial_user_message_submit_suppressed(false);
+        self.submit_initial_user_message_if_pending();
+    }
+
     pub(crate) fn submit_initial_user_message_if_pending(&mut self) {
         if self.suppress_initial_user_message_submit {
             return;

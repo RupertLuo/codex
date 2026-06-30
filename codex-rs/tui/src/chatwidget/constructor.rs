@@ -123,6 +123,7 @@ impl ChatWidget {
             model_runtime,
             pending_model_selection_for_credential: None,
             startup_model_picker_pending,
+            model_runtime_onboarding_active: false,
             startup_model_warning,
             pending_ready_submission: None,
             approved_submission_model: None,

@@ -1,6 +1,9 @@
 use super::*;
 use crate::app_event::ConnectorsSnapshot;
 use crate::chatwidget::connectors::ConnectorsCacheState;
+use crate::model_runtime::CredentialEntry;
+use crate::model_runtime::CredentialStatus;
+use crate::model_runtime::OnboardingProvider;
 use codex_app_server_protocol::HookErrorInfo;
 use codex_app_server_protocol::HooksListEntry;
 use codex_app_server_protocol::HooksListResponse;
@@ -36,6 +39,42 @@ fn model_preset(slug: &str, display_name: &str, description: &str) -> ModelPrese
         supported_in_api: true,
         input_modalities: default_input_modalities(),
     }
+}
+
+#[tokio::test]
+async fn provider_onboarding_filters_models_before_reasoning_selection() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("deepseek/deepseek-v4-pro")).await;
+    let provider = OnboardingProvider {
+        id: "deepseek".to_string(),
+        display_name: "DeepSeek".to_string(),
+        credential: CredentialEntry {
+            id: "deepseek".to_string(),
+            display_name: "DeepSeek".to_string(),
+            environment_variable: "CATALYST_DEEPSEEK_API_KEY".to_string(),
+            status: CredentialStatus::Verified,
+        },
+        model_ids: vec![
+            "deepseek/deepseek-v4-pro".to_string(),
+            "deepseek/deepseek-v4-flash".to_string(),
+        ],
+    };
+
+    chat.open_onboarding_model_popup_with_presets(
+        provider,
+        vec![
+            model_preset(
+                "deepseek/deepseek-v4-pro",
+                "DeepSeek V4 Pro",
+                "DeepSeek · quality-first coding",
+            ),
+            model_preset("glm/glm-code", "GLM Code", "GLM · coding model"),
+        ],
+    );
+
+    let popup = render_bottom_popup(&chat, /*width*/ 100);
+    assert!(popup.contains("Select DeepSeek Model"), "{popup}");
+    assert!(popup.contains("DeepSeek V4 Pro"), "{popup}");
+    assert!(!popup.contains("GLM Code"), "{popup}");
 }
 
 #[tokio::test]

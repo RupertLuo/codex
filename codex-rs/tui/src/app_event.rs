@@ -53,6 +53,7 @@ use codex_protocol::openai_models::ReasoningEffort;
 
 use crate::history_cell::HistoryCell;
 use crate::model_runtime::CredentialEntry;
+use crate::model_runtime::OnboardingProvider;
 use crate::model_runtime::SensitiveInput;
 
 #[derive(Debug, Clone)]
@@ -722,6 +723,14 @@ pub(crate) enum AppEvent {
     RequestModelSelection(PendingModelSelection),
     ApplyModelSelection(PendingModelSelection),
     CancelModelSelection,
+
+    BeginModelRuntimeOnboarding,
+    SelectOnboardingProvider(OnboardingProvider),
+    OpenOnboardingModels(OnboardingProvider),
+    StoreOnboardingCredential {
+        provider: OnboardingProvider,
+        value: SensitiveInput,
+    },
 
     OpenCredentialActions(CredentialEntry),
     OpenCredentialPrompt(CredentialEntry),

@@ -560,6 +560,7 @@ pub(crate) struct ChatWidget {
     model_runtime: Option<Arc<dyn TuiModelRuntime>>,
     pending_model_selection_for_credential: Option<(CredentialEntry, PendingModelSelection)>,
     startup_model_picker_pending: bool,
+    model_runtime_onboarding_active: bool,
     startup_model_warning: Option<String>,
     pending_ready_submission: Option<PendingReadySubmission>,
     approved_submission_model: Option<String>,
