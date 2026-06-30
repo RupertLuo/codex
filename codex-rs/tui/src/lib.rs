@@ -1845,7 +1845,17 @@ async fn run_ratatui_app(
         app_server.bootstrap(&config),
         load_startup_hooks_review_entry(hooks_request_handle, hooks_cwd),
     );
-    let startup_bootstrap = Some(startup_bootstrap?);
+    let mut startup_bootstrap = startup_bootstrap?;
+    let custom_runtime_startup_model = model_runtime.as_ref().map(|_| {
+        let decision = app::custom_runtime_startup_model(
+            config.model.as_deref(),
+            &startup_bootstrap.available_models,
+        );
+        config.model = Some(decision.model.clone());
+        startup_bootstrap.default_model = decision.model.clone();
+        decision
+    });
+    let startup_bootstrap = Some(startup_bootstrap);
     let startup_elapsed_before_app = startup_prefetch_started_at.elapsed();
     let startup_hooks_browser = match maybe_run_startup_hooks_review(
         &mut app_server,
@@ -1881,6 +1891,7 @@ async fn run_ratatui_app(
         startup_bootstrap,
         startup_hooks_browser,
         model_runtime,
+        custom_runtime_startup_model,
     )
     .await;
 

@@ -136,6 +136,14 @@ impl ChatWidget {
         if self.connectors_enabled() {
             self.prefetch_connectors();
         }
+        if display == SessionConfiguredDisplay::Normal {
+            if let Some(warning) = self.startup_model_warning.take() {
+                self.add_info_message(warning, /*hint*/ None);
+            }
+            if std::mem::take(&mut self.startup_model_picker_pending) {
+                self.open_model_popup();
+            }
+        }
         self.submit_initial_user_message_if_pending();
         if display == SessionConfiguredDisplay::Normal
             && let Some(forked_from_id) = forked_from_id

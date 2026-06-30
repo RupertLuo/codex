@@ -1497,6 +1497,8 @@ async fn make_startup_chat_with_cli_overrides(
         has_codex_backend_auth: false,
         model_catalog: test_model_catalog(&cfg),
         model_runtime: None,
+        startup_model_picker_pending: false,
+        startup_model_warning: None,
         feedback: codex_feedback::CodexFeedback::new(),
         is_first_run: true,
         status_account_display: None,

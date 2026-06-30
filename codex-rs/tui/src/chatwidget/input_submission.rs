@@ -137,6 +137,40 @@ impl ChatWidget {
             );
             return (false, None);
         }
+
+        // Local shell commands never contact a model and do not require provider credentials.
+        if shell_escape_policy == ShellEscapePolicy::Allow
+            && let Some(stripped) = user_message.text.strip_prefix('!')
+        {
+            let app_command =
+                match self.submit_shell_command_with_history(stripped, &user_message.text) {
+                    QueueDrain::Continue => None,
+                    QueueDrain::Stop => Some(AppCommand::run_user_shell_command(
+                        stripped.trim().to_string(),
+                    )),
+                };
+            return (app_command.is_some(), app_command);
+        }
+
+        let submission_model = self.effective_collaboration_mode().model().to_string();
+        if self.model_runtime.is_some() && !submission_model.trim().is_empty() {
+            if self.approved_submission_model.as_deref() == Some(submission_model.as_str()) {
+                self.approved_submission_model = None;
+            } else {
+                self.approved_submission_model = None;
+                self.pending_ready_submission = Some(PendingReadySubmission {
+                    user_message,
+                    history_record,
+                    shell_escape_policy,
+                });
+                self.app_event_tx
+                    .send(AppEvent::CheckModelReadyForSubmission {
+                        model: submission_model,
+                    });
+                return (true, None);
+            }
+        }
+
         let UserMessage {
             text,
             local_images,
@@ -147,19 +181,6 @@ impl ChatWidget {
 
         let render_in_history = !self.turn_lifecycle.agent_turn_running;
         let mut items: Vec<UserInput> = Vec::new();
-
-        // Special-case: "!cmd" executes a local shell command instead of sending to the model.
-        if shell_escape_policy == ShellEscapePolicy::Allow
-            && let Some(stripped) = text.strip_prefix('!')
-        {
-            let app_command = match self.submit_shell_command_with_history(stripped, &text) {
-                QueueDrain::Continue => None,
-                QueueDrain::Stop => Some(AppCommand::run_user_shell_command(
-                    stripped.trim().to_string(),
-                )),
-            };
-            return (app_command.is_some(), app_command);
-        }
 
         for image_url in &remote_image_urls {
             items.push(UserInput::Image {
@@ -418,6 +439,30 @@ impl ChatWidget {
 
         self.transcript.needs_final_message_separator = false;
         (true, Some(op))
+    }
+
+    pub(crate) fn resume_model_ready_submission(&mut self, model: String) {
+        let Some(pending) = self.pending_ready_submission.take() else {
+            return;
+        };
+        self.approved_submission_model = Some(model);
+        let _ = self.submit_user_message_with_history_and_shell_escape_policy(
+            pending.user_message,
+            pending.history_record,
+            pending.shell_escape_policy,
+        );
+    }
+
+    pub(crate) fn reject_model_ready_submission(&mut self, message: String) {
+        self.approved_submission_model = None;
+        if let Some(pending) = self.pending_ready_submission.take() {
+            let user_message =
+                user_message_for_restore(pending.user_message, &pending.history_record);
+            self.restore_user_message_to_composer(user_message);
+        }
+        if !message.is_empty() {
+            self.add_error_message(message);
+        }
     }
 
     /// Restore the blocked submission draft without losing mention resolution state.

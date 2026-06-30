@@ -502,6 +502,47 @@ struct InitialHistoryReplayBuffer {
     render_from_transcript_tail: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CustomRuntimeStartupModel {
+    pub(crate) model: String,
+    pub(crate) open_picker: bool,
+    pub(crate) persist_default: bool,
+    pub(crate) warning: Option<String>,
+}
+
+pub(crate) fn custom_runtime_startup_model(
+    configured_model: Option<&str>,
+    models: &[ModelPreset],
+) -> CustomRuntimeStartupModel {
+    if let Some(configured) = configured_model
+        && models.iter().any(|model| model.model == configured)
+    {
+        return CustomRuntimeStartupModel {
+            model: configured.to_string(),
+            open_picker: false,
+            persist_default: false,
+            warning: None,
+        };
+    }
+
+    let model = models
+        .iter()
+        .find(|model| model.is_default)
+        .or_else(|| models.first())
+        .expect("custom model runtime requires a non-empty catalog")
+        .model
+        .clone();
+    let warning = configured_model.map(|configured| {
+        format!("The previously selected model {configured} is unavailable. Choose another model.")
+    });
+    CustomRuntimeStartupModel {
+        model,
+        open_picker: true,
+        persist_default: true,
+        warning,
+    }
+}
+
 pub(crate) struct App {
     model_catalog: Arc<ModelCatalog>,
     model_runtime: Option<Arc<dyn TuiModelRuntime>>,
@@ -744,6 +785,8 @@ impl App {
             has_codex_backend_auth: self.chat_widget.has_codex_backend_auth(),
             model_catalog: self.model_catalog.clone(),
             model_runtime: self.model_runtime.clone(),
+            startup_model_picker_pending: false,
+            startup_model_warning: None,
             feedback: self.feedback.clone(),
             is_first_run: false,
             status_account_display: self.chat_widget.status_account_display().cloned(),
@@ -782,6 +825,7 @@ impl App {
         startup_bootstrap: Option<AppServerBootstrap>,
         startup_hooks_browser: Option<HooksListEntry>,
         model_runtime: Option<Arc<dyn TuiModelRuntime>>,
+        custom_runtime_startup_model: Option<CustomRuntimeStartupModel>,
     ) -> Result<AppExitInfo> {
         use tokio_stream::StreamExt;
         let startup_started_at = Instant::now();
@@ -915,6 +959,12 @@ impl App {
                     has_codex_backend_auth,
                     model_catalog: model_catalog.clone(),
                     model_runtime: model_runtime.clone(),
+                    startup_model_picker_pending: custom_runtime_startup_model
+                        .as_ref()
+                        .is_some_and(|decision| decision.open_picker),
+                    startup_model_warning: custom_runtime_startup_model
+                        .as_ref()
+                        .and_then(|decision| decision.warning.clone()),
                     feedback: feedback.clone(),
                     is_first_run,
                     status_account_display: status_account_display.clone(),
@@ -952,6 +1002,8 @@ impl App {
                     has_codex_backend_auth,
                     model_catalog: model_catalog.clone(),
                     model_runtime: model_runtime.clone(),
+                    startup_model_picker_pending: false,
+                    startup_model_warning: None,
                     feedback: feedback.clone(),
                     is_first_run,
                     status_account_display: status_account_display.clone(),
@@ -992,6 +1044,8 @@ impl App {
                     has_codex_backend_auth,
                     model_catalog: model_catalog.clone(),
                     model_runtime: model_runtime.clone(),
+                    startup_model_picker_pending: false,
+                    startup_model_warning: None,
                     feedback: feedback.clone(),
                     is_first_run,
                     status_account_display: status_account_display.clone(),
@@ -1076,6 +1130,19 @@ See the Codex keymap documentation for supported actions and examples."
             pending_plugin_enabled_writes: HashMap::new(),
             pending_hook_enabled_writes: HashMap::new(),
         };
+        if let Some(decision) = custom_runtime_startup_model
+            .as_ref()
+            .filter(|decision| decision.persist_default)
+        {
+            let effort = available_models
+                .iter()
+                .find(|preset| preset.model == decision.model)
+                .map(|preset| preset.default_reasoning_effort.clone());
+            app.app_event_tx.send(AppEvent::PersistModelSelection {
+                model: decision.model.clone(),
+                effort,
+            });
+        }
         if let Some(entry) = startup_hooks_browser {
             app.chat_widget.open_hooks_browser(entry);
         }

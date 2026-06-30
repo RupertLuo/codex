@@ -733,6 +733,22 @@ pub(crate) enum AppEvent {
     RevalidateCredential(CredentialEntry),
     DeleteCredential(CredentialEntry),
     RefreshCredentialsPopup,
+    StoreCredentialForSubmission {
+        entry: CredentialEntry,
+        value: SensitiveInput,
+        model: String,
+    },
+
+    CheckModelReadyForSubmission {
+        model: String,
+    },
+    ResumeModelReadySubmission {
+        model: String,
+    },
+    RejectModelReadySubmission {
+        message: String,
+    },
+    CancelModelReadySubmission,
 
     /// Update the current model slug in the running app and widget.
     UpdateModel(String),

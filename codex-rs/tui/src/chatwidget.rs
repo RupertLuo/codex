@@ -496,6 +496,8 @@ pub(crate) struct ChatWidgetInit {
     pub(crate) has_codex_backend_auth: bool,
     pub(crate) model_catalog: Arc<ModelCatalog>,
     pub(crate) model_runtime: Option<Arc<dyn TuiModelRuntime>>,
+    pub(crate) startup_model_picker_pending: bool,
+    pub(crate) startup_model_warning: Option<String>,
     pub(crate) feedback: codex_feedback::CodexFeedback,
     pub(crate) is_first_run: bool,
     pub(crate) status_account_display: Option<StatusAccountDisplay>,
@@ -508,6 +510,12 @@ pub(crate) struct ChatWidgetInit {
     // Shared latch so we only warn once about invalid terminal-title item IDs.
     pub(crate) terminal_title_invalid_items_warned: Arc<AtomicBool>,
     pub(crate) session_telemetry: SessionTelemetry,
+}
+
+struct PendingReadySubmission {
+    user_message: UserMessage,
+    history_record: UserMessageHistoryRecord,
+    shell_escape_policy: ShellEscapePolicy,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -551,6 +559,10 @@ pub(crate) struct ChatWidget {
     model_runtime_enabled: bool,
     model_runtime: Option<Arc<dyn TuiModelRuntime>>,
     pending_model_selection_for_credential: Option<(CredentialEntry, PendingModelSelection)>,
+    startup_model_picker_pending: bool,
+    startup_model_warning: Option<String>,
+    pending_ready_submission: Option<PendingReadySubmission>,
+    approved_submission_model: Option<String>,
     session_telemetry: SessionTelemetry,
     session_header: SessionHeader,
     initial_user_message: Option<UserMessage>,

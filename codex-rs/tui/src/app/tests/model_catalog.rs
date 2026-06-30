@@ -9,6 +9,60 @@ fn all_model_presets() -> Vec<ModelPreset> {
     crate::test_support::TEST_MODEL_PRESETS.clone()
 }
 
+fn catalog_with_default(default_model: &str) -> Vec<ModelPreset> {
+    catalog_with_models(&[default_model])
+}
+
+fn catalog_with_models(models: &[&str]) -> Vec<ModelPreset> {
+    models
+        .iter()
+        .enumerate()
+        .map(|(index, model)| {
+            let mut preset = all_model_presets()
+                .into_iter()
+                .next()
+                .expect("test model preset");
+            preset.id = (*model).to_string();
+            preset.model = (*model).to_string();
+            preset.display_name = (*model).to_string();
+            preset.is_default = index == 0;
+            preset
+        })
+        .collect()
+}
+
+#[test]
+fn custom_runtime_missing_config_uses_catalog_default_and_opens_picker() {
+    let decision = custom_runtime_startup_model(None, &catalog_with_default("glm/glm-4"));
+    assert_eq!(decision.model, "glm/glm-4");
+    assert!(decision.open_picker);
+    assert!(decision.warning.is_none());
+    assert!(decision.persist_default);
+}
+
+#[test]
+fn custom_runtime_removed_model_warns_and_uses_catalog_default() {
+    let decision =
+        custom_runtime_startup_model(Some("removed/model"), &catalog_with_default("glm/glm-4"));
+    assert_eq!(decision.model, "glm/glm-4");
+    assert!(decision.open_picker);
+    assert_eq!(
+        decision.warning.as_deref(),
+        Some("The previously selected model removed/model is unavailable. Choose another model.")
+    );
+}
+
+#[test]
+fn custom_runtime_valid_persisted_model_does_not_open_picker() {
+    let decision = custom_runtime_startup_model(
+        Some("deepseek/deepseek-chat"),
+        &catalog_with_models(&["glm/glm-4", "deepseek/deepseek-chat"]),
+    );
+    assert_eq!(decision.model, "deepseek/deepseek-chat");
+    assert!(!decision.open_picker);
+    assert!(!decision.persist_default);
+}
+
 fn model_availability_nux_config(shown_count: &[(&str, u32)]) -> ModelAvailabilityNuxConfig {
     ModelAvailabilityNuxConfig {
         shown_count: shown_count

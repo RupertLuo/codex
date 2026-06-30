@@ -73,6 +73,34 @@ impl ChatWidget {
         self.show_credential_prompt(entry, Some(selection), /*cancel_selection*/ true);
     }
 
+    pub(crate) fn open_submission_credential_prompt(
+        &mut self,
+        entry: CredentialEntry,
+        model: String,
+    ) {
+        let app_event_tx = self.app_event_tx.clone();
+        let entry_for_submit = entry.clone();
+        let view = SensitivePromptView::new(
+            "Enter credential".to_string(),
+            "Paste a credential and press Enter".to_string(),
+            Some(entry.display_name),
+            Box::new(move |value| {
+                app_event_tx.send(AppEvent::StoreCredentialForSubmission {
+                    entry: entry_for_submit.clone(),
+                    value,
+                    model: model.clone(),
+                });
+            }),
+        )
+        .with_cancel({
+            let app_event_tx = self.app_event_tx.clone();
+            Box::new(move || {
+                app_event_tx.send(AppEvent::CancelModelReadySubmission);
+            })
+        });
+        self.bottom_pane.show_view(Box::new(view));
+    }
+
     fn show_credential_prompt(
         &mut self,
         entry: CredentialEntry,

@@ -533,7 +533,7 @@ async fn queued_slash_menu_cancel_drains_next_input() {
 }
 
 #[tokio::test]
-async fn queued_settings_selection_applies_before_next_input() {
+async fn model_selection_during_active_turn_applies_to_next_turn() {
     let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(Some("gpt-5.3-codex")).await;
     chat.thread_id = Some(ThreadId::new());
     let mut preset = get_available_model(&chat, "gpt-5.4");

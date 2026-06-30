@@ -1067,6 +1067,50 @@ impl App {
                     Err(error) => self.chat_widget.add_error_message(error.to_string()),
                 }
             }
+            AppEvent::CheckModelReadyForSubmission { model } => {
+                self.check_model_ready_for_submission(model).await;
+            }
+            AppEvent::ResumeModelReadySubmission { model } => {
+                self.chat_widget.resume_model_ready_submission(model);
+            }
+            AppEvent::RejectModelReadySubmission { message } => {
+                self.chat_widget.reject_model_ready_submission(message);
+            }
+            AppEvent::CancelModelReadySubmission => {
+                self.chat_widget
+                    .reject_model_ready_submission(String::new());
+            }
+            AppEvent::StoreCredentialForSubmission {
+                entry,
+                value,
+                model,
+            } => {
+                let Some(runtime) = self.model_runtime.clone() else {
+                    self.app_event_tx
+                        .send(AppEvent::ResumeModelReadySubmission { model });
+                    return Ok(AppRunControl::Continue);
+                };
+                match runtime.store_credential(entry.id.clone(), value).await {
+                    Ok(CredentialMutation::Verified) => {
+                        self.chat_widget.add_info_message(
+                            format!("Credential for {} verified and saved", entry.display_name),
+                            /*hint*/ None,
+                        );
+                        self.app_event_tx
+                            .send(AppEvent::ResumeModelReadySubmission { model });
+                    }
+                    Ok(CredentialMutation::SavedUnverified { warning }) => {
+                        self.chat_widget.add_info_message(warning, /*hint*/ None);
+                        self.app_event_tx
+                            .send(AppEvent::ResumeModelReadySubmission { model });
+                    }
+                    Err(error) => {
+                        self.chat_widget.add_error_message(error.to_string());
+                        self.chat_widget
+                            .open_submission_credential_prompt(entry, model);
+                    }
+                }
+            }
             AppEvent::UpdateReasoningEffort(effort) => {
                 self.on_update_reasoning_effort(effort.clone());
                 self.sync_active_thread_reasoning_setting(app_server, effort)
@@ -2465,6 +2509,30 @@ impl App {
                 self.model_selection_apply_pending = false;
                 self.chat_widget.add_error_message(error.to_string());
                 self.app_event_tx.send(AppEvent::SettingsSelectionSettled);
+            }
+        }
+    }
+
+    pub(super) async fn check_model_ready_for_submission(&mut self, model: String) {
+        let Some(runtime) = self.model_runtime.clone() else {
+            self.app_event_tx
+                .send(AppEvent::ResumeModelReadySubmission { model });
+            return;
+        };
+        match runtime.model_readiness(model.clone()).await {
+            Ok(ModelReadiness::Ready) => {
+                self.app_event_tx
+                    .send(AppEvent::ResumeModelReadySubmission { model });
+            }
+            Ok(ModelReadiness::MissingCredential(entry)) => {
+                self.chat_widget
+                    .open_submission_credential_prompt(entry, model);
+            }
+            Err(error) => {
+                self.app_event_tx
+                    .send(AppEvent::RejectModelReadySubmission {
+                        message: error.to_string(),
+                    });
             }
         }
     }

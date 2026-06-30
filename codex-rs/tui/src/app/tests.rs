@@ -339,6 +339,37 @@ async fn missing_model_credential_emits_no_native_selection_events() {
 }
 
 #[tokio::test]
+async fn missing_submission_credential_opens_the_masked_prompt() {
+    let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
+    while app_event_rx.try_recv().is_ok() {}
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    app.model_runtime = Some(Arc::new(ReadinessRuntime {
+        readiness: ModelReadiness::MissingCredential(CredentialEntry {
+            id: "test-credential".to_string(),
+            display_name: "Test credential".to_string(),
+            environment_variable: "TEST_MODEL_API_KEY".to_string(),
+            status: CredentialStatus::Missing,
+        }),
+        calls: calls.clone(),
+    }));
+
+    app.check_model_ready_for_submission("provider/product-model".to_string())
+        .await;
+
+    assert_eq!(
+        calls.lock().expect("readiness calls lock").as_slice(),
+        &["provider/product-model".to_string()]
+    );
+    let popup = render_bottom_popup(&app.chat_widget, /*width*/ 80);
+    assert!(popup.contains("Enter credential"));
+    assert!(popup.contains("Paste a credential and press Enter"));
+    assert!(
+        std::iter::from_fn(|| app_event_rx.try_recv().ok())
+            .all(|event| !matches!(event, AppEvent::ResumeModelReadySubmission { .. }))
+    );
+}
+
+#[tokio::test]
 async fn ready_model_selection_preserves_native_update_and_persistence_order() {
     let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
     while app_event_rx.try_recv().is_ok() {}
@@ -558,6 +589,8 @@ async fn enqueue_primary_thread_session_replays_turns_before_initial_prompt_subm
         has_codex_backend_auth: false,
         model_catalog: app.model_catalog.clone(),
         model_runtime: None,
+        startup_model_picker_pending: false,
+        startup_model_warning: None,
         feedback: codex_feedback::CodexFeedback::new(),
         is_first_run: false,
         status_account_display: None,
@@ -5625,6 +5658,8 @@ async fn replace_chat_widget_reseeds_collab_agent_metadata_for_replay() {
         has_codex_backend_auth: app.chat_widget.has_codex_backend_auth(),
         model_catalog: app.model_catalog.clone(),
         model_runtime: None,
+        startup_model_picker_pending: false,
+        startup_model_warning: None,
         feedback: app.feedback.clone(),
         is_first_run: false,
         status_account_display: app.chat_widget.status_account_display().cloned(),
