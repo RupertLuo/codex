@@ -543,9 +543,6 @@ impl ChatWidget {
         selection: PendingModelSelection,
     ) {
         self.pending_model_selection_for_credential = Some((entry, selection));
-        self.add_info_message(
-            "A credential is required. Open /credentials to continue.".to_string(),
-            /*hint*/ None,
-        );
+        self.open_model_credential_prompt();
     }
 }

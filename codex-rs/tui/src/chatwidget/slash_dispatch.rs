@@ -1043,10 +1043,7 @@ impl ChatWidget {
         if self.model_runtime.is_none() {
             return;
         }
-        self.add_info_message(
-            "Credential management is initializing.".to_string(),
-            /*hint*/ None,
-        );
+        self.app_event_tx.send(AppEvent::RefreshCredentialsPopup);
     }
 
     fn queued_command_drain_result(&self, cmd: SlashCommand) -> QueueDrain {

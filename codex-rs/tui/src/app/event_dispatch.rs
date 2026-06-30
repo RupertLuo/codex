@@ -7,7 +7,10 @@ use super::resize_reflow::trailing_run_start;
 use super::*;
 use crate::config_update::format_config_error;
 use crate::external_agent_config_migration_flow::ExternalAgentConfigMigrationFlowOutcome;
+use crate::model_runtime::CredentialEntry;
+use crate::model_runtime::CredentialMutation;
 use crate::model_runtime::ModelReadiness;
+use crate::model_runtime::SensitiveInput;
 #[cfg(target_os = "windows")]
 use codex_config::types::WindowsSandboxModeToml;
 
@@ -1000,6 +1003,69 @@ impl App {
                 }
                 self.model_selection_apply_pending = false;
                 self.app_event_tx.send(AppEvent::SettingsSelectionSettled);
+            }
+            AppEvent::CancelModelSelection => {
+                self.model_selection_apply_pending = false;
+                self.app_event_tx.send(AppEvent::SettingsSelectionSettled);
+            }
+            AppEvent::RefreshCredentialsPopup => {
+                let Some(runtime) = self.model_runtime.clone() else {
+                    return Ok(AppRunControl::Continue);
+                };
+                match runtime.list_credentials().await {
+                    Ok(entries) => self
+                        .chat_widget
+                        .open_credentials_popup_with_entries(entries),
+                    Err(error) => self.chat_widget.add_error_message(error.to_string()),
+                }
+            }
+            AppEvent::OpenCredentialActions(entry) => {
+                self.chat_widget.open_credential_actions(entry);
+            }
+            AppEvent::OpenCredentialPrompt(entry) => {
+                self.chat_widget.open_credential_prompt(entry);
+            }
+            AppEvent::StoreCredential {
+                entry,
+                value,
+                continuation,
+            } => {
+                self.store_model_credential(entry, value, continuation)
+                    .await;
+            }
+            AppEvent::RevalidateCredential(entry) => {
+                let Some(runtime) = self.model_runtime.clone() else {
+                    return Ok(AppRunControl::Continue);
+                };
+                match runtime.revalidate_credential(entry.id.clone()).await {
+                    Ok(CredentialMutation::Verified) => {
+                        self.chat_widget.add_info_message(
+                            format!("Credential for {} verified", entry.display_name),
+                            /*hint*/ None,
+                        );
+                        self.app_event_tx.send(AppEvent::RefreshCredentialsPopup);
+                    }
+                    Ok(CredentialMutation::SavedUnverified { warning }) => {
+                        self.chat_widget.add_info_message(warning, /*hint*/ None);
+                        self.app_event_tx.send(AppEvent::RefreshCredentialsPopup);
+                    }
+                    Err(error) => self.chat_widget.add_error_message(error.to_string()),
+                }
+            }
+            AppEvent::DeleteCredential(entry) => {
+                let Some(runtime) = self.model_runtime.clone() else {
+                    return Ok(AppRunControl::Continue);
+                };
+                match runtime.delete_credential(entry.id.clone()).await {
+                    Ok(()) => {
+                        self.chat_widget.add_info_message(
+                            format!("Credential for {} deleted", entry.display_name),
+                            /*hint*/ None,
+                        );
+                        self.app_event_tx.send(AppEvent::RefreshCredentialsPopup);
+                    }
+                    Err(error) => self.chat_widget.add_error_message(error.to_string()),
+                }
             }
             AppEvent::UpdateReasoningEffort(effort) => {
                 self.on_update_reasoning_effort(effort.clone());
@@ -2399,6 +2465,47 @@ impl App {
                 self.model_selection_apply_pending = false;
                 self.chat_widget.add_error_message(error.to_string());
                 self.app_event_tx.send(AppEvent::SettingsSelectionSettled);
+            }
+        }
+    }
+
+    pub(super) async fn store_model_credential(
+        &mut self,
+        entry: CredentialEntry,
+        value: SensitiveInput,
+        continuation: Option<PendingModelSelection>,
+    ) {
+        let Some(runtime) = self.model_runtime.clone() else {
+            return;
+        };
+        match runtime.store_credential(entry.id.clone(), value).await {
+            Ok(CredentialMutation::Verified) => {
+                self.chat_widget.add_info_message(
+                    format!("Credential for {} verified and saved", entry.display_name),
+                    /*hint*/ None,
+                );
+                if let Some(selection) = continuation {
+                    self.app_event_tx
+                        .send(AppEvent::ApplyModelSelection(selection));
+                } else {
+                    self.app_event_tx.send(AppEvent::RefreshCredentialsPopup);
+                }
+            }
+            Ok(CredentialMutation::SavedUnverified { warning }) => {
+                self.chat_widget.add_info_message(warning, /*hint*/ None);
+                if let Some(selection) = continuation {
+                    self.app_event_tx
+                        .send(AppEvent::ApplyModelSelection(selection));
+                } else {
+                    self.app_event_tx.send(AppEvent::RefreshCredentialsPopup);
+                }
+            }
+            Err(error) => {
+                self.chat_widget.add_error_message(error.to_string());
+                if let Some(selection) = continuation {
+                    self.chat_widget
+                        .defer_model_selection_for_credential(entry, selection);
+                }
             }
         }
     }

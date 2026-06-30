@@ -52,6 +52,8 @@ use codex_protocol::models::ActivePermissionProfile;
 use codex_protocol::openai_models::ReasoningEffort;
 
 use crate::history_cell::HistoryCell;
+use crate::model_runtime::CredentialEntry;
+use crate::model_runtime::SensitiveInput;
 
 #[derive(Debug, Clone)]
 pub(crate) struct PendingModelSelection {
@@ -719,6 +721,18 @@ pub(crate) enum AppEvent {
 
     RequestModelSelection(PendingModelSelection),
     ApplyModelSelection(PendingModelSelection),
+    CancelModelSelection,
+
+    OpenCredentialActions(CredentialEntry),
+    OpenCredentialPrompt(CredentialEntry),
+    StoreCredential {
+        entry: CredentialEntry,
+        value: SensitiveInput,
+        continuation: Option<PendingModelSelection>,
+    },
+    RevalidateCredential(CredentialEntry),
+    DeleteCredential(CredentialEntry),
+    RefreshCredentialsPopup,
 
     /// Update the current model slug in the running app and widget.
     UpdateModel(String),

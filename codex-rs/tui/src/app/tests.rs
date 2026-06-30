@@ -164,6 +164,55 @@ impl TuiModelRuntime for ReadinessRuntime {
         Box::pin(async { Ok(()) })
     }
 }
+
+#[derive(Debug)]
+struct CredentialWorkflowRuntime {
+    store_result: CredentialMutation,
+    store_calls: Arc<Mutex<Vec<String>>>,
+}
+
+impl TuiModelRuntime for CredentialWorkflowRuntime {
+    fn list_credentials(
+        &self,
+    ) -> ModelRuntimeFuture<Result<Vec<CredentialEntry>, ModelRuntimeError>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+
+    fn model_readiness(
+        &self,
+        _model_id: String,
+    ) -> ModelRuntimeFuture<Result<ModelReadiness, ModelRuntimeError>> {
+        Box::pin(async { Ok(ModelReadiness::Ready) })
+    }
+
+    fn store_credential(
+        &self,
+        credential_id: String,
+        value: SensitiveInput,
+    ) -> ModelRuntimeFuture<Result<CredentialMutation, ModelRuntimeError>> {
+        assert_eq!(value.expose_secret(), "seeded-secret-marker");
+        self.store_calls
+            .lock()
+            .expect("store calls lock")
+            .push(credential_id);
+        let result = self.store_result.clone();
+        Box::pin(async move { Ok(result) })
+    }
+
+    fn revalidate_credential(
+        &self,
+        _credential_id: String,
+    ) -> ModelRuntimeFuture<Result<CredentialMutation, ModelRuntimeError>> {
+        Box::pin(async { Ok(CredentialMutation::Verified) })
+    }
+
+    fn delete_credential(
+        &self,
+        _credential_id: String,
+    ) -> ModelRuntimeFuture<Result<(), ModelRuntimeError>> {
+        Box::pin(async { Ok(()) })
+    }
+}
 use tempfile::tempdir;
 use tokio::time;
 
@@ -325,6 +374,51 @@ async fn ready_model_selection_preserves_native_update_and_persistence_order() {
     assert_eq!(
         calls.lock().expect("readiness calls lock").as_slice(),
         &["provider/product-model".to_string()]
+    );
+}
+
+#[tokio::test]
+async fn verified_credential_resumes_the_pending_model_selection() {
+    let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
+    while app_event_rx.try_recv().is_ok() {}
+    let store_calls = Arc::new(Mutex::new(Vec::new()));
+    app.model_runtime = Some(Arc::new(CredentialWorkflowRuntime {
+        store_result: CredentialMutation::Verified,
+        store_calls: store_calls.clone(),
+    }));
+    app.model_selection_apply_pending = true;
+    let selection = PendingModelSelection {
+        model: "provider/product-model".to_string(),
+        effort: Some(ReasoningEffort::Medium),
+        update_plan_mode_effort: false,
+    };
+
+    app.store_model_credential(
+        CredentialEntry {
+            id: "test-credential".to_string(),
+            display_name: "Test credential".to_string(),
+            environment_variable: "TEST_MODEL_API_KEY".to_string(),
+            status: CredentialStatus::Missing,
+        },
+        SensitiveInput::new("seeded-secret-marker".to_string()),
+        Some(selection.clone()),
+    )
+    .await;
+
+    assert_eq!(
+        store_calls.lock().expect("store calls lock").as_slice(),
+        &["test-credential".to_string()]
+    );
+    let events = std::iter::from_fn(|| app_event_rx.try_recv().ok()).collect::<Vec<_>>();
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AppEvent::ApplyModelSelection(applied)
+            if applied.model == selection.model && applied.effort == selection.effort
+    )));
+    assert!(
+        events
+            .iter()
+            .all(|event| !matches!(event, AppEvent::RefreshCredentialsPopup))
     );
 }
 
