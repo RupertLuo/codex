@@ -23,6 +23,14 @@ pub struct CredentialEntry {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OnboardingProvider {
+    pub id: String,
+    pub display_name: String,
+    pub credential: CredentialEntry,
+    pub model_ids: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ModelReadiness {
     Ready,
     MissingCredential(CredentialEntry),
@@ -92,6 +100,12 @@ impl fmt::Display for ModelRuntimeError {
 impl Error for ModelRuntimeError {}
 
 pub trait TuiModelRuntime: fmt::Debug + Send + Sync {
+    fn list_onboarding_providers(
+        &self,
+    ) -> ModelRuntimeFuture<Result<Vec<OnboardingProvider>, ModelRuntimeError>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+
     fn list_credentials(
         &self,
     ) -> ModelRuntimeFuture<Result<Vec<CredentialEntry>, ModelRuntimeError>>;
@@ -142,5 +156,23 @@ mod tests {
             error.to_string(),
             "A credential is required for this model. Open /credentials to add one."
         );
+    }
+
+    #[test]
+    fn onboarding_provider_contract_keeps_credential_and_model_ids_together() {
+        let provider = OnboardingProvider {
+            id: "deepseek".to_string(),
+            display_name: "DeepSeek".to_string(),
+            credential: CredentialEntry {
+                id: "deepseek".to_string(),
+                display_name: "DeepSeek".to_string(),
+                environment_variable: "CATALYST_DEEPSEEK_API_KEY".to_string(),
+                status: CredentialStatus::Missing,
+            },
+            model_ids: vec!["deepseek/deepseek-v4-pro".to_string()],
+        };
+
+        assert_eq!(provider.credential.id, provider.id);
+        assert_eq!(provider.model_ids, ["deepseek/deepseek-v4-pro"]);
     }
 }

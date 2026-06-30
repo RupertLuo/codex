@@ -72,6 +72,7 @@ pub use model_runtime::CredentialStatus;
 pub use model_runtime::ModelReadiness;
 pub use model_runtime::ModelRuntimeError;
 pub use model_runtime::ModelRuntimeFuture;
+pub use model_runtime::OnboardingProvider;
 pub use model_runtime::SensitiveInput;
 pub use model_runtime::TuiModelRuntime;
 pub use session_archive_commands::DeleteConfirmation;
