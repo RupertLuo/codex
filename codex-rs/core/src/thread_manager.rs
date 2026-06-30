@@ -42,11 +42,13 @@ use codex_model_provider_info::ModelProviderInfo;
 use codex_model_provider_info::OPENAI_PROVIDER_ID;
 use codex_models_manager::manager::RefreshStrategy;
 use codex_models_manager::manager::SharedModelsManager;
+use codex_models_manager::manager::StaticModelsManager;
 use codex_protocol::ThreadId;
 use codex_protocol::config_types::CollaborationModeMask;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result as CodexResult;
 use codex_protocol::openai_models::ModelPreset;
+use codex_protocol::openai_models::ModelsResponse;
 use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::InitialHistory;
@@ -188,6 +190,7 @@ pub struct ThreadManager {
 #[derive(Clone, Debug, Default)]
 pub struct ThreadManagerRuntimeOptions {
     http_transport: Option<HttpTransportHandle>,
+    model_catalog: Option<ModelsResponse>,
 }
 
 impl ThreadManagerRuntimeOptions {
@@ -196,12 +199,29 @@ impl ThreadManagerRuntimeOptions {
         self
     }
 
+    pub fn with_model_catalog(mut self, model_catalog: ModelsResponse) -> Self {
+        self.model_catalog = Some(model_catalog);
+        self
+    }
+
     pub fn has_http_transport_override(&self) -> bool {
         self.http_transport.is_some()
     }
 
+    pub fn has_model_catalog_override(&self) -> bool {
+        self.model_catalog.is_some()
+    }
+
+    pub fn has_process_local_overrides(&self) -> bool {
+        self.has_http_transport_override() || self.has_model_catalog_override()
+    }
+
     pub(crate) fn http_transport(&self) -> Option<HttpTransportHandle> {
         self.http_transport.clone()
+    }
+
+    pub(crate) fn model_catalog(&self) -> Option<ModelsResponse> {
+        self.model_catalog.clone()
     }
 }
 
@@ -286,6 +306,21 @@ pub fn build_models_manager(
     config: &Config,
     auth_manager: Arc<AuthManager>,
 ) -> SharedModelsManager {
+    build_models_manager_with_runtime_options(
+        config,
+        auth_manager,
+        &ThreadManagerRuntimeOptions::default(),
+    )
+}
+
+fn build_models_manager_with_runtime_options(
+    config: &Config,
+    auth_manager: Arc<AuthManager>,
+    runtime_options: &ThreadManagerRuntimeOptions,
+) -> SharedModelsManager {
+    if let Some(model_catalog) = runtime_options.model_catalog() {
+        return Arc::new(StaticModelsManager::new(Some(auth_manager), model_catalog));
+    }
     let provider = create_model_provider(config.model_provider.clone(), Some(auth_manager));
     provider.models_manager(
         config.codex_home.to_path_buf(),
@@ -389,11 +424,16 @@ impl ThreadManager {
             config.bundled_skills_enabled(),
             restriction_product,
         ));
+        let models_manager = build_models_manager_with_runtime_options(
+            config,
+            auth_manager.clone(),
+            &runtime_options,
+        );
         Self {
             state: Arc::new(ThreadManagerState {
                 threads: Arc::new(RwLock::new(HashMap::new())),
                 thread_created_tx,
-                models_manager: build_models_manager(config, auth_manager.clone()),
+                models_manager,
                 environment_manager,
                 skills_service,
                 plugins_manager,

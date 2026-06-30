@@ -94,6 +94,61 @@ fn runtime_options_report_http_transport_override() {
     assert!(configured_options.has_http_transport_override());
 }
 
+fn injected_model(slug: &str) -> codex_protocol::openai_models::ModelInfo {
+    serde_json::from_value(serde_json::json!({
+        "slug": slug,
+        "display_name": "Injected Model",
+        "description": "Injected model description",
+        "default_reasoning_level": "medium",
+        "supported_reasoning_levels": [{
+            "effort": "medium",
+            "description": "Medium"
+        }],
+        "shell_type": "shell_command",
+        "visibility": "list",
+        "supported_in_api": true,
+        "priority": 0,
+        "upgrade": null,
+        "base_instructions": "Injected instructions",
+        "supports_reasoning_summaries": false,
+        "support_verbosity": false,
+        "default_verbosity": null,
+        "apply_patch_tool_type": null,
+        "truncation_policy": {"mode": "tokens", "limit": 100000},
+        "supports_parallel_tool_calls": true,
+        "context_window": 128000,
+        "experimental_supported_tools": []
+    }))
+    .expect("injected model metadata should deserialize")
+}
+
+#[test]
+fn runtime_options_report_every_process_local_override() {
+    let catalog = ModelsResponse {
+        models: vec![injected_model("provider/model")],
+    };
+    let options = ThreadManagerRuntimeOptions::default().with_model_catalog(catalog);
+
+    assert!(options.has_model_catalog_override());
+    assert!(options.has_process_local_overrides());
+}
+
+#[tokio::test]
+async fn injected_catalog_builds_static_models_manager() {
+    let config = test_config().await;
+    let auth_manager =
+        AuthManager::from_auth_for_testing(CodexAuth::create_dummy_chatgpt_auth_for_testing());
+    let expected = ModelsResponse {
+        models: vec![injected_model("provider/model")],
+    };
+    let options = ThreadManagerRuntimeOptions::default().with_model_catalog(expected.clone());
+
+    let manager = build_models_manager_with_runtime_options(&config, auth_manager, &options);
+    let actual = manager.raw_model_catalog(RefreshStrategy::Online).await;
+
+    assert_eq!(actual, expected);
+}
+
 fn user_msg(text: &str) -> ResponseItem {
     ResponseItem::Message {
         id: None,
