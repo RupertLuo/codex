@@ -223,15 +223,15 @@ impl TuiModelRuntime for OnboardingRuntime {
 
 fn onboarding_provider_with_status(status: CredentialStatus) -> OnboardingProvider {
     OnboardingProvider {
-        id: "deepseek".to_string(),
-        display_name: "DeepSeek".to_string(),
+        id: "example".to_string(),
+        display_name: "Example Provider".to_string(),
         credential: CredentialEntry {
-            id: "deepseek".to_string(),
-            display_name: "DeepSeek".to_string(),
-            environment_variable: "CATALYST_DEEPSEEK_API_KEY".to_string(),
+            id: "example".to_string(),
+            display_name: "Example Provider".to_string(),
+            environment_variable: "EXAMPLE_PROVIDER_API_KEY".to_string(),
             status,
         },
-        model_ids: vec!["deepseek/deepseek-v4-pro".to_string()],
+        model_ids: vec!["example/model-pro".to_string()],
     }
 }
 
@@ -246,7 +246,7 @@ async fn custom_runtime_onboarding_begins_with_provider_selection() {
 
     let popup = render_bottom_popup(&app.chat_widget, /*width*/ 80);
     assert!(popup.contains("Select Service Provider"), "{popup}");
-    assert!(popup.contains("DeepSeek"), "{popup}");
+    assert!(popup.contains("Example Provider"), "{popup}");
 }
 
 #[tokio::test]
@@ -258,7 +258,7 @@ async fn custom_runtime_onboarding_requires_missing_credential_before_models() {
     app.select_onboarding_provider(provider).await;
 
     let popup = render_bottom_popup(&app.chat_widget, /*width*/ 80);
-    assert!(popup.contains("Enter DeepSeek API key"), "{popup}");
+    assert!(popup.contains("Enter Example Provider API key"), "{popup}");
     assert!(
         std::iter::from_fn(|| app_event_rx.try_recv().ok())
             .all(|event| !matches!(event, AppEvent::OpenOnboardingModels(_)))
@@ -298,7 +298,7 @@ async fn custom_runtime_onboarding_opens_only_selected_provider_models() {
     app.open_onboarding_models(provider).await;
 
     let popup = render_bottom_popup(&app.chat_widget, /*width*/ 80);
-    assert!(popup.contains("Select DeepSeek Model"), "{popup}");
+    assert!(popup.contains("Select Example Provider Model"), "{popup}");
     assert!(popup.contains("gpt-5.4"), "{popup}");
     assert!(!popup.contains("gpt-5.3-codex"), "{popup}");
 }

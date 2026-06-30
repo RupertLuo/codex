@@ -161,18 +161,18 @@ mod tests {
     #[test]
     fn onboarding_provider_contract_keeps_credential_and_model_ids_together() {
         let provider = OnboardingProvider {
-            id: "deepseek".to_string(),
-            display_name: "DeepSeek".to_string(),
+            id: "example".to_string(),
+            display_name: "Example Provider".to_string(),
             credential: CredentialEntry {
-                id: "deepseek".to_string(),
-                display_name: "DeepSeek".to_string(),
-                environment_variable: "CATALYST_DEEPSEEK_API_KEY".to_string(),
+                id: "example".to_string(),
+                display_name: "Example Provider".to_string(),
+                environment_variable: "EXAMPLE_PROVIDER_API_KEY".to_string(),
                 status: CredentialStatus::Missing,
             },
-            model_ids: vec!["deepseek/deepseek-v4-pro".to_string()],
+            model_ids: vec!["example/model-pro".to_string()],
         };
 
         assert_eq!(provider.credential.id, provider.id);
-        assert_eq!(provider.model_ids, ["deepseek/deepseek-v4-pro"]);
+        assert_eq!(provider.model_ids, ["example/model-pro"]);
     }
 }

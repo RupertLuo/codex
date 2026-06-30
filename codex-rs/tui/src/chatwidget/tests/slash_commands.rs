@@ -76,15 +76,15 @@ async fn provider_onboarding_lists_active_service_providers_first() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
 
     chat.open_onboarding_provider_popup(vec![onboarding_provider(
-        "deepseek",
-        "DeepSeek",
+        "example",
+        "Example Provider",
         CredentialStatus::Missing,
-        &["deepseek/deepseek-v4-pro"],
+        &["example/model-pro"],
     )]);
 
     let popup = render_bottom_popup(&chat, /*width*/ 100);
     assert!(popup.contains("Select Service Provider"), "{popup}");
-    assert!(popup.contains("DeepSeek"), "{popup}");
+    assert!(popup.contains("Example Provider"), "{popup}");
     assert!(popup.contains("API key required"), "{popup}");
 }
 
@@ -93,16 +93,16 @@ async fn provider_onboarding_collects_masked_credential_before_models() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     while rx.try_recv().is_ok() {}
     let provider = onboarding_provider(
-        "deepseek",
-        "DeepSeek",
+        "example",
+        "Example Provider",
         CredentialStatus::Missing,
-        &["deepseek/deepseek-v4-pro"],
+        &["example/model-pro"],
     );
 
     chat.open_onboarding_credential_prompt(provider.clone());
     chat.handle_paste("seeded-secret-marker".to_string());
     let popup = render_bottom_popup(&chat, /*width*/ 100);
-    assert!(popup.contains("Enter DeepSeek API key"), "{popup}");
+    assert!(popup.contains("Enter Example Provider API key"), "{popup}");
     assert!(!popup.contains("seeded-secret-marker"), "{popup}");
     chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
 
