@@ -1,6 +1,7 @@
 use super::*;
 use crate::bottom_pane::slash_commands::ServiceTierCommand;
 use crate::model_runtime::CredentialEntry;
+use crate::model_runtime::CredentialGroup;
 use crate::model_runtime::CredentialStatus;
 use crate::model_runtime::OnboardingProvider;
 use pretty_assertions::assert_eq;
@@ -44,11 +45,28 @@ fn credential_entry(
     environment_variable: &str,
     status: CredentialStatus,
 ) -> CredentialEntry {
+    credential_entry_in_group(
+        id,
+        display_name,
+        environment_variable,
+        status,
+        CredentialGroup::ModelProviders,
+    )
+}
+
+fn credential_entry_in_group(
+    id: &str,
+    display_name: &str,
+    environment_variable: &str,
+    status: CredentialStatus,
+    group: CredentialGroup,
+) -> CredentialEntry {
     CredentialEntry {
         id: id.to_string(),
         display_name: display_name.to_string(),
         environment_variable: environment_variable.to_string(),
         status,
+        group,
     }
 }
 
@@ -155,6 +173,37 @@ async fn credentials_popup_shows_generic_status_labels() {
             "missing {expected:?} in:\n{popup}"
         );
     }
+}
+
+#[tokio::test]
+async fn credentials_popup_groups_entries() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.open_credentials_popup_with_entries(vec![
+        credential_entry_in_group(
+            "metaso",
+            "Metaso",
+            "CATALYST_METASO_API_KEY",
+            CredentialStatus::Unverified,
+            CredentialGroup::SearchServices,
+        ),
+        credential_entry(
+            "deepseek",
+            "DeepSeek",
+            "DEEPSEEK_API_KEY",
+            CredentialStatus::Verified,
+        ),
+    ]);
+
+    let popup = render_bottom_popup(&chat, /*width*/ 100);
+    assert!(popup.contains("Credentials"), "{popup}");
+    assert!(popup.contains("Model Providers"), "{popup}");
+    assert!(popup.contains("Search Services"), "{popup}");
+    assert!(popup.contains("DeepSeek"), "{popup}");
+    assert!(popup.contains("Metaso"), "{popup}");
+    assert!(
+        popup.find("Model Providers") < popup.find("Search Services"),
+        "{popup}"
+    );
 }
 
 #[tokio::test]

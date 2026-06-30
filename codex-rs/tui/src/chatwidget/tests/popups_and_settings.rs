@@ -52,6 +52,7 @@ async fn provider_onboarding_filters_models_before_reasoning_selection() {
             display_name: "Example Provider".to_string(),
             environment_variable: "EXAMPLE_PROVIDER_API_KEY".to_string(),
             status: CredentialStatus::Verified,
+            group: crate::model_runtime::CredentialGroup::ModelProviders,
         },
         model_ids: vec![
             "example/model-pro".to_string(),

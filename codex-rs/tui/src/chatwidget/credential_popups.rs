@@ -62,32 +62,46 @@ impl ChatWidget {
 
     pub(crate) fn open_credentials_popup_with_entries(&mut self, entries: Vec<CredentialEntry>) {
         if entries.is_empty() {
-            self.add_info_message(
-                "No model provider credentials are configured.".to_string(),
-                /*hint*/ None,
-            );
+            self.add_info_message("No credentials are configured.".to_string(), /*hint*/ None);
             return;
         }
 
-        let items = entries
-            .into_iter()
-            .map(|entry| {
-                let entry_for_action = entry.clone();
-                let actions: Vec<SelectionAction> = vec![Box::new(move |tx| {
-                    tx.send(AppEvent::OpenCredentialActions(entry_for_action.clone()));
-                })];
-                SelectionItem {
-                    name: entry.display_name,
-                    description: Some(credential_status_label(&entry.status).to_string()),
-                    actions,
-                    dismiss_on_select: true,
+        let mut entries = entries;
+        entries.sort_by(|left, right| {
+            (&left.group, &left.display_name, &left.id).cmp(&(
+                &right.group,
+                &right.display_name,
+                &right.id,
+            ))
+        });
+
+        let mut items = Vec::with_capacity(entries.len() + 2);
+        let mut current_group = None;
+        for entry in entries {
+            if current_group != Some(entry.group) {
+                current_group = Some(entry.group);
+                items.push(SelectionItem {
+                    name: entry.group.display_name().to_string(),
+                    is_disabled: true,
                     ..Default::default()
-                }
-            })
-            .collect();
+                });
+            }
+
+            let entry_for_action = entry.clone();
+            let actions: Vec<SelectionAction> = vec![Box::new(move |tx| {
+                tx.send(AppEvent::OpenCredentialActions(entry_for_action.clone()));
+            })];
+            items.push(SelectionItem {
+                name: entry.display_name,
+                description: Some(credential_status_label(&entry.status).to_string()),
+                actions,
+                dismiss_on_select: true,
+                ..Default::default()
+            });
+        }
 
         self.bottom_pane.show_selection_view(SelectionViewParams {
-            title: Some("Model Provider Credentials".to_string()),
+            title: Some("Credentials".to_string()),
             footer_hint: Some(standard_popup_hint_line()),
             items,
             ..Default::default()

@@ -230,6 +230,7 @@ fn onboarding_provider_with_status(status: CredentialStatus) -> OnboardingProvid
             display_name: "Example Provider".to_string(),
             environment_variable: "EXAMPLE_PROVIDER_API_KEY".to_string(),
             status,
+            group: crate::model_runtime::CredentialGroup::ModelProviders,
         },
         model_ids: vec!["example/model-pro".to_string()],
     }
@@ -445,6 +446,7 @@ async fn missing_model_credential_emits_no_native_selection_events() {
             display_name: "Test credential".to_string(),
             environment_variable: "TEST_MODEL_API_KEY".to_string(),
             status: CredentialStatus::Missing,
+            group: crate::model_runtime::CredentialGroup::ModelProviders,
         }),
         calls: calls.clone(),
     }));
@@ -481,6 +483,7 @@ async fn missing_submission_credential_opens_the_masked_prompt() {
             display_name: "Test credential".to_string(),
             environment_variable: "TEST_MODEL_API_KEY".to_string(),
             status: CredentialStatus::Missing,
+            group: crate::model_runtime::CredentialGroup::ModelProviders,
         }),
         calls: calls.clone(),
     }));
@@ -562,6 +565,7 @@ async fn verified_credential_resumes_the_pending_model_selection() {
             display_name: "Test credential".to_string(),
             environment_variable: "TEST_MODEL_API_KEY".to_string(),
             status: CredentialStatus::Missing,
+            group: crate::model_runtime::CredentialGroup::ModelProviders,
         },
         SensitiveInput::new("seeded-secret-marker".to_string()),
         Some(selection.clone()),
