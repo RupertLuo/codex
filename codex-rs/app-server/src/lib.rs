@@ -88,6 +88,7 @@ mod app_server_tracing;
 mod attestation;
 mod auth_mode;
 mod bespoke_event_handling;
+mod cli;
 mod command_exec;
 mod config;
 mod config_layer;
@@ -118,6 +119,9 @@ mod thread_state;
 mod thread_status;
 mod transport;
 
+pub use crate::cli::AppServerCli;
+pub use crate::cli::AppServerServeArgs;
+pub use crate::cli::run_app_server_serve;
 pub use crate::error_code::INPUT_TOO_LARGE_ERROR_CODE;
 pub use crate::error_code::INVALID_PARAMS_ERROR_CODE;
 pub use crate::rpc_extension::AppServerRpcContext;
