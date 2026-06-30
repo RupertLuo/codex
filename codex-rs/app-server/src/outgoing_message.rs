@@ -508,6 +508,25 @@ impl OutgoingMessageSender {
             .await;
     }
 
+    pub(crate) async fn send_json_response(
+        &self,
+        request_id: ConnectionRequestId,
+        result: serde_json::Value,
+    ) {
+        let request_context = self.take_request_context(&request_id).await;
+        let message = OutgoingMessage::Response(OutgoingResponse {
+            id: request_id.request_id,
+            result,
+        });
+        self.send_outgoing_message_to_connection(
+            request_context,
+            request_id.connection_id,
+            message,
+            "extension_response",
+        )
+        .await;
+    }
+
     pub(crate) async fn send_response_with_thread_originator<T>(
         &self,
         request_id: ConnectionRequestId,

@@ -1,8 +1,12 @@
 use super::*;
+use crate::AppServerRpcTransportContext;
 use codex_app_server_protocol::ConfigWarningNotification;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::ServerNotification;
 use codex_app_server_protocol::ThreadRealtimeStartedNotification;
+use codex_app_server_transport::auth::AppServerWebsocketAuthConfig;
+use codex_app_server_transport::auth::AppServerWebsocketAuthSettings;
+use codex_app_server_transport::auth::AppServerWebsocketCapabilityTokenSource;
 use codex_protocol::protocol::RealtimeConversationVersion;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use pretty_assertions::assert_eq;
@@ -12,6 +16,62 @@ use tokio::time::timeout;
 
 fn absolute_path(path: &str) -> AbsolutePathBuf {
     AbsolutePathBuf::from_absolute_path(path).expect("absolute path")
+}
+
+fn test_socket_path() -> AbsolutePathBuf {
+    let root = tempfile::tempdir().expect("temporary directory").keep();
+    AbsolutePathBuf::from_absolute_path(root.join("app-server.sock")).expect("absolute socket path")
+}
+
+fn non_loopback_transport() -> AppServerTransport {
+    AppServerTransport::WebSocket {
+        bind_address: "0.0.0.0:4500".parse().expect("socket address"),
+    }
+}
+
+fn authenticated_settings() -> AppServerWebsocketAuthSettings {
+    AppServerWebsocketAuthSettings {
+        config: Some(AppServerWebsocketAuthConfig::CapabilityToken {
+            source: AppServerWebsocketCapabilityTokenSource::TokenSha256 {
+                token_sha256: [0xab; 32],
+            },
+        }),
+    }
+}
+
+#[test]
+fn unix_socket_is_local_extension_transport() {
+    let context = extension_transport_context(
+        ConnectionOrigin::WebSocket,
+        &AppServerTransport::UnixSocket {
+            socket_path: test_socket_path(),
+        },
+        &AppServerWebsocketAuthSettings::default(),
+    );
+    assert_eq!(context, AppServerRpcTransportContext::UnixSocket);
+}
+
+#[test]
+fn authenticated_non_loopback_websocket_is_marked_authenticated() {
+    let context = extension_transport_context(
+        ConnectionOrigin::WebSocket,
+        &non_loopback_transport(),
+        &authenticated_settings(),
+    );
+    assert_eq!(
+        context,
+        AppServerRpcTransportContext::AuthenticatedWebSocket
+    );
+}
+
+#[test]
+fn remote_control_stays_distinct() {
+    let context = extension_transport_context(
+        ConnectionOrigin::RemoteControl,
+        &AppServerTransport::Stdio,
+        &AppServerWebsocketAuthSettings::default(),
+    );
+    assert_eq!(context, AppServerRpcTransportContext::RemoteControl);
 }
 
 fn thread_realtime_started_notification() -> ServerNotification {

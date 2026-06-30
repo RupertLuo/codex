@@ -85,6 +85,17 @@ impl AppServerRpcRegistry {
     pub(crate) fn get(&self, method: &str) -> Option<&Arc<dyn AppServerRpcExtension>> {
         self.extensions.get(method)
     }
+
+    pub(crate) fn contains_namespace(&self, method: &str) -> bool {
+        let Some((namespace, _)) = method.split_once('/') else {
+            return false;
+        };
+        self.extensions.keys().any(|candidate| {
+            candidate
+                .split_once('/')
+                .is_some_and(|(candidate_namespace, _)| candidate_namespace == namespace)
+        })
+    }
 }
 
 #[cfg(test)]

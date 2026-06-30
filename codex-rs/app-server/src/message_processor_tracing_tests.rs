@@ -1,10 +1,16 @@
 use super::ConnectionSessionState;
 use super::MessageProcessor;
 use super::MessageProcessorArgs;
+use crate::AppServerRpcContext;
+use crate::AppServerRpcExtension;
+use crate::AppServerRpcFuture;
+use crate::AppServerRpcTransportContext;
 use crate::analytics_utils::analytics_events_client_from_config;
 use crate::config_manager::ConfigManager;
 use crate::outgoing_message::ConnectionId;
+use crate::outgoing_message::OutgoingMessage;
 use crate::outgoing_message::OutgoingMessageSender;
+use crate::rpc_extension::AppServerRpcRegistry;
 use crate::transport::AppServerTransport;
 use anyhow::Result;
 use app_test_support::create_mock_responses_server_repeating_assistant;
@@ -55,6 +61,31 @@ use tracing_subscriber::layer::SubscriberExt;
 use wiremock::MockServer;
 
 const TEST_CONNECTION_ID: ConnectionId = ConnectionId(7);
+
+#[derive(Debug)]
+struct StubExtension;
+
+impl AppServerRpcExtension for StubExtension {
+    fn methods(&self) -> &'static [&'static str] {
+        &["vendor/read"]
+    }
+
+    fn handle<'a>(
+        &'a self,
+        _context: AppServerRpcContext,
+        _method: &'a str,
+        params: Option<serde_json::Value>,
+    ) -> AppServerRpcFuture<'a> {
+        Box::pin(async move {
+            let input = params
+                .as_ref()
+                .and_then(|value| value.get("input"))
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+            Ok(serde_json::json!({"input": input, "ok": true}))
+        })
+    }
+}
 
 struct TestTracing {
     exporter: InMemorySpanExporter,
@@ -117,10 +148,18 @@ struct TracingHarness {
 
 impl TracingHarness {
     async fn new() -> Result<Self> {
+        Self::new_with_extensions(Vec::new(), /*initialize*/ true).await
+    }
+
+    async fn new_with_extensions(
+        rpc_extensions: Vec<Arc<dyn AppServerRpcExtension>>,
+        initialize: bool,
+    ) -> Result<Self> {
         let server = create_mock_responses_server_repeating_assistant("Done").await;
         let codex_home = TempDir::new()?;
         let config = Arc::new(build_test_config(codex_home.path(), &server.uri()).await?);
-        let (processor, outgoing_rx) = build_test_processor(config).await;
+        let (processor, outgoing_rx) =
+            build_test_processor_with_extensions(config, rpc_extensions).await;
         let tracing = init_test_tracing();
         tracing.exporter.reset();
         tracing::callsite::rebuild_interest_cache();
@@ -133,26 +172,28 @@ impl TracingHarness {
             tracing,
         };
 
-        let _: InitializeResponse = harness
-            .request(
-                ClientRequest::Initialize {
-                    request_id: RequestId::Integer(1),
-                    params: InitializeParams {
-                        client_info: ClientInfo {
-                            name: "codex-app-server-tests".to_string(),
-                            title: None,
-                            version: "0.1.0".to_string(),
+        if initialize {
+            let _: InitializeResponse = harness
+                .request(
+                    ClientRequest::Initialize {
+                        request_id: RequestId::Integer(1),
+                        params: InitializeParams {
+                            client_info: ClientInfo {
+                                name: "codex-app-server-tests".to_string(),
+                                title: None,
+                                version: "0.1.0".to_string(),
+                            },
+                            capabilities: Some(InitializeCapabilities {
+                                experimental_api: true,
+                                ..Default::default()
+                            }),
                         },
-                        capabilities: Some(InitializeCapabilities {
-                            experimental_api: true,
-                            ..Default::default()
-                        }),
                     },
-                },
-                /*trace*/ None,
-            )
-            .await;
-        assert!(harness.session.initialized());
+                    /*trace*/ None,
+                )
+                .await;
+            assert!(harness.session.initialized());
+        }
 
         Ok(harness)
     }
@@ -182,10 +223,38 @@ impl TracingHarness {
                 TEST_CONNECTION_ID,
                 request,
                 &AppServerTransport::Stdio,
+                AppServerRpcContext {
+                    transport: AppServerRpcTransportContext::Stdio,
+                },
                 Arc::clone(&self.session),
             )
             .await;
         read_response(&mut self.outgoing_rx, request_id).await
+    }
+
+    async fn raw_request(
+        &mut self,
+        request_id: i64,
+        method: &str,
+        params: serde_json::Value,
+    ) -> OutgoingMessage {
+        self.processor
+            .process_request(
+                TEST_CONNECTION_ID,
+                JSONRPCRequest {
+                    id: RequestId::Integer(request_id),
+                    method: method.to_string(),
+                    params: Some(params),
+                    trace: None,
+                },
+                &AppServerTransport::Stdio,
+                AppServerRpcContext {
+                    transport: AppServerRpcTransportContext::Stdio,
+                },
+                Arc::clone(&self.session),
+            )
+            .await;
+        read_outgoing_message(&mut self.outgoing_rx, request_id).await
     }
 
     async fn start_thread(
@@ -227,8 +296,9 @@ async fn build_test_config(codex_home: &Path, server_uri: &str) -> Result<Config
         .await?)
 }
 
-async fn build_test_processor(
+async fn build_test_processor_with_extensions(
     config: Arc<Config>,
+    rpc_extensions: Vec<Arc<dyn AppServerRpcExtension>>,
 ) -> (
     Arc<MessageProcessor>,
     mpsc::Receiver<crate::outgoing_message::OutgoingEnvelope>,
@@ -269,6 +339,9 @@ async fn build_test_processor(
         rpc_transport: AppServerRpcTransport::Stdio,
         remote_control_handle: None,
         plugin_startup_tasks: crate::PluginStartupTasks::Start,
+        rpc_registry: Arc::new(
+            AppServerRpcRegistry::new(rpc_extensions).expect("valid extension registry"),
+        ),
     }));
     (processor, outgoing_rx)
 }
@@ -454,6 +527,98 @@ async fn read_response<T: serde::de::DeserializeOwned>(
         return serde_json::from_value(response.result)
             .expect("response payload should deserialize");
     }
+}
+
+async fn read_outgoing_message(
+    outgoing_rx: &mut mpsc::Receiver<crate::outgoing_message::OutgoingEnvelope>,
+    request_id: i64,
+) -> OutgoingMessage {
+    loop {
+        let envelope = tokio::time::timeout(std::time::Duration::from_secs(5), outgoing_rx.recv())
+            .await
+            .expect("timed out waiting for outgoing message")
+            .expect("outgoing channel closed");
+        let crate::outgoing_message::OutgoingEnvelope::ToConnection {
+            connection_id,
+            message,
+            ..
+        } = envelope
+        else {
+            continue;
+        };
+        if connection_id != TEST_CONNECTION_ID {
+            continue;
+        }
+        let matches_request = match &message {
+            OutgoingMessage::Response(response) => response.id == RequestId::Integer(request_id),
+            OutgoingMessage::Error(response) => response.id == RequestId::Integer(request_id),
+            _ => false,
+        };
+        if matches_request {
+            return message;
+        }
+    }
+}
+
+async fn send_extension_request(
+    initialize: bool,
+    method: &str,
+    params: serde_json::Value,
+) -> Result<OutgoingMessage> {
+    let mut harness =
+        TracingHarness::new_with_extensions(vec![Arc::new(StubExtension)], initialize).await?;
+    let message = harness.raw_request(90, method, params).await;
+    harness.shutdown().await;
+    Ok(message)
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[serial(app_server_tracing)]
+async fn extension_request_requires_initialize() -> Result<()> {
+    let response = send_extension_request(
+        /*initialize*/ false,
+        "vendor/read",
+        serde_json::json!({}),
+    )
+    .await?;
+    let OutgoingMessage::Error(response) = response else {
+        panic!("expected extension request to return an error");
+    };
+    assert_eq!(response.error.code, -32600);
+    assert_eq!(response.error.message, "Not initialized");
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[serial(app_server_tracing)]
+async fn initialized_extension_request_returns_raw_json_on_same_connection() -> Result<()> {
+    let response = send_extension_request(
+        /*initialize*/ true,
+        "vendor/read",
+        serde_json::json!({"input": 7}),
+    )
+    .await?;
+    let OutgoingMessage::Response(response) = response else {
+        panic!("expected extension request to return a response");
+    };
+    assert_eq!(response.result, serde_json::json!({"input": 7, "ok": true}));
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[serial(app_server_tracing)]
+async fn unknown_extension_method_remains_method_not_found() -> Result<()> {
+    let response = send_extension_request(
+        /*initialize*/ true,
+        "vendor/missing",
+        serde_json::json!({}),
+    )
+    .await?;
+    let OutgoingMessage::Error(response) = response else {
+        panic!("expected unknown extension method to return an error");
+    };
+    assert_eq!(response.error.code, -32601);
+    Ok(())
 }
 
 async fn read_thread_started_notification(

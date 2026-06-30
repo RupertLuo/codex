@@ -9,6 +9,7 @@ use crate::config_manager::ConfigManager;
 use crate::connection_rpc_gate::ConnectionRpcGate;
 use crate::current_time::app_server_time_provider;
 use crate::error_code::invalid_request;
+use crate::error_code::method_not_found;
 use crate::extensions::ThreadExtensionDependencies;
 use crate::extensions::app_server_extension_event_sink;
 use crate::extensions::guardian_agent_spawner;
@@ -43,6 +44,8 @@ use crate::request_processors::WindowsSandboxRequestProcessor;
 use crate::request_serialization::QueuedInitializedRequest;
 use crate::request_serialization::RequestSerializationQueueKey;
 use crate::request_serialization::RequestSerializationQueues;
+use crate::rpc_extension::AppServerRpcContext;
+use crate::rpc_extension::AppServerRpcRegistry;
 use crate::skills_watcher::SkillsWatcher;
 use crate::thread_state::ConnectionCapabilities;
 use crate::thread_state::ThreadStateManager;
@@ -210,6 +213,7 @@ pub(crate) struct MessageProcessor {
     turn_processor: TurnRequestProcessor,
     windows_sandbox_processor: WindowsSandboxRequestProcessor,
     request_serialization_queues: RequestSerializationQueues,
+    rpc_registry: Arc<AppServerRpcRegistry>,
 }
 
 #[derive(Debug)]
@@ -305,6 +309,7 @@ pub(crate) struct MessageProcessorArgs {
     pub(crate) rpc_transport: AppServerRpcTransport,
     pub(crate) remote_control_handle: Option<RemoteControlHandle>,
     pub(crate) plugin_startup_tasks: crate::PluginStartupTasks,
+    pub(crate) rpc_registry: Arc<AppServerRpcRegistry>,
 }
 
 impl MessageProcessor {
@@ -329,6 +334,7 @@ impl MessageProcessor {
             rpc_transport,
             remote_control_handle,
             plugin_startup_tasks,
+            rpc_registry,
         } = args;
         auth_manager.set_external_auth(Arc::new(ExternalAuthRefreshBridge {
             outgoing: outgoing.clone(),
@@ -583,6 +589,7 @@ impl MessageProcessor {
             turn_processor,
             windows_sandbox_processor,
             request_serialization_queues: RequestSerializationQueues::default(),
+            rpc_registry,
         }
     }
 
@@ -598,6 +605,7 @@ impl MessageProcessor {
         connection_id: ConnectionId,
         request: JSONRPCRequest,
         transport: &AppServerTransport,
+        rpc_context: AppServerRpcContext,
         session: Arc<ConnectionSessionState>,
     ) {
         let request_method = request.method.as_str();
@@ -621,6 +629,37 @@ impl MessageProcessor {
             Arc::clone(&self.outgoing),
             request_context.clone(),
             async {
+                if let Some(extension) = self.rpc_registry.get(request_method).cloned() {
+                    if !session.initialized() {
+                        self.outgoing
+                            .send_error(request_id.clone(), invalid_request("Not initialized"))
+                            .await;
+                        return;
+                    }
+                    match extension
+                        .handle(rpc_context, request_method, request.params.clone())
+                        .await
+                    {
+                        Ok(result) => {
+                            self.outgoing
+                                .send_json_response(request_id.clone(), result)
+                                .await;
+                        }
+                        Err(error) => {
+                            self.outgoing.send_error(request_id.clone(), error).await;
+                        }
+                    }
+                    return;
+                }
+                if self.rpc_registry.contains_namespace(request_method) {
+                    self.outgoing
+                        .send_error(
+                            request_id.clone(),
+                            method_not_found(format!("Method not found: {request_method}")),
+                        )
+                        .await;
+                    return;
+                }
                 let codex_request = deserialize_client_request(&request);
                 let result = match codex_request {
                     Ok(codex_request) => {
