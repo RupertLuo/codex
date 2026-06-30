@@ -337,15 +337,18 @@ async fn reasoning_selection_in_plan_mode_without_effort_change_does_not_open_sc
     assert!(
         events.iter().any(|event| matches!(
             event,
-            AppEvent::UpdateModel(model) if model == "gpt-5.4"
+            AppEvent::RequestModelSelection(selection)
+                if selection.model == "gpt-5.4"
+                    && selection.effort == Some(ReasoningEffortConfig::Medium)
+                    && !selection.update_plan_mode_effort
         )),
-        "expected model update event; events: {events:?}"
+        "expected gated model selection request; events: {events:?}"
     );
     assert!(
         events
             .iter()
-            .any(|event| matches!(event, AppEvent::UpdateReasoningEffort(Some(_)))),
-        "expected reasoning update event; events: {events:?}"
+            .all(|event| !matches!(event, AppEvent::OpenPlanReasoningScopePrompt { .. })),
+        "expected no Plan reasoning scope prompt event; events: {events:?}"
     );
 }
 
@@ -469,20 +472,23 @@ async fn reasoning_selection_in_plan_mode_model_switch_does_not_open_scope_promp
     assert!(
         events.iter().any(|event| matches!(
             event,
-            AppEvent::UpdateModel(model) if model == "gpt-5.2"
+            AppEvent::RequestModelSelection(selection)
+                if selection.model == "gpt-5.2"
+                    && selection.effort == Some(ReasoningEffortConfig::Medium)
+                    && !selection.update_plan_mode_effort
         )),
-        "expected model update event; events: {events:?}"
+        "expected gated model selection request; events: {events:?}"
     );
     assert!(
         events
             .iter()
-            .any(|event| matches!(event, AppEvent::UpdateReasoningEffort(Some(_)))),
-        "expected reasoning update event; events: {events:?}"
+            .all(|event| !matches!(event, AppEvent::OpenPlanReasoningScopePrompt { .. })),
+        "expected no Plan reasoning scope prompt event; events: {events:?}"
     );
 }
 
 #[tokio::test]
-async fn plan_reasoning_scope_popup_all_modes_persists_global_and_plan_override() {
+async fn plan_reasoning_scope_popup_all_modes_requests_global_and_plan_override() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.4")).await;
     chat.open_plan_reasoning_scope_prompt("gpt-5.4".to_string(), Some(ReasoningEffortConfig::High));
 
@@ -493,24 +499,12 @@ async fn plan_reasoning_scope_popup_all_modes_persists_global_and_plan_override(
     assert!(
         events.iter().any(|event| matches!(
             event,
-            AppEvent::UpdatePlanModeReasoningEffort(Some(ReasoningEffortConfig::High))
+            AppEvent::RequestModelSelection(selection)
+                if selection.model == "gpt-5.4"
+                    && selection.effort == Some(ReasoningEffortConfig::High)
+                    && selection.update_plan_mode_effort
         )),
-        "expected plan override to be updated; events: {events:?}"
-    );
-    assert!(
-        events.iter().any(|event| matches!(
-            event,
-            AppEvent::PersistPlanModeReasoningEffort(Some(ReasoningEffortConfig::High))
-        )),
-        "expected updated plan override to be persisted; events: {events:?}"
-    );
-    assert!(
-        events.iter().any(|event| matches!(
-            event,
-            AppEvent::PersistModelSelection { model, effort: Some(ReasoningEffortConfig::High) }
-                if model == "gpt-5.4"
-        )),
-        "expected global model reasoning selection persistence; events: {events:?}"
+        "expected gated selection request for global and Plan defaults; events: {events:?}"
     );
 }
 

@@ -296,7 +296,6 @@ pub(crate) struct ThreadManagerState {
     session_source: SessionSource,
     installation_id: String,
     analytics_events_client: Option<AnalyticsEventsClient>,
-    state_db: Option<StateDbHandle>,
     runtime_options: ThreadManagerRuntimeOptions,
     // Captures submitted ops for testing purpose when test mode is enabled.
     ops_log: Option<SharedCapturedOps>,
@@ -383,7 +382,7 @@ impl ThreadManager {
             user_instructions_provider,
             analytics_events_client,
             thread_store,
-            state_db,
+            agent_graph_store,
             installation_id,
             attestation_provider,
             external_time_provider,
@@ -401,7 +400,7 @@ impl ThreadManager {
         user_instructions_provider: Arc<dyn UserInstructionsProvider>,
         analytics_events_client: Option<AnalyticsEventsClient>,
         thread_store: Arc<dyn ThreadStore>,
-        state_db: Option<StateDbHandle>,
+        agent_graph_store: Option<Arc<dyn AgentGraphStore>>,
         installation_id: String,
         attestation_provider: Option<Arc<dyn AttestationProvider>>,
         external_time_provider: Option<Arc<dyn TimeProvider>>,
@@ -453,7 +452,6 @@ impl ThreadManager {
                 session_source,
                 installation_id,
                 analytics_events_client,
-                state_db,
                 runtime_options,
                 ops_log: should_use_test_thread_manager_behavior()
                     .then(|| Arc::new(std::sync::Mutex::new(Vec::new()))),
@@ -563,7 +561,6 @@ impl ThreadManager {
                 session_source: SessionSource::Exec,
                 installation_id,
                 analytics_events_client: None,
-                state_db,
                 runtime_options: ThreadManagerRuntimeOptions::default(),
                 ops_log: should_use_test_thread_manager_behavior()
                     .then(|| Arc::new(std::sync::Mutex::new(Vec::new()))),
