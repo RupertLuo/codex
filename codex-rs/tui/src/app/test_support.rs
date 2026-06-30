@@ -18,6 +18,7 @@ pub(super) async fn make_test_app() -> App {
 
     App {
         model_catalog: chat_widget.model_catalog(),
+        model_runtime: None,
         session_telemetry,
         app_event_tx,
         chat_widget,

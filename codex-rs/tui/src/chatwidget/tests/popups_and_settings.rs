@@ -44,6 +44,7 @@ async fn experimental_mode_plan_is_ignored_on_startup() {
         has_chatgpt_account: false,
         has_codex_backend_auth: false,
         model_catalog: test_model_catalog(&cfg),
+        model_runtime: None,
         feedback: codex_feedback::CodexFeedback::new(),
         is_first_run: true,
         status_account_display: None,

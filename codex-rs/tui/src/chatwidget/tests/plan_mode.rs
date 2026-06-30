@@ -1496,6 +1496,7 @@ async fn make_startup_chat_with_cli_overrides(
         has_chatgpt_account: false,
         has_codex_backend_auth: false,
         model_catalog: test_model_catalog(&cfg),
+        model_runtime: None,
         feedback: codex_feedback::CodexFeedback::new(),
         is_first_run: true,
         status_account_display: None,

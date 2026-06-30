@@ -239,6 +239,7 @@ const TUI_LOG_FILE_NAME: &str = "codex-tui.log";
 #[derive(Clone, Debug, Default)]
 pub struct TuiRuntimeOptions {
     thread_manager: ThreadManagerRuntimeOptions,
+    model_runtime: Option<Arc<dyn TuiModelRuntime>>,
 }
 
 impl TuiRuntimeOptions {
@@ -250,8 +251,13 @@ impl TuiRuntimeOptions {
         self
     }
 
+    pub fn with_model_runtime(mut self, model_runtime: Arc<dyn TuiModelRuntime>) -> Self {
+        self.model_runtime = Some(model_runtime);
+        self
+    }
+
     fn requires_embedded_app_server(&self) -> bool {
-        self.thread_manager.has_process_local_overrides()
+        self.thread_manager.has_process_local_overrides() || self.model_runtime.is_some()
     }
 }
 
@@ -1366,6 +1372,7 @@ async fn run_ratatui_app(
     runtime_options: TuiRuntimeOptions,
 ) -> color_eyre::Result<AppExitInfo> {
     let uses_remote_workspace = app_server_target.uses_remote_workspace();
+    let model_runtime = runtime_options.model_runtime.clone();
     color_eyre::install()?;
 
     tooltips::announcement::prewarm();
@@ -1873,6 +1880,7 @@ async fn run_ratatui_app(
         startup_elapsed_before_app,
         startup_bootstrap,
         startup_hooks_browser,
+        model_runtime,
     )
     .await;
 
@@ -2098,6 +2106,46 @@ mod tests {
     use serial_test::serial;
     use tempfile::TempDir;
 
+    #[derive(Debug)]
+    struct FakeModelRuntime;
+
+    impl TuiModelRuntime for FakeModelRuntime {
+        fn list_credentials(
+            &self,
+        ) -> ModelRuntimeFuture<Result<Vec<CredentialEntry>, ModelRuntimeError>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+
+        fn model_readiness(
+            &self,
+            _model_id: String,
+        ) -> ModelRuntimeFuture<Result<ModelReadiness, ModelRuntimeError>> {
+            Box::pin(async { Ok(ModelReadiness::Ready) })
+        }
+
+        fn store_credential(
+            &self,
+            _credential_id: String,
+            _value: SensitiveInput,
+        ) -> ModelRuntimeFuture<Result<CredentialMutation, ModelRuntimeError>> {
+            Box::pin(async { Ok(CredentialMutation::Verified) })
+        }
+
+        fn revalidate_credential(
+            &self,
+            _credential_id: String,
+        ) -> ModelRuntimeFuture<Result<CredentialMutation, ModelRuntimeError>> {
+            Box::pin(async { Ok(CredentialMutation::Verified) })
+        }
+
+        fn delete_credential(
+            &self,
+            _credential_id: String,
+        ) -> ModelRuntimeFuture<Result<(), ModelRuntimeError>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
     fn custom_tui_runtime_options() -> TuiRuntimeOptions {
         let transport = HttpTransportHandle::new(
             |_request| async { Err(TransportError::Build("execute test sentinel".to_string())) },
@@ -2112,6 +2160,13 @@ mod tests {
         TuiRuntimeOptions::default().with_thread_manager_options(
             ThreadManagerRuntimeOptions::default().with_model_catalog(ModelsResponse::default()),
         )
+    }
+
+    #[test]
+    fn model_runtime_requires_embedded_app_server() {
+        let runtime_options =
+            TuiRuntimeOptions::default().with_model_runtime(Arc::new(FakeModelRuntime));
+        assert!(runtime_options.requires_embedded_app_server());
     }
 
     async fn build_config(temp_dir: &TempDir) -> std::io::Result<Config> {

@@ -333,6 +333,11 @@ impl BottomPane {
         self.request_redraw();
     }
 
+    pub fn set_model_runtime_enabled(&mut self, enabled: bool) {
+        self.composer.set_model_runtime_enabled(enabled);
+        self.request_redraw();
+    }
+
     pub fn set_mentions_v2_enabled(&mut self, enabled: bool) {
         self.composer.set_mentions_v2_enabled(enabled);
         self.request_redraw();

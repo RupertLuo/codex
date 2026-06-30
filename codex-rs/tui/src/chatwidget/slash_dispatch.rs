@@ -272,6 +272,9 @@ impl ChatWidget {
                 self.open_model_popup();
                 self.defer_input_until_settings_applied();
             }
+            SlashCommand::Credentials => {
+                self.open_credentials_popup();
+            }
             SlashCommand::Personality => {
                 self.open_personality_popup();
                 self.defer_input_until_settings_applied();
@@ -1019,6 +1022,7 @@ impl ChatWidget {
             connectors_enabled: self.connectors_enabled(),
             plugins_command_enabled: self.config.features.enabled(Feature::Plugins),
             token_activity_command_enabled: self.has_codex_backend_auth,
+            model_runtime_enabled: self.model_runtime_enabled,
             goal_command_enabled: self.config.features.enabled(Feature::Goals),
             service_tier_commands_enabled: self.fast_mode_enabled(),
             personality_command_enabled: self.config.features.enabled(Feature::Personality),
@@ -1033,6 +1037,16 @@ impl ChatWidget {
         }
         self.add_error_message(USAGE_CHATGPT_LOGIN_REQUIRED.to_string());
         false
+    }
+
+    fn open_credentials_popup(&mut self) {
+        if self.model_runtime.is_none() {
+            return;
+        }
+        self.add_info_message(
+            "Credential management is initializing.".to_string(),
+            /*hint*/ None,
+        );
     }
 
     fn queued_command_drain_result(&self, cmd: SlashCommand) -> QueueDrain {
@@ -1070,6 +1084,7 @@ impl ChatWidget {
             | SlashCommand::Compact
             | SlashCommand::Review
             | SlashCommand::Model
+            | SlashCommand::Credentials
             | SlashCommand::Personality
             | SlashCommand::Plan
             | SlashCommand::Goal

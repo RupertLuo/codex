@@ -21,6 +21,7 @@ impl ChatWidget {
             has_chatgpt_account,
             has_codex_backend_auth,
             model_catalog,
+            model_runtime,
             feedback,
             is_first_run,
             status_account_display,
@@ -116,6 +117,8 @@ impl ChatWidget {
             has_chatgpt_account,
             has_codex_backend_auth,
             model_catalog,
+            model_runtime_enabled: model_runtime.is_some(),
+            model_runtime,
             session_telemetry,
             session_header: SessionHeader::new(header_model),
             initial_user_message,
@@ -279,6 +282,9 @@ impl ChatWidget {
         widget
             .bottom_pane
             .set_token_activity_command_enabled(widget.has_codex_backend_auth);
+        widget
+            .bottom_pane
+            .set_model_runtime_enabled(widget.model_runtime_enabled);
         widget.refresh_status_surfaces();
 
         widget

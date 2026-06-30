@@ -329,6 +329,7 @@ async fn enqueue_primary_thread_session_replays_turns_before_initial_prompt_subm
         has_chatgpt_account: false,
         has_codex_backend_auth: false,
         model_catalog: app.model_catalog.clone(),
+        model_runtime: None,
         feedback: codex_feedback::CodexFeedback::new(),
         is_first_run: false,
         status_account_display: None,
@@ -4055,6 +4056,7 @@ async fn make_test_app() -> App {
 
     App {
         model_catalog: chat_widget.model_catalog(),
+        model_runtime: None,
         session_telemetry,
         app_event_tx,
         chat_widget,
@@ -4120,6 +4122,7 @@ async fn make_test_app_with_channels() -> (
     (
         App {
             model_catalog: chat_widget.model_catalog(),
+            model_runtime: None,
             session_telemetry,
             app_event_tx,
             chat_widget,
@@ -5391,6 +5394,7 @@ async fn replace_chat_widget_reseeds_collab_agent_metadata_for_replay() {
         has_chatgpt_account: app.chat_widget.has_chatgpt_account(),
         has_codex_backend_auth: app.chat_widget.has_codex_backend_auth(),
         model_catalog: app.model_catalog.clone(),
+        model_runtime: None,
         feedback: app.feedback.clone(),
         is_first_run: false,
         status_account_display: app.chat_widget.status_account_display().cloned(),

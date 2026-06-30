@@ -56,6 +56,7 @@ use crate::model_catalog::ModelCatalog;
 use crate::model_migration::ModelMigrationOutcome;
 use crate::model_migration::migration_copy_for_models;
 use crate::model_migration::run_model_migration_prompt;
+use crate::model_runtime::TuiModelRuntime;
 use crate::multi_agents::agent_picker_status_dot_spans;
 use crate::multi_agents::format_agent_picker_item_name;
 use crate::multi_agents::next_agent_shortcut_matches;
@@ -502,6 +503,7 @@ struct InitialHistoryReplayBuffer {
 
 pub(crate) struct App {
     model_catalog: Arc<ModelCatalog>,
+    model_runtime: Option<Arc<dyn TuiModelRuntime>>,
     pub(crate) session_telemetry: SessionTelemetry,
     pub(crate) app_event_tx: AppEventSender,
     pub(crate) chat_widget: ChatWidget,
@@ -739,6 +741,7 @@ impl App {
             has_chatgpt_account: self.chat_widget.has_chatgpt_account(),
             has_codex_backend_auth: self.chat_widget.has_codex_backend_auth(),
             model_catalog: self.model_catalog.clone(),
+            model_runtime: self.model_runtime.clone(),
             feedback: self.feedback.clone(),
             is_first_run: false,
             status_account_display: self.chat_widget.status_account_display().cloned(),
@@ -776,6 +779,7 @@ impl App {
         startup_elapsed_before_app: Duration,
         startup_bootstrap: Option<AppServerBootstrap>,
         startup_hooks_browser: Option<HooksListEntry>,
+        model_runtime: Option<Arc<dyn TuiModelRuntime>>,
     ) -> Result<AppExitInfo> {
         use tokio_stream::StreamExt;
         let startup_started_at = Instant::now();
@@ -908,6 +912,7 @@ impl App {
                     has_chatgpt_account,
                     has_codex_backend_auth,
                     model_catalog: model_catalog.clone(),
+                    model_runtime: model_runtime.clone(),
                     feedback: feedback.clone(),
                     is_first_run,
                     status_account_display: status_account_display.clone(),
@@ -944,6 +949,7 @@ impl App {
                     has_chatgpt_account,
                     has_codex_backend_auth,
                     model_catalog: model_catalog.clone(),
+                    model_runtime: model_runtime.clone(),
                     feedback: feedback.clone(),
                     is_first_run,
                     status_account_display: status_account_display.clone(),
@@ -983,6 +989,7 @@ impl App {
                     has_chatgpt_account,
                     has_codex_backend_auth,
                     model_catalog: model_catalog.clone(),
+                    model_runtime: model_runtime.clone(),
                     feedback: feedback.clone(),
                     is_first_run,
                     status_account_display: status_account_display.clone(),
@@ -1016,6 +1023,7 @@ See the Codex keymap documentation for supported actions and examples."
 
         let mut app = Self {
             model_catalog,
+            model_runtime,
             session_telemetry: session_telemetry.clone(),
             app_event_tx,
             chat_widget,
