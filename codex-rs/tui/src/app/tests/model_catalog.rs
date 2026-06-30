@@ -33,8 +33,8 @@ fn catalog_with_models(models: &[&str]) -> Vec<ModelPreset> {
 
 #[test]
 fn custom_runtime_missing_config_uses_catalog_default_and_opens_picker() {
-    let decision = custom_runtime_startup_model(None, &catalog_with_default("glm/glm-4"));
-    assert_eq!(decision.model, "glm/glm-4");
+    let decision = custom_runtime_startup_model(None, &catalog_with_default("alpha/code-large"));
+    assert_eq!(decision.model, "alpha/code-large");
     assert!(decision.open_picker);
     assert!(decision.warning.is_none());
     assert!(decision.persist_default);
@@ -42,9 +42,11 @@ fn custom_runtime_missing_config_uses_catalog_default_and_opens_picker() {
 
 #[test]
 fn custom_runtime_removed_model_warns_and_uses_catalog_default() {
-    let decision =
-        custom_runtime_startup_model(Some("removed/model"), &catalog_with_default("glm/glm-4"));
-    assert_eq!(decision.model, "glm/glm-4");
+    let decision = custom_runtime_startup_model(
+        Some("removed/model"),
+        &catalog_with_default("alpha/code-large"),
+    );
+    assert_eq!(decision.model, "alpha/code-large");
     assert!(decision.open_picker);
     assert_eq!(
         decision.warning.as_deref(),
@@ -55,10 +57,10 @@ fn custom_runtime_removed_model_warns_and_uses_catalog_default() {
 #[test]
 fn custom_runtime_valid_persisted_model_does_not_open_picker() {
     let decision = custom_runtime_startup_model(
-        Some("deepseek/deepseek-chat"),
-        &catalog_with_models(&["glm/glm-4", "deepseek/deepseek-chat"]),
+        Some("beta/chat"),
+        &catalog_with_models(&["alpha/code-large", "beta/chat"]),
     );
-    assert_eq!(decision.model, "deepseek/deepseek-chat");
+    assert_eq!(decision.model, "beta/chat");
     assert!(!decision.open_picker);
     assert!(!decision.persist_default);
 }

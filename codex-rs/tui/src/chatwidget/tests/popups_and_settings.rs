@@ -3177,36 +3177,40 @@ async fn model_picker_hides_show_in_picker_false_models_from_cache() {
 
 #[tokio::test]
 async fn model_picker_is_flat_searchable_and_searches_description() {
-    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("glm/glm-4")).await;
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("alpha/code-large")).await;
     chat.thread_id = Some(ThreadId::new());
     chat.open_model_popup_with_presets(vec![
-        model_preset("glm/glm-4", "GLM 4", "Zhipu · balanced coding model"),
         model_preset(
-            "deepseek/deepseek-chat",
-            "DeepSeek Chat",
-            "DeepSeek · efficient chat model",
+            "alpha/code-large",
+            "Alpha Code",
+            "Acme Labs · balanced coding model",
+        ),
+        model_preset(
+            "beta/chat",
+            "Beta Chat",
+            "Example AI · efficient chat model",
         ),
     ]);
 
     let initial = render_bottom_popup(&chat, /*width*/ 80);
-    assert!(initial.contains("GLM 4"));
-    assert!(initial.contains("DeepSeek Chat"));
+    assert!(initial.contains("Alpha Code"));
+    assert!(initial.contains("Beta Chat"));
 
-    for character in "deepseek".chars() {
+    for character in "beta".chars() {
         chat.handle_key_event(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
     }
     let filtered = render_bottom_popup(&chat, /*width*/ 80);
-    assert!(!filtered.contains("GLM 4"));
-    assert!(filtered.contains("DeepSeek Chat"));
+    assert!(!filtered.contains("Alpha Code"));
+    assert!(filtered.contains("Beta Chat"));
 }
 
 #[tokio::test]
 async fn model_selection_waits_for_readiness() {
-    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(Some("glm/glm-4")).await;
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(Some("alpha/code-large")).await;
     chat.open_reasoning_popup(model_preset(
-        "deepseek/deepseek-chat",
-        "DeepSeek Chat",
-        "DeepSeek · efficient chat model",
+        "beta/chat",
+        "Beta Chat",
+        "Example AI · efficient chat model",
     ));
 
     let events = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
@@ -3223,7 +3227,7 @@ async fn model_selection_waits_for_readiness() {
     assert!(events.iter().any(|event| matches!(
         event,
         AppEvent::RequestModelSelection(selection)
-            if selection.model == "deepseek/deepseek-chat"
+            if selection.model == "beta/chat"
     )));
 }
 
