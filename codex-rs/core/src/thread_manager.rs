@@ -192,6 +192,7 @@ pub struct ThreadManager {
 pub struct ThreadManagerRuntimeOptions {
     http_transport: Option<HttpTransportHandle>,
     model_catalog: Option<ModelsResponse>,
+    required_base_instructions: Option<String>,
     runtime_extensions: Vec<Arc<dyn RuntimeExtension<Config>>>,
 }
 
@@ -203,6 +204,11 @@ impl ThreadManagerRuntimeOptions {
 
     pub fn with_model_catalog(mut self, model_catalog: ModelsResponse) -> Self {
         self.model_catalog = Some(model_catalog);
+        self
+    }
+
+    pub fn with_required_base_instructions(mut self, instructions: String) -> Self {
+        self.required_base_instructions = Some(instructions);
         self
     }
 
@@ -229,7 +235,12 @@ impl ThreadManagerRuntimeOptions {
     pub fn has_process_local_overrides(&self) -> bool {
         self.has_http_transport_override()
             || self.has_model_catalog_override()
+            || self.required_base_instructions.is_some()
             || self.has_runtime_extension_override()
+    }
+
+    pub fn required_base_instructions(&self) -> Option<&str> {
+        self.required_base_instructions.as_deref()
     }
 
     pub fn runtime_extensions(&self) -> &[Arc<dyn RuntimeExtension<Config>>] {
@@ -242,6 +253,18 @@ impl ThreadManagerRuntimeOptions {
 
     pub(crate) fn model_catalog(&self) -> Option<ModelsResponse> {
         self.model_catalog.clone()
+    }
+}
+
+fn compose_required_base_instructions(required: &str, requested: Option<&str>) -> String {
+    let required = required.trim();
+    let requested = requested.map(str::trim).filter(|value| !value.is_empty());
+    match requested {
+        None => required.to_string(),
+        Some(value) if value == required || value.starts_with(&format!("{required}\n\n")) => {
+            value.to_string()
+        }
+        Some(value) => format!("{required}\n\n# Additional task instructions\n\n{value}"),
     }
 }
 
@@ -1641,6 +1664,13 @@ impl ThreadManagerState {
         supports_openai_form_elicitation: bool,
         user_shell_override: Option<crate::shell::Shell>,
     ) -> CodexResult<NewThread> {
+        let mut config = config;
+        if let Some(required) = self.runtime_options.required_base_instructions() {
+            config.base_instructions = Some(compose_required_base_instructions(
+                required,
+                config.base_instructions.as_deref(),
+            ));
+        }
         let is_resumed_thread = matches!(&initial_history, InitialHistory::Resumed(_));
         if let InitialHistory::Resumed(resumed) = &initial_history {
             let mut threads = self.threads.write().await;
