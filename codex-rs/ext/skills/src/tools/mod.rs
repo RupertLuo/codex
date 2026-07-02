@@ -125,7 +125,7 @@ impl SkillToolAuthority {
         }
     }
 
-    fn into_authority(&self) -> Result<SkillAuthority, FunctionCallError> {
+    fn to_authority(&self) -> Result<SkillAuthority, FunctionCallError> {
         validate_handle("authority.kind", &self.kind, MAX_HANDLE_BYTES)?;
         match self.kind.as_str() {
             "orchestrator" => Ok(SkillAuthority::new(

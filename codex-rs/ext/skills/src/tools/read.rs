@@ -58,7 +58,7 @@ impl ToolExecutor<ToolCall> for ReadTool {
     fn handle(&self, call: ToolCall) -> ToolExecutorFuture<'_> {
         Box::pin(async move {
             let args: ReadArgs = parse_args(&call)?;
-            let authority = args.authority.into_authority()?;
+            let authority = args.authority.to_authority()?;
             validate_handle("package", &args.package, MAX_HANDLE_BYTES)?;
             validate_handle("resource", &args.resource, MAX_HANDLE_BYTES)?;
 
