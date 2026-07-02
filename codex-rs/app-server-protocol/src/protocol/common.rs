@@ -189,6 +189,23 @@ macro_rules! serialization_scope_expr {
 /// client can send to the server. Each variant has associated `params` and
 /// `response` types. Also generates a `export_client_responses()` function to
 /// export all response types to TypeScript.
+fn lower_first_ascii(value: &str) -> String {
+    let mut bytes = value.as_bytes().to_vec();
+    if let Some(first) = bytes.first_mut() {
+        first.make_ascii_lowercase();
+    }
+    String::from_utf8(bytes).expect("Rust identifiers are UTF-8")
+}
+
+macro_rules! client_method_name {
+    ($variant:ident => $wire:literal) => {
+        $wire.to_string()
+    };
+    ($variant:ident) => {
+        lower_first_ascii(stringify!($variant))
+    };
+}
+
 macro_rules! client_request_definitions {
     (
         $(
@@ -217,6 +234,10 @@ macro_rules! client_request_definitions {
                     params: $params,
                 },
             )*
+        }
+
+        pub fn client_request_methods() -> Vec<String> {
+            vec![$(client_method_name!($variant $(=> $wire)?),)*]
         }
 
         impl ClientRequest {
@@ -1740,6 +1761,23 @@ mod tests {
     fn request_id() -> RequestId {
         const REQUEST_ID: i64 = 1;
         RequestId::Integer(REQUEST_ID)
+    }
+
+    #[test]
+    fn client_request_methods_are_exact_unique_wire_names() {
+        let methods = client_request_methods();
+        let unique = methods.iter().collect::<std::collections::BTreeSet<_>>();
+
+        assert_eq!(methods.len(), unique.len());
+        assert!(methods.iter().any(|method| method == "initialize"));
+        assert!(methods.iter().any(|method| method == "model/list"));
+        assert!(methods.iter().any(|method| method == "thread/start"));
+        assert!(
+            methods
+                .iter()
+                .any(|method| method == "thread/settings/update")
+        );
+        assert!(methods.iter().any(|method| method == "turn/start"));
     }
 
     #[test]

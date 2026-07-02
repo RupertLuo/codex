@@ -32,6 +32,7 @@ use crate::outgoing_message::ConnectionId;
 use crate::outgoing_message::OutgoingEnvelope;
 use crate::outgoing_message::OutgoingMessageSender;
 use crate::outgoing_message::QueuedOutgoingMessage;
+use crate::rpc_extension::AppServerRpcRegistry;
 use crate::transport::CHANNEL_CAPACITY;
 use crate::transport::ConnectionState;
 use crate::transport::OutboundConnectionState;
@@ -41,6 +42,7 @@ use crate::transport::TransportEvent;
 use crate::transport::acquire_app_server_startup_lock;
 use crate::transport::app_server_startup_lock_path;
 use crate::transport::auth::policy_from_settings;
+use crate::transport::extension_transport_context;
 use crate::transport::prepare_control_socket_path;
 use crate::transport::route_outgoing_envelope;
 use crate::transport::start_control_socket_acceptor;
@@ -86,6 +88,7 @@ mod app_server_tracing;
 mod attestation;
 mod auth_mode;
 mod bespoke_event_handling;
+mod cli;
 mod command_exec;
 mod config;
 mod config_layer;
@@ -109,14 +112,23 @@ mod models_refresh_worker;
 mod outgoing_message;
 mod request_processors;
 mod request_serialization;
+mod rpc_extension;
 mod server_request_error;
 mod skills_watcher;
 mod thread_state;
 mod thread_status;
 mod transport;
 
+pub use crate::cli::AppServerCli;
+pub use crate::cli::AppServerServeArgs;
+pub use crate::cli::run_app_server_serve;
 pub use crate::error_code::INPUT_TOO_LARGE_ERROR_CODE;
 pub use crate::error_code::INVALID_PARAMS_ERROR_CODE;
+pub use crate::rpc_extension::AppServerRpcContext;
+pub use crate::rpc_extension::AppServerRpcExtension;
+pub use crate::rpc_extension::AppServerRpcFuture;
+pub use crate::rpc_extension::AppServerRpcRegistryError;
+pub use crate::rpc_extension::AppServerRpcTransportContext;
 pub use crate::transport::AppServerTransport;
 pub use crate::transport::RemoteControlStartupMode;
 pub use crate::transport::app_server_control_socket_path;
@@ -434,6 +446,28 @@ impl Default for AppServerRuntimeOptions {
     }
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct AppServerProcessOverrides {
+    thread_manager: ThreadManagerRuntimeOptions,
+    rpc_extensions: Vec<Arc<dyn AppServerRpcExtension>>,
+}
+
+impl AppServerProcessOverrides {
+    pub fn with_thread_manager_options(mut self, value: ThreadManagerRuntimeOptions) -> Self {
+        self.thread_manager = value;
+        self
+    }
+
+    pub fn with_rpc_extension(mut self, value: Arc<dyn AppServerRpcExtension>) -> Self {
+        self.rpc_extensions.push(value);
+        self
+    }
+
+    pub fn thread_manager_options(&self) -> &ThreadManagerRuntimeOptions {
+        &self.thread_manager
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn run_main_with_transport_options(
     arg0_paths: Arg0DispatchPaths,
@@ -446,6 +480,42 @@ pub async fn run_main_with_transport_options(
     auth: AppServerWebsocketAuthSettings,
     runtime_options: AppServerRuntimeOptions,
 ) -> IoResult<()> {
+    run_main_with_transport_options_and_overrides(
+        arg0_paths,
+        cli_config_overrides,
+        loader_overrides,
+        strict_config,
+        default_analytics_enabled,
+        transport,
+        session_source,
+        auth,
+        runtime_options,
+        AppServerProcessOverrides::default(),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn run_main_with_transport_options_and_overrides(
+    arg0_paths: Arg0DispatchPaths,
+    cli_config_overrides: CliConfigOverrides,
+    loader_overrides: LoaderOverrides,
+    strict_config: bool,
+    default_analytics_enabled: bool,
+    transport: AppServerTransport,
+    session_source: SessionSource,
+    auth: AppServerWebsocketAuthSettings,
+    runtime_options: AppServerRuntimeOptions,
+    process_overrides: AppServerProcessOverrides,
+) -> IoResult<()> {
+    let AppServerProcessOverrides {
+        thread_manager,
+        rpc_extensions,
+    } = process_overrides;
+    let rpc_registry = Arc::new(
+        AppServerRpcRegistry::new(rpc_extensions)
+            .map_err(|err| std::io::Error::new(ErrorKind::InvalidInput, err))?,
+    );
     let loader_overrides = loader_overrides_with_test_user_config_file(
         loader_overrides,
         test_user_config_file_from_env(),
@@ -892,7 +962,7 @@ pub async fn run_main_with_transport_options(
             config: Arc::new(config),
             config_manager,
             environment_manager,
-            thread_manager_runtime_options: ThreadManagerRuntimeOptions::default(),
+            thread_manager_runtime_options: thread_manager,
             feedback: feedback.clone(),
             log_db,
             state_db: state_db.clone(),
@@ -903,6 +973,7 @@ pub async fn run_main_with_transport_options(
             rpc_transport: analytics_rpc_transport(&transport),
             remote_control_handle: Some(remote_control_handle.clone()),
             plugin_startup_tasks: runtime_options.plugin_startup_tasks,
+            rpc_registry,
         }));
         let mut thread_created_rx = processor.thread_created_receiver();
         let mut running_turn_count_rx = processor.subscribe_running_assistant_turn_count();
@@ -1027,6 +1098,13 @@ pub async fn run_main_with_transport_options(
                                                 connection_id,
                                                 request,
                                                 &transport,
+                                                AppServerRpcContext {
+                                                    transport: extension_transport_context(
+                                                        connection_state.origin,
+                                                        &transport,
+                                                        &auth,
+                                                    ),
+                                                },
                                                 Arc::clone(&connection_state.session),
                                             )
                                             .await;
