@@ -1,6 +1,7 @@
 use anyhow::Result;
 use codex_core::StartThreadOptions;
 use codex_core::ThreadConfigSnapshot;
+use codex_core::ThreadManagerRuntimeOptions;
 use codex_core::config::AgentRoleConfig;
 use codex_features::Feature;
 use codex_protocol::ThreadId;
@@ -357,6 +358,37 @@ async fn setup_turn_one_with_spawned_child(
     )
     .await?;
     Ok((test, spawned_id))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn spawn_agent_inherits_required_base_instructions() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+    let (_test, _spawned_id, child_request_log) = setup_turn_one_with_custom_spawned_child(
+        &server,
+        json!({ "message": CHILD_PROMPT }),
+        /*child_response_delay*/ None,
+        /*wait_for_parent_notification*/ true,
+        |builder| {
+            builder.with_runtime_options(
+                ThreadManagerRuntimeOptions::default()
+                    .with_required_base_instructions("product policy".to_string()),
+            )
+        },
+    )
+    .await?;
+
+    let child_request = child_request_log
+        .requests()
+        .into_iter()
+        .find(|request| request.header("x-openai-subagent").as_deref() == Some("collab_spawn"))
+        .expect("expected collab_spawn child request");
+    let instructions = child_request.instructions_text();
+    assert!(instructions.starts_with("product policy"));
+    assert_eq!(instructions.matches("product policy").count(), 1);
+
+    Ok(())
 }
 
 async fn setup_turn_one_with_custom_spawned_child(

@@ -1,4 +1,5 @@
 use anyhow::Result;
+use codex_core::ThreadManagerRuntimeOptions;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
 use codex_protocol::user_input::ByteRange;
@@ -364,6 +365,58 @@ async fn resume_switches_models_preserves_base_instructions() -> Result<()> {
         second_model_switch_count, 1,
         "did not expect duplicate model switch message after first post-resume turn"
     );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resume_uses_current_required_base_instructions() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+    let responses = mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![
+                ev_response_created("resp-initial-policy"),
+                ev_assistant_message("msg-initial-policy", "initial complete"),
+                ev_completed("resp-initial-policy"),
+            ]),
+            sse(vec![
+                ev_response_created("resp-current-policy"),
+                ev_assistant_message("msg-current-policy", "resume complete"),
+                ev_completed("resp-current-policy"),
+            ]),
+        ],
+    )
+    .await;
+
+    let mut initial_builder = test_codex().with_runtime_options(
+        ThreadManagerRuntimeOptions::default()
+            .with_required_base_instructions("old product policy".to_string()),
+    );
+    let initial = initial_builder.build(&server).await?;
+    let home = initial.home.clone();
+    let rollout_path = initial
+        .session_configured
+        .rollout_path
+        .clone()
+        .expect("rollout path");
+    initial.submit_turn("persist the old policy").await?;
+
+    let mut resume_builder = test_codex().with_runtime_options(
+        ThreadManagerRuntimeOptions::default()
+            .with_required_base_instructions("current product policy".to_string()),
+    );
+    let resumed = resume_builder.resume(&server, home, rollout_path).await?;
+    resumed.submit_turn("use the current policy").await?;
+
+    let requests = responses.requests();
+    assert_eq!(requests.len(), 2, "expected initial and resumed requests");
+    let instructions = requests[1].instructions_text();
+    assert!(instructions.starts_with("current product policy"));
+    assert!(!instructions.starts_with("old product policy"));
+    assert_eq!(instructions.matches("current product policy").count(), 1);
 
     Ok(())
 }

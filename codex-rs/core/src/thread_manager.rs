@@ -256,7 +256,10 @@ impl ThreadManagerRuntimeOptions {
     }
 }
 
-fn compose_required_base_instructions(required: &str, requested: Option<&str>) -> String {
+pub(crate) fn compose_required_base_instructions(
+    required: &str,
+    requested: Option<&str>,
+) -> String {
     let required = required.trim();
     let requested = requested.map(str::trim).filter(|value| !value.is_empty());
     match requested {

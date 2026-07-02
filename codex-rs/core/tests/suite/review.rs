@@ -1,5 +1,6 @@
 use codex_core::CodexThread;
 use codex_core::REVIEW_PROMPT;
+use codex_core::ThreadManagerRuntimeOptions;
 use codex_core::config::Config;
 use codex_core::review_format::render_review_output_text;
 use codex_protocol::models::ContentItem;
@@ -482,6 +483,51 @@ async fn review_uses_session_model_when_review_model_unset() {
     assert_eq!(request.path(), "/v1/responses");
     let body = request.body_json();
     assert_eq!(body["model"].as_str().unwrap(), "gpt-4.1");
+
+    let _codex_home_guard = codex_home;
+    server.verify().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn review_keeps_required_base_instructions() {
+    skip_if_no_network!();
+
+    let (server, request_log) =
+        start_responses_server_with_sse(completed_sse(), /*expected_requests*/ 1).await;
+    let codex_home = Arc::new(TempDir::new().unwrap());
+    let base_url = format!("{}/v1", server.uri());
+    let mut builder = test_codex()
+        .with_home(codex_home.clone())
+        .with_runtime_options(
+            ThreadManagerRuntimeOptions::default()
+                .with_required_base_instructions("product policy".to_string()),
+        )
+        .with_config(move |config| {
+            config.model_provider.base_url = Some(base_url);
+        });
+    let codex = builder.build(&server).await.unwrap().codex;
+
+    codex
+        .submit(Op::Review {
+            review_request: ReviewRequest {
+                target: ReviewTarget::Custom {
+                    instructions: "preserve the product policy".to_string(),
+                },
+                user_facing_hint: None,
+            },
+        })
+        .await
+        .unwrap();
+    let _entered = wait_for_event(&codex, |ev| matches!(ev, EventMsg::EnteredReviewMode(_))).await;
+    let _complete = wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+
+    let instructions = request_log.single_request().instructions_text();
+    assert!(instructions.starts_with("product policy"));
+    assert_eq!(instructions.matches("product policy").count(), 1);
+    assert!(
+        instructions.contains(REVIEW_PROMPT.trim()),
+        "review rubric missing from instructions: {instructions}"
+    );
 
     let _codex_home_guard = codex_home;
     server.verify().await;

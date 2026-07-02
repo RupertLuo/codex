@@ -1004,12 +1004,22 @@ pub(crate) fn build_guardian_review_session_config(
     guardian_config.include_skill_instructions = false;
     guardian_config.memories.use_memories = false;
     guardian_config.memories.dedicated_tools = false;
+    let guardian_policy = parent_config
+        .guardian_policy_config
+        .as_deref()
+        .map(guardian_policy_prompt_with_config)
+        .unwrap_or_else(guardian_policy_prompt);
     guardian_config.base_instructions = Some(
         parent_config
-            .guardian_policy_config
+            .base_instructions
             .as_deref()
-            .map(guardian_policy_prompt_with_config)
-            .unwrap_or_else(guardian_policy_prompt),
+            .map(|base| {
+                crate::thread_manager::compose_required_base_instructions(
+                    base,
+                    Some(&guardian_policy),
+                )
+            })
+            .unwrap_or(guardian_policy),
     );
     guardian_config.notify = None;
     guardian_config.developer_instructions = None;
