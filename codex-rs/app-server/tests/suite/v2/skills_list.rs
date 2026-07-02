@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
@@ -9,21 +10,56 @@ use app_test_support::create_mock_responses_server_repeating_assistant;
 use app_test_support::to_response;
 use app_test_support::write_chatgpt_auth;
 use app_test_support::write_mock_responses_config_toml_with_chatgpt_base_url;
+use codex_app_server::in_process;
+use codex_app_server::in_process::InProcessServerEvent;
+use codex_app_server::in_process::InProcessStartArgs;
+use codex_app_server_protocol::ClientInfo;
+use codex_app_server_protocol::ClientRequest;
 use codex_app_server_protocol::ExperimentalFeatureEnablementSetParams;
 use codex_app_server_protocol::ExperimentalFeatureEnablementSetResponse;
+use codex_app_server_protocol::InitializeParams;
 use codex_app_server_protocol::JSONRPCResponse;
 use codex_app_server_protocol::PluginListParams;
 use codex_app_server_protocol::PluginListResponse;
 use codex_app_server_protocol::RequestId;
+use codex_app_server_protocol::ServerNotification;
 use codex_app_server_protocol::SkillsChangedNotification;
 use codex_app_server_protocol::SkillsExtraRootsSetParams;
 use codex_app_server_protocol::SkillsExtraRootsSetResponse;
 use codex_app_server_protocol::SkillsListParams;
 use codex_app_server_protocol::SkillsListResponse;
 use codex_app_server_protocol::ThreadStartParams;
+use codex_app_server_protocol::ThreadStartResponse;
+use codex_app_server_protocol::TurnStartParams;
+use codex_app_server_protocol::UserInput as V2UserInput;
+use codex_arg0::Arg0DispatchPaths;
+use codex_config::CloudConfigBundleLoader;
+use codex_config::LoaderOverrides;
+use codex_config::NoopThreadConfigLoader;
 use codex_config::types::AuthCredentialsStoreMode;
+use codex_core::ThreadManagerRuntimeOptions;
+use codex_core::config::ConfigBuilder;
 use codex_exec_server::CODEX_EXEC_SERVER_URL_ENV_VAR;
+use codex_exec_server::EnvironmentManager;
+use codex_feedback::CodexFeedback;
+use codex_protocol::protocol::SessionSource;
+use codex_skills_extension::SkillProvider;
+use codex_skills_extension::SkillProviderSource;
+use codex_skills_extension::catalog::SkillAuthority;
+use codex_skills_extension::catalog::SkillCatalog;
+use codex_skills_extension::catalog::SkillCatalogEntry;
+use codex_skills_extension::catalog::SkillPackageId;
+use codex_skills_extension::catalog::SkillProviderError;
+use codex_skills_extension::catalog::SkillReadResult;
+use codex_skills_extension::catalog::SkillResourceId;
+use codex_skills_extension::catalog::SkillSearchResult;
+use codex_skills_extension::catalog::SkillSourceKind;
+use codex_skills_extension::provider::SkillListQuery;
+use codex_skills_extension::provider::SkillProviderFuture;
+use codex_skills_extension::provider::SkillReadRequest;
+use codex_skills_extension::provider::SkillSearchRequest;
 use codex_utils_absolute_path::AbsolutePathBuf;
+use core_test_support::responses;
 use pretty_assertions::assert_eq;
 use tempfile::TempDir;
 use tokio::time::timeout;
@@ -37,6 +73,220 @@ use wiremock::matchers::query_param;
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 const WATCHER_TIMEOUT: Duration = Duration::from_secs(20);
+const CUSTOM_SKILL_PACKAGE: &str = "skill://private/demo";
+const CUSTOM_SKILL_RESOURCE: &str = "skill://private/demo/SKILL.md";
+const CUSTOM_SKILL_CONTENTS: &str =
+    "---\nname: private-demo\ndescription: private demo\n---\n\n# Private demo\n";
+
+struct StaticCustomProvider;
+
+impl SkillProvider for StaticCustomProvider {
+    fn list(&self, _query: SkillListQuery) -> SkillProviderFuture<'_, SkillCatalog> {
+        Box::pin(async {
+            Ok(SkillCatalog {
+                entries: vec![SkillCatalogEntry::new(
+                    SkillPackageId(CUSTOM_SKILL_PACKAGE.to_string()),
+                    SkillAuthority::new(SkillSourceKind::Custom("private".to_string()), "private"),
+                    "private-demo",
+                    "private demo",
+                    SkillResourceId::new(CUSTOM_SKILL_RESOURCE),
+                )],
+                warnings: Vec::new(),
+            })
+        })
+    }
+
+    fn read(&self, request: SkillReadRequest) -> SkillProviderFuture<'_, SkillReadResult> {
+        Box::pin(async move {
+            let expected_authority =
+                SkillAuthority::new(SkillSourceKind::Custom("private".to_string()), "private");
+            if request.authority != expected_authority
+                || request.package.0 != CUSTOM_SKILL_PACKAGE
+                || request.resource.as_str() != CUSTOM_SKILL_RESOURCE
+            {
+                return Err(SkillProviderError::new("unexpected private skill handle"));
+            }
+            Ok(SkillReadResult {
+                resource: request.resource,
+                contents: CUSTOM_SKILL_CONTENTS.to_string(),
+            })
+        })
+    }
+
+    fn search(&self, _request: SkillSearchRequest) -> SkillProviderFuture<'_, SkillSearchResult> {
+        Box::pin(async { Ok(SkillSearchResult::default()) })
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn custom_runtime_skill_provider_lists_and_reads() -> Result<()> {
+    let codex_home = TempDir::new()?;
+    let responses_server = responses::start_mock_server().await;
+    std::fs::write(
+        codex_home.path().join("config.toml"),
+        format!(
+            r#"
+model = "mock-model"
+approval_policy = "never"
+sandbox_mode = "read-only"
+model_provider = "mock_provider"
+
+[model_providers.mock_provider]
+name = "Mock provider for test"
+base_url = "{}/v1"
+wire_api = "responses"
+request_max_retries = 0
+stream_max_retries = 0
+
+[features]
+plugins = false
+"#,
+            responses_server.uri()
+        ),
+    )?;
+    let response_mock = responses::mount_sse_sequence(
+        &responses_server,
+        vec![
+            responses::sse(vec![
+                responses::ev_response_created("resp-custom-list"),
+                responses::ev_function_call_with_namespace(
+                    "custom-list",
+                    "skills",
+                    "list",
+                    &serde_json::json!({ "authority": { "kind": "private" } }).to_string(),
+                ),
+                responses::ev_completed("resp-custom-list"),
+            ]),
+            responses::sse(vec![
+                responses::ev_response_created("resp-custom-read"),
+                responses::ev_function_call_with_namespace(
+                    "custom-read",
+                    "skills",
+                    "read",
+                    &serde_json::json!({
+                        "authority": { "kind": "private" },
+                        "package": CUSTOM_SKILL_PACKAGE,
+                        "resource": CUSTOM_SKILL_RESOURCE,
+                    })
+                    .to_string(),
+                ),
+                responses::ev_completed("resp-custom-read"),
+            ]),
+            responses::sse(vec![
+                responses::ev_response_created("resp-custom-done"),
+                responses::ev_assistant_message("msg-custom-done", "Done"),
+                responses::ev_completed("resp-custom-done"),
+            ]),
+        ],
+    )
+    .await;
+
+    let loader_overrides = LoaderOverrides::without_managed_config_for_tests();
+    let config = ConfigBuilder::default()
+        .codex_home(codex_home.path().to_path_buf())
+        .fallback_cwd(Some(codex_home.path().to_path_buf()))
+        .loader_overrides(loader_overrides.clone())
+        .build()
+        .await?;
+    let mut client = in_process::start(InProcessStartArgs {
+        arg0_paths: Arg0DispatchPaths::default(),
+        config: Arc::new(config),
+        cli_overrides: Vec::new(),
+        loader_overrides,
+        strict_config: false,
+        cloud_config_bundle: CloudConfigBundleLoader::default(),
+        thread_config_loader: Arc::new(NoopThreadConfigLoader),
+        feedback: CodexFeedback::new(),
+        log_db: None,
+        state_db: None,
+        environment_manager: Arc::new(EnvironmentManager::default_for_tests()),
+        thread_manager_runtime_options: ThreadManagerRuntimeOptions::default().with_skill_provider(
+            SkillProviderSource::new(
+                SkillSourceKind::Custom("private".to_string()),
+                "private",
+                Arc::new(StaticCustomProvider),
+            ),
+        ),
+        config_warnings: Vec::new(),
+        session_source: SessionSource::Cli,
+        enable_codex_api_key_env: false,
+        initialize: InitializeParams {
+            client_info: ClientInfo {
+                name: "custom-skill-provider-test".to_string(),
+                title: None,
+                version: "0.1.0".to_string(),
+            },
+            capabilities: None,
+        },
+        channel_capacity: in_process::DEFAULT_IN_PROCESS_CHANNEL_CAPACITY,
+    })
+    .await?;
+
+    let thread_response = client
+        .request(ClientRequest::ThreadStart {
+            request_id: RequestId::Integer(1),
+            params: ThreadStartParams {
+                model: Some("gpt-5.5".to_string()),
+                ..Default::default()
+            },
+        })
+        .await?
+        .expect("thread/start should succeed");
+    let ThreadStartResponse { thread, .. } = serde_json::from_value(thread_response)?;
+    client
+        .request(ClientRequest::TurnStart {
+            request_id: RequestId::Integer(2),
+            params: TurnStartParams {
+                thread_id: thread.id.clone(),
+                input: vec![V2UserInput::Text {
+                    text: "List and read the private demo skill".to_string(),
+                    text_elements: Vec::new(),
+                }],
+                ..Default::default()
+            },
+        })
+        .await?
+        .expect("turn/start should succeed");
+    timeout(DEFAULT_TIMEOUT, async {
+        loop {
+            let Some(event) = client.next_event().await else {
+                anyhow::bail!("in-process app-server stopped before turn/completed");
+            };
+            if let InProcessServerEvent::ServerNotification(ServerNotification::TurnCompleted(
+                completed,
+            )) = event
+                && completed.thread_id == thread.id
+            {
+                return Ok::<(), anyhow::Error>(());
+            }
+        }
+    })
+    .await??;
+    client.shutdown().await?;
+
+    let requests = response_mock.requests();
+    assert_eq!(requests.len(), 3);
+    assert!(
+        requests[0].tool_by_name("skills", "list").is_some(),
+        "skills.list should be exposed: {}",
+        requests[0].body_json()
+    );
+    assert!(
+        requests[0].tool_by_name("skills", "read").is_some(),
+        "skills.read should be exposed: {}",
+        requests[0].body_json()
+    );
+    let list_output = requests[1]
+        .function_call_output_text("custom-list")
+        .context("skills.list output should reach the model")?;
+    assert!(list_output.contains("private-demo"), "{list_output}");
+    let read_output = requests[2]
+        .function_call_output_text("custom-read")
+        .context("skills.read output should reach the model")?;
+    assert!(read_output.contains("# Private demo"), "{read_output}");
+
+    Ok(())
+}
 
 fn write_skill(root: &TempDir, name: &str) -> Result<()> {
     let skill_dir = root.path().join("skills").join(name);
