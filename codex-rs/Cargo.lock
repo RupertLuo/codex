@@ -2687,6 +2687,7 @@ dependencies = [
  "codex-sandboxing",
  "codex-shell-command",
  "codex-shell-escalation",
+ "codex-skills-extension",
  "codex-state",
  "codex-terminal-detection",
  "codex-test-binary-support",

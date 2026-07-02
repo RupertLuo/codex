@@ -29,6 +29,17 @@ use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::ThreadSource;
 use codex_protocol::protocol::TurnStartedEvent;
 use codex_protocol::protocol::UserMessageEvent;
+use codex_skills_extension::SkillProvider;
+use codex_skills_extension::SkillProviderSource;
+use codex_skills_extension::catalog::SkillCatalog;
+use codex_skills_extension::catalog::SkillProviderError;
+use codex_skills_extension::catalog::SkillReadResult;
+use codex_skills_extension::catalog::SkillSearchResult;
+use codex_skills_extension::catalog::SkillSourceKind;
+use codex_skills_extension::provider::SkillListQuery;
+use codex_skills_extension::provider::SkillProviderFuture;
+use codex_skills_extension::provider::SkillReadRequest;
+use codex_skills_extension::provider::SkillSearchRequest;
 use codex_utils_path_uri::PathUri;
 use core_test_support::PathBufExt;
 use core_test_support::PathExt;
@@ -42,6 +53,22 @@ const TEST_INSTALLATION_ID: &str = "11111111-1111-4111-8111-111111111111";
 
 #[derive(Debug)]
 struct ProbeRuntimeExtension;
+
+struct ProbeSkillProvider;
+
+impl SkillProvider for ProbeSkillProvider {
+    fn list(&self, _query: SkillListQuery) -> SkillProviderFuture<'_, SkillCatalog> {
+        Box::pin(async { Ok(SkillCatalog::default()) })
+    }
+
+    fn read(&self, _request: SkillReadRequest) -> SkillProviderFuture<'_, SkillReadResult> {
+        Box::pin(async { Err(SkillProviderError::new("probe has no resources")) })
+    }
+
+    fn search(&self, _request: SkillSearchRequest) -> SkillProviderFuture<'_, SkillSearchResult> {
+        Box::pin(async { Ok(SkillSearchResult::default()) })
+    }
+}
 
 impl codex_extension_api::RuntimeExtension<crate::config::Config> for ProbeRuntimeExtension {
     fn install(
@@ -124,6 +151,19 @@ fn runtime_options_expose_required_base_instructions() {
         .with_required_base_instructions("product policy".to_string());
 
     assert_eq!(options.required_base_instructions(), Some("product policy"));
+    assert!(options.has_process_local_overrides());
+}
+
+#[test]
+fn runtime_options_retain_skill_provider_sources() {
+    let source = SkillProviderSource::new(
+        SkillSourceKind::Custom("private".to_string()),
+        "private",
+        Arc::new(ProbeSkillProvider),
+    );
+    let options = ThreadManagerRuntimeOptions::default().with_skill_provider(source);
+
+    assert_eq!(options.skill_provider_sources().len(), 1);
     assert!(options.has_process_local_overrides());
 }
 

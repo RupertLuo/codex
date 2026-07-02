@@ -368,6 +368,9 @@ impl MessageProcessor {
                         goal_service: Arc::clone(&goal_service),
                         environment_manager: Arc::clone(&environment_manager_for_extensions),
                         executor_skill_provider: Arc::clone(&executor_skill_provider),
+                        additional_skill_providers: thread_manager_runtime_options
+                            .skill_provider_sources()
+                            .to_vec(),
                         thread_store: Arc::clone(&thread_store),
                     },
                     thread_manager_runtime_options.runtime_extensions(),

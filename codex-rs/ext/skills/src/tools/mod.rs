@@ -60,8 +60,8 @@ struct SkillToolContext {
 
 impl SkillToolContext {
     async fn catalog(&self, turn_id: &str, authority: SkillToolAuthority) -> SkillCatalog {
-        match authority {
-            SkillToolAuthority::Orchestrator => {
+        match authority.kind.as_str() {
+            "orchestrator" => {
                 self.thread_state
                     .orchestrator_catalog_snapshot(
                         self.mcp_resources.as_deref(),
@@ -77,31 +77,68 @@ impl SkillToolContext {
                     )
                     .await
             }
+            custom_kind => {
+                let kind = SkillSourceKind::Custom(custom_kind.to_string());
+                self.providers
+                    .list_custom_for_turn(
+                        SkillListQuery {
+                            turn_id: turn_id.to_string(),
+                            executor_roots: Vec::new(),
+                            host_snapshot: None,
+                            include_host_skills: false,
+                            include_bundled_skills: false,
+                            include_orchestrator_skills: false,
+                            mcp_resources: self.mcp_resources.clone(),
+                        },
+                        &kind,
+                    )
+                    .await
+            }
         }
     }
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-enum SkillToolAuthority {
-    Orchestrator,
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
+struct SkillToolAuthority {
+    kind: String,
 }
 
 impl SkillToolAuthority {
     fn from_authority(authority: &SkillAuthority) -> Option<Self> {
-        if authority
-            != &SkillAuthority::new(SkillSourceKind::Orchestrator, CODEX_APPS_MCP_SERVER_NAME)
-        {
-            return None;
+        match &authority.kind {
+            SkillSourceKind::Orchestrator if authority.id == CODEX_APPS_MCP_SERVER_NAME => {
+                Some(Self {
+                    kind: "orchestrator".to_string(),
+                })
+            }
+            SkillSourceKind::Custom(kind)
+                if authority.id == *kind && is_bounded_handle(kind, MAX_HANDLE_BYTES) =>
+            {
+                Some(Self { kind: kind.clone() })
+            }
+            SkillSourceKind::Host
+            | SkillSourceKind::Executor
+            | SkillSourceKind::Orchestrator
+            | SkillSourceKind::Custom(_) => None,
         }
-        Some(Self::Orchestrator)
     }
 
-    fn into_authority(self) -> SkillAuthority {
-        match self {
-            Self::Orchestrator => {
-                SkillAuthority::new(SkillSourceKind::Orchestrator, CODEX_APPS_MCP_SERVER_NAME)
-            }
+    fn into_authority(&self) -> Result<SkillAuthority, FunctionCallError> {
+        validate_handle("authority.kind", &self.kind, MAX_HANDLE_BYTES)?;
+        match self.kind.as_str() {
+            "orchestrator" => Ok(SkillAuthority::new(
+                SkillSourceKind::Orchestrator,
+                CODEX_APPS_MCP_SERVER_NAME,
+            )),
+            "host" | "executor" => Err(FunctionCallError::RespondToModel(
+                "skills tools do not support host or executor authorities".to_string(),
+            )),
+            custom_kind => Ok(SkillAuthority::new(
+                SkillSourceKind::Custom(custom_kind.to_string()),
+                custom_kind,
+            )),
         }
     }
 }

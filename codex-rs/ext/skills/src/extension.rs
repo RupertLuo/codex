@@ -191,9 +191,9 @@ where
         let Some(thread_state) = thread_store.get::<SkillsThreadState>() else {
             return Vec::new();
         };
-        if !self.providers.has_orchestrator_provider()
-            || !thread_state.orchestrator_skills_enabled()
-        {
+        let orchestrator_tools_enabled = self.providers.has_orchestrator_provider()
+            && thread_state.orchestrator_skills_enabled();
+        if !orchestrator_tools_enabled && !self.providers.has_custom_provider() {
             return Vec::new();
         }
 

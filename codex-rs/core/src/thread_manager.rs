@@ -194,6 +194,7 @@ pub struct ThreadManagerRuntimeOptions {
     model_catalog: Option<ModelsResponse>,
     required_base_instructions: Option<String>,
     runtime_extensions: Vec<Arc<dyn RuntimeExtension<Config>>>,
+    skill_provider_sources: Vec<codex_skills_extension::SkillProviderSource>,
 }
 
 impl ThreadManagerRuntimeOptions {
@@ -220,6 +221,14 @@ impl ThreadManagerRuntimeOptions {
         self
     }
 
+    pub fn with_skill_provider(
+        mut self,
+        source: codex_skills_extension::SkillProviderSource,
+    ) -> Self {
+        self.skill_provider_sources.push(source);
+        self
+    }
+
     pub fn has_http_transport_override(&self) -> bool {
         self.http_transport.is_some()
     }
@@ -237,6 +246,7 @@ impl ThreadManagerRuntimeOptions {
             || self.has_model_catalog_override()
             || self.required_base_instructions.is_some()
             || self.has_runtime_extension_override()
+            || !self.skill_provider_sources.is_empty()
     }
 
     pub fn required_base_instructions(&self) -> Option<&str> {
@@ -245,6 +255,10 @@ impl ThreadManagerRuntimeOptions {
 
     pub fn runtime_extensions(&self) -> &[Arc<dyn RuntimeExtension<Config>>] {
         &self.runtime_extensions
+    }
+
+    pub fn skill_provider_sources(&self) -> &[codex_skills_extension::SkillProviderSource] {
+        &self.skill_provider_sources
     }
 
     pub(crate) fn http_transport(&self) -> Option<HttpTransportHandle> {

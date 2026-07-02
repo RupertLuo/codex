@@ -38,6 +38,7 @@ pub(crate) struct ThreadExtensionDependencies {
     pub(crate) goal_service: Arc<GoalService>,
     pub(crate) environment_manager: Arc<EnvironmentManager>,
     pub(crate) executor_skill_provider: Arc<dyn codex_skills_extension::SkillProvider>,
+    pub(crate) additional_skill_providers: Vec<codex_skills_extension::SkillProviderSource>,
     /// Process-scoped persistence backend for extensions that need stored thread history.
     pub(crate) thread_store: Arc<dyn ThreadStore>,
 }
@@ -59,6 +60,7 @@ where
         goal_service,
         environment_manager,
         executor_skill_provider,
+        additional_skill_providers,
         thread_store: _thread_store,
     } = dependencies;
     let mut builder = ExtensionRegistryBuilder::<Config>::with_event_sink(event_sink);
@@ -81,11 +83,14 @@ where
     codex_image_generation_extension::install(&mut builder, auth_manager, |config: &Config| {
         Some(config.codex_home.clone())
     });
-    let skill_providers = codex_skills_extension::SkillProviders::new()
+    let mut skill_providers = codex_skills_extension::SkillProviders::new()
         .with_executor_provider(executor_skill_provider)
         .with_orchestrator_provider(Arc::new(
             codex_skills_extension::OrchestratorSkillProvider::new(),
         ));
+    for source in additional_skill_providers {
+        skill_providers = skill_providers.with_provider(source);
+    }
     codex_skills_extension::install_with_providers(
         &mut builder,
         skill_providers,
