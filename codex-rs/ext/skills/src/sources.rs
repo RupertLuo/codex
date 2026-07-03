@@ -155,6 +155,13 @@ impl SkillProviders {
             .await
     }
 
+    pub(crate) async fn list_all_custom_for_turn(&self, query: SkillListQuery) -> SkillCatalog {
+        self.list_matching(&query, |source| {
+            matches!(source.kind, SkillSourceKind::Custom(_))
+        })
+        .await
+    }
+
     async fn list_matching(
         &self,
         query: &SkillListQuery,

@@ -60,20 +60,23 @@ impl ToolExecutor<ToolCall> for ListTool {
     fn spec(&self) -> ToolSpec {
         skill_function_tool::<ListArgs, ListResponse>(
             TOOL_NAME,
-            "List enabled skills owned by an orchestrator or custom authority. Returns the opaque package and main-resource handles required by skills.read.",
+            "List enabled skills owned by an orchestrator or custom authority. Use authority kind `custom` to discover every custom authority. Reuse each returned authority, opaque package, and main-resource handle exactly when calling skills.read.",
         )
     }
 
     fn handle(&self, call: ToolCall) -> ToolExecutorFuture<'_> {
         Box::pin(async move {
             let args: ListArgs = parse_args(&call)?;
-            let authority = args.authority.to_authority()?;
+            args.authority.to_authority()?;
+            let requested_authority = args.authority.clone();
             let catalog = self.context.catalog(&call.turn_id, args.authority).await;
             let response = ListResponse {
                 skills: catalog
                     .entries
                     .into_iter()
-                    .filter(|entry| entry.enabled && entry.authority == authority)
+                    .filter(|entry| {
+                        entry.enabled && requested_authority.matches_authority(&entry.authority)
+                    })
                     .filter_map(listed_skill)
                     .collect(),
                 warnings: bounded_warnings(catalog.warnings),

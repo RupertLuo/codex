@@ -31,6 +31,7 @@ use codex_protocol::protocol::SkillScope;
 use codex_protocol::protocol::TruncationPolicy;
 use codex_protocol::protocol::TurnEnvironmentSelection;
 use codex_protocol::user_input::UserInput;
+use codex_skills_extension::SkillProviderSource;
 use codex_skills_extension::SkillProviders;
 use codex_skills_extension::SkillsExtensionConfig;
 use codex_skills_extension::catalog::SkillAuthority;
@@ -453,6 +454,130 @@ async fn skills_list_truncates_catalog_descriptions_in_tool_output() -> TestResu
 
     assert_eq!(rendered_description, "x".repeat(1_021) + "...");
     assert_ne!(rendered_description, description);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn skills_list_custom_discovers_all_named_custom_authorities() -> TestResult {
+    let custom_provider = |authority: &str, name: &str| {
+        let package = format!("private/{name}/1.0.0");
+        let resource = format!("skill://{authority}/{name}/1.0.0/SKILL.md");
+        Arc::new(StaticSkillProvider {
+            catalog: SkillCatalog {
+                entries: vec![SkillCatalogEntry::new(
+                    SkillPackageId(package),
+                    SkillAuthority::new(SkillSourceKind::Custom(authority.to_string()), authority),
+                    name,
+                    format!("Use the {name} skill."),
+                    SkillResourceId::new(resource),
+                )],
+                warnings: Vec::new(),
+            },
+            read_requests: Arc::new(Mutex::new(Vec::new())),
+            list_calls: None,
+            fail_first_list: false,
+        }) as Arc<dyn SkillProvider>
+    };
+    let providers = SkillProviders::new()
+        .with_provider(SkillProviderSource::new(
+            SkillSourceKind::Custom("catalyst-private".to_string()),
+            "catalyst-private",
+            custom_provider("catalyst-private", "evidence-draft"),
+        ))
+        .with_provider(SkillProviderSource::new(
+            SkillSourceKind::Custom("partner-private".to_string()),
+            "partner-private",
+            custom_provider("partner-private", "market-data"),
+        ));
+    let mut builder = ExtensionRegistryBuilder::new();
+    install_with_providers(&mut builder, providers, skills_extension_config);
+    let registry = builder.build();
+    let session_store = ExtensionData::new("session");
+    let thread_store = ExtensionData::new("thread");
+    let session_source = SessionSource::Cli;
+    let config = default_config();
+    registry.thread_lifecycle_contributors()[0]
+        .on_thread_start(ThreadStartInput {
+            config: &config,
+            session_source: &session_source,
+            persistent_thread_state_available: true,
+            environments: &[],
+            session_store: &session_store,
+            thread_store: &thread_store,
+        })
+        .await;
+
+    let tools = registry.tool_contributors()[0].tools(&session_store, &thread_store);
+    let list_tool = tools
+        .iter()
+        .find(|tool| tool.tool_name().name == "list")
+        .ok_or("skills.list tool should be registered")?;
+    let payload = ToolPayload::Function {
+        arguments: serde_json::json!({"authority": {"kind": "custom"}}).to_string(),
+    };
+    let output = list_tool
+        .handle(ToolCall {
+            turn_id: "turn-1".to_string(),
+            call_id: "call-1".to_string(),
+            tool_name: list_tool.tool_name(),
+            model: "gpt-test".to_string(),
+            truncation_policy: TruncationPolicy::Bytes(4_096),
+            conversation_history: ConversationHistory::default(),
+            turn_item_emitter: Arc::new(NoopTurnItemEmitter),
+            environments: Vec::new(),
+            payload: payload.clone(),
+        })
+        .await?;
+    let response = output
+        .post_tool_use_response("call-1", &payload)
+        .ok_or("skills.list should expose structured output")?;
+
+    assert_eq!(
+        response["skills"],
+        serde_json::json!([
+            {
+                "authority": {"kind": "catalyst-private"},
+                "package": "private/evidence-draft/1.0.0",
+                "name": "evidence-draft",
+                "description": "Use the evidence-draft skill.",
+                "main_resource": "skill://catalyst-private/evidence-draft/1.0.0/SKILL.md"
+            },
+            {
+                "authority": {"kind": "partner-private"},
+                "package": "private/market-data/1.0.0",
+                "name": "market-data",
+                "description": "Use the market-data skill.",
+                "main_resource": "skill://partner-private/market-data/1.0.0/SKILL.md"
+            }
+        ])
+    );
+
+    let payload = ToolPayload::Function {
+        arguments: serde_json::json!({"authority": {"kind": "catalyst-private"}}).to_string(),
+    };
+    let output = list_tool
+        .handle(ToolCall {
+            turn_id: "turn-1".to_string(),
+            call_id: "call-2".to_string(),
+            tool_name: list_tool.tool_name(),
+            model: "gpt-test".to_string(),
+            truncation_policy: TruncationPolicy::Bytes(4_096),
+            conversation_history: ConversationHistory::default(),
+            turn_item_emitter: Arc::new(NoopTurnItemEmitter),
+            environments: Vec::new(),
+            payload: payload.clone(),
+        })
+        .await?;
+    let response = output
+        .post_tool_use_response("call-2", &payload)
+        .ok_or("skills.list should expose structured output")?;
+
+    assert_eq!(response["skills"].as_array().map(Vec::len), Some(1));
+    assert_eq!(
+        response["skills"][0]["authority"],
+        serde_json::json!({"kind": "catalyst-private"})
+    );
 
     Ok(())
 }

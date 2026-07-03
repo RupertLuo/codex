@@ -77,6 +77,19 @@ impl SkillToolContext {
                     )
                     .await
             }
+            "custom" => {
+                self.providers
+                    .list_all_custom_for_turn(SkillListQuery {
+                        turn_id: turn_id.to_string(),
+                        executor_roots: Vec::new(),
+                        host_snapshot: None,
+                        include_host_skills: false,
+                        include_bundled_skills: false,
+                        include_orchestrator_skills: false,
+                        mcp_resources: self.mcp_resources.clone(),
+                    })
+                    .await
+            }
             custom_kind => {
                 let kind = SkillSourceKind::Custom(custom_kind.to_string());
                 self.providers
@@ -139,6 +152,16 @@ impl SkillToolAuthority {
                 SkillSourceKind::Custom(custom_kind.to_string()),
                 custom_kind,
             )),
+        }
+    }
+
+    fn matches_authority(&self, authority: &SkillAuthority) -> bool {
+        match self.kind.as_str() {
+            "custom" => matches!(
+                &authority.kind,
+                SkillSourceKind::Custom(kind) if authority.id == *kind
+            ),
+            _ => Self::from_authority(authority).as_ref() == Some(self),
         }
     }
 }
