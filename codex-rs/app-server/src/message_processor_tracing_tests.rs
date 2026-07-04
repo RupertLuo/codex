@@ -21,6 +21,7 @@ use codex_app_server_protocol::ClientRequest;
 use codex_app_server_protocol::InitializeCapabilities;
 use codex_app_server_protocol::InitializeParams;
 use codex_app_server_protocol::InitializeResponse;
+use codex_app_server_protocol::JSONRPCErrorError;
 use codex_app_server_protocol::JSONRPCRequest;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::ThreadStartParams;
@@ -83,6 +84,40 @@ impl AppServerRpcExtension for StubExtension {
                 .cloned()
                 .unwrap_or(serde_json::Value::Null);
             Ok(serde_json::json!({"input": input, "ok": true}))
+        })
+    }
+}
+
+#[derive(Debug)]
+struct NativeTurnExtension;
+
+impl AppServerRpcExtension for NativeTurnExtension {
+    fn methods(&self) -> &'static [&'static str] {
+        &["vendor/turn"]
+    }
+
+    fn handle<'a>(
+        &'a self,
+        context: AppServerRpcContext,
+        _method: &'a str,
+        params: Option<serde_json::Value>,
+    ) -> AppServerRpcFuture<'a> {
+        Box::pin(async move {
+            let params = serde_json::from_value::<TurnStartParams>(
+                params.unwrap_or(serde_json::Value::Null),
+            )
+            .map_err(|error| JSONRPCErrorError {
+                code: -32602,
+                message: error.to_string(),
+                data: None,
+            })?;
+            serde_json::to_value(context.start_turn(params).await?).map_err(|error| {
+                JSONRPCErrorError {
+                    code: -32603,
+                    message: error.to_string(),
+                    data: None,
+                }
+            })
         })
     }
 }
@@ -223,9 +258,7 @@ impl TracingHarness {
                 TEST_CONNECTION_ID,
                 request,
                 &AppServerTransport::Stdio,
-                AppServerRpcContext {
-                    transport: AppServerRpcTransportContext::Stdio,
-                },
+                AppServerRpcContext::new(AppServerRpcTransportContext::Stdio),
                 Arc::clone(&self.session),
             )
             .await;
@@ -248,9 +281,7 @@ impl TracingHarness {
                     trace: None,
                 },
                 &AppServerTransport::Stdio,
-                AppServerRpcContext {
-                    transport: AppServerRpcTransportContext::Stdio,
-                },
+                AppServerRpcContext::new(AppServerRpcTransportContext::Stdio),
                 Arc::clone(&self.session),
             )
             .await;
@@ -602,6 +633,36 @@ async fn initialized_extension_request_returns_raw_json_on_same_connection() -> 
         panic!("expected extension request to return a response");
     };
     assert_eq!(response.result, serde_json::json!({"input": 7, "ok": true}));
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[serial(app_server_tracing)]
+async fn extension_can_start_one_native_turn_through_its_request_context() -> Result<()> {
+    let mut harness =
+        TracingHarness::new_with_extensions(vec![Arc::new(NativeTurnExtension)], true).await?;
+    let thread = harness.start_thread(/*request_id*/ 2, /*trace*/ None).await;
+    let response = harness
+        .raw_request(
+            3,
+            "vendor/turn",
+            serde_json::to_value(TurnStartParams {
+                thread_id: thread.thread.id,
+                input: vec![UserInput::Text {
+                    text: "hello from extension".to_string(),
+                    text_elements: Vec::new(),
+                }],
+                ..Default::default()
+            })?,
+        )
+        .await;
+
+    let OutgoingMessage::Response(response) = response else {
+        panic!("expected extension native turn response, got {response:?}");
+    };
+    assert_eq!(response.result["turn"]["status"], "inProgress");
+    assert!(response.result["turn"]["id"].as_str().is_some());
+    harness.shutdown().await;
     Ok(())
 }
 

@@ -1098,13 +1098,13 @@ pub async fn run_main_with_transport_options_and_overrides(
                                                 connection_id,
                                                 request,
                                                 &transport,
-                                                AppServerRpcContext {
-                                                    transport: extension_transport_context(
+                                                AppServerRpcContext::new(
+                                                    extension_transport_context(
                                                         connection_state.origin,
                                                         &transport,
                                                         &auth,
                                                     ),
-                                                },
+                                                ),
                                                 Arc::clone(&connection_state.session),
                                             )
                                             .await;

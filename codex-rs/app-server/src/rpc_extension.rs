@@ -1,4 +1,6 @@
 use codex_app_server_protocol::JSONRPCErrorError;
+use codex_app_server_protocol::TurnStartParams;
+use codex_app_server_protocol::TurnStartResponse;
 use codex_app_server_protocol::client_request_methods;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -10,6 +12,12 @@ use thiserror::Error;
 
 pub type AppServerRpcFuture<'a> =
     Pin<Box<dyn Future<Output = Result<serde_json::Value, JSONRPCErrorError>> + Send + 'a>>;
+pub(crate) type AppServerNativeTurnFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<TurnStartResponse, JSONRPCErrorError>> + Send + 'a>>;
+
+pub(crate) trait AppServerNativeTurnGateway: Debug + Send + Sync {
+    fn start_turn<'a>(&'a self, params: TurnStartParams) -> AppServerNativeTurnFuture<'a>;
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AppServerRpcTransportContext {
@@ -21,9 +29,59 @@ pub enum AppServerRpcTransportContext {
     RemoteControl,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone)]
 pub struct AppServerRpcContext {
     pub transport: AppServerRpcTransportContext,
+    native_turn_gateway: Option<Arc<dyn AppServerNativeTurnGateway>>,
+}
+
+impl AppServerRpcContext {
+    pub fn new(transport: AppServerRpcTransportContext) -> Self {
+        Self {
+            transport,
+            native_turn_gateway: None,
+        }
+    }
+
+    pub(crate) fn with_native_turn_gateway(
+        mut self,
+        gateway: Arc<dyn AppServerNativeTurnGateway>,
+    ) -> Self {
+        self.native_turn_gateway = Some(gateway);
+        self
+    }
+
+    pub async fn start_turn(
+        &self,
+        params: TurnStartParams,
+    ) -> Result<TurnStartResponse, JSONRPCErrorError> {
+        let gateway = self
+            .native_turn_gateway
+            .as_ref()
+            .ok_or_else(native_turn_gateway_unavailable)?;
+        gateway.start_turn(params).await
+    }
+}
+
+impl Debug for AppServerRpcContext {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AppServerRpcContext")
+            .field("transport", &self.transport)
+            .field(
+                "native_turn_gateway_available",
+                &self.native_turn_gateway.is_some(),
+            )
+            .finish()
+    }
+}
+
+fn native_turn_gateway_unavailable() -> JSONRPCErrorError {
+    JSONRPCErrorError {
+        code: -32603,
+        message: "Native turn gateway is unavailable in this RPC context.".to_string(),
+        data: None,
+    }
 }
 
 pub trait AppServerRpcExtension: Debug + Send + Sync {
@@ -102,6 +160,7 @@ impl AppServerRpcRegistry {
 mod tests {
     use super::*;
     use std::sync::Arc;
+    use std::sync::Mutex;
 
     #[derive(Debug)]
     struct StubExtension(&'static [&'static str]);
@@ -149,5 +208,43 @@ mod tests {
             result,
             Err(AppServerRpcRegistryError::InvalidMethod(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn rpc_context_delegates_native_turn_start_to_the_injected_gateway() {
+        #[derive(Debug, Default)]
+        struct StubNativeTurnGateway {
+            thread_ids: Mutex<Vec<String>>,
+        }
+
+        impl AppServerNativeTurnGateway for StubNativeTurnGateway {
+            fn start_turn<'a>(
+                &'a self,
+                params: codex_app_server_protocol::TurnStartParams,
+            ) -> AppServerNativeTurnFuture<'a> {
+                self.thread_ids.lock().unwrap().push(params.thread_id);
+                Box::pin(async {
+                    Err(JSONRPCErrorError {
+                        code: -32041,
+                        message: "stub native turn".to_string(),
+                        data: None,
+                    })
+                })
+            }
+        }
+
+        let gateway = Arc::new(StubNativeTurnGateway::default());
+        let context = AppServerRpcContext::new(AppServerRpcTransportContext::Stdio)
+            .with_native_turn_gateway(gateway.clone());
+        let error = context
+            .start_turn(codex_app_server_protocol::TurnStartParams {
+                thread_id: "thread-1".to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.code, -32041);
+        assert_eq!(*gateway.thread_ids.lock().unwrap(), ["thread-1"]);
     }
 }
