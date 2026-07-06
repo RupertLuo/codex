@@ -1,5 +1,6 @@
 use crate::SkillsService;
 use crate::agent::AgentControl;
+use crate::agent::AgentStatus;
 use crate::agent::control::SpawnAgentForkMode;
 use crate::agent::control::SpawnAgentOptions;
 use crate::attestation::AttestationProvider;
@@ -72,11 +73,16 @@ use codex_protocol::protocol::TurnEnvironmentSelection;
 use codex_protocol::protocol::W3cTraceContext;
 use codex_rollout::state_db::StateDbHandle;
 use codex_thread_store::InMemoryThreadStore;
+use codex_thread_store::ListTurnsParams;
 use codex_thread_store::LocalThreadStore;
 use codex_thread_store::LocalThreadStoreConfig;
 use codex_thread_store::ReadThreadByRolloutPathParams;
 use codex_thread_store::ReadThreadParams;
+use codex_thread_store::SortDirection;
 use codex_thread_store::StoredThread;
+use codex_thread_store::StoredTurnError;
+use codex_thread_store::StoredTurnItemsView;
+use codex_thread_store::StoredTurnStatus;
 use codex_thread_store::ThreadMetadataPatch;
 use codex_thread_store::ThreadStore;
 use codex_thread_store::ThreadStoreError;
@@ -86,7 +92,9 @@ use futures::StreamExt;
 use futures::stream::FuturesUnordered;
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::future::Future;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
@@ -133,10 +141,29 @@ pub struct NewThread {
     pub session_configured: SessionConfiguredEvent,
 }
 
-/// The native app-server subagent spawning capability exposed to process-local
-/// runtime extensions without coupling those extensions to [`ThreadManager`].
-pub type NativeAgentSpawner =
-    dyn AgentSpawner<NativeAgentSpawnRequest, Spawned = NativeAgentSpawn, Error = CodexErr>;
+/// Boxed operation exposed by the native agent runtime capability.
+pub type NativeAgentFuture<'a, T> = Pin<Box<dyn Future<Output = CodexResult<T>> + Send + 'a>>;
+
+/// Native child-agent capability exposed to process-local runtime extensions
+/// without coupling them to [`ThreadManager`].
+///
+/// Spawning, status reads, and interruption share one capability so an
+/// extension cannot accidentally mix native execution with a parallel status
+/// source.
+pub trait NativeAgentRuntime:
+    AgentSpawner<NativeAgentSpawnRequest, Spawned = NativeAgentSpawn, Error = CodexErr> + Send + Sync
+{
+    fn agent_status<'a>(&'a self, thread_id: ThreadId) -> NativeAgentFuture<'a, AgentStatus>;
+
+    fn interrupt_agent<'a>(
+        &'a self,
+        parent_thread_id: ThreadId,
+        child_thread_id: ThreadId,
+    ) -> NativeAgentFuture<'a, ()>;
+}
+
+/// Object-safe native agent runtime passed to runtime-extension factories.
+pub type NativeAgentSpawner = dyn NativeAgentRuntime;
 
 pub struct NativeAgentSpawnRequest {
     pub config: Config,
@@ -1004,6 +1031,53 @@ impl ThreadManager {
         })
     }
 
+    /// Returns the live status tracked by the native agent graph.
+    ///
+    /// Runtime extensions use this instead of maintaining a second execution
+    /// status for child agents they spawned through [`Self::spawn_native_agent`].
+    pub async fn native_agent_status(&self, thread_id: ThreadId) -> AgentStatus {
+        match self.get_thread(thread_id).await {
+            Ok(thread) => thread.agent_status().await,
+            Err(_) => match self
+                .state
+                .thread_store
+                .list_turns(ListTurnsParams {
+                    thread_id,
+                    include_archived: true,
+                    cursor: None,
+                    page_size: 1,
+                    sort_direction: SortDirection::Desc,
+                    items_view: StoredTurnItemsView::NotLoaded,
+                })
+                .await
+            {
+                Ok(page) => page.turns.first().map_or(AgentStatus::PendingInit, |turn| {
+                    stored_turn_status_to_agent_status(turn.status, turn.error.as_ref())
+                }),
+                Err(_) => AgentStatus::NotFound,
+            },
+        }
+    }
+
+    /// Interrupts one native child through the parent thread's shared
+    /// [`AgentControl`], preserving the same graph ownership checks used by
+    /// Codex collaboration tools.
+    pub async fn interrupt_native_agent(
+        &self,
+        parent_thread_id: ThreadId,
+        child_thread_id: ThreadId,
+    ) -> CodexResult<()> {
+        let parent = self.get_thread(parent_thread_id).await?;
+        parent
+            .codex
+            .session
+            .services
+            .agent_control
+            .interrupt_agent(child_thread_id)
+            .await
+            .map(|_| ())
+    }
+
     pub async fn resume_thread_from_rollout(
         &self,
         config: Config,
@@ -1331,6 +1405,22 @@ impl ThreadManager {
             .as_ref()
             .and_then(|ops_log| ops_log.lock().ok().map(|log| log.clone()))
             .unwrap_or_default()
+    }
+}
+
+fn stored_turn_status_to_agent_status(
+    status: StoredTurnStatus,
+    error: Option<&StoredTurnError>,
+) -> AgentStatus {
+    match status {
+        StoredTurnStatus::Completed => AgentStatus::Completed(None),
+        StoredTurnStatus::Interrupted => AgentStatus::Interrupted,
+        StoredTurnStatus::Failed => AgentStatus::Errored(
+            error
+                .map(|error| error.message.clone())
+                .unwrap_or_else(|| "persisted agent turn failed".to_string()),
+        ),
+        StoredTurnStatus::InProgress => AgentStatus::Running,
     }
 }
 
