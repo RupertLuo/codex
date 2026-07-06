@@ -1,6 +1,7 @@
 use super::*;
 use crate::error_code::internal_error;
 use crate::error_code::invalid_request;
+use crate::rpc_extension::AppServerNativePluginRoot;
 use codex_app_server_protocol::PluginAvailability;
 use codex_app_server_protocol::PluginInstallPolicy;
 use codex_app_server_protocol::PluginSharePrincipalRole;
@@ -784,6 +785,36 @@ impl PluginRequestProcessor {
             marketplace_load_errors,
             featured_plugin_ids,
         })
+    }
+
+    pub(crate) async fn loaded_plugin_roots(
+        &self,
+    ) -> Result<Vec<AppServerNativePluginRoot>, JSONRPCErrorError> {
+        let config = self.load_latest_config(/*fallback_cwd*/ None).await?;
+        if !config.features.enabled(Feature::Plugins) {
+            return Ok(Vec::new());
+        }
+        let auth = self.auth_manager.auth().await;
+        if !self
+            .workspace_codex_plugins_enabled(&config, auth.as_ref())
+            .await
+        {
+            return Ok(Vec::new());
+        }
+        let manager = self.thread_manager.plugins_manager();
+        manager.set_auth_mode(auth.as_ref().map(CodexAuth::api_auth_mode));
+        let outcome = manager
+            .plugins_for_config(&config.plugins_config_input())
+            .await;
+        Ok(outcome
+            .plugins()
+            .iter()
+            .filter(|plugin| plugin.is_active())
+            .map(|plugin| AppServerNativePluginRoot {
+                plugin_id: plugin.config_name.clone(),
+                root: plugin.root.clone(),
+            })
+            .collect())
     }
 
     async fn plugin_installed_response(

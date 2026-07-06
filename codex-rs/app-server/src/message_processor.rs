@@ -49,6 +49,7 @@ use crate::request_serialization::RequestSerializationQueueKey;
 use crate::request_serialization::RequestSerializationQueues;
 use crate::rpc_extension::AppServerNativePluginFuture;
 use crate::rpc_extension::AppServerNativePluginGateway;
+use crate::rpc_extension::AppServerNativePluginRootsFuture;
 use crate::rpc_extension::AppServerNativeTurnFuture;
 use crate::rpc_extension::AppServerNativeTurnGateway;
 use crate::rpc_extension::AppServerRpcContext;
@@ -275,6 +276,10 @@ impl AppServerNativePluginGateway for MessageProcessorNativePluginGateway {
                 .plugin_list_response(params)
                 .await
         })
+    }
+
+    fn loaded_plugin_roots<'a>(&'a self) -> AppServerNativePluginRootsFuture<'a> {
+        Box::pin(async move { self.processor.plugin_processor.loaded_plugin_roots().await })
     }
 }
 

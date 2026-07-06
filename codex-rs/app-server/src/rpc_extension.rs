@@ -24,8 +24,19 @@ pub(crate) trait AppServerNativeTurnGateway: Debug + Send + Sync {
 pub(crate) type AppServerNativePluginFuture<'a> =
     Pin<Box<dyn Future<Output = Result<PluginListResponse, JSONRPCErrorError>> + Send + 'a>>;
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AppServerNativePluginRoot {
+    pub plugin_id: String,
+    pub root: codex_utils_absolute_path::AbsolutePathBuf,
+}
+
+pub(crate) type AppServerNativePluginRootsFuture<'a> = Pin<
+    Box<dyn Future<Output = Result<Vec<AppServerNativePluginRoot>, JSONRPCErrorError>> + Send + 'a>,
+>;
+
 pub(crate) trait AppServerNativePluginGateway: Debug + Send + Sync {
     fn list_plugins<'a>(&'a self, params: PluginListParams) -> AppServerNativePluginFuture<'a>;
+    fn loaded_plugin_roots<'a>(&'a self) -> AppServerNativePluginRootsFuture<'a>;
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -79,6 +90,16 @@ impl AppServerRpcContext {
             .as_ref()
             .ok_or_else(native_plugin_gateway_unavailable)?;
         gateway.list_plugins(params).await
+    }
+
+    pub async fn loaded_plugin_roots(
+        &self,
+    ) -> Result<Vec<AppServerNativePluginRoot>, JSONRPCErrorError> {
+        let gateway = self
+            .native_plugin_gateway
+            .as_ref()
+            .ok_or_else(native_plugin_gateway_unavailable)?;
+        gateway.loaded_plugin_roots().await
     }
 
     pub async fn start_turn(
@@ -300,6 +321,10 @@ mod tests {
                     })
                 })
             }
+
+            fn loaded_plugin_roots<'a>(&'a self) -> AppServerNativePluginRootsFuture<'a> {
+                Box::pin(async { Ok(Vec::new()) })
+            }
         }
 
         let context = AppServerRpcContext::new(AppServerRpcTransportContext::Stdio)
@@ -313,6 +338,41 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.featured_plugin_ids, ["fixture-plugin"]);
+    }
+
+    #[tokio::test]
+    async fn rpc_context_exposes_loaded_plugin_roots_without_prompt_bodies() {
+        #[derive(Debug)]
+        struct StubNativePluginGateway;
+
+        impl AppServerNativePluginGateway for StubNativePluginGateway {
+            fn list_plugins<'a>(
+                &'a self,
+                _params: codex_app_server_protocol::PluginListParams,
+            ) -> AppServerNativePluginFuture<'a> {
+                Box::pin(async { unreachable!() })
+            }
+
+            fn loaded_plugin_roots<'a>(&'a self) -> AppServerNativePluginRootsFuture<'a> {
+                Box::pin(async {
+                    Ok(vec![AppServerNativePluginRoot {
+                        plugin_id: "drive".to_string(),
+                        root:
+                            codex_utils_absolute_path::AbsolutePathBuf::from_absolute_path_checked(
+                                std::env::temp_dir().join("drive-plugin"),
+                            )
+                            .unwrap(),
+                    }])
+                })
+            }
+        }
+
+        let context = AppServerRpcContext::new(AppServerRpcTransportContext::Stdio)
+            .with_native_plugin_gateway(Arc::new(StubNativePluginGateway));
+        let roots = context.loaded_plugin_roots().await.unwrap();
+
+        assert_eq!(roots[0].plugin_id, "drive");
+        assert!(!format!("{roots:?}").contains("prompt"));
     }
 }
 
