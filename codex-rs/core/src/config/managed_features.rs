@@ -123,6 +123,19 @@ impl ManagedFeatures {
     pub fn disable(&mut self, feature: Feature) -> ConstraintResult<()> {
         self.set_enabled(feature, /*enabled*/ false)
     }
+
+    /// Disables a feature in a derived, single-turn config even when the source config pins it on.
+    ///
+    /// This is intentionally narrower than ordinary config mutation: callers use it to remove a
+    /// capability from one already-authorized execution context, never to persist user settings.
+    pub(crate) fn disable_for_turn_policy(&mut self, feature: Feature) {
+        let pinned = self.pinned_features.remove(&feature);
+        self.disable(feature)
+            .expect("removing a turn-scoped capability satisfies the derived config");
+        if let Some(required) = pinned {
+            self.pinned_features.insert(feature, required);
+        }
+    }
 }
 
 /// Only available for tests to ensure `ManagedFeatures` is constructed with
@@ -326,4 +339,27 @@ pub(crate) fn validate_feature_requirements_in_config_toml(
         FeatureOverrides::default(),
     );
     ManagedFeatures::from_configured(configured_features, feature_requirements.cloned()).map(|_| ())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn turn_policy_can_remove_a_source_pinned_capability_without_changing_the_pin() {
+        let mut configured = Features::with_defaults();
+        configured.enable(Feature::Plugins);
+        let mut managed = ManagedFeatures {
+            value: ConstrainedWithSource::new(
+                Constrained::allow_any(configured),
+                /*source*/ None,
+            ),
+            pinned_features: BTreeMap::from([(Feature::Plugins, true)]),
+        };
+
+        managed.disable_for_turn_policy(Feature::Plugins);
+
+        assert!(!managed.enabled(Feature::Plugins));
+        assert_eq!(managed.pinned_features.get(&Feature::Plugins), Some(&true));
+    }
 }

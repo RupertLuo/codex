@@ -1,6 +1,7 @@
 use super::*;
 use crate::environment_selection::TurnEnvironmentSnapshot;
 use crate::shell_snapshot::ShellSnapshotFile;
+use crate::state::DynamicSelectedCapabilityRoots;
 use codex_core_skills::HostSkillsSnapshot;
 use codex_file_system::FileSystemSandboxContext;
 use codex_model_provider::SharedModelProvider;
@@ -684,7 +685,17 @@ impl Session {
             .as_ref()
             .and_then(|turn_environment| turn_environment.cwd().to_abs_path().ok())
             .unwrap_or_else(|| session_configuration.cwd().clone());
-        let per_turn_config = Self::build_per_turn_config(&session_configuration, cwd.clone());
+        let mut per_turn_config = Self::build_per_turn_config(&session_configuration, cwd.clone());
+        if self
+            .services
+            .thread_extension_data
+            .get::<DynamicSelectedCapabilityRoots>()
+            .is_some()
+        {
+            per_turn_config
+                .features
+                .disable_for_turn_policy(Feature::Plugins);
+        }
         {
             let mcp_runtime = self.services.latest_mcp_runtime();
             let mcp_connection_manager = mcp_runtime.manager();
