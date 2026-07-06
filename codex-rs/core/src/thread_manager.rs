@@ -145,6 +145,7 @@ pub struct NativeAgentSpawnRequest {
     pub fork_turns: usize,
     pub agent_role: Option<String>,
     pub agent_nickname: Option<String>,
+    pub thread_extension_init: ExtensionDataInit,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -977,6 +978,7 @@ impl ThreadManager {
             fork_mode,
             parent_thread_id: Some(parent_thread_id),
             environments: None,
+            thread_extension_init: request.thread_extension_init,
         };
         let session_source = SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
             parent_thread_id,
@@ -1590,6 +1592,7 @@ impl ThreadManagerState {
             /*inherited_environments*/ None,
             /*inherited_exec_policy*/ None,
             /*environments*/ None,
+            /*thread_extension_init*/ ExtensionDataInit::default(),
         ))
         .await
     }
@@ -1607,6 +1610,7 @@ impl ThreadManagerState {
         inherited_environments: Option<TurnEnvironmentSnapshot>,
         inherited_exec_policy: Option<Arc<crate::exec_policy::ExecPolicyManager>>,
         environments: Option<Vec<TurnEnvironmentSelection>>,
+        thread_extension_init: ExtensionDataInit,
     ) -> CodexResult<NewThread> {
         let environments = environments.unwrap_or_else(|| {
             default_thread_environment_selections(self.environment_manager.as_ref(), &config.cwd)
@@ -1628,7 +1632,7 @@ impl ThreadManagerState {
             inherited_exec_policy,
             /*parent_trace*/ None,
             environments,
-            /*thread_extension_init*/ ExtensionDataInit::default(),
+            thread_extension_init,
             /*supports_openai_form_elicitation*/ false,
             /*user_shell_override*/ None,
         ))

@@ -1,6 +1,5 @@
 use super::residency::is_v2_resident_session_source;
 use super::*;
-use codex_extension_api::ExtensionDataInit;
 
 const AGENT_NAMES: &str = include_str!("../agent_names.txt");
 
@@ -289,6 +288,7 @@ impl AgentControl {
                     inheritance.environments,
                     inheritance.exec_policy,
                     options.environments.clone(),
+                    options.thread_extension_init.clone(),
                 ))
                 .await?
             }
@@ -515,7 +515,7 @@ impl AgentControl {
         {
             forked_rollout_items.push(RolloutItem::ResponseItem(subagent_usage_hint_message));
         }
-        let mut thread_extension_init = ExtensionDataInit::new();
+        let mut thread_extension_init = options.thread_extension_init.clone();
         thread_extension_init.insert(selected_capability_roots);
 
         state

@@ -167,6 +167,9 @@ fn runtime_options_retain_agent_spawner_extension_factories() {
 
 #[tokio::test]
 async fn native_agent_spawn_uses_parent_agent_control_and_submits_initial_operation() {
+    #[derive(Debug)]
+    struct NativeSpawnMarker;
+
     let temp_dir = tempdir().expect("tempdir");
     let mut config = test_config().await;
     config.codex_home = temp_dir.path().join("codex-home").abs();
@@ -193,6 +196,8 @@ async fn native_agent_spawn_uses_parent_agent_control_and_submits_initial_operat
         thread_settings: Default::default(),
     };
 
+    let mut thread_extension_init = codex_extension_api::ExtensionDataInit::new();
+    thread_extension_init.insert(NativeSpawnMarker);
     let spawned = manager
         .spawn_native_agent(
             parent.thread_id,
@@ -203,6 +208,7 @@ async fn native_agent_spawn_uses_parent_agent_control_and_submits_initial_operat
                 fork_turns: 0,
                 agent_role: Some("research-analyst".to_string()),
                 agent_nickname: Some("Research Analyst".to_string()),
+                thread_extension_init,
             },
         )
         .await
@@ -215,6 +221,15 @@ async fn native_agent_spawn_uses_parent_agent_control_and_submits_initial_operat
             .contains(&(spawned.thread_id, operation))
     );
     let child = manager.get_thread(spawned.thread_id).await.unwrap();
+    assert!(
+        child
+            .codex
+            .session
+            .services
+            .thread_extension_data
+            .get::<NativeSpawnMarker>()
+            .is_some()
+    );
     let snapshot = child.codex.thread_config_snapshot().await;
     assert!(matches!(
         snapshot.session_source,
