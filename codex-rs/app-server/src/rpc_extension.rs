@@ -18,7 +18,11 @@ pub(crate) type AppServerNativeTurnFuture<'a> =
     Pin<Box<dyn Future<Output = Result<TurnStartResponse, JSONRPCErrorError>> + Send + 'a>>;
 
 pub(crate) trait AppServerNativeTurnGateway: Debug + Send + Sync {
-    fn start_turn<'a>(&'a self, params: TurnStartParams) -> AppServerNativeTurnFuture<'a>;
+    fn start_turn<'a>(
+        &'a self,
+        params: TurnStartParams,
+        selected_plugin_ids: Option<Vec<String>>,
+    ) -> AppServerNativeTurnFuture<'a>;
 }
 
 pub(crate) type AppServerNativePluginFuture<'a> =
@@ -110,7 +114,19 @@ impl AppServerRpcContext {
             .native_turn_gateway
             .as_ref()
             .ok_or_else(native_turn_gateway_unavailable)?;
-        gateway.start_turn(params).await
+        gateway.start_turn(params, None).await
+    }
+
+    pub async fn start_turn_with_plugins(
+        &self,
+        params: TurnStartParams,
+        selected_plugin_ids: Vec<String>,
+    ) -> Result<TurnStartResponse, JSONRPCErrorError> {
+        let gateway = self
+            .native_turn_gateway
+            .as_ref()
+            .ok_or_else(native_turn_gateway_unavailable)?;
+        gateway.start_turn(params, Some(selected_plugin_ids)).await
     }
 }
 
@@ -270,14 +286,17 @@ mod tests {
         #[derive(Debug, Default)]
         struct StubNativeTurnGateway {
             thread_ids: Mutex<Vec<String>>,
+            plugin_ids: Mutex<Vec<Option<Vec<String>>>>,
         }
 
         impl AppServerNativeTurnGateway for StubNativeTurnGateway {
             fn start_turn<'a>(
                 &'a self,
                 params: codex_app_server_protocol::TurnStartParams,
+                selected_plugin_ids: Option<Vec<String>>,
             ) -> AppServerNativeTurnFuture<'a> {
                 self.thread_ids.lock().unwrap().push(params.thread_id);
+                self.plugin_ids.lock().unwrap().push(selected_plugin_ids);
                 Box::pin(async {
                     Err(JSONRPCErrorError {
                         code: -32041,
@@ -292,15 +311,30 @@ mod tests {
         let context = AppServerRpcContext::new(AppServerRpcTransportContext::Stdio)
             .with_native_turn_gateway(gateway.clone());
         let error = context
-            .start_turn(codex_app_server_protocol::TurnStartParams {
-                thread_id: "thread-1".to_string(),
-                ..Default::default()
-            })
+            .start_turn_with_plugins(
+                codex_app_server_protocol::TurnStartParams {
+                    thread_id: "thread-1".to_string(),
+                    ..Default::default()
+                },
+                vec!["drive".to_string()],
+            )
             .await
             .unwrap_err();
 
         assert_eq!(error.code, -32041);
         assert_eq!(*gateway.thread_ids.lock().unwrap(), ["thread-1"]);
+        assert_eq!(
+            *gateway.plugin_ids.lock().unwrap(),
+            [Some(vec!["drive".to_string()])]
+        );
+
+        let _ = context
+            .start_turn(codex_app_server_protocol::TurnStartParams {
+                thread_id: "thread-2".to_string(),
+                ..Default::default()
+            })
+            .await;
+        assert_eq!(gateway.plugin_ids.lock().unwrap()[1], None);
     }
 
     #[tokio::test]

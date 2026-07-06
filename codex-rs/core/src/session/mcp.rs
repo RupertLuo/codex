@@ -1,4 +1,5 @@
 use super::*;
+use crate::state::DynamicSelectedCapabilityRoots;
 use codex_exec_server::ResolvedSelectedCapabilityRoot;
 use codex_mcp::ElicitationReviewRequest;
 use codex_mcp::ElicitationReviewer;
@@ -177,11 +178,19 @@ impl Session {
         &self,
         environments: &TurnEnvironmentSnapshot,
     ) -> Vec<ResolvedSelectedCapabilityRoot> {
+        let dynamic_roots = self
+            .services
+            .thread_extension_data
+            .get::<DynamicSelectedCapabilityRoots>();
+        let selected_roots = dynamic_roots
+            .as_ref()
+            .map(|roots| roots.0.as_slice())
+            .unwrap_or(&self.services.selected_capability_roots);
         self.services
             .turn_environments
             .environment_manager()
             .resolve_selected_capability_roots(
-                &self.services.selected_capability_roots,
+                selected_roots,
                 &environments.captured_environments(),
             )
             .await

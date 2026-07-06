@@ -3,9 +3,11 @@ use crate::config::ConstraintResult;
 use crate::session::Codex;
 use crate::session::SessionSettingsUpdate;
 use crate::session::SteerInputError;
+use crate::state::DynamicSelectedCapabilityRoots;
 use codex_features::Feature;
 use codex_otel::SessionTelemetry;
 use codex_protocol::ThreadId;
+use codex_protocol::capabilities::SelectedCapabilityRoot;
 use codex_protocol::config_types::ApprovalsReviewer;
 use codex_protocol::config_types::CollaborationMode;
 use codex_protocol::config_types::Personality;
@@ -193,6 +195,19 @@ impl CodexThread {
 
     pub async fn submit(&self, op: Op) -> CodexResult<String> {
         self.codex.submit(op).await
+    }
+
+    pub fn replace_selected_capability_roots(&self, roots: Vec<SelectedCapabilityRoot>) {
+        self.codex
+            .session
+            .services
+            .thread_extension_data
+            .insert(DynamicSelectedCapabilityRoots(roots.clone()));
+        self.codex
+            .session
+            .services
+            .thread_extension_data
+            .insert(roots);
     }
 
     /// Returns the session telemetry handle for thread-scoped production instrumentation.

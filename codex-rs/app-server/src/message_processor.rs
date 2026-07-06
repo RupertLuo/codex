@@ -244,13 +244,22 @@ impl std::fmt::Debug for MessageProcessorNativeTurnGateway {
 }
 
 impl AppServerNativeTurnGateway for MessageProcessorNativeTurnGateway {
-    fn start_turn<'a>(&'a self, params: TurnStartParams) -> AppServerNativeTurnFuture<'a> {
+    fn start_turn<'a>(
+        &'a self,
+        params: TurnStartParams,
+        selected_plugin_ids: Option<Vec<String>>,
+    ) -> AppServerNativeTurnFuture<'a> {
         let connection_request_id = self.connection_request_id.clone();
         let processor = Arc::clone(&self.processor);
         let session = Arc::clone(&self.session);
         Box::pin(async move {
             processor
-                .start_extension_native_turn(connection_request_id, session, params)
+                .start_extension_native_turn(
+                    connection_request_id,
+                    session,
+                    params,
+                    selected_plugin_ids,
+                )
                 .await
         })
     }
@@ -677,8 +686,10 @@ impl MessageProcessor {
         connection_request_id: ConnectionRequestId,
         session: Arc<ConnectionSessionState>,
         params: TurnStartParams,
+        selected_plugin_ids: Option<Vec<String>>,
     ) -> Result<TurnStartResponse, JSONRPCErrorError> {
         let thread_id = params.thread_id.clone();
+        let queued_thread_id = thread_id.clone();
         let app_server_client_name = session.app_server_client_name().map(str::to_string);
         let client_version = session.client_version().map(str::to_string);
         let supports_openai_form_elicitation = session.supports_openai_form_elicitation();
@@ -688,6 +699,18 @@ impl MessageProcessor {
         let request = QueuedInitializedRequest::new(
             Arc::clone(&session.rpc_gate),
             async move {
+                let plugin_selection_result = if let Some(selected_plugin_ids) = selected_plugin_ids
+                {
+                    processor
+                        .apply_extension_plugin_selection(&thread_id, &selected_plugin_ids)
+                        .await
+                } else {
+                    Ok(())
+                };
+                if let Err(error) = plugin_selection_result {
+                    let _ = result_tx.send(Err(error));
+                    return;
+                }
                 let result = processor
                     .turn_processor
                     .turn_start(
@@ -710,7 +733,9 @@ impl MessageProcessor {
         );
         self.request_serialization_queues
             .enqueue(
-                RequestSerializationQueueKey::Thread { thread_id },
+                RequestSerializationQueueKey::Thread {
+                    thread_id: queued_thread_id,
+                },
                 RequestSerializationAccess::Exclusive,
                 request,
             )
@@ -718,6 +743,16 @@ impl MessageProcessor {
         result_rx.await.map_err(|_| {
             internal_error("native turn gateway was cancelled before the request completed")
         })?
+    }
+
+    async fn apply_extension_plugin_selection(
+        &self,
+        thread_id: &str,
+        selected_plugin_ids: &[String],
+    ) -> Result<(), JSONRPCErrorError> {
+        self.plugin_processor
+            .apply_plugin_selection(thread_id, selected_plugin_ids)
+            .await
     }
 
     pub(crate) async fn process_request(

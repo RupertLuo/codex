@@ -2,10 +2,12 @@ use super::*;
 use crate::error_code::internal_error;
 use crate::error_code::invalid_request;
 use crate::rpc_extension::AppServerNativePluginRoot;
+use codex_app_server_protocol::CapabilityRootLocation;
 use codex_app_server_protocol::PluginAvailability;
 use codex_app_server_protocol::PluginInstallPolicy;
 use codex_app_server_protocol::PluginSharePrincipalRole;
 use codex_app_server_protocol::PluginShareTargetRole;
+use codex_app_server_protocol::SelectedCapabilityRoot;
 use codex_config::types::McpServerConfig;
 use codex_core_plugins::OPENAI_CURATED_MARKETPLACE_NAME;
 use codex_core_plugins::PluginListBackgroundTaskOptions;
@@ -25,8 +27,10 @@ use codex_mcp::oauth_login_support;
 use codex_mcp::should_retry_without_scopes;
 use codex_plugin::PluginId;
 use codex_plugin::PluginTelemetryMetadata;
+use codex_protocol::ThreadId;
 use codex_protocol::auth::AuthMode as DomainAuthMode;
 use codex_rmcp_client::perform_oauth_login_silent;
+use codex_utils_path_uri::PathUri;
 
 #[derive(Clone)]
 pub(crate) struct PluginRequestProcessor {
@@ -815,6 +819,41 @@ impl PluginRequestProcessor {
                 root: plugin.root.clone(),
             })
             .collect())
+    }
+
+    pub(crate) async fn apply_plugin_selection(
+        &self,
+        thread_id: &str,
+        selected_plugin_ids: &[String],
+    ) -> Result<(), JSONRPCErrorError> {
+        let selected = selected_plugin_ids.iter().cloned().collect::<HashSet<_>>();
+        let loaded = self.loaded_plugin_roots().await?;
+        if selected
+            .iter()
+            .any(|id| !loaded.iter().any(|plugin| &plugin.plugin_id == id))
+        {
+            return Err(invalid_request("selected Plugin root is unavailable"));
+        }
+        let roots = loaded
+            .into_iter()
+            .filter(|plugin| selected.contains(&plugin.plugin_id))
+            .map(|plugin| SelectedCapabilityRoot {
+                id: plugin.plugin_id,
+                location: CapabilityRootLocation::Environment {
+                    environment_id: codex_exec_server::LOCAL_ENVIRONMENT_ID.to_string(),
+                    path: PathUri::from_abs_path(&plugin.root),
+                },
+            })
+            .collect();
+        let thread_id = ThreadId::from_string(thread_id)
+            .map_err(|_| invalid_request("invalid thread id for Plugin selection"))?;
+        let thread = self
+            .thread_manager
+            .get_thread(thread_id)
+            .await
+            .map_err(|_| invalid_request("thread not found for Plugin selection"))?;
+        thread.replace_selected_capability_roots(roots);
+        Ok(())
     }
 
     async fn plugin_installed_response(
