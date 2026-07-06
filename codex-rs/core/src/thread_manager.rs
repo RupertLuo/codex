@@ -1,5 +1,7 @@
 use crate::SkillsService;
 use crate::agent::AgentControl;
+use crate::agent::control::SpawnAgentForkMode;
+use crate::agent::control::SpawnAgentOptions;
 use crate::attestation::AttestationProvider;
 use crate::codex_thread::CodexThread;
 use crate::config::Config;
@@ -134,11 +136,20 @@ pub struct NewThread {
 /// The native app-server subagent spawning capability exposed to process-local
 /// runtime extensions without coupling those extensions to [`ThreadManager`].
 pub type NativeAgentSpawner =
-    dyn AgentSpawner<NativeAgentSpawnRequest, Spawned = NewThread, Error = CodexErr>;
+    dyn AgentSpawner<NativeAgentSpawnRequest, Spawned = NativeAgentSpawn, Error = CodexErr>;
 
 pub struct NativeAgentSpawnRequest {
-    pub options: StartThreadOptions,
-    pub fork_snapshot: ForkSnapshot,
+    pub config: Config,
+    pub initial_operation: Op,
+    pub parent_spawn_call_id: String,
+    pub fork_turns: usize,
+    pub agent_role: Option<String>,
+    pub agent_nickname: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NativeAgentSpawn {
+    pub thread_id: ThreadId,
 }
 
 /// Creates a runtime extension after the app-server has a native subagent
@@ -946,6 +957,49 @@ impl ThreadManager {
         );
         self.start_thread_with_options_and_fork_source(options, Some(forked_from_thread_id))
             .await
+    }
+
+    pub async fn spawn_native_agent(
+        &self,
+        parent_thread_id: ThreadId,
+        request: NativeAgentSpawnRequest,
+    ) -> CodexResult<NativeAgentSpawn> {
+        let parent = self.get_thread(parent_thread_id).await?;
+        let parent_snapshot = parent.codex.thread_config_snapshot().await;
+        let depth = match parent_snapshot.session_source {
+            SessionSource::SubAgent(SubAgentSource::ThreadSpawn { depth, .. }) => depth + 1,
+            _ => 1,
+        };
+        let fork_mode =
+            (request.fork_turns > 0).then_some(SpawnAgentForkMode::LastNTurns(request.fork_turns));
+        let options = SpawnAgentOptions {
+            fork_parent_spawn_call_id: fork_mode.as_ref().map(|_| request.parent_spawn_call_id),
+            fork_mode,
+            parent_thread_id: Some(parent_thread_id),
+            environments: None,
+        };
+        let session_source = SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+            parent_thread_id,
+            depth,
+            agent_path: None,
+            agent_nickname: request.agent_nickname,
+            agent_role: request.agent_role,
+        });
+        let spawned = parent
+            .codex
+            .session
+            .services
+            .agent_control
+            .spawn_agent_with_metadata(
+                request.config,
+                request.initial_operation,
+                Some(session_source),
+                options,
+            )
+            .await?;
+        Ok(NativeAgentSpawn {
+            thread_id: spawned.thread_id,
+        })
     }
 
     pub async fn resume_thread_from_rollout(

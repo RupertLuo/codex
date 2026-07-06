@@ -165,6 +165,68 @@ fn runtime_options_retain_agent_spawner_extension_factories() {
     assert!(options.has_process_local_overrides());
 }
 
+#[tokio::test]
+async fn native_agent_spawn_uses_parent_agent_control_and_submits_initial_operation() {
+    let temp_dir = tempdir().expect("tempdir");
+    let mut config = test_config().await;
+    config.codex_home = temp_dir.path().join("codex-home").abs();
+    config.cwd = config.codex_home.abs();
+    std::fs::create_dir_all(&config.codex_home).expect("create codex home");
+    let manager = ThreadManager::with_models_provider_and_home_for_tests(
+        CodexAuth::from_api_key("dummy"),
+        config.model_provider.clone(),
+        config.codex_home.to_path_buf(),
+        Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+    );
+    let parent = manager
+        .start_thread(config.clone())
+        .await
+        .expect("start parent thread");
+    let operation = Op::UserInput {
+        items: vec![codex_protocol::user_input::UserInput::Text {
+            text: "delegated Expert task".to_string(),
+            text_elements: Vec::new(),
+        }],
+        final_output_json_schema: None,
+        responsesapi_client_metadata: None,
+        additional_context: Default::default(),
+        thread_settings: Default::default(),
+    };
+
+    let spawned = manager
+        .spawn_native_agent(
+            parent.thread_id,
+            NativeAgentSpawnRequest {
+                config,
+                initial_operation: operation.clone(),
+                parent_spawn_call_id: "delegate-call-1".to_string(),
+                fork_turns: 0,
+                agent_role: Some("research-analyst".to_string()),
+                agent_nickname: Some("Research Analyst".to_string()),
+            },
+        )
+        .await
+        .expect("spawn native agent");
+
+    assert!(manager.get_thread(spawned.thread_id).await.is_ok());
+    assert!(
+        manager
+            .captured_ops()
+            .contains(&(spawned.thread_id, operation))
+    );
+    let child = manager.get_thread(spawned.thread_id).await.unwrap();
+    let snapshot = child.codex.thread_config_snapshot().await;
+    assert!(matches!(
+        snapshot.session_source,
+        SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+            parent_thread_id,
+            depth: 1,
+            agent_role: Some(ref role),
+            ..
+        }) if parent_thread_id == parent.thread_id && role == "research-analyst"
+    ));
+}
+
 #[test]
 fn runtime_options_expose_required_base_instructions() {
     let options = ThreadManagerRuntimeOptions::default()
