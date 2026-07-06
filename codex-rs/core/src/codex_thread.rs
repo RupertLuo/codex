@@ -3,7 +3,6 @@ use crate::config::ConstraintResult;
 use crate::session::Codex;
 use crate::session::SessionSettingsUpdate;
 use crate::session::SteerInputError;
-use crate::state::DynamicSelectedCapabilityRoots;
 use codex_features::Feature;
 use codex_otel::SessionTelemetry;
 use codex_protocol::ThreadId;
@@ -167,6 +166,12 @@ pub struct CodexThread {
     out_of_band_elicitation_count: Mutex<u64>,
 }
 
+#[derive(Clone, Debug)]
+pub struct ManagedSelectedCapabilityRoots(pub Vec<SelectedCapabilityRoot>);
+
+#[derive(Clone, Debug, Default)]
+pub struct MemberSelectedCapabilityRoots(pub BTreeMap<String, Vec<SelectedCapabilityRoot>>);
+
 #[derive(Debug, Eq, PartialEq)]
 pub struct BackgroundTerminalInfo {
     pub item_id: String,
@@ -202,12 +207,23 @@ impl CodexThread {
             .session
             .services
             .thread_extension_data
-            .insert(DynamicSelectedCapabilityRoots(roots.clone()));
+            .insert(ManagedSelectedCapabilityRoots(roots.clone()));
         self.codex
             .session
             .services
             .thread_extension_data
             .insert(roots);
+    }
+
+    pub fn replace_member_selected_capability_roots(
+        &self,
+        roots: BTreeMap<String, Vec<SelectedCapabilityRoot>>,
+    ) {
+        self.codex
+            .session
+            .services
+            .thread_extension_data
+            .insert(MemberSelectedCapabilityRoots(roots));
     }
 
     /// Returns the session telemetry handle for thread-scoped production instrumentation.

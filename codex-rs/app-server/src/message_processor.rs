@@ -50,6 +50,7 @@ use crate::request_serialization::RequestSerializationQueues;
 use crate::rpc_extension::AppServerNativePluginFuture;
 use crate::rpc_extension::AppServerNativePluginGateway;
 use crate::rpc_extension::AppServerNativePluginRootsFuture;
+use crate::rpc_extension::AppServerNativePluginSelection;
 use crate::rpc_extension::AppServerNativeTurnFuture;
 use crate::rpc_extension::AppServerNativeTurnGateway;
 use crate::rpc_extension::AppServerRpcContext;
@@ -247,7 +248,7 @@ impl AppServerNativeTurnGateway for MessageProcessorNativeTurnGateway {
     fn start_turn<'a>(
         &'a self,
         params: TurnStartParams,
-        selected_plugin_ids: Option<Vec<String>>,
+        plugin_selection: Option<AppServerNativePluginSelection>,
     ) -> AppServerNativeTurnFuture<'a> {
         let connection_request_id = self.connection_request_id.clone();
         let processor = Arc::clone(&self.processor);
@@ -258,7 +259,7 @@ impl AppServerNativeTurnGateway for MessageProcessorNativeTurnGateway {
                     connection_request_id,
                     session,
                     params,
-                    selected_plugin_ids,
+                    plugin_selection,
                 )
                 .await
         })
@@ -686,7 +687,7 @@ impl MessageProcessor {
         connection_request_id: ConnectionRequestId,
         session: Arc<ConnectionSessionState>,
         params: TurnStartParams,
-        selected_plugin_ids: Option<Vec<String>>,
+        plugin_selection: Option<AppServerNativePluginSelection>,
     ) -> Result<TurnStartResponse, JSONRPCErrorError> {
         let thread_id = params.thread_id.clone();
         let queued_thread_id = thread_id.clone();
@@ -699,10 +700,9 @@ impl MessageProcessor {
         let request = QueuedInitializedRequest::new(
             Arc::clone(&session.rpc_gate),
             async move {
-                let plugin_selection_result = if let Some(selected_plugin_ids) = selected_plugin_ids
-                {
+                let plugin_selection_result = if let Some(plugin_selection) = plugin_selection {
                     processor
-                        .apply_extension_plugin_selection(&thread_id, &selected_plugin_ids)
+                        .apply_extension_plugin_selection(&thread_id, &plugin_selection)
                         .await
                 } else {
                     Ok(())
@@ -748,10 +748,10 @@ impl MessageProcessor {
     async fn apply_extension_plugin_selection(
         &self,
         thread_id: &str,
-        selected_plugin_ids: &[String],
+        plugin_selection: &AppServerNativePluginSelection,
     ) -> Result<(), JSONRPCErrorError> {
         self.plugin_processor
-            .apply_plugin_selection(thread_id, selected_plugin_ids)
+            .apply_plugin_selection(thread_id, plugin_selection)
             .await
     }
 

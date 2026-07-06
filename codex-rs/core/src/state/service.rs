@@ -144,5 +144,3 @@ impl SessionServices {
         runtime
     }
 }
-#[derive(Clone, Debug)]
-pub(crate) struct DynamicSelectedCapabilityRoots(pub(crate) Vec<SelectedCapabilityRoot>);

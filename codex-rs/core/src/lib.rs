@@ -26,6 +26,8 @@ mod config_lock;
 pub use codex_thread::BackgroundTerminalInfo;
 pub use codex_thread::CodexThread;
 pub use codex_thread::CodexThreadSettingsOverrides;
+pub use codex_thread::ManagedSelectedCapabilityRoots;
+pub use codex_thread::MemberSelectedCapabilityRoots;
 pub use codex_thread::ThreadConfigSnapshot;
 pub use codex_thread::TryStartTurnIfIdleError;
 pub use codex_thread::TryStartTurnIfIdleRejectionReason;

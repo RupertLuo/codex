@@ -2,6 +2,7 @@ use super::*;
 use crate::error_code::internal_error;
 use crate::error_code::invalid_request;
 use crate::rpc_extension::AppServerNativePluginRoot;
+use crate::rpc_extension::AppServerNativePluginSelection;
 use codex_app_server_protocol::CapabilityRootLocation;
 use codex_app_server_protocol::PluginAvailability;
 use codex_app_server_protocol::PluginInstallPolicy;
@@ -40,6 +41,27 @@ pub(crate) struct PluginRequestProcessor {
     analytics_events_client: AnalyticsEventsClient,
     config_manager: ConfigManager,
     workspace_settings_cache: Arc<workspace_settings::WorkspaceSettingsCache>,
+}
+
+fn selected_plugin_roots(
+    loaded: &[AppServerNativePluginRoot],
+    selected_plugin_ids: &[String],
+) -> Vec<SelectedCapabilityRoot> {
+    let selected = selected_plugin_ids
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    loaded
+        .iter()
+        .filter(|plugin| selected.contains(plugin.plugin_id.as_str()))
+        .map(|plugin| SelectedCapabilityRoot {
+            id: plugin.plugin_id.clone(),
+            location: CapabilityRootLocation::Environment {
+                environment_id: codex_exec_server::LOCAL_ENVIRONMENT_ID.to_string(),
+                path: PathUri::from_abs_path(&plugin.root),
+            },
+        })
+        .collect()
 }
 
 fn plugin_skills_to_info(
@@ -824,9 +846,14 @@ impl PluginRequestProcessor {
     pub(crate) async fn apply_plugin_selection(
         &self,
         thread_id: &str,
-        selected_plugin_ids: &[String],
+        selection: &AppServerNativePluginSelection,
     ) -> Result<(), JSONRPCErrorError> {
-        let selected = selected_plugin_ids.iter().cloned().collect::<HashSet<_>>();
+        let selected = selection
+            .selected_plugin_ids
+            .iter()
+            .chain(selection.member_plugin_ids.values().flatten())
+            .cloned()
+            .collect::<HashSet<_>>();
         let loaded = self.loaded_plugin_roots().await?;
         if selected
             .iter()
@@ -834,15 +861,15 @@ impl PluginRequestProcessor {
         {
             return Err(invalid_request("selected Plugin root is unavailable"));
         }
-        let roots = loaded
-            .into_iter()
-            .filter(|plugin| selected.contains(&plugin.plugin_id))
-            .map(|plugin| SelectedCapabilityRoot {
-                id: plugin.plugin_id,
-                location: CapabilityRootLocation::Environment {
-                    environment_id: codex_exec_server::LOCAL_ENVIRONMENT_ID.to_string(),
-                    path: PathUri::from_abs_path(&plugin.root),
-                },
+        let selected_roots = selected_plugin_roots(&loaded, &selection.selected_plugin_ids);
+        let member_roots = selection
+            .member_plugin_ids
+            .iter()
+            .map(|(member_id, plugin_ids)| {
+                (
+                    member_id.clone(),
+                    selected_plugin_roots(&loaded, plugin_ids),
+                )
             })
             .collect();
         let thread_id = ThreadId::from_string(thread_id)
@@ -852,7 +879,8 @@ impl PluginRequestProcessor {
             .get_thread(thread_id)
             .await
             .map_err(|_| invalid_request("thread not found for Plugin selection"))?;
-        thread.replace_selected_capability_roots(roots);
+        thread.replace_selected_capability_roots(selected_roots);
+        thread.replace_member_selected_capability_roots(member_roots);
         Ok(())
     }
 

@@ -1,7 +1,7 @@
 use super::*;
+use crate::ManagedSelectedCapabilityRoots;
 use crate::environment_selection::TurnEnvironmentSnapshot;
 use crate::shell_snapshot::ShellSnapshotFile;
-use crate::state::DynamicSelectedCapabilityRoots;
 use codex_core_skills::HostSkillsSnapshot;
 use codex_file_system::FileSystemSandboxContext;
 use codex_model_provider::SharedModelProvider;
@@ -689,7 +689,7 @@ impl Session {
         if self
             .services
             .thread_extension_data
-            .get::<DynamicSelectedCapabilityRoots>()
+            .get::<ManagedSelectedCapabilityRoots>()
             .is_some()
         {
             per_turn_config

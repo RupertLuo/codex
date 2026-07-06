@@ -17,11 +17,17 @@ pub type AppServerRpcFuture<'a> =
 pub(crate) type AppServerNativeTurnFuture<'a> =
     Pin<Box<dyn Future<Output = Result<TurnStartResponse, JSONRPCErrorError>> + Send + 'a>>;
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct AppServerNativePluginSelection {
+    pub selected_plugin_ids: Vec<String>,
+    pub member_plugin_ids: BTreeMap<String, Vec<String>>,
+}
+
 pub(crate) trait AppServerNativeTurnGateway: Debug + Send + Sync {
     fn start_turn<'a>(
         &'a self,
         params: TurnStartParams,
-        selected_plugin_ids: Option<Vec<String>>,
+        plugin_selection: Option<AppServerNativePluginSelection>,
     ) -> AppServerNativeTurnFuture<'a>;
 }
 
@@ -126,7 +132,36 @@ impl AppServerRpcContext {
             .native_turn_gateway
             .as_ref()
             .ok_or_else(native_turn_gateway_unavailable)?;
-        gateway.start_turn(params, Some(selected_plugin_ids)).await
+        gateway
+            .start_turn(
+                params,
+                Some(AppServerNativePluginSelection {
+                    selected_plugin_ids,
+                    member_plugin_ids: BTreeMap::new(),
+                }),
+            )
+            .await
+    }
+
+    pub async fn start_turn_with_plugin_members(
+        &self,
+        params: TurnStartParams,
+        selected_plugin_ids: Vec<String>,
+        member_plugin_ids: BTreeMap<String, Vec<String>>,
+    ) -> Result<TurnStartResponse, JSONRPCErrorError> {
+        let gateway = self
+            .native_turn_gateway
+            .as_ref()
+            .ok_or_else(native_turn_gateway_unavailable)?;
+        gateway
+            .start_turn(
+                params,
+                Some(AppServerNativePluginSelection {
+                    selected_plugin_ids,
+                    member_plugin_ids,
+                }),
+            )
+            .await
     }
 }
 
@@ -286,17 +321,20 @@ mod tests {
         #[derive(Debug, Default)]
         struct StubNativeTurnGateway {
             thread_ids: Mutex<Vec<String>>,
-            plugin_ids: Mutex<Vec<Option<Vec<String>>>>,
+            plugin_selections: Mutex<Vec<Option<AppServerNativePluginSelection>>>,
         }
 
         impl AppServerNativeTurnGateway for StubNativeTurnGateway {
             fn start_turn<'a>(
                 &'a self,
                 params: codex_app_server_protocol::TurnStartParams,
-                selected_plugin_ids: Option<Vec<String>>,
+                plugin_selection: Option<AppServerNativePluginSelection>,
             ) -> AppServerNativeTurnFuture<'a> {
                 self.thread_ids.lock().unwrap().push(params.thread_id);
-                self.plugin_ids.lock().unwrap().push(selected_plugin_ids);
+                self.plugin_selections
+                    .lock()
+                    .unwrap()
+                    .push(plugin_selection);
                 Box::pin(async {
                     Err(JSONRPCErrorError {
                         code: -32041,
@@ -311,12 +349,13 @@ mod tests {
         let context = AppServerRpcContext::new(AppServerRpcTransportContext::Stdio)
             .with_native_turn_gateway(gateway.clone());
         let error = context
-            .start_turn_with_plugins(
+            .start_turn_with_plugin_members(
                 codex_app_server_protocol::TurnStartParams {
                     thread_id: "thread-1".to_string(),
                     ..Default::default()
                 },
                 vec!["drive".to_string()],
+                BTreeMap::from([("research".to_string(), vec!["mail".to_string()])]),
             )
             .await
             .unwrap_err();
@@ -324,8 +363,14 @@ mod tests {
         assert_eq!(error.code, -32041);
         assert_eq!(*gateway.thread_ids.lock().unwrap(), ["thread-1"]);
         assert_eq!(
-            *gateway.plugin_ids.lock().unwrap(),
-            [Some(vec!["drive".to_string()])]
+            *gateway.plugin_selections.lock().unwrap(),
+            [Some(AppServerNativePluginSelection {
+                selected_plugin_ids: vec!["drive".to_string()],
+                member_plugin_ids: BTreeMap::from([(
+                    "research".to_string(),
+                    vec!["mail".to_string()],
+                )]),
+            })]
         );
 
         let _ = context
@@ -334,7 +379,7 @@ mod tests {
                 ..Default::default()
             })
             .await;
-        assert_eq!(gateway.plugin_ids.lock().unwrap()[1], None);
+        assert_eq!(gateway.plugin_selections.lock().unwrap()[1], None);
     }
 
     #[tokio::test]
