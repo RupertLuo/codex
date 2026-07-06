@@ -54,6 +54,15 @@ const TEST_INSTALLATION_ID: &str = "11111111-1111-4111-8111-111111111111";
 #[derive(Debug)]
 struct ProbeRuntimeExtension;
 
+#[derive(Debug)]
+struct ProbeAgentSpawnerExtensionFactory;
+
+impl AgentSpawnerRuntimeExtensionFactory for ProbeAgentSpawnerExtensionFactory {
+    fn create(&self, _spawner: Arc<NativeAgentSpawner>) -> Arc<dyn RuntimeExtension<Config>> {
+        Arc::new(ProbeRuntimeExtension)
+    }
+}
+
 struct ProbeSkillProvider;
 
 impl SkillProvider for ProbeSkillProvider {
@@ -142,6 +151,17 @@ fn runtime_options_report_runtime_extension_override() {
 
     assert_eq!(options.runtime_extensions().len(), 1);
     assert!(options.has_runtime_extension_override());
+    assert!(options.has_process_local_overrides());
+}
+
+#[test]
+fn runtime_options_retain_agent_spawner_extension_factories() {
+    let factory: Arc<dyn AgentSpawnerRuntimeExtensionFactory> =
+        Arc::new(ProbeAgentSpawnerExtensionFactory);
+    let options = ThreadManagerRuntimeOptions::default()
+        .with_agent_spawner_runtime_extension_factory(factory);
+
+    assert_eq!(options.agent_spawner_runtime_extension_factories().len(), 1);
     assert!(options.has_process_local_overrides());
 }
 

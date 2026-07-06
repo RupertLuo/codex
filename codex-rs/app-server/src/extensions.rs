@@ -5,6 +5,8 @@ use codex_analytics::AnalyticsEventsClient;
 use codex_app_server_protocol::ServerNotification;
 use codex_app_server_protocol::ThreadGoal;
 use codex_app_server_protocol::ThreadGoalUpdatedNotification;
+use codex_core::AgentSpawnerRuntimeExtensionFactory;
+use codex_core::NativeAgentSpawner;
 use codex_core::NewThread;
 use codex_core::StartThreadOptions;
 use codex_core::ThreadManager;
@@ -45,8 +47,10 @@ pub(crate) struct ThreadExtensionDependencies {
 
 pub(crate) fn thread_extensions<S>(
     guardian_agent_spawner: S,
+    native_agent_spawner: Arc<NativeAgentSpawner>,
     dependencies: ThreadExtensionDependencies,
     runtime_extensions: &[Arc<dyn RuntimeExtension<Config>>],
+    agent_spawner_runtime_extension_factories: &[Arc<dyn AgentSpawnerRuntimeExtensionFactory>],
 ) -> Arc<ExtensionRegistry<Config>>
 where
     S: AgentSpawner<StartThreadOptions, Spawned = NewThread, Error = CodexErr> + 'static,
@@ -101,6 +105,11 @@ where
         },
     );
     install_runtime_extensions(&mut builder, runtime_extensions);
+    install_agent_spawner_runtime_extensions(
+        &mut builder,
+        agent_spawner_runtime_extension_factories,
+        native_agent_spawner,
+    );
     Arc::new(builder.build())
 }
 
@@ -110,6 +119,16 @@ fn install_runtime_extensions(
 ) {
     for extension in runtime_extensions {
         extension.install(builder);
+    }
+}
+
+fn install_agent_spawner_runtime_extensions(
+    builder: &mut ExtensionRegistryBuilder<Config>,
+    factories: &[Arc<dyn AgentSpawnerRuntimeExtensionFactory>],
+    spawner: Arc<NativeAgentSpawner>,
+) {
+    for factory in factories {
+        factory.create(Arc::clone(&spawner)).install(builder);
     }
 }
 
@@ -211,6 +230,15 @@ mod tests {
 
     struct ProbeToolContributor;
 
+    #[derive(Debug)]
+    struct ProbeAgentSpawnerExtensionFactory;
+
+    impl AgentSpawnerRuntimeExtensionFactory for ProbeAgentSpawnerExtensionFactory {
+        fn create(&self, _spawner: Arc<NativeAgentSpawner>) -> Arc<dyn RuntimeExtension<Config>> {
+            Arc::new(ProbeRuntimeExtension)
+        }
+    }
+
     impl ToolContributor for ProbeToolContributor {
         fn tools(
             &self,
@@ -237,6 +265,22 @@ mod tests {
         let extensions: Vec<Arc<dyn RuntimeExtension<Config>>> =
             vec![Arc::new(ProbeRuntimeExtension)];
         install_runtime_extensions(&mut builder, &extensions);
+
+        assert_eq!(builder.build().tool_contributors().len(), 1);
+    }
+
+    #[test]
+    fn agent_spawner_factories_install_runtime_extensions() {
+        let factory: Arc<dyn AgentSpawnerRuntimeExtensionFactory> =
+            Arc::new(ProbeAgentSpawnerExtensionFactory);
+        let spawner: Arc<NativeAgentSpawner> =
+            Arc::new(|_thread_id: ThreadId, _options: StartThreadOptions| {
+                Box::pin(async { Err(CodexErr::UnsupportedOperation("test spawner".to_string())) })
+                    as AgentSpawnFuture<'static, NewThread, CodexErr>
+            });
+        let mut builder = ExtensionRegistryBuilder::<Config>::new();
+
+        install_agent_spawner_runtime_extensions(&mut builder, &[factory], spawner);
 
         assert_eq!(builder.build().tool_contributors().len(), 1);
     }

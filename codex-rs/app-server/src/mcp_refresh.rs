@@ -230,6 +230,7 @@ mod tests {
                 Arc::clone(&environment_manager),
                 thread_extensions(
                     guardian_agent_spawner(thread_manager.clone()),
+                    Arc::new(guardian_agent_spawner(thread_manager.clone())),
                     ThreadExtensionDependencies {
                         event_sink: Arc::new(NoopExtensionEventSink),
                         auth_manager: auth_manager.clone(),
@@ -242,6 +243,7 @@ mod tests {
                         additional_skill_providers: Vec::new(),
                         thread_store: Arc::clone(&thread_store),
                     },
+                    &[],
                     &[],
                 ),
                 Arc::new(CodexHomeUserInstructionsProvider::new(

@@ -397,6 +397,7 @@ impl MessageProcessor {
                 environment_manager,
                 thread_extensions(
                     guardian_agent_spawner(thread_manager.clone()),
+                    Arc::new(guardian_agent_spawner(thread_manager.clone())),
                     ThreadExtensionDependencies {
                         event_sink: app_server_extension_event_sink(
                             outgoing.clone(),
@@ -415,6 +416,7 @@ impl MessageProcessor {
                         thread_store: Arc::clone(&thread_store),
                     },
                     thread_manager_runtime_options.runtime_extensions(),
+                    thread_manager_runtime_options.agent_spawner_runtime_extension_factories(),
                 ),
                 Arc::new(CodexHomeUserInstructionsProvider::new(
                     config.codex_home.clone(),
