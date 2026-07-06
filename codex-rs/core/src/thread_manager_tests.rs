@@ -1569,6 +1569,28 @@ fn interrupted_fork_snapshot_appends_interrupt_boundary() {
 }
 
 #[test]
+fn last_n_turns_fork_snapshot_keeps_only_the_requested_recent_turns() {
+    let history = InitialHistory::Forked(vec![
+        RolloutItem::ResponseItem(user_msg("first user")),
+        RolloutItem::ResponseItem(assistant_msg("first answer")),
+        RolloutItem::ResponseItem(user_msg("second user")),
+        RolloutItem::ResponseItem(assistant_msg("second answer")),
+    ]);
+
+    let forked = fork_history_from_snapshot(
+        ForkSnapshot::LastNTurns(1),
+        history,
+        InterruptedTurnHistoryMarker::Disabled,
+    );
+
+    let serialized = serde_json::to_string(forked.get_rollout_items()).expect("serialize fork");
+    assert!(serialized.contains("second user"));
+    assert!(serialized.contains("second answer"));
+    assert!(!serialized.contains("first user"));
+    assert!(!serialized.contains("first answer"));
+}
+
+#[test]
 fn disabled_interrupted_fork_snapshot_appends_only_interrupt_event() {
     let committed_history =
         InitialHistory::Forked(vec![RolloutItem::ResponseItem(user_msg("hello"))]);

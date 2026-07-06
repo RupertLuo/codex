@@ -6,6 +6,7 @@ use codex_app_server_protocol::ServerNotification;
 use codex_app_server_protocol::ThreadGoal;
 use codex_app_server_protocol::ThreadGoalUpdatedNotification;
 use codex_core::AgentSpawnerRuntimeExtensionFactory;
+use codex_core::NativeAgentSpawnRequest;
 use codex_core::NativeAgentSpawner;
 use codex_core::NewThread;
 use codex_core::StartThreadOptions;
@@ -207,6 +208,28 @@ pub(crate) fn guardian_agent_spawner(
     }
 }
 
+pub(crate) fn native_agent_spawner(
+    thread_manager: Weak<ThreadManager>,
+) -> impl AgentSpawner<NativeAgentSpawnRequest, Spawned = NewThread, Error = CodexErr> {
+    move |forked_from_thread_id: ThreadId,
+          request: NativeAgentSpawnRequest|
+          -> AgentSpawnFuture<'static, NewThread, CodexErr> {
+        let thread_manager = thread_manager.clone();
+        Box::pin(async move {
+            let thread_manager = thread_manager.upgrade().ok_or_else(|| {
+                CodexErr::UnsupportedOperation("thread manager dropped".to_string())
+            })?;
+            thread_manager
+                .spawn_subagent_with_snapshot(
+                    forked_from_thread_id,
+                    request.options,
+                    request.fork_snapshot,
+                )
+                .await
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
@@ -274,7 +297,7 @@ mod tests {
         let factory: Arc<dyn AgentSpawnerRuntimeExtensionFactory> =
             Arc::new(ProbeAgentSpawnerExtensionFactory);
         let spawner: Arc<NativeAgentSpawner> =
-            Arc::new(|_thread_id: ThreadId, _options: StartThreadOptions| {
+            Arc::new(|_thread_id: ThreadId, _request: NativeAgentSpawnRequest| {
                 Box::pin(async { Err(CodexErr::UnsupportedOperation("test spawner".to_string())) })
                     as AgentSpawnFuture<'static, NewThread, CodexErr>
             });

@@ -14,6 +14,7 @@ use crate::error_code::method_not_found;
 use crate::extensions::ThreadExtensionDependencies;
 use crate::extensions::app_server_extension_event_sink;
 use crate::extensions::guardian_agent_spawner;
+use crate::extensions::native_agent_spawner;
 use crate::extensions::thread_extensions;
 use crate::fs_watch::FsWatchManager;
 use crate::outgoing_message::ConnectionId;
@@ -397,7 +398,7 @@ impl MessageProcessor {
                 environment_manager,
                 thread_extensions(
                     guardian_agent_spawner(thread_manager.clone()),
-                    Arc::new(guardian_agent_spawner(thread_manager.clone())),
+                    Arc::new(native_agent_spawner(thread_manager.clone())),
                     ThreadExtensionDependencies {
                         event_sink: app_server_extension_event_sink(
                             outgoing.clone(),

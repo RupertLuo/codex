@@ -114,6 +114,7 @@ pub(crate) mod web_search;
 pub(crate) mod windows_sandbox_read_grants;
 pub use thread_manager::AgentSpawnerRuntimeExtensionFactory;
 pub use thread_manager::ForkSnapshot;
+pub use thread_manager::NativeAgentSpawnRequest;
 pub use thread_manager::NativeAgentSpawner;
 pub use thread_manager::NewThread;
 pub use thread_manager::StartThreadOptions;
