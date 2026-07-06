@@ -534,7 +534,7 @@ impl PluginRequestProcessor {
         }
     }
 
-    async fn plugin_list_response(
+    pub(crate) async fn plugin_list_response(
         &self,
         params: PluginListParams,
     ) -> Result<PluginListResponse, JSONRPCErrorError> {

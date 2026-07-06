@@ -1,4 +1,6 @@
 use codex_app_server_protocol::JSONRPCErrorError;
+use codex_app_server_protocol::PluginListParams;
+use codex_app_server_protocol::PluginListResponse;
 use codex_app_server_protocol::TurnStartParams;
 use codex_app_server_protocol::TurnStartResponse;
 use codex_app_server_protocol::client_request_methods;
@@ -19,6 +21,13 @@ pub(crate) trait AppServerNativeTurnGateway: Debug + Send + Sync {
     fn start_turn<'a>(&'a self, params: TurnStartParams) -> AppServerNativeTurnFuture<'a>;
 }
 
+pub(crate) type AppServerNativePluginFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<PluginListResponse, JSONRPCErrorError>> + Send + 'a>>;
+
+pub(crate) trait AppServerNativePluginGateway: Debug + Send + Sync {
+    fn list_plugins<'a>(&'a self, params: PluginListParams) -> AppServerNativePluginFuture<'a>;
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AppServerRpcTransportContext {
     Stdio,
@@ -32,6 +41,7 @@ pub enum AppServerRpcTransportContext {
 #[derive(Clone)]
 pub struct AppServerRpcContext {
     pub transport: AppServerRpcTransportContext,
+    native_plugin_gateway: Option<Arc<dyn AppServerNativePluginGateway>>,
     native_turn_gateway: Option<Arc<dyn AppServerNativeTurnGateway>>,
 }
 
@@ -39,6 +49,7 @@ impl AppServerRpcContext {
     pub fn new(transport: AppServerRpcTransportContext) -> Self {
         Self {
             transport,
+            native_plugin_gateway: None,
             native_turn_gateway: None,
         }
     }
@@ -49,6 +60,25 @@ impl AppServerRpcContext {
     ) -> Self {
         self.native_turn_gateway = Some(gateway);
         self
+    }
+
+    pub(crate) fn with_native_plugin_gateway(
+        mut self,
+        gateway: Arc<dyn AppServerNativePluginGateway>,
+    ) -> Self {
+        self.native_plugin_gateway = Some(gateway);
+        self
+    }
+
+    pub async fn list_plugins(
+        &self,
+        params: PluginListParams,
+    ) -> Result<PluginListResponse, JSONRPCErrorError> {
+        let gateway = self
+            .native_plugin_gateway
+            .as_ref()
+            .ok_or_else(native_plugin_gateway_unavailable)?;
+        gateway.list_plugins(params).await
     }
 
     pub async fn start_turn(
@@ -68,6 +98,10 @@ impl Debug for AppServerRpcContext {
         formatter
             .debug_struct("AppServerRpcContext")
             .field("transport", &self.transport)
+            .field(
+                "native_plugin_gateway_available",
+                &self.native_plugin_gateway.is_some(),
+            )
             .field(
                 "native_turn_gateway_available",
                 &self.native_turn_gateway.is_some(),
@@ -246,5 +280,46 @@ mod tests {
 
         assert_eq!(error.code, -32041);
         assert_eq!(*gateway.thread_ids.lock().unwrap(), ["thread-1"]);
+    }
+
+    #[tokio::test]
+    async fn rpc_context_delegates_native_plugin_list_to_the_injected_gateway() {
+        #[derive(Debug)]
+        struct StubNativePluginGateway;
+
+        impl AppServerNativePluginGateway for StubNativePluginGateway {
+            fn list_plugins<'a>(
+                &'a self,
+                _params: codex_app_server_protocol::PluginListParams,
+            ) -> AppServerNativePluginFuture<'a> {
+                Box::pin(async {
+                    Ok(codex_app_server_protocol::PluginListResponse {
+                        marketplaces: Vec::new(),
+                        marketplace_load_errors: Vec::new(),
+                        featured_plugin_ids: vec!["fixture-plugin".to_string()],
+                    })
+                })
+            }
+        }
+
+        let context = AppServerRpcContext::new(AppServerRpcTransportContext::Stdio)
+            .with_native_plugin_gateway(Arc::new(StubNativePluginGateway));
+        let response = context
+            .list_plugins(codex_app_server_protocol::PluginListParams {
+                cwds: None,
+                marketplace_kinds: None,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(response.featured_plugin_ids, ["fixture-plugin"]);
+    }
+}
+
+fn native_plugin_gateway_unavailable() -> JSONRPCErrorError {
+    JSONRPCErrorError {
+        code: -32603,
+        message: "Native Plugin gateway is unavailable in this RPC context.".to_string(),
+        data: None,
     }
 }

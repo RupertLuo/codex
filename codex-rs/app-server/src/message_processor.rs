@@ -47,6 +47,8 @@ use crate::request_serialization::QueuedInitializedRequest;
 use crate::request_serialization::RequestSerializationAccess;
 use crate::request_serialization::RequestSerializationQueueKey;
 use crate::request_serialization::RequestSerializationQueues;
+use crate::rpc_extension::AppServerNativePluginFuture;
+use crate::rpc_extension::AppServerNativePluginGateway;
 use crate::rpc_extension::AppServerNativeTurnFuture;
 use crate::rpc_extension::AppServerNativeTurnGateway;
 use crate::rpc_extension::AppServerRpcContext;
@@ -71,6 +73,7 @@ use codex_app_server_protocol::JSONRPCErrorError;
 use codex_app_server_protocol::JSONRPCNotification;
 use codex_app_server_protocol::JSONRPCRequest;
 use codex_app_server_protocol::JSONRPCResponse;
+use codex_app_server_protocol::PluginListParams;
 use codex_app_server_protocol::ServerRequestPayload;
 use codex_app_server_protocol::TurnStartParams;
 use codex_app_server_protocol::TurnStartResponse;
@@ -247,6 +250,29 @@ impl AppServerNativeTurnGateway for MessageProcessorNativeTurnGateway {
         Box::pin(async move {
             processor
                 .start_extension_native_turn(connection_request_id, session, params)
+                .await
+        })
+    }
+}
+
+struct MessageProcessorNativePluginGateway {
+    processor: Arc<MessageProcessor>,
+}
+
+impl std::fmt::Debug for MessageProcessorNativePluginGateway {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("MessageProcessorNativePluginGateway")
+            .finish_non_exhaustive()
+    }
+}
+
+impl AppServerNativePluginGateway for MessageProcessorNativePluginGateway {
+    fn list_plugins<'a>(&'a self, params: PluginListParams) -> AppServerNativePluginFuture<'a> {
+        Box::pin(async move {
+            self.processor
+                .plugin_processor
+                .plugin_list_response(params)
                 .await
         })
     }
@@ -725,13 +751,15 @@ impl MessageProcessor {
                             .await;
                         return;
                     }
-                    let rpc_context = rpc_context.with_native_turn_gateway(Arc::new(
-                        MessageProcessorNativeTurnGateway {
+                    let rpc_context = rpc_context
+                        .with_native_plugin_gateway(Arc::new(MessageProcessorNativePluginGateway {
+                            processor: Arc::clone(self),
+                        }))
+                        .with_native_turn_gateway(Arc::new(MessageProcessorNativeTurnGateway {
                             connection_request_id: request_id.clone(),
                             processor: Arc::clone(self),
                             session: Arc::clone(&session),
-                        },
-                    ));
+                        }));
                     match extension
                         .handle(rpc_context, request_method, request.params.clone())
                         .await
