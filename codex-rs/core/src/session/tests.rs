@@ -43,6 +43,7 @@ use codex_models_manager::test_support::get_model_offline_for_tests;
 use codex_protocol::AgentPath;
 use codex_protocol::SessionId;
 use codex_protocol::ThreadId;
+use codex_protocol::config_types::AutoCompactTokenLimitScope;
 use codex_protocol::config_types::SERVICE_TIER_DEFAULT_REQUEST_VALUE;
 use codex_protocol::config_types::ServiceTier;
 use codex_protocol::config_types::TrustLevel;
@@ -10130,6 +10131,92 @@ async fn set_total_token_usage(sess: &Session, total_token_usage: TokenUsage) {
         last_token_usage: TokenUsage::default(),
         model_context_window: None,
     }));
+}
+
+async fn auto_compact_token_status_for_test(
+    scope: AutoCompactTokenLimitScope,
+    enabled: Option<bool>,
+    active_context_tokens: i64,
+) -> super::context_window::ContextWindowTokenStatus {
+    let (session, turn_context, _rx) = make_session_and_context_with_auth_and_config_and_rx(
+        CodexAuth::from_api_key("Test API Key"),
+        Vec::new(),
+        |config| {
+            config.model_context_window = Some(100);
+            config.model_auto_compact_token_limit = Some(95);
+            config.model_auto_compact_token_limit_scope = scope;
+            if let Some(enabled) = enabled {
+                config.model_auto_compact_enabled = enabled;
+            }
+        },
+    )
+    .await;
+    {
+        let mut state = session.state.lock().await;
+        state.set_token_info(Some(TokenUsageInfo {
+            total_token_usage: TokenUsage::default(),
+            last_token_usage: TokenUsage {
+                total_tokens: active_context_tokens,
+                ..Default::default()
+            },
+            model_context_window: Some(100),
+        }));
+        state.set_auto_compact_window_estimated_prefill(0);
+    }
+
+    super::context_window::context_window_token_status(&session, &turn_context).await
+}
+
+#[tokio::test]
+async fn auto_compact_enabled_by_default_reaches_proactive_threshold() {
+    for scope in [
+        AutoCompactTokenLimitScope::Total,
+        AutoCompactTokenLimitScope::BodyAfterPrefix,
+    ] {
+        let status = auto_compact_token_status_for_test(scope, None, 90).await;
+        assert_eq!(
+            (
+                status.auto_compact_scope_limit,
+                status.full_context_window_limit,
+                status.tokens_until_compaction,
+                status.full_context_window_limit_reached,
+                status.token_limit_reached,
+            ),
+            (Some(90), Some(95), Some(0), false, true),
+        );
+    }
+}
+
+#[tokio::test]
+async fn auto_compact_disabled_uses_full_context_as_safety_boundary() {
+    for scope in [
+        AutoCompactTokenLimitScope::Total,
+        AutoCompactTokenLimitScope::BodyAfterPrefix,
+    ] {
+        let below = auto_compact_token_status_for_test(scope, Some(false), 90).await;
+        assert_eq!(
+            (
+                below.auto_compact_scope_limit,
+                below.full_context_window_limit,
+                below.tokens_until_compaction,
+                below.full_context_window_limit_reached,
+                below.token_limit_reached,
+            ),
+            (None, Some(95), Some(5), false, false),
+        );
+
+        let full = auto_compact_token_status_for_test(scope, Some(false), 95).await;
+        assert_eq!(
+            (
+                full.auto_compact_scope_limit,
+                full.full_context_window_limit,
+                full.tokens_until_compaction,
+                full.full_context_window_limit_reached,
+                full.token_limit_reached,
+            ),
+            (None, Some(95), Some(0), true, true),
+        );
+    }
 }
 
 #[tokio::test]

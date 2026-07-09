@@ -160,6 +160,66 @@ sandbox_mode = "workspace-write"
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn config_read_and_batch_write_round_trip_model_auto_compact_enabled() -> Result<()> {
+    let codex_home = TempDir::new()?;
+    write_config(&codex_home, "model_auto_compact_enabled = false\n")?;
+
+    let mut mcp = TestAppServer::new(codex_home.path()).await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+
+    let request_id = mcp
+        .send_config_read_request(ConfigReadParams {
+            include_layers: false,
+            cwd: None,
+        })
+        .await?;
+    let response: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
+    )
+    .await??;
+    let response: ConfigReadResponse = to_response(response)?;
+
+    assert_eq!(response.config.model_auto_compact_enabled, Some(false));
+
+    let batch_id = mcp
+        .send_config_batch_write_request(ConfigBatchWriteParams {
+            file_path: None,
+            edits: vec![ConfigEdit {
+                key_path: "model_auto_compact_enabled".to_string(),
+                value: json!(true),
+                merge_strategy: MergeStrategy::Replace,
+            }],
+            expected_version: None,
+            reload_user_config: true,
+        })
+        .await?;
+    let batch_response: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(batch_id)),
+    )
+    .await??;
+    let batch_response: ConfigWriteResponse = to_response(batch_response)?;
+    assert_eq!(batch_response.status, WriteStatus::Ok);
+
+    let read_id = mcp
+        .send_config_read_request(ConfigReadParams {
+            include_layers: false,
+            cwd: None,
+        })
+        .await?;
+    let read_response: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(read_id)),
+    )
+    .await??;
+    let read_response: ConfigReadResponse = to_response(read_response)?;
+
+    assert_eq!(read_response.config.model_auto_compact_enabled, Some(true));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn config_read_includes_tools() -> Result<()> {
     let codex_home = TempDir::new()?;
     write_config(

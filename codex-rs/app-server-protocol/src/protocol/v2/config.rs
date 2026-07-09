@@ -246,6 +246,7 @@ pub struct Config {
     pub review_model: Option<String>,
     pub model_context_window: Option<i64>,
     pub model_auto_compact_token_limit: Option<i64>,
+    pub model_auto_compact_enabled: Option<bool>,
     pub model_auto_compact_token_limit_scope: Option<AutoCompactTokenLimitScope>,
     pub model_provider: Option<String>,
     #[experimental(nested)]

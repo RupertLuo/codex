@@ -5230,6 +5230,10 @@
       "description": "Optional override of model selection.",
       "type": "string"
     },
+    "model_auto_compact_enabled": {
+      "description": "Whether proactive automatic compaction is enabled. The full context-window safety threshold remains active when this is disabled.",
+      "type": "boolean"
+    },
     "model_auto_compact_token_limit": {
       "description": "Token usage threshold triggering auto-compaction of conversation history.",
       "format": "int64",

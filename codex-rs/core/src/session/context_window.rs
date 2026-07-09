@@ -16,18 +16,13 @@ pub(crate) struct ContextWindowTokenStatus {
     pub(crate) token_limit_reached: bool,
 }
 
-struct BodyAfterPrefixWindowStatus {
-    full_context_window_limit: Option<i64>,
-    auto_compact_window_prefill_tokens: Option<i64>,
-}
-
 pub(crate) async fn context_window_token_status(
     sess: &Session,
     turn_context: &TurnContext,
 ) -> ContextWindowTokenStatus {
     let active_context_tokens = sess.get_total_token_usage().await;
 
-    let (auto_compact_scope_tokens, auto_compact_scope_limit, body_window) =
+    let (auto_compact_scope_tokens, configured_scope_limit, auto_compact_window_prefill_tokens) =
         match turn_context.config.model_auto_compact_token_limit_scope {
             AutoCompactTokenLimitScope::Total => (
                 active_context_tokens,
@@ -38,29 +33,20 @@ pub(crate) async fn context_window_token_status(
                 let window = sess.auto_compact_window_snapshot().await;
                 let baseline = window.prefill_input_tokens.unwrap_or(active_context_tokens);
 
-                let scope_limit = turn_context
-                    .config
-                    .model_auto_compact_token_limit
-                    .or_else(|| turn_context.model_info.auto_compact_token_limit());
-                let full_context_window_limit = turn_context.model_context_window();
-
                 (
                     active_context_tokens.saturating_sub(baseline),
-                    scope_limit,
-                    Some(BodyAfterPrefixWindowStatus {
-                        full_context_window_limit,
-                        auto_compact_window_prefill_tokens: window.prefill_input_tokens,
-                    }),
+                    turn_context.model_info.auto_compact_token_limit(),
+                    window.prefill_input_tokens,
                 )
             }
         };
 
-    let full_context_window_limit = body_window
-        .as_ref()
-        .and_then(|window| window.full_context_window_limit);
-    let auto_compact_window_prefill_tokens = body_window
-        .as_ref()
-        .and_then(|window| window.auto_compact_window_prefill_tokens);
+    let auto_compact_scope_limit = if turn_context.config.model_auto_compact_enabled {
+        configured_scope_limit
+    } else {
+        None
+    };
+    let full_context_window_limit = turn_context.model_context_window();
 
     let full_context_window_limit_reached =
         full_context_window_limit.is_some_and(|full_context_window_limit| {

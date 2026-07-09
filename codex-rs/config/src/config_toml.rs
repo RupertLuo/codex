@@ -166,6 +166,10 @@ pub struct ConfigToml {
     /// Token usage threshold triggering auto-compaction of conversation history.
     pub model_auto_compact_token_limit: Option<i64>,
 
+    /// Whether proactive automatic compaction is enabled. The full context-window
+    /// safety threshold remains active when this is disabled.
+    pub model_auto_compact_enabled: Option<bool>,
+
     /// Controls whether the auto-compaction limit applies to the full context or
     /// only to tokens after the carried prefix in the current compaction window.
     pub model_auto_compact_token_limit_scope: Option<AutoCompactTokenLimitScope>,

@@ -879,10 +879,14 @@ async fn maybe_run_previous_model_inline_compact(
         .model_auto_compact_token_limit_scope
     {
         AutoCompactTokenLimitScope::Total => {
-            let new_auto_compact_limit = turn_context
-                .model_info
-                .auto_compact_token_limit()
-                .unwrap_or(i64::MAX);
+            let new_auto_compact_limit = if turn_context.config.model_auto_compact_enabled {
+                turn_context
+                    .model_info
+                    .auto_compact_token_limit()
+                    .unwrap_or(i64::MAX)
+            } else {
+                i64::MAX
+            };
             active_context_tokens > new_auto_compact_limit
                 || active_context_tokens >= new_context_window
         }
