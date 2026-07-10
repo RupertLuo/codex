@@ -1,12 +1,76 @@
 use std::borrow::Cow;
+use std::fs;
+use std::path::Path;
 
+use sqlx::AssertSqlSafe;
 use sqlx::Row;
+use sqlx::SqlSafeStr;
 use sqlx::migrate::Migration;
 use sqlx::migrate::Migrator;
 use sqlx::sqlite::SqlitePoolOptions;
 
+use super::GOALS_MIGRATOR;
+use super::LOGS_MIGRATOR;
+use super::MEMORIES_MIGRATOR;
 use super::STATE_MIGRATOR;
 use super::repair_legacy_recency_migration_version;
+
+#[test]
+fn migration_sources_are_lf_normalized_and_match_embedded_checksums() {
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let attributes = fs::read_to_string(manifest_dir.join("../../.gitattributes"))
+        .expect("workspace .gitattributes should be readable");
+    for required_rule in [
+        "codex-rs/state/migrations/*.sql text eol=lf",
+        "codex-rs/state/*_migrations/*.sql text eol=lf",
+    ] {
+        assert!(
+            attributes.lines().any(|line| line.trim() == required_rule),
+            "missing migration line-ending rule: {required_rule}"
+        );
+    }
+
+    for (directory, migrator) in [
+        ("migrations", &STATE_MIGRATOR),
+        ("logs_migrations", &LOGS_MIGRATOR),
+        ("goals_migrations", &GOALS_MIGRATOR),
+        ("memory_migrations", &MEMORIES_MIGRATOR),
+    ] {
+        for embedded in migrator.migrations.iter() {
+            let prefix = format!("{:04}_", embedded.version);
+            let path = fs::read_dir(manifest_dir.join(directory))
+                .expect("migration directory should be readable")
+                .map(|entry| entry.expect("migration entry should be readable").path())
+                .find(|path| {
+                    path.file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| name.starts_with(&prefix) && name.ends_with(".sql"))
+                })
+                .unwrap_or_else(|| panic!("missing migration source for version {}", embedded.version));
+            let bytes = fs::read(&path).expect("migration source should be readable");
+            assert!(
+                !bytes.windows(2).any(|window| window == b"\r\n"),
+                "migration source must use LF line endings: {}",
+                path.display()
+            );
+
+            let sql = String::from_utf8(bytes).expect("migration source should be UTF-8");
+            let normalized = Migration::new(
+                embedded.version,
+                embedded.description.clone(),
+                embedded.migration_type,
+                AssertSqlSafe(sql.replace("\r\n", "\n")).into_sql_str(),
+                embedded.no_tx,
+            );
+            assert_eq!(
+                embedded.checksum,
+                normalized.checksum,
+                "embedded checksum must be derived from LF-normalized SQL: {}",
+                path.display()
+            );
+        }
+    }
+}
 
 fn migrator_through(version: i64) -> Migrator {
     Migrator {
