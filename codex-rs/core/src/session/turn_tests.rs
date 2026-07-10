@@ -65,3 +65,47 @@ async fn plan_mode_uses_contributed_turn_item_for_last_agent_message() {
         Some("plan contributed assistant text")
     );
 }
+
+#[test]
+fn model_downshift_compact_disabled_ignores_proactive_threshold() {
+    assert!(!should_run_model_downshift_compact(
+        "large-model",
+        "small-model",
+        200,
+        100,
+        90,
+        AutoCompactTokenLimitScope::Total,
+        false,
+        Some(80),
+    ));
+
+    assert!(should_run_model_downshift_compact(
+        "large-model",
+        "small-model",
+        200,
+        100,
+        90,
+        AutoCompactTokenLimitScope::Total,
+        true,
+        Some(80),
+    ));
+}
+
+#[test]
+fn model_downshift_compact_disabled_keeps_full_context_safety() {
+    for scope in [
+        AutoCompactTokenLimitScope::Total,
+        AutoCompactTokenLimitScope::BodyAfterPrefix,
+    ] {
+        assert!(should_run_model_downshift_compact(
+            "large-model",
+            "small-model",
+            200,
+            100,
+            100,
+            scope,
+            false,
+            Some(80),
+        ));
+    }
+}

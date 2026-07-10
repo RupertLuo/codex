@@ -874,27 +874,16 @@ async fn maybe_run_previous_model_inline_compact(
         return Ok(());
     };
     let active_context_tokens = sess.get_total_token_usage().await;
-    let previous_model_limit_reached = match turn_context
-        .config
-        .model_auto_compact_token_limit_scope
-    {
-        AutoCompactTokenLimitScope::Total => {
-            let new_auto_compact_limit = if turn_context.config.model_auto_compact_enabled {
-                turn_context
-                    .model_info
-                    .auto_compact_token_limit()
-                    .unwrap_or(i64::MAX)
-            } else {
-                i64::MAX
-            };
-            active_context_tokens > new_auto_compact_limit
-                || active_context_tokens >= new_context_window
-        }
-        AutoCompactTokenLimitScope::BodyAfterPrefix => active_context_tokens >= new_context_window,
-    };
-    let should_run = previous_model_limit_reached
-        && previous_model_turn_context.model_info.slug != turn_context.model_info.slug
-        && old_context_window > new_context_window;
+    let should_run = should_run_model_downshift_compact(
+        previous_model_turn_context.model_info.slug.as_str(),
+        turn_context.model_info.slug.as_str(),
+        old_context_window,
+        new_context_window,
+        active_context_tokens,
+        turn_context.config.model_auto_compact_token_limit_scope,
+        turn_context.config.model_auto_compact_enabled,
+        turn_context.model_info.auto_compact_token_limit(),
+    );
     if should_run {
         // This pre-turn request needs a step built from the previous model's turn context.
         let step_context = sess
@@ -911,6 +900,31 @@ async fn maybe_run_previous_model_inline_compact(
         .await?;
     }
     Ok(())
+}
+
+fn should_run_model_downshift_compact(
+    previous_model_slug: &str,
+    current_model_slug: &str,
+    old_context_window: i64,
+    new_context_window: i64,
+    active_context_tokens: i64,
+    auto_compact_scope: AutoCompactTokenLimitScope,
+    auto_compact_enabled: bool,
+    current_model_auto_compact_limit: Option<i64>,
+) -> bool {
+    if previous_model_slug == current_model_slug || old_context_window <= new_context_window {
+        return false;
+    }
+
+    match auto_compact_scope {
+        AutoCompactTokenLimitScope::Total => {
+            let proactive_limit_reached = auto_compact_enabled
+                && current_model_auto_compact_limit
+                    .is_some_and(|limit| active_context_tokens > limit);
+            proactive_limit_reached || active_context_tokens >= new_context_window
+        }
+        AutoCompactTokenLimitScope::BodyAfterPrefix => active_context_tokens >= new_context_window,
+    }
 }
 
 #[instrument(

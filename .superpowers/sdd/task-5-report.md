@@ -38,7 +38,8 @@ The first attempts through `just test` were tooling-blocked because `just` and t
 - `cargo nextest run --no-fail-fast -p codex-app-server-protocol`: 252/252 passed.
 - Final app-server schema fixture verification: 4/4 passed.
 - Core config-matching suite: 433/433 passed.
-- Core compact-matching suite: 145/149 passed; see concerns below.
+- Core compact-matching suite: 145/149 passed on the first host run; an independent reviewer then provided a bundled Python shim and verified the four hook-execution cases, bringing the compact-matching suite to 149/149.
+- `cargo nextest run --no-fail-fast -p codex-core model_downshift_compact_disabled`: 2/2 passed.
 - Scoped `cargo fmt ... -- --check`: passed.
 - `git diff --check`: passed.
 
@@ -53,12 +54,5 @@ Feature commit: `b7b541398e47cba3d7bbd54abb313c96d0624085`
 
 ## Concerns
 
-1. The four failing compact-matching tests are hook-execution tests:
-   - `manual_pre_compact_block_decision_does_not_block_compaction`
-   - `compact_hooks_respect_matchers_and_post_runs_after_compaction`
-   - `token_budget_compaction_runs_compact_hooks`
-   - `remote_compaction_parity_manual_hooks`
-
-   All invoke `python3` hook scripts. This host only has the Windows Microsoft Store `python3.exe` alias and no real Python interpreter, so scripts do not run and expected hook log files are absent. The remaining 145 compact-matching tests passed, including the focused proactive clamp and full-context tests.
-2. Scoped Clippy is blocked by a pre-existing denied lint in `app-server-protocol/src/protocol/common.rs:197` (`clippy::expect_used`). The changed files did not introduce that diagnostic.
-3. Rustfmt prints existing stable-toolchain warnings for the nightly-only `imports_granularity` setting, but formatting and `--check` both exit successfully.
+1. Scoped Clippy is blocked by a pre-existing denied lint in `app-server-protocol/src/protocol/common.rs:197` (`clippy::expect_used`). The changed files did not introduce that diagnostic.
+2. Rustfmt prints existing stable-toolchain warnings for the nightly-only `imports_granularity` setting, but formatting and `--check` both exit successfully.
