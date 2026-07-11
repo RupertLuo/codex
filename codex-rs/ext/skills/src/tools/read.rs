@@ -9,8 +9,10 @@ use serde::Deserialize;
 use serde::Serialize;
 
 use crate::catalog::SkillPackageId;
+use crate::catalog::SkillProviderError;
 use crate::catalog::SkillResourceId;
 use crate::provider::SkillReadRequest;
+use crate::render::truncate_utf8_to_bytes;
 
 use super::MAX_HANDLE_BYTES;
 use super::SkillToolAuthority;
@@ -22,6 +24,9 @@ use super::skill_tool_name;
 use super::validate_handle;
 
 const TOOL_NAME: &str = "read";
+const MAX_PROVIDER_ERROR_CODE_BYTES: usize = 64;
+const MAX_PROVIDER_ERROR_MESSAGE_BYTES: usize = 512;
+const GENERIC_READ_ERROR: &str = "skill_read_failed: failed to read skill resource";
 
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -85,11 +90,7 @@ impl ToolExecutor<ToolCall> for ReadTool {
                         resource = requested_resource.as_str(),
                         "skills.read provider request failed"
                     );
-                    let message = match err.code.as_deref() {
-                        Some(code) => format!("{code}: {}", err.message),
-                        None => "skill_read_failed: failed to read skill resource".to_string(),
-                    };
-                    FunctionCallError::RespondToModel(message)
+                    FunctionCallError::RespondToModel(provider_error_model_message(&err))
                 })?;
             if result.resource != requested_resource {
                 return Err(FunctionCallError::Fatal(
@@ -103,4 +104,42 @@ impl ToolExecutor<ToolCall> for ReadTool {
             })
         })
     }
+}
+
+fn provider_error_model_message(error: &SkillProviderError) -> String {
+    let Some(code) = error.code.as_deref().filter(|code| valid_error_code(code)) else {
+        return GENERIC_READ_ERROR.to_string();
+    };
+    let Some(message) = sanitized_error_message(&error.message) else {
+        return GENERIC_READ_ERROR.to_string();
+    };
+    format!("{code}: {message}")
+}
+
+fn valid_error_code(code: &str) -> bool {
+    let mut bytes = code.bytes();
+    code.len() <= MAX_PROVIDER_ERROR_CODE_BYTES
+        && bytes.next().is_some_and(|byte| byte.is_ascii_lowercase())
+        && bytes.all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+}
+
+fn sanitized_error_message(message: &str) -> Option<String> {
+    let sanitized = message
+        .chars()
+        .map(|character| {
+            if character.is_control() || character.is_whitespace() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if sanitized.is_empty() {
+        return None;
+    }
+    let (sanitized, _) = truncate_utf8_to_bytes(&sanitized, MAX_PROVIDER_ERROR_MESSAGE_BYTES);
+    Some(sanitized)
 }

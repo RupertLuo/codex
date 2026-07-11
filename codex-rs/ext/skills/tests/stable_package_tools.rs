@@ -11,6 +11,7 @@ use codex_extension_api::ToolExecutor;
 use codex_extension_api::ToolPayload;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::TruncationPolicy;
+use codex_skills_extension::OrchestratorSkillProvider;
 use codex_skills_extension::SkillProviderSource;
 use codex_skills_extension::SkillProviders;
 use codex_skills_extension::SkillsExtensionConfig;
@@ -167,15 +168,140 @@ async fn invalid_dependency_is_omitted_without_omitting_parent() -> TestResult {
     Ok(())
 }
 
+#[tokio::test]
+async fn dependency_output_is_capped_per_entry_and_across_the_list() -> TestResult {
+    let tools = tools(Arc::new(FakePrivateProvider::with_many_dependencies())).await;
+    let listed = call_json(
+        tool(&tools, "list")?,
+        "turn-a",
+        "list-many-dependencies",
+        serde_json::json!({"authority": {"kind": PRIVATE_KIND}}),
+    )
+    .await?;
+
+    let skills = listed["skills"]
+        .as_array()
+        .ok_or("skills should be an array")?;
+    assert_eq!(skills.len(), 5);
+    assert_eq!(skills[0]["dependencies"].as_array().map(Vec::len), Some(32));
+    assert_eq!(
+        skills
+            .iter()
+            .filter_map(|skill| skill["dependencies"].as_array())
+            .map(Vec::len)
+            .sum::<usize>(),
+        100
+    );
+    let truncation_warnings = listed["warnings"]
+        .as_array()
+        .ok_or("warnings should be an array")?
+        .iter()
+        .filter_map(Value::as_str)
+        .filter(|warning| warning.contains("truncated"))
+        .collect::<Vec<_>>();
+    assert_eq!(truncation_warnings.len(), 1);
+    assert!(truncation_warnings[0].len() <= 256);
+    Ok(())
+}
+
+#[tokio::test]
+async fn orchestrator_provider_rejects_unlisted_package_before_transport_access() -> TestResult {
+    let provider = OrchestratorSkillProvider::new();
+    let error = provider
+        .read(SkillReadRequest {
+            authority: SkillAuthority::new(SkillSourceKind::Orchestrator, "codex_apps"),
+            package: SkillPackageId("skill://apps/private".to_string()),
+            resource: SkillResourceId::new("skill://apps/private/SKILL.md"),
+            host_snapshot: None,
+            mcp_resources: None,
+        })
+        .await
+        .expect_err("unlisted orchestrator package should be rejected");
+
+    assert_eq!(
+        error.message,
+        "orchestrator skill package is not authorized by discovery"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn coded_provider_error_is_sanitized_and_bounded_for_the_model() -> TestResult {
+    let tools = tools(Arc::new(FakePrivateProvider::default())).await;
+    let error = match call(
+        tool(&tools, "read")?,
+        "turn-b",
+        "read-unsafe-error",
+        serde_json::json!({
+            "authority": {"kind": PRIVATE_KIND},
+            "package": "private/unsafe-error",
+            "resource": "skill://private/unsafe-error/SKILL.md"
+        }),
+    )
+    .await
+    {
+        Ok(_) => panic!("unsafe provider error should fail"),
+        Err(error) => error,
+    };
+    let FunctionCallError::RespondToModel(message) = error else {
+        panic!("provider failure should be returned to the model");
+    };
+
+    assert!(message.starts_with("private_skill_handle_legacy: "));
+    assert!(message.len() <= 64 + 2 + 512);
+    assert!(!message.chars().any(char::is_control));
+    assert!(!message.contains("/Users/provider/private-skills"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn invalid_provider_error_code_uses_generic_model_message() -> TestResult {
+    let tools = tools(Arc::new(FakePrivateProvider::default())).await;
+    for package in ["private/invalid-code", "private/oversized-code"] {
+        let error = match call(
+            tool(&tools, "read")?,
+            "turn-b",
+            "read-invalid-code",
+            serde_json::json!({
+                "authority": {"kind": PRIVATE_KIND},
+                "package": package,
+                "resource": format!("skill://{package}/SKILL.md")
+            }),
+        )
+        .await
+        {
+            Ok(_) => panic!("invalid coded provider error should fail"),
+            Err(error) => error,
+        };
+
+        assert_eq!(
+            error,
+            FunctionCallError::RespondToModel(
+                "skill_read_failed: failed to read skill resource".to_string()
+            )
+        );
+    }
+    Ok(())
+}
+
 #[derive(Default)]
 struct FakePrivateProvider {
     invalid_dependency: bool,
+    many_dependencies: bool,
 }
 
 impl FakePrivateProvider {
     fn with_invalid_dependency() -> Self {
         Self {
             invalid_dependency: true,
+            many_dependencies: false,
+        }
+    }
+
+    fn with_many_dependencies() -> Self {
+        Self {
+            invalid_dependency: false,
+            many_dependencies: true,
         }
     }
 }
@@ -183,7 +309,36 @@ impl FakePrivateProvider {
 impl SkillProvider for FakePrivateProvider {
     fn list(&self, query: SkillListQuery) -> SkillProviderFuture<'_, SkillCatalog> {
         let invalid_dependency = self.invalid_dependency;
+        let many_dependencies = self.many_dependencies;
         Box::pin(async move {
+            if many_dependencies {
+                return Ok(SkillCatalog {
+                    entries: (0..5)
+                        .map(|parent| {
+                            SkillCatalogEntry::new(
+                                SkillPackageId(format!("private/parent-{parent}")),
+                                private_authority(),
+                                format!("parent-{parent}"),
+                                "Parent Skill",
+                                SkillResourceId::new(format!(
+                                    "skill://private/parent-{parent}/SKILL.md"
+                                )),
+                            )
+                            .with_package_dependencies(
+                                (0..40)
+                                    .map(|child| SkillPackageDependency {
+                                        authority: private_authority(),
+                                        package: SkillPackageId(format!(
+                                            "private/parent-{parent}/child-{child}"
+                                        )),
+                                    })
+                                    .collect(),
+                            )
+                        })
+                        .collect(),
+                    warnings: Vec::new(),
+                });
+            }
             let entry = if query.turn_id == "turn-a" {
                 let dependency_authority = if invalid_dependency {
                     SkillAuthority::new(SkillSourceKind::Host, "host")
@@ -225,6 +380,21 @@ impl SkillProvider for FakePrivateProvider {
                     "The private Skill handle is from the retired turn-scoped format; call skills.list again.",
                 )),
                 "private/failed" => Err(SkillProviderError::new(
+                    "failed below /Users/provider/private-skills/parent/SKILL.md",
+                )),
+                "private/unsafe-error" => Err(SkillProviderError::coded_with_internal(
+                    "private_skill_handle_legacy",
+                    format!("line one\nline two\u{1b} {}", "x".repeat(1_024)),
+                    "failed below /Users/provider/private-skills/parent/SKILL.md",
+                )),
+                "private/invalid-code" => Err(SkillProviderError::coded_with_internal(
+                    "INVALID\nCODE",
+                    "public text",
+                    "failed below /Users/provider/private-skills/parent/SKILL.md",
+                )),
+                "private/oversized-code" => Err(SkillProviderError::coded_with_internal(
+                    "a".repeat(65),
+                    "public text",
                     "failed below /Users/provider/private-skills/parent/SKILL.md",
                 )),
                 _ => Ok(SkillReadResult {
@@ -308,7 +478,7 @@ async fn call(
         call_id: call_id.to_string(),
         tool_name: tool.tool_name(),
         model: "gpt-test".to_string(),
-        truncation_policy: TruncationPolicy::Bytes(4_096),
+        truncation_policy: TruncationPolicy::Bytes(32_768),
         conversation_history: ConversationHistory::default(),
         turn_item_emitter: Arc::new(NoopTurnItemEmitter),
         environments: Vec::new(),

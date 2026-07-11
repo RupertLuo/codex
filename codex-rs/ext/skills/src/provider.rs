@@ -56,7 +56,10 @@ pub type SkillProviderFuture<'a, T> =
 ///
 /// Implementations must preserve authority boundaries: a resource listed by a
 /// provider must be read or searched through the same provider/authority rather
-/// than converted into an ambient local path.
+/// than converted into an ambient local path. Providers are also the final
+/// authorization boundary for their opaque package and resource handles: every
+/// read and search must reject handles that were not issued or otherwise
+/// entitled by that provider. Callers route handles but do not authorize them.
 pub trait SkillProvider: Send + Sync {
     fn list(&self, query: SkillListQuery) -> SkillProviderFuture<'_, SkillCatalog>;
 

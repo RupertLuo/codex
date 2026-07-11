@@ -23,6 +23,8 @@ use super::skill_tool_name;
 const TOOL_NAME: &str = "list";
 const MAX_WARNINGS: usize = 4;
 const MAX_WARNING_BYTES: usize = 256;
+const MAX_DEPENDENCIES_PER_SKILL: usize = 32;
+const MAX_DEPENDENCIES_PER_RESPONSE: usize = 100;
 
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -79,7 +81,10 @@ impl ToolExecutor<ToolCall> for ListTool {
             args.authority.to_authority()?;
             let requested_authority = args.authority.clone();
             let catalog = self.context.catalog(&call.turn_id, args.authority).await;
-            let mut warnings = catalog.warnings;
+            let mut dependency_state = DependencyListState {
+                remaining: MAX_DEPENDENCIES_PER_RESPONSE,
+                ..Default::default()
+            };
             let response = ListResponse {
                 skills: catalog
                     .entries
@@ -87,9 +92,9 @@ impl ToolExecutor<ToolCall> for ListTool {
                     .filter(|entry| {
                         entry.enabled && requested_authority.matches_authority(&entry.authority)
                     })
-                    .filter_map(|entry| listed_skill(entry, &mut warnings))
+                    .filter_map(|entry| listed_skill(entry, &mut dependency_state))
                     .collect(),
-                warnings: bounded_warnings(warnings),
+                warnings: bounded_warnings(dependency_state.warnings(catalog.warnings)),
             };
 
             external_json_output(&response)
@@ -97,34 +102,59 @@ impl ToolExecutor<ToolCall> for ListTool {
     }
 }
 
-fn listed_skill(entry: SkillCatalogEntry, warnings: &mut Vec<String>) -> Option<ListedSkill> {
+#[derive(Default)]
+struct DependencyListState {
+    remaining: usize,
+    invalid: bool,
+    truncated: bool,
+}
+
+impl DependencyListState {
+    fn warnings(self, catalog_warnings: Vec<String>) -> Vec<String> {
+        let mut warnings = Vec::new();
+        if self.invalid {
+            warnings.push(invalid_dependency_warning());
+        }
+        if self.truncated {
+            warnings.push(
+                "skill dependencies were truncated to bounded per-skill and response limits"
+                    .to_string(),
+            );
+        }
+        warnings.extend(catalog_warnings);
+        warnings
+    }
+}
+
+fn listed_skill(
+    entry: SkillCatalogEntry,
+    dependency_state: &mut DependencyListState,
+) -> Option<ListedSkill> {
     let authority = SkillToolAuthority::from_authority(&entry.authority)?;
     if !is_bounded_handle(&entry.id.0, MAX_HANDLE_BYTES)
         || !is_bounded_handle(entry.main_prompt.as_str(), MAX_HANDLE_BYTES)
     {
         return None;
     }
-    let mut omitted_dependency = false;
-    let dependencies = entry
-        .package_dependencies
-        .into_iter()
-        .filter_map(|dependency| {
-            let Some(authority) = SkillToolAuthority::from_authority(&dependency.authority) else {
-                omitted_dependency = true;
-                return None;
-            };
-            if !is_bounded_handle(&dependency.package.0, MAX_HANDLE_BYTES) {
-                omitted_dependency = true;
-                return None;
-            }
-            Some(ListedSkillDependency {
-                authority,
-                package: dependency.package.0,
-            })
-        })
-        .collect();
-    if omitted_dependency {
-        warnings.push(invalid_dependency_warning());
+    let mut dependencies = Vec::new();
+    for dependency in entry.package_dependencies {
+        let Some(authority) = SkillToolAuthority::from_authority(&dependency.authority) else {
+            dependency_state.invalid = true;
+            continue;
+        };
+        if !is_bounded_handle(&dependency.package.0, MAX_HANDLE_BYTES) {
+            dependency_state.invalid = true;
+            continue;
+        }
+        if dependencies.len() >= MAX_DEPENDENCIES_PER_SKILL || dependency_state.remaining == 0 {
+            dependency_state.truncated = true;
+            continue;
+        }
+        dependencies.push(ListedSkillDependency {
+            authority,
+            package: dependency.package.0,
+        });
+        dependency_state.remaining = dependency_state.remaining.saturating_sub(1);
     }
 
     Some(ListedSkill {

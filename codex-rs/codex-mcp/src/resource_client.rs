@@ -48,6 +48,13 @@ impl PartialEq for McpResourceClientCacheKey {
 
 impl Eq for McpResourceClientCacheKey {}
 
+impl McpResourceClientCacheKey {
+    /// Returns whether the manager generation represented by this key is still retained.
+    pub fn is_alive(&self) -> bool {
+        self.0.strong_count() > 0
+    }
+}
+
 impl std::fmt::Debug for McpResourceClient {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter

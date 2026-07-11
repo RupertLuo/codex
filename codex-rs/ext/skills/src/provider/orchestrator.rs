@@ -1,7 +1,10 @@
 use std::collections::HashSet;
+use std::sync::Arc;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use codex_mcp::CODEX_APPS_MCP_SERVER_NAME;
+use codex_mcp::McpResourceClientCacheKey;
 use codex_protocol::mcp::Resource;
 use codex_protocol::mcp::ResourceContent;
 use url::Url;
@@ -36,17 +39,28 @@ const MAX_SKILL_RESOURCE_CONTENT_BYTES: usize = 1024 * 1024;
 ///
 /// The provider uses session-scoped resources without exposing the transport or
 /// resource server to callers that configure the skills extension.
-#[derive(Clone, Debug, Default)]
-pub struct OrchestratorSkillProvider;
+#[derive(Clone, Default)]
+pub struct OrchestratorSkillProvider {
+    authorized_catalogs: Arc<Mutex<Vec<AuthorizedCatalog>>>,
+}
+
+impl std::fmt::Debug for OrchestratorSkillProvider {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("OrchestratorSkillProvider")
+            .finish_non_exhaustive()
+    }
+}
 
 impl OrchestratorSkillProvider {
     pub fn new() -> Self {
-        Self
+        Self::default()
     }
 }
 
 impl SkillProvider for OrchestratorSkillProvider {
     fn list(&self, query: SkillListQuery) -> SkillProviderFuture<'_, SkillCatalog> {
+        let authorized_catalogs = Arc::clone(&self.authorized_catalogs);
         Box::pin(async move {
             let Some(client) = query.mcp_resources else {
                 return Ok(SkillCatalog::default());
@@ -144,11 +158,14 @@ impl SkillProvider for OrchestratorSkillProvider {
                 ));
             }
 
+            authorize_catalog(&authorized_catalogs, client.cache_key(), &catalog);
+
             Ok(catalog)
         })
     }
 
     fn read(&self, request: SkillReadRequest) -> SkillProviderFuture<'_, SkillReadResult> {
+        let authorized_catalogs = Arc::clone(&self.authorized_catalogs);
         Box::pin(async move {
             if request.authority
                 != SkillAuthority::new(SkillSourceKind::Orchestrator, CODEX_APPS_MCP_SERVER_NAME)
@@ -164,10 +181,22 @@ impl SkillProvider for OrchestratorSkillProvider {
                 ));
             }
 
-            let Some(client) = request.mcp_resources.as_ref() else {
+            let authorized = request.mcp_resources.as_ref().is_some_and(|client| {
+                is_authorized(
+                    &authorized_catalogs,
+                    &client.cache_key(),
+                    &request.package,
+                    &request.resource,
+                )
+            });
+            if !authorized {
                 return Err(SkillProviderError::new(
-                    "session MCP resource client is not configured",
+                    "orchestrator skill package is not authorized by discovery",
                 ));
+            }
+
+            let Some(client) = request.mcp_resources.as_ref() else {
+                unreachable!("authorized orchestrator reads have an MCP resource client");
             };
             let result = tokio::time::timeout(
                 ORCHESTRATOR_SKILL_READ_TIMEOUT,
@@ -217,6 +246,63 @@ impl SkillProvider for OrchestratorSkillProvider {
     fn search(&self, _request: SkillSearchRequest) -> SkillProviderFuture<'_, SkillSearchResult> {
         Box::pin(async { Ok(SkillSearchResult::default()) })
     }
+}
+
+struct AuthorizedCatalog {
+    client: McpResourceClientCacheKey,
+    resources: HashSet<AuthorizedResource>,
+}
+
+#[derive(Hash, PartialEq, Eq)]
+struct AuthorizedResource {
+    package: SkillPackageId,
+    resource: SkillResourceId,
+}
+
+fn authorize_catalog(
+    authorized_catalogs: &Mutex<Vec<AuthorizedCatalog>>,
+    client: McpResourceClientCacheKey,
+    catalog: &SkillCatalog,
+) {
+    let resources = catalog
+        .entries
+        .iter()
+        .filter(|entry| entry.enabled)
+        .map(|entry| AuthorizedResource {
+            package: entry.id.clone(),
+            resource: entry.main_prompt.clone(),
+        })
+        .collect();
+    let mut authorized_catalogs = authorized_catalogs
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    authorized_catalogs.retain(|catalog| catalog.client.is_alive());
+    if let Some(position) = authorized_catalogs
+        .iter()
+        .position(|catalog| catalog.client == client)
+    {
+        authorized_catalogs.remove(position);
+    }
+    authorized_catalogs.push(AuthorizedCatalog { client, resources });
+}
+
+fn is_authorized(
+    authorized_catalogs: &Mutex<Vec<AuthorizedCatalog>>,
+    client: &McpResourceClientCacheKey,
+    package: &SkillPackageId,
+    resource: &SkillResourceId,
+) -> bool {
+    authorized_catalogs
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .find(|catalog| &catalog.client == client)
+        .is_some_and(|catalog| {
+            catalog.resources.contains(&AuthorizedResource {
+                package: package.clone(),
+                resource: resource.clone(),
+            })
+        })
 }
 
 fn catalog_entry_from_resource(resource: &Resource) -> Option<SkillCatalogEntry> {

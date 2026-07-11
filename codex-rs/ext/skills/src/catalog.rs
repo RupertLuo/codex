@@ -239,20 +239,37 @@ pub struct SkillSearchMatch {
 pub struct SkillProviderError {
     pub code: Option<String>,
     pub message: String,
+    pub internal_message: String,
 }
 
 impl SkillProviderError {
     pub fn new(message: impl Into<String>) -> Self {
+        let message = message.into();
         Self {
             code: None,
-            message: message.into(),
+            internal_message: message.clone(),
+            message,
         }
     }
 
     pub fn coded(code: impl Into<String>, message: impl Into<String>) -> Self {
+        let message = message.into();
+        Self {
+            code: Some(code.into()),
+            internal_message: message.clone(),
+            message,
+        }
+    }
+
+    pub fn coded_with_internal(
+        code: impl Into<String>,
+        message: impl Into<String>,
+        internal_message: impl Into<String>,
+    ) -> Self {
         Self {
             code: Some(code.into()),
             message: message.into(),
+            internal_message: internal_message.into(),
         }
     }
 }
@@ -260,9 +277,9 @@ impl SkillProviderError {
 impl std::fmt::Display for SkillProviderError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if let Some(code) = &self.code {
-            write!(formatter, "{code}: {}", self.message)
+            write!(formatter, "{code}: {}", self.internal_message)
         } else {
-            self.message.fmt(formatter)
+            self.internal_message.fmt(formatter)
         }
     }
 }
