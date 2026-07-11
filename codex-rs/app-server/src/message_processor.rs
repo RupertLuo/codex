@@ -792,6 +792,7 @@ impl MessageProcessor {
                         return;
                     }
                     let rpc_context = rpc_context
+                        .with_outgoing(Arc::clone(&self.outgoing))
                         .with_native_plugin_gateway(Arc::new(MessageProcessorNativePluginGateway {
                             processor: Arc::clone(self),
                         }))

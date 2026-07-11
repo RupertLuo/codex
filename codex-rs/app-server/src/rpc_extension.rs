@@ -1,4 +1,5 @@
 use codex_app_server_protocol::JSONRPCErrorError;
+use codex_app_server_protocol::JSONRPCNotification;
 use codex_app_server_protocol::PluginListParams;
 use codex_app_server_protocol::PluginListResponse;
 use codex_app_server_protocol::TurnStartParams;
@@ -11,6 +12,8 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use thiserror::Error;
+
+use crate::outgoing_message::OutgoingMessageSender;
 
 pub type AppServerRpcFuture<'a> =
     Pin<Box<dyn Future<Output = Result<serde_json::Value, JSONRPCErrorError>> + Send + 'a>>;
@@ -62,6 +65,7 @@ pub enum AppServerRpcTransportContext {
 #[derive(Clone)]
 pub struct AppServerRpcContext {
     pub transport: AppServerRpcTransportContext,
+    outgoing: Option<Arc<OutgoingMessageSender>>,
     native_plugin_gateway: Option<Arc<dyn AppServerNativePluginGateway>>,
     native_turn_gateway: Option<Arc<dyn AppServerNativeTurnGateway>>,
 }
@@ -70,9 +74,34 @@ impl AppServerRpcContext {
     pub fn new(transport: AppServerRpcTransportContext) -> Self {
         Self {
             transport,
+            outgoing: None,
             native_plugin_gateway: None,
             native_turn_gateway: None,
         }
+    }
+
+    pub(crate) fn with_outgoing(mut self, outgoing: Arc<OutgoingMessageSender>) -> Self {
+        self.outgoing = Some(outgoing);
+        self
+    }
+
+    /// Emits an arbitrary JSON-RPC notification owned by the active extension.
+    pub async fn send_notification(
+        &self,
+        method: impl Into<String>,
+        params: Option<serde_json::Value>,
+    ) -> Result<(), JSONRPCErrorError> {
+        let outgoing = self
+            .outgoing
+            .as_ref()
+            .ok_or_else(extension_notification_gateway_unavailable)?;
+        outgoing
+            .send_extension_notification(JSONRPCNotification {
+                method: method.into(),
+                params,
+            })
+            .await;
+        Ok(())
     }
 
     pub(crate) fn with_native_turn_gateway(
@@ -178,7 +207,16 @@ impl Debug for AppServerRpcContext {
                 "native_turn_gateway_available",
                 &self.native_turn_gateway.is_some(),
             )
+            .field("notification_gateway_available", &self.outgoing.is_some())
             .finish()
+    }
+}
+
+fn extension_notification_gateway_unavailable() -> JSONRPCErrorError {
+    JSONRPCErrorError {
+        code: -32603,
+        message: "Extension notification gateway is unavailable in this RPC context.".to_string(),
+        data: None,
     }
 }
 

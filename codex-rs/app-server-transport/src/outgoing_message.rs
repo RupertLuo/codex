@@ -1,6 +1,7 @@
 use std::fmt;
 
 use codex_app_server_protocol::JSONRPCErrorError;
+use codex_app_server_protocol::JSONRPCNotification;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::Result;
 use codex_app_server_protocol::ServerNotification;
@@ -26,6 +27,8 @@ pub enum OutgoingMessage {
     /// AppServerNotification is specific to the case where this is run as an
     /// "app server" as opposed to an MCP server.
     AppServerNotification(ServerNotification),
+    /// Notification emitted by an installed RPC extension.
+    ExtensionNotification(JSONRPCNotification),
     Response(OutgoingResponse),
     Error(OutgoingError),
 }

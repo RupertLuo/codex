@@ -685,6 +685,9 @@ async fn start_uninitialized(args: InProcessStartArgs) -> IoResult<InProcessClie
                                 }
                             }
                         }
+                        OutgoingMessage::ExtensionNotification(_) => {
+                            warn!("dropping extension notification for in-process client");
+                        }
                     }
                     if let Some(write_complete_tx) = queued_message.write_complete_tx {
                         let _ = write_complete_tx.send(());

@@ -610,6 +610,21 @@ impl OutgoingMessageSender {
             .await;
     }
 
+    pub(crate) async fn send_extension_notification(
+        &self,
+        notification: codex_app_server_protocol::JSONRPCNotification,
+    ) {
+        if let Err(err) = self
+            .sender
+            .send(OutgoingEnvelope::Broadcast {
+                message: OutgoingMessage::ExtensionNotification(notification),
+            })
+            .await
+        {
+            warn!("failed to send extension notification to client: {err:?}");
+        }
+    }
+
     pub(crate) async fn send_server_notification_to_connections(
         &self,
         connection_ids: &[ConnectionId],
