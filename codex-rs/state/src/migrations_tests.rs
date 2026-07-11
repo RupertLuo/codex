@@ -46,7 +46,9 @@ fn migration_sources_are_lf_normalized_and_match_embedded_checksums() {
                         .and_then(|name| name.to_str())
                         .is_some_and(|name| name.starts_with(&prefix) && name.ends_with(".sql"))
                 })
-                .unwrap_or_else(|| panic!("missing migration source for version {}", embedded.version));
+                .unwrap_or_else(|| {
+                    panic!("missing migration source for version {}", embedded.version)
+                });
             let bytes = fs::read(&path).expect("migration source should be readable");
             assert!(
                 !bytes.windows(2).any(|window| window == b"\r\n"),

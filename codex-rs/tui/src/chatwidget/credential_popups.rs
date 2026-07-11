@@ -62,7 +62,10 @@ impl ChatWidget {
 
     pub(crate) fn open_credentials_popup_with_entries(&mut self, entries: Vec<CredentialEntry>) {
         if entries.is_empty() {
-            self.add_info_message("No credentials are configured.".to_string(), /*hint*/ None);
+            self.add_info_message(
+                "No credentials are configured.".to_string(),
+                /*hint*/ None,
+            );
             return;
         }
 
