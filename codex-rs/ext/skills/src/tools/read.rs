@@ -62,16 +62,6 @@ impl ToolExecutor<ToolCall> for ReadTool {
             validate_handle("package", &args.package, MAX_HANDLE_BYTES)?;
             validate_handle("resource", &args.resource, MAX_HANDLE_BYTES)?;
 
-            let catalog = self.context.catalog(&call.turn_id, args.authority).await;
-            let package_is_available = catalog.entries.iter().any(|entry| {
-                entry.enabled && entry.authority == authority && entry.id.0 == args.package
-            });
-            if !package_is_available {
-                return Err(FunctionCallError::RespondToModel(
-                    "skill package is not available from the requested authority".to_string(),
-                ));
-            }
-
             let requested_resource = SkillResourceId::new(args.resource);
             let result = self
                 .context
@@ -95,7 +85,11 @@ impl ToolExecutor<ToolCall> for ReadTool {
                         resource = requested_resource.as_str(),
                         "skills.read provider request failed"
                     );
-                    FunctionCallError::RespondToModel("failed to read skill resource".to_string())
+                    let message = match err.code.as_deref() {
+                        Some(code) => format!("{code}: {}", err.message),
+                        None => "skill_read_failed: failed to read skill resource".to_string(),
+                    };
+                    FunctionCallError::RespondToModel(message)
                 })?;
             if result.resource != requested_resource {
                 return Err(FunctionCallError::Fatal(

@@ -57,6 +57,12 @@ impl SkillAuthority {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct SkillPackageId(pub String);
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SkillPackageDependency {
+    pub authority: SkillAuthority,
+    pub package: SkillPackageId,
+}
+
 /// Opaque resource id inside a skill package, optionally bound to the
 /// environment path that owns its contents.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -115,6 +121,7 @@ pub struct SkillCatalogEntry {
     pub main_prompt: SkillResourceId,
     pub display_path: Option<String>,
     pub dependencies: Option<SkillDependencies>,
+    pub package_dependencies: Vec<SkillPackageDependency>,
     pub enabled: bool,
     pub prompt_visible: bool,
 }
@@ -136,6 +143,7 @@ impl SkillCatalogEntry {
             main_prompt,
             display_path: None,
             dependencies: None,
+            package_dependencies: Vec::new(),
             enabled: true,
             prompt_visible: true,
         }
@@ -153,6 +161,11 @@ impl SkillCatalogEntry {
 
     pub fn with_dependencies(mut self, dependencies: Option<SkillDependencies>) -> Self {
         self.dependencies = dependencies;
+        self
+    }
+
+    pub fn with_package_dependencies(mut self, dependencies: Vec<SkillPackageDependency>) -> Self {
+        self.package_dependencies = dependencies;
         self
     }
 
@@ -224,12 +237,21 @@ pub struct SkillSearchMatch {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SkillProviderError {
+    pub code: Option<String>,
     pub message: String,
 }
 
 impl SkillProviderError {
     pub fn new(message: impl Into<String>) -> Self {
         Self {
+            code: None,
+            message: message.into(),
+        }
+    }
+
+    pub fn coded(code: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            code: Some(code.into()),
             message: message.into(),
         }
     }
@@ -237,7 +259,11 @@ impl SkillProviderError {
 
 impl std::fmt::Display for SkillProviderError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.message.fmt(formatter)
+        if let Some(code) = &self.code {
+            write!(formatter, "{code}: {}", self.message)
+        } else {
+            self.message.fmt(formatter)
+        }
     }
 }
 
