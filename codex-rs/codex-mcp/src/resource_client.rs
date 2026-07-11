@@ -36,6 +36,12 @@ pub struct McpResourceClient {
     manager: Arc<ArcSwap<McpConnectionManager>>,
 }
 
+/// One stable MCP connection-manager generation used for a multi-call operation.
+#[derive(Clone)]
+pub struct McpResourceClientGeneration {
+    manager: Arc<McpConnectionManager>,
+}
+
 /// Opaque identity for the manager currently used by an MCP resource client.
 #[derive(Clone)]
 pub struct McpResourceClientCacheKey(Weak<McpConnectionManager>);
@@ -63,22 +69,37 @@ impl std::fmt::Debug for McpResourceClient {
     }
 }
 
+impl std::fmt::Debug for McpResourceClientGeneration {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("McpResourceClientGeneration")
+            .finish_non_exhaustive()
+    }
+}
+
 impl McpResourceClient {
     /// Creates a resource client backed by the session's replaceable MCP manager.
     pub fn new(manager: Arc<ArcSwap<McpConnectionManager>>) -> Self {
         Self { manager }
     }
 
+    /// Captures the currently published manager for a generation-consistent operation.
+    pub fn capture_generation(&self) -> McpResourceClientGeneration {
+        McpResourceClientGeneration {
+            manager: self.manager.load_full(),
+        }
+    }
+
     /// Returns an identity that changes whenever the published manager changes.
     pub fn cache_key(&self) -> McpResourceClientCacheKey {
-        McpResourceClientCacheKey(Arc::downgrade(&self.manager.load_full()))
+        self.capture_generation().cache_key()
     }
 
     /// Returns whether the current manager contains the named server.
     ///
     /// This does not wait for server startup or imply that startup succeeded.
     pub async fn has_server(&self, server: &str) -> bool {
-        self.manager.load_full().contains_server(server)
+        self.capture_generation().has_server(server)
     }
 
     /// Lists one resource page from the named server.
@@ -89,11 +110,45 @@ impl McpResourceClient {
     ) -> Result<McpResourcePage> {
         let params =
             cursor.map(|cursor| PaginatedRequestParams::default().with_cursor(Some(cursor)));
-        let result = self
-            .manager
-            .load_full()
-            .list_resources(server, params)
-            .await?;
+        self.capture_generation()
+            .list_resources_with_params(server, params)
+            .await
+    }
+
+    /// Reads one resource using the manager generation current at call start.
+    pub async fn read_resource(&self, server: &str, uri: &str) -> Result<McpResourceReadResult> {
+        self.capture_generation().read_resource(server, uri).await
+    }
+}
+
+impl McpResourceClientGeneration {
+    /// Returns the identity of this exact manager generation.
+    pub fn cache_key(&self) -> McpResourceClientCacheKey {
+        McpResourceClientCacheKey(Arc::downgrade(&self.manager))
+    }
+
+    /// Returns whether this generation contains the named server.
+    pub fn has_server(&self, server: &str) -> bool {
+        self.manager.contains_server(server)
+    }
+
+    /// Lists one resource page through this exact manager generation.
+    pub async fn list_resources(
+        &self,
+        server: &str,
+        cursor: Option<String>,
+    ) -> Result<McpResourcePage> {
+        let params =
+            cursor.map(|cursor| PaginatedRequestParams::default().with_cursor(Some(cursor)));
+        self.list_resources_with_params(server, params).await
+    }
+
+    async fn list_resources_with_params(
+        &self,
+        server: &str,
+        params: Option<PaginatedRequestParams>,
+    ) -> Result<McpResourcePage> {
+        let result = self.manager.list_resources(server, params).await?;
         let resources = result
             .resources
             .into_iter()
@@ -105,11 +160,10 @@ impl McpResourceClient {
         })
     }
 
-    /// Reads one resource from the named server.
+    /// Reads one resource through this exact manager generation.
     pub async fn read_resource(&self, server: &str, uri: &str) -> Result<McpResourceReadResult> {
         let result = self
             .manager
-            .load_full()
             .read_resource(server, ReadResourceRequestParams::new(uri.to_string()))
             .await?;
         let contents = result

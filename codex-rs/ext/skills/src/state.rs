@@ -3,8 +3,8 @@ use std::future::Future;
 use std::sync::Arc;
 use std::sync::Mutex;
 
-use codex_mcp::McpResourceClient;
 use codex_mcp::McpResourceClientCacheKey;
+use codex_mcp::McpResourceClientGeneration;
 use codex_protocol::capabilities::SelectedCapabilityRoot;
 use tokio::sync::OnceCell;
 
@@ -85,10 +85,10 @@ impl SkillsThreadState {
 
     pub(crate) async fn orchestrator_catalog_snapshot(
         &self,
-        mcp_resources: Option<&McpResourceClient>,
+        mcp_resource_generation: Option<&McpResourceClientGeneration>,
         initialize: impl Future<Output = Result<SkillCatalog, SkillProviderError>> + Send,
     ) -> SkillCatalog {
-        self.orchestrator_cache(mcp_resources)
+        self.orchestrator_cache(mcp_resource_generation.map(McpResourceClientGeneration::cache_key))
             .catalog
             .get_or_init(|| async {
                 initialize.await.unwrap_or_else(|err| SkillCatalog {
@@ -103,13 +103,24 @@ impl SkillsThreadState {
     pub(crate) async fn read_skill(
         &self,
         providers: &SkillProviders,
-        request: SkillReadRequest,
+        mut request: SkillReadRequest,
     ) -> SkillProviderResult<SkillReadResult> {
         if request.authority.kind != SkillSourceKind::Orchestrator {
             return providers.read(request).await;
         }
 
-        let cache = self.orchestrator_cache(request.mcp_resources.as_deref());
+        let generation = request.mcp_resource_generation.clone().or_else(|| {
+            request
+                .mcp_resources
+                .as_ref()
+                .map(|client| client.capture_generation())
+        });
+        request.mcp_resource_generation = generation.clone();
+        let cache = self.orchestrator_cache(
+            generation
+                .as_ref()
+                .map(McpResourceClientGeneration::cache_key),
+        );
         let cache_key = SkillReadCacheKey::from(&request);
         if let Some(result) = cache
             .resources
@@ -134,13 +145,12 @@ impl SkillsThreadState {
 
     fn orchestrator_cache(
         &self,
-        mcp_resources: Option<&McpResourceClient>,
+        cache_key: Option<McpResourceClientCacheKey>,
     ) -> Arc<OrchestratorGenerationCache> {
         let mut cache = self
             .orchestrator_cache
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let cache_key = mcp_resources.map(McpResourceClient::cache_key);
         if let Some(cache) = cache
             .as_ref()
             .filter(|cache| cache.mcp_cache_key == cache_key)

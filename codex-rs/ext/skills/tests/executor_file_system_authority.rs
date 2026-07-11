@@ -265,6 +265,7 @@ async fn selected_root_id_distinguishes_identical_executor_paths() {
             include_bundled_skills: true,
             include_orchestrator_skills: false,
             mcp_resources: None,
+            mcp_resource_generation: None,
         })
         .await
         .expect("list executor skills");

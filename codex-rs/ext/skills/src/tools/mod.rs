@@ -62,9 +62,13 @@ impl SkillToolContext {
     async fn catalog(&self, turn_id: &str, authority: SkillToolAuthority) -> SkillCatalog {
         match authority.kind.as_str() {
             "orchestrator" => {
+                let generation = self
+                    .mcp_resources
+                    .as_ref()
+                    .map(|client| client.capture_generation());
                 self.thread_state
                     .orchestrator_catalog_snapshot(
-                        self.mcp_resources.as_deref(),
+                        generation.as_ref(),
                         self.providers.list_orchestrator_for_turn(SkillListQuery {
                             turn_id: turn_id.to_string(),
                             executor_roots: Vec::new(),
@@ -73,6 +77,7 @@ impl SkillToolContext {
                             include_bundled_skills: false,
                             include_orchestrator_skills: true,
                             mcp_resources: self.mcp_resources.clone(),
+                            mcp_resource_generation: generation.clone(),
                         }),
                     )
                     .await
@@ -87,6 +92,7 @@ impl SkillToolContext {
                         include_bundled_skills: false,
                         include_orchestrator_skills: false,
                         mcp_resources: self.mcp_resources.clone(),
+                        mcp_resource_generation: None,
                     })
                     .await
             }
@@ -102,6 +108,7 @@ impl SkillToolContext {
                             include_bundled_skills: false,
                             include_orchestrator_skills: false,
                             mcp_resources: self.mcp_resources.clone(),
+                            mcp_resource_generation: None,
                         },
                         &kind,
                     )

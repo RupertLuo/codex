@@ -8,6 +8,7 @@ mod orchestrator;
 
 use codex_core_skills::HostSkillsSnapshot;
 use codex_mcp::McpResourceClient;
+use codex_mcp::McpResourceClientGeneration;
 use codex_protocol::capabilities::SelectedCapabilityRoot;
 
 use crate::catalog::SkillAuthority;
@@ -31,6 +32,7 @@ pub struct SkillListQuery {
     pub include_bundled_skills: bool,
     pub include_orchestrator_skills: bool,
     pub mcp_resources: Option<Arc<McpResourceClient>>,
+    pub mcp_resource_generation: Option<McpResourceClientGeneration>,
 }
 
 #[derive(Clone, Debug)]
@@ -40,6 +42,7 @@ pub struct SkillReadRequest {
     pub resource: SkillResourceId,
     pub host_snapshot: Option<Arc<HostSkillsSnapshot>>,
     pub mcp_resources: Option<Arc<McpResourceClient>>,
+    pub mcp_resource_generation: Option<McpResourceClientGeneration>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

@@ -123,6 +123,7 @@ where
                         include_bundled_skills: config.bundled_skills_enabled,
                         include_orchestrator_skills: thread_state.orchestrator_skills_enabled(),
                         mcp_resources: session_store.get::<McpResourceClient>(),
+                        mcp_resource_generation: None,
                     },
                     &thread_state,
                 )
@@ -160,6 +161,7 @@ where
                         include_bundled_skills: config.bundled_skills_enabled,
                         include_orchestrator_skills: false,
                         mcp_resources: input.session_store.get::<McpResourceClient>(),
+                        mcp_resource_generation: None,
                     },
                 )
                 .await;
@@ -231,6 +233,7 @@ where
                 include_bundled_skills: config.bundled_skills_enabled,
                 include_orchestrator_skills: thread_state.orchestrator_skills_enabled(),
                 mcp_resources: session_store.get::<McpResourceClient>(),
+                mcp_resource_generation: None,
             };
             let mut catalog = self.list_skills(query, &thread_state).await;
             if let Some(executor_skills) = turn_store.get::<ExecutorSkillsStepState>() {
@@ -338,15 +341,19 @@ impl<C> SkillsExtension<C> {
         thread_state: &SkillsThreadState,
     ) -> SkillCatalog {
         let include_orchestrator_skills = query.include_orchestrator_skills;
-        let orchestrator_query = query.clone();
+        let mut orchestrator_query = query.clone();
         let mcp_resources = orchestrator_query.mcp_resources.clone();
+        let mcp_resource_generation = mcp_resources
+            .as_ref()
+            .map(|client| client.capture_generation());
+        orchestrator_query.mcp_resource_generation = mcp_resource_generation.clone();
         query.include_orchestrator_skills = false;
 
         let mut catalog = self.providers.list_for_turn(query).await;
         if include_orchestrator_skills {
             let orchestrator_catalog = thread_state
                 .orchestrator_catalog_snapshot(
-                    mcp_resources.as_deref(),
+                    mcp_resource_generation.as_ref(),
                     self.providers
                         .list_orchestrator_for_turn(orchestrator_query),
                 )
@@ -364,6 +371,10 @@ impl<C> SkillsExtension<C> {
         session_store: &ExtensionData,
         thread_state: &SkillsThreadState,
     ) -> Result<SkillReadResult, String> {
+        let mcp_resources = session_store.get::<McpResourceClient>();
+        let mcp_resource_generation = mcp_resources
+            .as_ref()
+            .map(|client| client.capture_generation());
         thread_state
             .read_skill(
                 &self.providers,
@@ -372,7 +383,8 @@ impl<C> SkillsExtension<C> {
                     package: entry.id.clone(),
                     resource: entry.main_prompt.clone(),
                     host_snapshot,
-                    mcp_resources: session_store.get::<McpResourceClient>(),
+                    mcp_resources,
+                    mcp_resource_generation,
                 },
             )
             .await

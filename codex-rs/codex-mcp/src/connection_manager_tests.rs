@@ -19,6 +19,7 @@ use crate::tools::ToolInfo;
 use crate::tools::filter_tools;
 use crate::tools::normalize_tools_for_model_with_prefix;
 use crate::tools::tool_with_model_visible_input_schema;
+use arc_swap::ArcSwap;
 use codex_config::AppToolApproval;
 use codex_config::Constrained;
 use codex_config::McpServerConfig;
@@ -30,22 +31,41 @@ use codex_protocol::ToolName;
 use codex_protocol::mcp::McpServerInfo;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::protocol::GranularApprovalConfig;
+use codex_rmcp_client::ElicitationResponse;
 use codex_rmcp_client::InProcessTransportFactory;
 use codex_rmcp_client::RmcpClient;
 use futures::FutureExt;
 use futures::future::BoxFuture;
 use pretty_assertions::assert_eq;
+use rmcp::ServerHandler;
+use rmcp::ServiceExt;
+use rmcp::model::ClientCapabilities;
 use rmcp::model::CreateElicitationRequestParams;
 use rmcp::model::ElicitationAction;
 use rmcp::model::ElicitationCapability;
+use rmcp::model::Implementation;
+use rmcp::model::InitializeRequestParams;
 use rmcp::model::JsonObject;
+use rmcp::model::ListResourcesResult;
 use rmcp::model::Meta;
 use rmcp::model::NumberOrString;
+use rmcp::model::ProtocolVersion;
+use rmcp::model::RawResource;
+use rmcp::model::ReadResourceRequestParams;
+use rmcp::model::ReadResourceResult;
+use rmcp::model::Resource;
+use rmcp::model::ResourceContents;
+use rmcp::model::ServerCapabilities;
+use rmcp::model::ServerInfo;
 use rmcp::model::Tool;
+use rmcp::service::RequestContext;
+use rmcp::service::RoleServer;
+use serde_json::json;
 use std::collections::HashSet;
 use std::io;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering as AtomicOrdering;
 use tempfile::tempdir;
 use tokio::io::DuplexStream;
 
@@ -104,6 +124,212 @@ impl InProcessTransportFactory for TestInProcessTransportFactory {
         }
         .boxed()
     }
+}
+
+#[derive(Default)]
+struct GenerationResourceCalls {
+    list: AtomicUsize,
+    read: AtomicUsize,
+}
+
+#[derive(Clone)]
+struct GenerationResourceServer {
+    generation: &'static str,
+    calls: Arc<GenerationResourceCalls>,
+}
+
+impl ServerHandler for GenerationResourceServer {
+    fn get_info(&self) -> ServerInfo {
+        ServerInfo::new(ServerCapabilities::builder().enable_resources().build())
+    }
+
+    async fn list_resources(
+        &self,
+        request: Option<rmcp::model::PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListResourcesResult, rmcp::ErrorData> {
+        self.calls.list.fetch_add(1, AtomicOrdering::Relaxed);
+        let page = if request.and_then(|request| request.cursor).is_none() {
+            "one"
+        } else {
+            "two"
+        };
+        Ok(ListResourcesResult {
+            resources: vec![Resource::new(
+                RawResource::new(
+                    format!("skill://{}/{page}", self.generation),
+                    format!("{}-{page}", self.generation),
+                ),
+                /*annotations*/ None,
+            )],
+            next_cursor: (page == "one").then(|| "next".to_string()),
+            meta: None,
+        })
+    }
+
+    async fn read_resource(
+        &self,
+        request: ReadResourceRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ReadResourceResult, rmcp::ErrorData> {
+        self.calls.read.fetch_add(1, AtomicOrdering::Relaxed);
+        Ok(ReadResourceResult::new(vec![
+            ResourceContents::TextResourceContents {
+                uri: request.uri,
+                mime_type: Some("text/plain".to_string()),
+                text: self.generation.to_string(),
+                meta: None,
+            },
+        ]))
+    }
+}
+
+#[derive(Clone)]
+struct GenerationResourceTransportFactory {
+    server: GenerationResourceServer,
+}
+
+impl InProcessTransportFactory for GenerationResourceTransportFactory {
+    fn open(&self) -> BoxFuture<'static, io::Result<DuplexStream>> {
+        let server = self.server.clone();
+        async move {
+            let (client_stream, server_stream) = tokio::io::duplex(16 * 1024);
+            tokio::spawn(async move {
+                let running = server
+                    .serve(server_stream)
+                    .await
+                    .expect("serve generation test MCP");
+                let _ = running.waiting().await;
+            });
+            Ok(client_stream)
+        }
+        .boxed()
+    }
+}
+
+async fn generation_test_manager(
+    generation: &'static str,
+    calls: Arc<GenerationResourceCalls>,
+) -> Arc<McpConnectionManager> {
+    let client = Arc::new(
+        RmcpClient::new_in_process_client(Arc::new(GenerationResourceTransportFactory {
+            server: GenerationResourceServer { generation, calls },
+        }))
+        .await
+        .expect("create generation test MCP client"),
+    );
+    client
+        .initialize(
+            InitializeRequestParams::new(
+                ClientCapabilities::default(),
+                Implementation::new("generation-test", "0.0.0"),
+            )
+            .with_protocol_version(ProtocolVersion::V_2025_06_18),
+            /*timeout*/ None,
+            Box::new(|_, _| {
+                async {
+                    Ok(ElicitationResponse {
+                        action: ElicitationAction::Accept,
+                        content: Some(json!({})),
+                        meta: None,
+                    })
+                }
+                .boxed()
+            }),
+        )
+        .await
+        .expect("initialize generation test MCP client");
+    let managed = ManagedClient {
+        client,
+        server_info: create_test_server_info(generation),
+        tools: Vec::new(),
+        tool_filter: ToolFilter::default(),
+        tool_timeout: None,
+        server_instructions: None,
+        server_supports_sandbox_state_meta_capability: false,
+        codex_apps_tools_cache_context: None,
+    };
+    let approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
+    let permission_profile = Constrained::allow_any(PermissionProfile::default());
+    let mut manager = McpConnectionManager::new_uninitialized(
+        &approval_policy,
+        &permission_profile,
+        /*prefix_mcp_tool_names*/ true,
+    );
+    manager.clients.insert(
+        CODEX_APPS_MCP_SERVER_NAME.to_string(),
+        AsyncManagedClient {
+            client: futures::future::ready::<Result<ManagedClient, StartupOutcomeError>>(Ok(
+                managed,
+            ))
+            .boxed()
+            .shared(),
+            is_codex_apps_mcp_server: true,
+            cached_server_info: None,
+            codex_apps_tools_cache_context: None,
+            tool_filter: ToolFilter::default(),
+            startup_complete: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            startup_reconnect: None,
+            tool_plugin_provenance: Arc::new(ToolPluginProvenance::default()),
+            cancel_token: CancellationToken::new(),
+        },
+    );
+    Arc::new(manager)
+}
+
+#[tokio::test]
+async fn resource_generation_uses_one_manager_for_every_discovery_page() {
+    let calls_a = Arc::new(GenerationResourceCalls::default());
+    let calls_b = Arc::new(GenerationResourceCalls::default());
+    let manager_a = generation_test_manager("generation-a", Arc::clone(&calls_a)).await;
+    let manager_b = generation_test_manager("generation-b", Arc::clone(&calls_b)).await;
+    let published = Arc::new(ArcSwap::from(manager_a));
+    let client = crate::McpResourceClient::new(Arc::clone(&published));
+    let generation = client.capture_generation();
+
+    let first = generation
+        .list_resources(CODEX_APPS_MCP_SERVER_NAME, /*cursor*/ None)
+        .await
+        .expect("first discovery page");
+    published.store(manager_b);
+    let second = generation
+        .list_resources(CODEX_APPS_MCP_SERVER_NAME, first.next_cursor.clone())
+        .await
+        .expect("second discovery page");
+
+    assert_eq!(first.resources[0].uri, "skill://generation-a/one");
+    assert_eq!(second.resources[0].uri, "skill://generation-a/two");
+    assert_eq!(calls_a.list.load(AtomicOrdering::Relaxed), 2);
+    assert_eq!(calls_b.list.load(AtomicOrdering::Relaxed), 0);
+}
+
+#[tokio::test]
+async fn resource_generation_cannot_read_through_replacement_manager() {
+    let calls_a = Arc::new(GenerationResourceCalls::default());
+    let calls_b = Arc::new(GenerationResourceCalls::default());
+    let manager_a = generation_test_manager("generation-a", Arc::clone(&calls_a)).await;
+    let manager_b = generation_test_manager("generation-b", Arc::clone(&calls_b)).await;
+    let published = Arc::new(ArcSwap::from(manager_a));
+    let client = crate::McpResourceClient::new(Arc::clone(&published));
+    let generation = client.capture_generation();
+    let authorization_key = generation.cache_key();
+    published.store(manager_b);
+    let replacement_key = client.capture_generation().cache_key();
+
+    let read = generation
+        .read_resource(CODEX_APPS_MCP_SERVER_NAME, "skill://generation-a/one")
+        .await
+        .expect("generation-bound read");
+    let crate::McpResourceReadResult { contents } = read;
+
+    assert!(authorization_key.is_alive());
+    assert!(authorization_key != replacement_key);
+    assert!(matches!(
+        contents.as_slice(),
+        [codex_protocol::mcp::ResourceContent::Text { text, .. }] if text == "generation-a"
+    ));
+    assert_eq!(calls_a.read.load(AtomicOrdering::Relaxed), 1);
+    assert_eq!(calls_b.read.load(AtomicOrdering::Relaxed), 0);
 }
 
 async fn create_test_managed_client(tools: Vec<ToolInfo>) -> ManagedClient {

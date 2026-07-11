@@ -62,10 +62,16 @@ impl SkillProvider for OrchestratorSkillProvider {
     fn list(&self, query: SkillListQuery) -> SkillProviderFuture<'_, SkillCatalog> {
         let authorized_catalogs = Arc::clone(&self.authorized_catalogs);
         Box::pin(async move {
-            let Some(client) = query.mcp_resources else {
+            let generation = query.mcp_resource_generation.or_else(|| {
+                query
+                    .mcp_resources
+                    .as_ref()
+                    .map(|client| client.capture_generation())
+            });
+            let Some(generation) = generation else {
                 return Ok(SkillCatalog::default());
             };
-            if !client.has_server(CODEX_APPS_MCP_SERVER_NAME).await {
+            if !generation.has_server(CODEX_APPS_MCP_SERVER_NAME) {
                 return Ok(SkillCatalog::default());
             }
 
@@ -82,7 +88,7 @@ impl SkillProvider for OrchestratorSkillProvider {
             for _ in 0..MAX_RESOURCE_PAGES {
                 let page = match tokio::time::timeout_at(
                     discovery_deadline,
-                    client.list_resources(CODEX_APPS_MCP_SERVER_NAME, cursor.clone()),
+                    generation.list_resources(CODEX_APPS_MCP_SERVER_NAME, cursor.clone()),
                 )
                 .await
                 {
@@ -158,7 +164,7 @@ impl SkillProvider for OrchestratorSkillProvider {
                 ));
             }
 
-            authorize_catalog(&authorized_catalogs, client.cache_key(), &catalog);
+            authorize_catalog(&authorized_catalogs, generation.cache_key(), &catalog);
 
             Ok(catalog)
         })
@@ -181,10 +187,16 @@ impl SkillProvider for OrchestratorSkillProvider {
                 ));
             }
 
-            let authorized = request.mcp_resources.as_ref().is_some_and(|client| {
+            let generation = request.mcp_resource_generation.or_else(|| {
+                request
+                    .mcp_resources
+                    .as_ref()
+                    .map(|client| client.capture_generation())
+            });
+            let authorized = generation.as_ref().is_some_and(|generation| {
                 is_authorized(
                     &authorized_catalogs,
-                    &client.cache_key(),
+                    &generation.cache_key(),
                     &request.package,
                     &request.resource,
                 )
@@ -195,12 +207,12 @@ impl SkillProvider for OrchestratorSkillProvider {
                 ));
             }
 
-            let Some(client) = request.mcp_resources.as_ref() else {
-                unreachable!("authorized orchestrator reads have an MCP resource client");
+            let Some(generation) = generation else {
+                unreachable!("authorized orchestrator reads have an MCP resource generation");
             };
             let result = tokio::time::timeout(
                 ORCHESTRATOR_SKILL_READ_TIMEOUT,
-                client.read_resource(CODEX_APPS_MCP_SERVER_NAME, request.resource.as_str()),
+                generation.read_resource(CODEX_APPS_MCP_SERVER_NAME, request.resource.as_str()),
             )
             .await
             .map_err(|_| {

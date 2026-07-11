@@ -214,6 +214,7 @@ async fn orchestrator_provider_rejects_unlisted_package_before_transport_access(
             resource: SkillResourceId::new("skill://apps/private/SKILL.md"),
             host_snapshot: None,
             mcp_resources: None,
+            mcp_resource_generation: None,
         })
         .await
         .expect_err("unlisted orchestrator package should be rejected");

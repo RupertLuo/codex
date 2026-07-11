@@ -79,6 +79,11 @@ impl ToolExecutor<ToolCall> for ReadTool {
                         resource: requested_resource.clone(),
                         host_snapshot: None,
                         mcp_resources: self.context.mcp_resources.clone(),
+                        mcp_resource_generation: self
+                            .context
+                            .mcp_resources
+                            .as_ref()
+                            .map(|client| client.capture_generation()),
                     },
                 )
                 .await
