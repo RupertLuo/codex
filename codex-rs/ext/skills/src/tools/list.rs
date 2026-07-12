@@ -136,24 +136,30 @@ fn listed_skill(
     {
         return None;
     }
+    let Some(addressable_dependencies) = entry
+        .package_dependencies
+        .into_iter()
+        .map(|dependency| {
+            let authority = SkillToolAuthority::from_authority(&dependency.authority)?;
+            is_bounded_handle(&dependency.package.0, MAX_HANDLE_BYTES).then_some(
+                ListedSkillDependency {
+                    authority,
+                    package: dependency.package.0,
+                },
+            )
+        })
+        .collect::<Option<Vec<_>>>()
+    else {
+        dependency_state.invalid = true;
+        return None;
+    };
     let mut dependencies = Vec::new();
-    for dependency in entry.package_dependencies {
-        let Some(authority) = SkillToolAuthority::from_authority(&dependency.authority) else {
-            dependency_state.invalid = true;
-            continue;
-        };
-        if !is_bounded_handle(&dependency.package.0, MAX_HANDLE_BYTES) {
-            dependency_state.invalid = true;
-            continue;
-        }
+    for dependency in addressable_dependencies {
         if dependencies.len() >= MAX_DEPENDENCIES_PER_SKILL || dependency_state.remaining == 0 {
             dependency_state.truncated = true;
             continue;
         }
-        dependencies.push(ListedSkillDependency {
-            authority,
-            package: dependency.package.0,
-        });
+        dependencies.push(dependency);
         dependency_state.remaining = dependency_state.remaining.saturating_sub(1);
     }
 
@@ -168,7 +174,7 @@ fn listed_skill(
 }
 
 fn invalid_dependency_warning() -> String {
-    "skill dependency omitted because its authority or package handle is not tool-addressable"
+    "Skill was omitted because a dependency authority or package handle is not tool-addressable"
         .to_string()
 }
 

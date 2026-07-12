@@ -143,7 +143,7 @@ async fn uncoded_provider_error_uses_generic_model_message() -> TestResult {
 }
 
 #[tokio::test]
-async fn invalid_dependency_is_omitted_without_omitting_parent() -> TestResult {
+async fn invalid_dependency_omits_entire_parent_and_bounds_warnings() -> TestResult {
     let tools = tools(Arc::new(FakePrivateProvider::with_invalid_dependency())).await;
     let listed = call_json(
         tool(&tools, "list")?,
@@ -153,17 +153,29 @@ async fn invalid_dependency_is_omitted_without_omitting_parent() -> TestResult {
     )
     .await?;
 
-    assert_eq!(listed["skills"].as_array().map(Vec::len), Some(1));
-    assert_eq!(listed["skills"][0]["package"], PARENT_PACKAGE);
-    assert!(listed["skills"][0].get("dependencies").is_none());
+    assert_eq!(
+        listed["skills"],
+        serde_json::json!([{
+            "authority": {"kind": PRIVATE_KIND},
+            "package": "private/safe",
+            "name": "safe",
+            "description": "Safe Skill",
+            "main_resource": "skill://private/safe/SKILL.md"
+        }])
+    );
     let warnings = listed["warnings"]
         .as_array()
         .ok_or("warnings should be an array")?;
-    assert_eq!(warnings.len(), 1);
+    assert_eq!(warnings.len(), 4);
     assert!(
         warnings[0]
             .as_str()
-            .is_some_and(|warning| warning.contains("dependency") && warning.len() <= 256)
+            .is_some_and(|warning| warning.contains("Skill was omitted") && warning.len() <= 256)
+    );
+    assert!(
+        warnings
+            .iter()
+            .all(|warning| warning.as_str().is_some_and(|warning| warning.len() <= 256))
     );
     Ok(())
 }
@@ -341,10 +353,26 @@ impl SkillProvider for FakePrivateProvider {
                 });
             }
             let entry = if query.turn_id == "turn-a" {
-                let dependency_authority = if invalid_dependency {
-                    SkillAuthority::new(SkillSourceKind::Host, "host")
+                let dependencies = if invalid_dependency {
+                    vec![
+                        SkillPackageDependency {
+                            authority: private_authority(),
+                            package: SkillPackageId("private/valid-before".to_string()),
+                        },
+                        SkillPackageDependency {
+                            authority: SkillAuthority::new(SkillSourceKind::Host, "host"),
+                            package: SkillPackageId("private/child".to_string()),
+                        },
+                        SkillPackageDependency {
+                            authority: private_authority(),
+                            package: SkillPackageId("private/valid-after".to_string()),
+                        },
+                    ]
                 } else {
-                    private_authority()
+                    vec![SkillPackageDependency {
+                        authority: private_authority(),
+                        package: SkillPackageId("private/child".to_string()),
+                    }]
                 };
                 SkillCatalogEntry::new(
                     SkillPackageId(PARENT_PACKAGE.to_string()),
@@ -353,10 +381,7 @@ impl SkillProvider for FakePrivateProvider {
                     "Parent Skill",
                     SkillResourceId::new(PARENT_RESOURCE),
                 )
-                .with_package_dependencies(vec![SkillPackageDependency {
-                    authority: dependency_authority,
-                    package: SkillPackageId("private/child".to_string()),
-                }])
+                .with_package_dependencies(dependencies)
             } else {
                 SkillCatalogEntry::new(
                     SkillPackageId("private/current-turn".to_string()),
@@ -366,10 +391,28 @@ impl SkillProvider for FakePrivateProvider {
                     SkillResourceId::new("skill://private/current-turn/SKILL.md"),
                 )
             };
-            Ok(SkillCatalog {
-                entries: vec![entry],
-                warnings: Vec::new(),
-            })
+            let entries = if invalid_dependency {
+                vec![
+                    entry,
+                    SkillCatalogEntry::new(
+                        SkillPackageId("private/safe".to_string()),
+                        private_authority(),
+                        "safe",
+                        "Safe Skill",
+                        SkillResourceId::new("skill://private/safe/SKILL.md"),
+                    ),
+                ]
+            } else {
+                vec![entry]
+            };
+            let warnings = if invalid_dependency {
+                (0..8)
+                    .map(|index| format!("catalog warning {index}: {}", "x".repeat(512)))
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            Ok(SkillCatalog { entries, warnings })
         })
     }
 
