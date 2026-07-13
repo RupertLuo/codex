@@ -143,7 +143,7 @@ pub(super) fn stored_thread_from_rollout_item(
         cli_version: item.cli_version.unwrap_or_default(),
         source,
         history_mode: item.history_mode,
-        thread_source: None,
+        thread_source: item.thread_source,
         agent_nickname: item.agent_nickname,
         agent_role: item.agent_role,
         agent_path: None,
@@ -244,6 +244,7 @@ fn thread_id_from_rollout_path(path: &Path) -> Option<ThreadId> {
 
 #[cfg(test)]
 mod tests {
+    use codex_protocol::protocol::ThreadSource;
     use codex_rollout::ThreadItem;
     use pretty_assertions::assert_eq;
     use uuid::Uuid;
@@ -259,6 +260,9 @@ mod tests {
         let thread = stored_thread_from_rollout_item(
             ThreadItem {
                 path: compressed_path.clone(),
+                thread_source: Some(ThreadSource::Feature(
+                    "catalyst:meeting-summary".to_string(),
+                )),
                 ..Default::default()
             },
             /*archived*/ false,
@@ -271,6 +275,12 @@ mod tests {
             Some(
                 compressed_path.with_file_name(format!("rollout-2025-01-03T12-00-00-{uuid}.jsonl"))
             )
+        );
+        assert_eq!(
+            thread.thread_source,
+            Some(ThreadSource::Feature(
+                "catalyst:meeting-summary".to_string()
+            ))
         );
     }
 }

@@ -20,6 +20,7 @@ use codex_app_server_protocol::ThreadListCwdFilter;
 use codex_app_server_protocol::ThreadListResponse;
 use codex_app_server_protocol::ThreadSearchResponse;
 use codex_app_server_protocol::ThreadSortKey;
+use codex_app_server_protocol::ThreadSource;
 use codex_app_server_protocol::ThreadSourceKind;
 use codex_app_server_protocol::ThreadStartParams;
 use codex_app_server_protocol::ThreadStartResponse;
@@ -35,6 +36,7 @@ use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::RolloutLine;
 use codex_protocol::protocol::SessionSource as CoreSessionSource;
 use codex_protocol::protocol::SubAgentSource;
+use codex_protocol::protocol::ThreadSource as CoreThreadSource;
 use codex_state::DirectionalThreadSpawnEdgeStatus;
 use core_test_support::responses;
 use pretty_assertions::assert_eq;
@@ -220,6 +222,26 @@ fn set_rollout_cwd(path: &Path, cwd: &Path) -> Result<()> {
     Ok(())
 }
 
+fn set_rollout_thread_source(path: &Path, thread_source: CoreThreadSource) -> Result<()> {
+    let content = fs::read_to_string(path)?;
+    let mut lines: Vec<String> = content.lines().map(str::to_string).collect();
+    let first_line = lines
+        .first_mut()
+        .ok_or_else(|| anyhow::anyhow!("rollout at {} is empty", path.display()))?;
+    let mut rollout_line: RolloutLine = serde_json::from_str(first_line)?;
+    let RolloutItem::SessionMeta(mut session_meta_line) = rollout_line.item else {
+        return Err(anyhow::anyhow!(
+            "rollout at {} does not start with session metadata",
+            path.display()
+        ));
+    };
+    session_meta_line.meta.thread_source = Some(thread_source);
+    rollout_line.item = RolloutItem::SessionMeta(session_meta_line);
+    *first_line = serde_json::to_string(&rollout_line)?;
+    fs::write(path, lines.join("\n") + "\n")?;
+    Ok(())
+}
+
 #[tokio::test]
 async fn thread_list_basic_empty() -> Result<()> {
     let codex_home = TempDir::new()?;
@@ -241,6 +263,43 @@ async fn thread_list_basic_empty() -> Result<()> {
     assert!(data.is_empty());
     assert_eq!(next_cursor, None);
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn thread_list_preserves_feature_thread_source() -> Result<()> {
+    let codex_home = TempDir::new()?;
+    create_minimal_config(codex_home.path())?;
+    let id = create_fake_rollout(
+        codex_home.path(),
+        "2025-01-02T10-00-00",
+        "2025-01-02T10:00:00Z",
+        "QuickStart task",
+        Some("mock_provider"),
+        /*git_info*/ None,
+    )?;
+    set_rollout_thread_source(
+        rollout_path(codex_home.path(), "2025-01-02T10-00-00", &id).as_path(),
+        CoreThreadSource::Feature("catalyst:quickstart:industry-report".to_string()),
+    )?;
+
+    let mut mcp = init_mcp(codex_home.path()).await?;
+    let response = list_threads(
+        &mut mcp,
+        /*cursor*/ None,
+        Some(10),
+        Some(vec!["mock_provider".to_string()]),
+        /*source_kinds*/ None,
+        /*archived*/ None,
+    )
+    .await?;
+
+    assert_eq!(
+        response.data[0].thread_source,
+        Some(ThreadSource::Feature(
+            "catalyst:quickstart:industry-report".to_string()
+        ))
+    );
     Ok(())
 }
 
