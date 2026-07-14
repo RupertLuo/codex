@@ -12,6 +12,7 @@ use crate::render::truncate_catalog_skill_description;
 use crate::render::truncate_utf8_to_bytes;
 
 use super::MAX_HANDLE_BYTES;
+use super::SkillToolAddress;
 use super::SkillToolAuthority;
 use super::SkillToolContext;
 use super::external_json_output;
@@ -130,12 +131,7 @@ fn listed_skill(
     entry: SkillCatalogEntry,
     dependency_state: &mut DependencyListState,
 ) -> Option<ListedSkill> {
-    let authority = SkillToolAuthority::from_authority(&entry.authority)?;
-    if !is_bounded_handle(&entry.id.0, MAX_HANDLE_BYTES)
-        || !is_bounded_handle(entry.main_prompt.as_str(), MAX_HANDLE_BYTES)
-    {
-        return None;
-    }
+    let address = SkillToolAddress::from_entry(&entry)?;
     let Some(addressable_dependencies) = entry
         .package_dependencies
         .into_iter()
@@ -164,11 +160,11 @@ fn listed_skill(
     }
 
     Some(ListedSkill {
-        authority,
-        package: entry.id.0,
+        authority: address.authority,
+        package: address.package,
         name: entry.name,
         description: truncate_catalog_skill_description(&entry.description).into_owned(),
-        main_resource: entry.main_prompt.as_str().to_string(),
+        main_resource: address.main_resource,
         dependencies,
     })
 }

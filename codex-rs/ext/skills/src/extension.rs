@@ -31,6 +31,7 @@ use crate::catalog::SkillCatalog;
 use crate::catalog::SkillCatalogEntry;
 use crate::catalog::SkillReadResult;
 use crate::catalog::SkillSourceKind;
+use crate::fragments::SkillAccess;
 use crate::fragments::SkillInstructions;
 use crate::provider::HostSkillProvider;
 use crate::provider::SkillListQuery;
@@ -45,6 +46,7 @@ use crate::sources::SkillProviders;
 use crate::state::ExecutorSkillsStepState;
 use crate::state::SkillsThreadState;
 use crate::state::SkillsTurnState;
+use crate::tools::SkillToolAddress;
 use crate::tools::skill_tools;
 use crate::world_state::executor_skills_world_state_section;
 
@@ -285,6 +287,7 @@ where
                                 MAX_SKILL_PATH_BYTES,
                             )
                             .0,
+                            access: SkillToolAddress::from_entry(entry).map(SkillAccess::from),
                             contents,
                         };
                         fragments.push(Box::new(fragment));

@@ -4,6 +4,8 @@ use codex_extension_api::ContextualUserFragment;
 use codex_protocol::protocol::SKILLS_INSTRUCTIONS_CLOSE_TAG;
 use codex_protocol::protocol::SKILLS_INSTRUCTIONS_OPEN_TAG;
 
+use crate::tools::SkillToolAddress;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct AvailableSkillsInstructions {
     skill_lines: Vec<String>,
@@ -44,7 +46,25 @@ impl ContextualUserFragment for AvailableSkillsInstructions {
 pub(crate) struct SkillInstructions {
     pub(crate) name: String,
     pub(crate) path: String,
+    pub(crate) access: Option<SkillAccess>,
     pub(crate) contents: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct SkillAccess {
+    authority_kind: String,
+    package: String,
+    main_resource: String,
+}
+
+impl From<SkillToolAddress> for SkillAccess {
+    fn from(address: SkillToolAddress) -> Self {
+        Self {
+            authority_kind: address.authority.kind().to_string(),
+            package: address.package,
+            main_resource: address.main_resource,
+        }
+    }
 }
 
 impl ContextualUserFragment for SkillInstructions {
@@ -64,6 +84,29 @@ impl ContextualUserFragment for SkillInstructions {
         let name = &self.name;
         let path = &self.path;
         let contents = &self.contents;
-        format!("\n<name>{name}</name>\n<path>{path}</path>\n{contents}\n")
+        let access = self.access.as_ref().map_or_else(String::new, |access| {
+            let authority_kind = escape_xml_text(&access.authority_kind);
+            let package = escape_xml_text(&access.package);
+            let main_resource = escape_xml_text(&access.main_resource);
+            format!(
+                "<access>\n<authority-kind>{authority_kind}</authority-kind>\n<package>{package}</package>\n<main-resource>{main_resource}</main-resource>\n</access>\n"
+            )
+        });
+        format!("\n<name>{name}</name>\n<path>{path}</path>\n{access}{contents}\n")
     }
+}
+
+fn escape_xml_text(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for character in value.chars() {
+        match character {
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            '"' => escaped.push_str("&quot;"),
+            '\'' => escaped.push_str("&apos;"),
+            _ => escaped.push(character),
+        }
+    }
+    escaped
 }

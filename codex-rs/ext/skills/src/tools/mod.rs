@@ -21,6 +21,7 @@ use serde_json::Value;
 
 use crate::catalog::SkillAuthority;
 use crate::catalog::SkillCatalog;
+use crate::catalog::SkillCatalogEntry;
 use crate::catalog::SkillSourceKind;
 use crate::provider::SkillListQuery;
 use crate::sources::SkillProviders;
@@ -121,12 +122,12 @@ impl SkillToolContext {
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 #[schemars(deny_unknown_fields)]
-struct SkillToolAuthority {
+pub(crate) struct SkillToolAuthority {
     kind: String,
 }
 
 impl SkillToolAuthority {
-    fn from_authority(authority: &SkillAuthority) -> Option<Self> {
+    pub(crate) fn from_authority(authority: &SkillAuthority) -> Option<Self> {
         match &authority.kind {
             SkillSourceKind::Orchestrator if authority.id == CODEX_APPS_MCP_SERVER_NAME => {
                 Some(Self {
@@ -170,6 +171,33 @@ impl SkillToolAuthority {
             ),
             _ => Self::from_authority(authority).as_ref() == Some(self),
         }
+    }
+
+    pub(crate) fn kind(&self) -> &str {
+        &self.kind
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct SkillToolAddress {
+    pub(crate) authority: SkillToolAuthority,
+    pub(crate) package: String,
+    pub(crate) main_resource: String,
+}
+
+impl SkillToolAddress {
+    pub(crate) fn from_entry(entry: &SkillCatalogEntry) -> Option<Self> {
+        let authority = SkillToolAuthority::from_authority(&entry.authority)?;
+        if !is_bounded_handle(&entry.id.0, MAX_HANDLE_BYTES)
+            || !is_bounded_handle(entry.main_prompt.as_str(), MAX_HANDLE_BYTES)
+        {
+            return None;
+        }
+        Some(Self {
+            authority,
+            package: entry.id.0.clone(),
+            main_resource: entry.main_prompt.as_str().to_string(),
+        })
     }
 }
 

@@ -244,6 +244,7 @@ async fn selected_executor_catalog_follows_step_availability_and_reuses_its_cach
     assert_eq!("user", fragments[0].role());
     assert!(fragments[0].render().contains("<name>lint-fix</name>"));
     assert!(fragments[0].render().contains("# Lint Fix"));
+    assert!(!fragments[0].render().contains("<access>"));
     assert_eq!(
         vec![(
             SkillAuthority::new(SkillSourceKind::Executor, "env-1"),
@@ -577,6 +578,91 @@ async fn skills_list_custom_discovers_all_named_custom_authorities() -> TestResu
     assert_eq!(
         response["skills"][0]["authority"],
         serde_json::json!({"kind": "catalyst-private"})
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn selected_custom_skill_includes_tool_access_descriptor() -> TestResult {
+    let read_requests = Arc::new(Mutex::new(Vec::new()));
+    let main_resource = "skill://catalyst-private/market-research-report/1.0.11/SKILL.md";
+    let provider = Arc::new(StaticSkillProvider {
+        catalog: SkillCatalog {
+            entries: vec![
+                SkillCatalogEntry::new(
+                    SkillPackageId("private/market-research-report".to_string()),
+                    SkillAuthority::new(
+                        SkillSourceKind::Custom("catalyst-private".to_string()),
+                        "catalyst-private",
+                    ),
+                    "market-research-report",
+                    "Create a market research report.",
+                    SkillResourceId::new(main_resource),
+                )
+                .with_display_path(main_resource),
+            ],
+            warnings: Vec::new(),
+        },
+        read_requests: Arc::clone(&read_requests),
+        list_calls: None,
+        fail_first_list: false,
+    });
+    let providers = SkillProviders::new().with_provider(SkillProviderSource::new(
+        SkillSourceKind::Custom("catalyst-private".to_string()),
+        "catalyst-private",
+        provider,
+    ));
+    let mut builder = ExtensionRegistryBuilder::new();
+    install_with_providers(&mut builder, providers, skills_extension_config);
+    let registry = builder.build();
+    let session_store = ExtensionData::new("session");
+    let thread_store = ExtensionData::new("thread");
+    let config = default_config();
+    registry.thread_lifecycle_contributors()[0]
+        .on_thread_start(ThreadStartInput {
+            config: &config,
+            session_source: &SessionSource::Cli,
+            persistent_thread_state_available: true,
+            environments: &[],
+            session_store: &session_store,
+            thread_store: &thread_store,
+        })
+        .await;
+
+    let fragments = registry.turn_input_contributors()[0]
+        .contribute(
+            TurnInputContext {
+                turn_id: "turn-1".to_string(),
+                user_input: vec![UserInput::Mention {
+                    name: "market-research-report".to_string(),
+                    path: main_resource.to_string(),
+                }],
+                environments: Vec::new(),
+            },
+            &session_store,
+            &thread_store,
+            &ExtensionData::new("turn-1"),
+        )
+        .await;
+
+    assert_eq!(2, fragments.len());
+    assert_eq!(
+        format!(
+            "<skill>\n<name>market-research-report</name>\n<path>{main_resource}</path>\n<access>\n<authority-kind>catalyst-private</authority-kind>\n<package>private/market-research-report</package>\n<main-resource>{main_resource}</main-resource>\n</access>\n# Lint Fix\n\nRun the formatter.\n</skill>"
+        ),
+        fragments[1].render()
+    );
+    assert_eq!(
+        vec![(
+            SkillAuthority::new(
+                SkillSourceKind::Custom("catalyst-private".to_string()),
+                "catalyst-private",
+            ),
+            SkillPackageId("private/market-research-report".to_string()),
+            SkillResourceId::new(main_resource),
+        )],
+        read_request_keys(&read_requests)
     );
 
     Ok(())
