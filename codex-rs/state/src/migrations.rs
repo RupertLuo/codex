@@ -1,6 +1,9 @@
 use std::borrow::Cow;
 
+use sqlx::AssertSqlSafe;
+use sqlx::SqlSafeStr;
 use sqlx::SqlitePool;
+use sqlx::migrate::Migration;
 use sqlx::migrate::Migrator;
 
 pub(crate) static STATE_MIGRATOR: Migrator = sqlx::migrate!("./migrations");
@@ -39,6 +42,74 @@ pub(crate) fn runtime_goals_migrator() -> Migrator {
 
 pub(crate) fn runtime_memories_migrator() -> Migrator {
     runtime_migrator(&MEMORIES_MIGRATOR)
+}
+
+fn migration_with_crlf_line_endings(migration: &Migration) -> Migration {
+    Migration::new(
+        migration.version,
+        migration.description.clone(),
+        migration.migration_type,
+        AssertSqlSafe(migration.sql.as_str().replace('\n', "\r\n")).into_sql_str(),
+        migration.no_tx,
+    )
+}
+
+pub(crate) async fn repair_legacy_crlf_migration_checksums(
+    pool: &SqlitePool,
+    migrator: &Migrator,
+) -> anyhow::Result<()> {
+    let migrations_table_exists = sqlx::query_scalar::<_, i64>(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = '_sqlx_migrations'",
+    )
+    .fetch_optional(pool)
+    .await?
+    .is_some();
+    if !migrations_table_exists {
+        return Ok(());
+    }
+
+    let applied_migrations = sqlx::query_as::<_, (i64, Vec<u8>)>(
+        "SELECT version, checksum FROM _sqlx_migrations WHERE success = TRUE ORDER BY version",
+    )
+    .fetch_all(pool)
+    .await?;
+    let mut repairs = Vec::new();
+    for (version, applied_checksum) in applied_migrations {
+        let Some(migration) = migrator
+            .migrations
+            .iter()
+            .find(|migration| migration.version == version)
+        else {
+            continue;
+        };
+        if applied_checksum.as_slice() == migration.checksum.as_ref() {
+            continue;
+        }
+
+        let legacy_migration = migration_with_crlf_line_endings(migration);
+        if applied_checksum.as_slice() == legacy_migration.checksum.as_ref() {
+            repairs.push((
+                version,
+                applied_checksum,
+                migration.checksum.as_ref().to_vec(),
+            ));
+        }
+    }
+    if repairs.is_empty() {
+        return Ok(());
+    }
+
+    let mut transaction = pool.begin().await?;
+    for (version, legacy_checksum, current_checksum) in repairs {
+        sqlx::query("UPDATE _sqlx_migrations SET checksum = ? WHERE version = ? AND checksum = ?")
+            .bind(current_checksum)
+            .bind(version)
+            .bind(legacy_checksum)
+            .execute(&mut *transaction)
+            .await?;
+    }
+    transaction.commit().await?;
+    Ok(())
 }
 
 pub(crate) async fn repair_legacy_recency_migration_version(
