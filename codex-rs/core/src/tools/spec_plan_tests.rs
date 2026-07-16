@@ -1,11 +1,17 @@
 use std::collections::BTreeMap;
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use codex_features::Feature;
 use codex_login::AuthManager;
 use codex_login::CodexAuth;
 use codex_mcp::ToolInfo;
+use codex_model_provider::ModelProvider;
+use codex_model_provider::ModelProviderFuture;
+use codex_model_provider::ProviderAccountResult;
+use codex_model_provider::ProviderCapabilities;
+use codex_model_provider::SharedModelProvider;
 use codex_model_provider::create_model_provider;
 use codex_model_provider_info::AMAZON_BEDROCK_PROVIDER_ID;
 use codex_model_provider_info::ModelProviderInfo;
@@ -295,6 +301,51 @@ fn use_actor_authorized_provider(turn: &mut TurnContext) {
     turn.provider = create_model_provider(provider_info, /*auth_manager*/ None);
 }
 
+#[derive(Debug)]
+struct CapabilityOverrideProvider {
+    inner: SharedModelProvider,
+    capabilities: ProviderCapabilities,
+}
+
+impl ModelProvider for CapabilityOverrideProvider {
+    fn info(&self) -> &ModelProviderInfo {
+        self.inner.info()
+    }
+
+    fn capabilities(&self) -> ProviderCapabilities {
+        self.capabilities
+    }
+
+    fn auth_manager(&self) -> Option<Arc<AuthManager>> {
+        self.inner.auth_manager()
+    }
+
+    fn auth(&self) -> ModelProviderFuture<'_, Option<CodexAuth>> {
+        self.inner.auth()
+    }
+
+    fn account_state(&self) -> ProviderAccountResult {
+        self.inner.account_state()
+    }
+
+    fn models_manager(
+        &self,
+        codex_home: PathBuf,
+        config_model_catalog: Option<codex_protocol::openai_models::ModelsResponse>,
+    ) -> codex_models_manager::manager::SharedModelsManager {
+        self.inner.models_manager(codex_home, config_model_catalog)
+    }
+}
+
+fn set_namespace_tools_capability(turn: &mut TurnContext, enabled: bool) {
+    let mut capabilities = turn.provider.capabilities();
+    capabilities.namespace_tools = enabled;
+    turn.provider = Arc::new(CapabilityOverrideProvider {
+        inner: Arc::clone(&turn.provider),
+        capabilities,
+    });
+}
+
 struct WebRunExtensionTool;
 
 impl ToolExecutor<ExtensionToolCall> for WebRunExtensionTool {
@@ -309,6 +360,35 @@ impl ToolExecutor<ExtensionToolCall> for WebRunExtensionTool {
             tools: vec![ResponsesApiNamespaceTool::Function(ResponsesApiTool {
                 name: "run".to_string(),
                 description: "Test standalone web search tool.".to_string(),
+                strict: false,
+                defer_loading: None,
+                parameters: codex_tools::JsonSchema::default(),
+                output_schema: None,
+            })],
+        })
+    }
+
+    fn handle(&self, _call: ExtensionToolCall) -> codex_tools::ToolExecutorFuture<'_> {
+        Box::pin(async {
+            Ok(Box::new(codex_tools::JsonToolOutput::new(json!({}))) as Box<dyn ToolOutput>)
+        })
+    }
+}
+
+struct ImageGenExtensionTool;
+
+impl ToolExecutor<ExtensionToolCall> for ImageGenExtensionTool {
+    fn tool_name(&self) -> ToolName {
+        ToolName::namespaced("image_gen", "imagegen")
+    }
+
+    fn spec(&self) -> ToolSpec {
+        ToolSpec::Namespace(codex_tools::ResponsesApiNamespace {
+            name: "image_gen".to_string(),
+            description: "Test standalone image generation.".to_string(),
+            tools: vec![ResponsesApiNamespaceTool::Function(ResponsesApiTool {
+                name: "imagegen".to_string(),
+                description: "Generate a test image.".to_string(),
                 strict: false,
                 defer_loading: None,
                 parameters: codex_tools::JsonSchema::default(),
@@ -1665,4 +1745,61 @@ async fn hosted_tools_follow_provider_auth_model_and_config_gates() {
     })
     .await;
     unsupported_provider.assert_visible_lacks(&["web_search"]);
+}
+
+#[tokio::test]
+async fn standalone_image_extension_visibility_is_provider_neutral() {
+    let extension_inputs = || ToolPlanInputs {
+        extension_tool_executors: vec![Arc::new(ImageGenExtensionTool)],
+        ..Default::default()
+    };
+
+    let product_extension = probe_with(
+        |turn| {
+            set_feature(turn, Feature::ImageGenExt, /*enabled*/ true);
+            turn.model_info.input_modalities = vec![InputModality::Text, InputModality::Image];
+        },
+        extension_inputs(),
+    )
+    .await;
+    product_extension.assert_visible_contains(&["image_gen"]);
+    assert_eq!(
+        product_extension.namespace_function_names("image_gen"),
+        &["imagegen"]
+    );
+    product_extension.assert_visible_lacks(&["image_generation"]);
+
+    let feature_disabled = probe_with(
+        |turn| {
+            set_feature(turn, Feature::ImageGenExt, /*enabled*/ false);
+            turn.model_info.input_modalities = vec![InputModality::Text, InputModality::Image];
+        },
+        extension_inputs(),
+    )
+    .await;
+    feature_disabled.assert_visible_lacks(&["image_gen", "image_generation"]);
+    feature_disabled.assert_registered_lacks(&["image_gen.imagegen"]);
+
+    let namespace_tools_disabled = probe_with(
+        |turn| {
+            set_feature(turn, Feature::ImageGenExt, /*enabled*/ true);
+            set_namespace_tools_capability(turn, false);
+            turn.model_info.input_modalities = vec![InputModality::Text, InputModality::Image];
+        },
+        extension_inputs(),
+    )
+    .await;
+    namespace_tools_disabled.assert_visible_lacks(&["image_gen", "image_generation"]);
+    namespace_tools_disabled.assert_registered_lacks(&["image_gen.imagegen"]);
+
+    let text_only_model = probe_with(
+        |turn| {
+            set_feature(turn, Feature::ImageGenExt, /*enabled*/ true);
+            turn.model_info.input_modalities = vec![InputModality::Text];
+        },
+        extension_inputs(),
+    )
+    .await;
+    text_only_model.assert_visible_lacks(&["image_gen", "image_generation"]);
+    text_only_model.assert_registered_lacks(&["image_gen.imagegen"]);
 }

@@ -153,6 +153,10 @@ impl SkillToolAuthority {
                 SkillSourceKind::Orchestrator,
                 CODEX_APPS_MCP_SERVER_NAME,
             )),
+            "file" => Err(FunctionCallError::RespondToModel(
+                "skills.read cannot read file-backed skills; expand the listed skill-root alias and read the resulting SKILL.md with a filesystem tool"
+                    .to_string(),
+            )),
             "host" | "executor" => Err(FunctionCallError::RespondToModel(
                 "skills tools do not support host or executor authorities".to_string(),
             )),
