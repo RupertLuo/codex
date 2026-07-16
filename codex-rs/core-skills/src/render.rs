@@ -1007,9 +1007,10 @@ mod tests {
             SKILLS_HOW_TO_USE_WITH_ABSOLUTE_PATHS
                 .contains("do not replace it with the main resource")
         );
-        assert!(SKILLS_HOW_TO_USE_WITH_ALIASES.contains(
-            "Never call `skills.read` for a `file` entry or an aliased local path"
-        ));
+        assert!(
+            SKILLS_HOW_TO_USE_WITH_ALIASES
+                .contains("Never call `skills.read` for a `file` entry or an aliased local path")
+        );
         for instructions in [
             SKILLS_HOW_TO_USE_WITH_ABSOLUTE_PATHS,
             SKILLS_HOW_TO_USE_WITH_ALIASES,
