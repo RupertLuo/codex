@@ -297,6 +297,35 @@ async fn invalid_provider_error_code_uses_generic_model_message() -> TestResult 
     Ok(())
 }
 
+#[tokio::test]
+async fn file_authority_redirects_the_model_to_the_filesystem() -> TestResult {
+    let tools = tools(Arc::new(FakePrivateProvider::default())).await;
+    let error = match call(
+        tool(&tools, "read")?,
+        "turn-file",
+        "read-file",
+        serde_json::json!({
+            "authority": {"kind": "file"},
+            "package": "r1/imagegen",
+            "resource": "SKILL.md"
+        }),
+    )
+    .await
+    {
+        Ok(_) => panic!("file authority must not be routed to a custom provider"),
+        Err(error) => error,
+    };
+
+    assert_eq!(
+        error,
+        FunctionCallError::RespondToModel(
+            "skills.read cannot read file-backed skills; expand the listed skill-root alias and read the resulting SKILL.md with a filesystem tool"
+                .to_string()
+        )
+    );
+    Ok(())
+}
+
 #[derive(Default)]
 struct FakePrivateProvider {
     invalid_dependency: bool,
