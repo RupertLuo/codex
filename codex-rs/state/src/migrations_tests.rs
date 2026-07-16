@@ -2,6 +2,7 @@ use std::borrow::Cow;
 use std::fs;
 use std::path::Path;
 
+use pretty_assertions::assert_eq;
 use sqlx::AssertSqlSafe;
 use sqlx::Row;
 use sqlx::SqlSafeStr;
@@ -13,6 +14,7 @@ use super::GOALS_MIGRATOR;
 use super::LOGS_MIGRATOR;
 use super::MEMORIES_MIGRATOR;
 use super::STATE_MIGRATOR;
+use super::repair_legacy_crlf_migration_checksums;
 use super::repair_legacy_recency_migration_version;
 
 #[test]
@@ -90,6 +92,178 @@ fn migrator_through(version: i64) -> Migrator {
         create_schemas: STATE_MIGRATOR.create_schemas.clone(),
         no_tx: STATE_MIGRATOR.no_tx,
     }
+}
+
+fn migrator_with_crlf_line_endings_through(base: &Migrator, version: i64) -> Migrator {
+    Migrator {
+        migrations: Cow::Owned(
+            base.migrations
+                .iter()
+                .filter(|migration| migration.version <= version)
+                .map(|migration| {
+                    Migration::new(
+                        migration.version,
+                        migration.description.clone(),
+                        migration.migration_type,
+                        AssertSqlSafe(migration.sql.as_str().replace('\n', "\r\n")).into_sql_str(),
+                        migration.no_tx,
+                    )
+                })
+                .collect(),
+        ),
+        ignore_missing: base.ignore_missing,
+        locking: base.locking,
+        table_name: base.table_name.clone(),
+        create_schemas: base.create_schemas.clone(),
+        no_tx: base.no_tx,
+    }
+}
+
+async fn applied_migration_checksums(pool: &sqlx::SqlitePool) -> Vec<(i64, Vec<u8>)> {
+    sqlx::query_as("SELECT version, checksum FROM _sqlx_migrations ORDER BY version")
+        .fetch_all(pool)
+        .await
+        .expect("applied migration checksums should load")
+}
+
+#[tokio::test]
+async fn repairs_crlf_migration_checksums_and_preserves_state_data() {
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .expect("in-memory database should open");
+    migrator_with_crlf_line_endings_through(&STATE_MIGRATOR, /*version*/ 29)
+        .run(&pool)
+        .await
+        .expect("legacy CRLF migrations should apply");
+    sqlx::query(
+        r#"
+INSERT INTO threads (
+    id,
+    rollout_path,
+    created_at,
+    updated_at,
+    source,
+    model_provider,
+    cwd,
+    title,
+    sandbox_policy,
+    approval_mode
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        "#,
+    )
+    .bind("legacy-thread")
+    .bind("/tmp/legacy.jsonl")
+    .bind(1_700_000_000_i64)
+    .bind(1_700_000_100_i64)
+    .bind("cli")
+    .bind("openai")
+    .bind("/tmp")
+    .bind("Legacy thread")
+    .bind("read-only")
+    .bind("on-request")
+    .execute(&pool)
+    .await
+    .expect("legacy thread should insert");
+
+    repair_legacy_crlf_migration_checksums(&pool, &STATE_MIGRATOR)
+        .await
+        .expect("legacy CRLF checksums should be repaired");
+    STATE_MIGRATOR
+        .run(&pool)
+        .await
+        .expect("current migrations should apply after repair");
+
+    let thread_ids = sqlx::query_scalar::<_, String>("SELECT id FROM threads ORDER BY id")
+        .fetch_all(&pool)
+        .await
+        .expect("threads should load");
+    assert_eq!(thread_ids, vec!["legacy-thread"]);
+    let expected_checksums = STATE_MIGRATOR
+        .migrations
+        .iter()
+        .map(|migration| (migration.version, migration.checksum.as_ref().to_vec()))
+        .collect::<Vec<_>>();
+    assert_eq!(applied_migration_checksums(&pool).await, expected_checksums);
+}
+
+#[tokio::test]
+async fn repairs_crlf_migration_checksums_and_preserves_logs() {
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .expect("in-memory database should open");
+    migrator_with_crlf_line_endings_through(&LOGS_MIGRATOR, i64::MAX)
+        .run(&pool)
+        .await
+        .expect("legacy CRLF log migrations should apply");
+    sqlx::query(
+        "INSERT INTO logs (ts, ts_nanos, level, target, feedback_log_body) VALUES (?, ?, ?, ?, ?)",
+    )
+    .bind(1_700_000_000_i64)
+    .bind(123_i64)
+    .bind("INFO")
+    .bind("codex_test")
+    .bind("legacy log")
+    .execute(&pool)
+    .await
+    .expect("legacy log should insert");
+
+    repair_legacy_crlf_migration_checksums(&pool, &LOGS_MIGRATOR)
+        .await
+        .expect("legacy CRLF checksums should be repaired");
+    LOGS_MIGRATOR
+        .run(&pool)
+        .await
+        .expect("current log migrations should validate after repair");
+
+    let logs = sqlx::query_as::<_, (String, String)>(
+        "SELECT target, feedback_log_body FROM logs ORDER BY id",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("logs should load");
+    assert_eq!(
+        logs,
+        vec![("codex_test".to_string(), "legacy log".to_string())]
+    );
+    let expected_checksums = LOGS_MIGRATOR
+        .migrations
+        .iter()
+        .map(|migration| (migration.version, migration.checksum.as_ref().to_vec()))
+        .collect::<Vec<_>>();
+    assert_eq!(applied_migration_checksums(&pool).await, expected_checksums);
+}
+
+#[tokio::test]
+async fn does_not_repair_unrecognized_migration_checksum() {
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .expect("in-memory database should open");
+    migrator_through(/*version*/ 1)
+        .run(&pool)
+        .await
+        .expect("initial migration should apply");
+    let unknown_checksum = vec![0x5a; 48];
+    sqlx::query("UPDATE _sqlx_migrations SET checksum = ? WHERE version = 1")
+        .bind(&unknown_checksum)
+        .execute(&pool)
+        .await
+        .expect("migration checksum should be replaced for the test");
+
+    repair_legacy_crlf_migration_checksums(&pool, &STATE_MIGRATOR)
+        .await
+        .expect("unrecognized checksum should be left for SQLx to validate");
+
+    assert_eq!(
+        applied_migration_checksums(&pool).await,
+        vec![(1, unknown_checksum)]
+    );
+    assert!(STATE_MIGRATOR.run(&pool).await.is_err());
 }
 
 #[tokio::test]
