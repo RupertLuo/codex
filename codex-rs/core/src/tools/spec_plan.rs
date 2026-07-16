@@ -403,7 +403,12 @@ fn image_generation_runtime_enabled(turn_context: &TurnContext) -> bool {
 }
 
 fn standalone_image_generation_model_visible(turn_context: &TurnContext) -> bool {
-    if !image_generation_runtime_enabled(turn_context) || !namespace_tools_enabled(turn_context) {
+    if !namespace_tools_enabled(turn_context)
+        || !turn_context
+            .model_info
+            .input_modalities
+            .contains(&InputModality::Image)
+    {
         return false;
     }
 
