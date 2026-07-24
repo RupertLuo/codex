@@ -9,7 +9,7 @@ use crate::exec::ExecCapturePolicy;
 use crate::exec::ExecExpiration;
 use crate::guardian::GuardianApprovalRequest;
 use crate::guardian::GuardianNetworkAccessTrigger;
-use crate::guardian::review_approval_request;
+use crate::guardian::review_approval_request_with_user_fallback;
 use crate::sandboxing::ExecOptions;
 use crate::sandboxing::ExecServerEnvConfig;
 use crate::sandboxing::SandboxPermissions;
@@ -193,7 +193,7 @@ impl Approvable<UnifiedExecRequest> for UnifiedExecRuntime<'_> {
                 }
             };
             if let Some(review_id) = guardian_review_id {
-                return review_approval_request(
+                return review_approval_request_with_user_fallback(
                     session,
                     turn,
                     review_id,
