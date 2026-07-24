@@ -21,6 +21,8 @@ use crate::StoredThreadHistory;
 use crate::ThreadMetadataPatch;
 use crate::ThreadStore;
 use crate::ThreadStoreResult;
+use crate::ThreadTitleGenerator;
+use crate::ThreadTitleRequest;
 use crate::UpdateThreadMetadataParams;
 use crate::thread_metadata_sync::ThreadMetadataSync;
 
@@ -184,7 +186,31 @@ impl LiveThread {
                 .await
                 .mark_pending_update_applied(&update);
         }
+        self.maybe_dispatch_llm_title(items).await;
         Ok(())
+    }
+
+    /// Best-effort: once the first assistant turn completes, spawn an async task
+    /// that upgrades the rule-based title to an LLM-generated one. This never
+    /// blocks the append/turn hot path and leaves the rule-based title on any
+    /// failure.
+    async fn maybe_dispatch_llm_title(&self, items: &[RolloutItem]) {
+        let request = {
+            let mut metadata_sync = self.metadata_sync.lock().await;
+            metadata_sync.take_llm_title_request(items)
+        };
+        let Some(request) = request else {
+            return;
+        };
+        let Some(generator) = self.thread_store.title_generator() else {
+            return;
+        };
+        spawn_llm_title_task(
+            Arc::clone(&self.thread_store),
+            generator,
+            self.thread_id,
+            request,
+        );
     }
 
     pub async fn persist(&self) -> ThreadStoreResult<()> {
@@ -319,4 +345,92 @@ impl LiveThread {
             .mark_pending_update_applied(&update);
         Ok(())
     }
+}
+
+/// Spawns the best-effort LLM title task on the current Tokio runtime.
+///
+/// The task calls the host generator, then writes the title through the same
+/// [`ThreadStore::update_thread_metadata`] path used by rule-based titles and
+/// manual renames. It only overwrites when the stored name is still the
+/// rule-based first-user-message title, so a manual rename is never clobbered.
+fn spawn_llm_title_task(
+    thread_store: Arc<dyn ThreadStore>,
+    generator: Arc<dyn ThreadTitleGenerator>,
+    thread_id: ThreadId,
+    request: ThreadTitleRequest,
+) {
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        return;
+    };
+    handle.spawn(async move {
+        let guard_title = request.first_user_message.clone();
+        let Some(title) = generator
+            .generate_title(request)
+            .await
+            .map(|title| sanitize_title(&title))
+            .filter(|title| !title.is_empty())
+        else {
+            return;
+        };
+        match thread_store
+            .read_thread(ReadThreadParams {
+                thread_id,
+                include_archived: true,
+                include_history: false,
+            })
+            .await
+        {
+            // Only replace the auto-derived rule-based title, never a manual
+            // rename. Stores that keep the rule-based title equal to the first
+            // user message surface it as an *empty* name (it is not a "distinct"
+            // title), so `None` is the common auto-derived state; other stores may
+            // instead expose the name verbatim. Treat both as still-auto-derived,
+            // while a manual rename or an already-applied generated title leaves a
+            // different, non-empty name and is left untouched.
+            Ok(thread)
+                if thread.name.is_none()
+                    || thread.name.as_deref() == Some(guard_title.as_str()) =>
+            {
+                if let Err(err) = thread_store
+                    .update_thread_metadata(UpdateThreadMetadataParams {
+                        thread_id,
+                        patch: ThreadMetadataPatch {
+                            title: Some(title),
+                            ..Default::default()
+                        },
+                        include_archived: true,
+                    })
+                    .await
+                {
+                    warn!("failed to persist generated thread title for {thread_id}: {err}");
+                }
+            }
+            Ok(_) => {}
+            Err(err) => {
+                warn!(
+                    "failed to read thread before applying generated title for {thread_id}: {err}"
+                );
+            }
+        }
+    });
+}
+
+/// Normalizes a raw model title into a short, single-line, punctuation-trimmed
+/// display title.
+fn sanitize_title(raw: &str) -> String {
+    let first_line = raw
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or("")
+        .trim();
+    let unquoted = first_line.trim_matches(|c: char| {
+        c.is_whitespace() || matches!(c, '"' | '\'' | '「' | '」' | '《' | '》' | '“' | '”')
+    });
+    let trimmed = unquoted.trim_end_matches(|c: char| {
+        matches!(
+            c,
+            '。' | '.' | '!' | '！' | '?' | '？' | '，' | ',' | '、' | '：' | ':' | ';' | '；'
+        )
+    });
+    trimmed.chars().take(30).collect()
 }

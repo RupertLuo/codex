@@ -23,8 +23,10 @@ use crate::ThreadPage;
 use crate::ThreadSearchPage;
 use crate::ThreadStoreError;
 use crate::ThreadStoreResult;
+use crate::ThreadTitleGenerator;
 use crate::TurnPage;
 use crate::UpdateThreadMetadataParams;
+use std::sync::Arc;
 
 /// Future returned by [`ThreadStore`] operations.
 pub type ThreadStoreFuture<'a, T> = Pin<Box<dyn Future<Output = ThreadStoreResult<T>> + Send + 'a>>;
@@ -33,6 +35,18 @@ pub type ThreadStoreFuture<'a, T> = Pin<Box<dyn Future<Output = ThreadStoreResul
 pub trait ThreadStore: Any + Send + Sync {
     /// Return this store as [`Any`] for implementation-owned escape hatches.
     fn as_any(&self) -> &dyn Any;
+
+    /// Installs a best-effort generator that derives a short thread title from
+    /// the opening exchange once the first assistant turn completes.
+    ///
+    /// The default is a no-op so stores that do not support LLM titles simply
+    /// ignore the generator and keep their rule-based titles.
+    fn set_title_generator(&self, _generator: Arc<dyn ThreadTitleGenerator>) {}
+
+    /// Returns the installed title generator, when the store supports one.
+    fn title_generator(&self) -> Option<Arc<dyn ThreadTitleGenerator>> {
+        None
+    }
 
     /// Returns the history mode to use when history does not carry a persisted mode.
     ///

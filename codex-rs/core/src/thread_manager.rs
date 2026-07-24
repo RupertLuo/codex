@@ -257,6 +257,7 @@ pub struct ThreadManagerRuntimeOptions {
     runtime_extensions: Vec<Arc<dyn RuntimeExtension<Config>>>,
     agent_spawner_runtime_extension_factories: Vec<Arc<dyn AgentSpawnerRuntimeExtensionFactory>>,
     skill_provider_sources: Vec<codex_skills_extension::SkillProviderSource>,
+    title_generator: Option<Arc<dyn codex_thread_store::ThreadTitleGenerator>>,
 }
 
 impl ThreadManagerRuntimeOptions {
@@ -297,6 +298,20 @@ impl ThreadManagerRuntimeOptions {
     ) -> Self {
         self.skill_provider_sources.push(source);
         self
+    }
+
+    /// Installs a best-effort generator that upgrades the rule-based thread
+    /// title to an LLM-generated one after the first assistant turn completes.
+    pub fn with_title_generator(
+        mut self,
+        title_generator: Arc<dyn codex_thread_store::ThreadTitleGenerator>,
+    ) -> Self {
+        self.title_generator = Some(title_generator);
+        self
+    }
+
+    pub fn title_generator(&self) -> Option<Arc<dyn codex_thread_store::ThreadTitleGenerator>> {
+        self.title_generator.clone()
     }
 
     pub fn has_http_transport_override(&self) -> bool {

@@ -10,6 +10,7 @@ mod live_thread;
 mod local;
 mod store;
 mod thread_metadata_sync;
+mod title_generator;
 mod types;
 
 pub use error::ThreadStoreError;
@@ -22,6 +23,8 @@ pub use local::LocalThreadStore;
 pub use local::LocalThreadStoreConfig;
 pub use store::ThreadStore;
 pub use store::ThreadStoreFuture;
+pub use title_generator::ThreadTitleGenerator;
+pub use title_generator::ThreadTitleRequest;
 pub use types::AppendThreadItemsParams;
 pub use types::ArchiveThreadParams;
 pub use types::ClearableField;

@@ -20,6 +20,7 @@ use crate::CreateThreadParams;
 use crate::GitInfoPatch;
 use crate::ResumeThreadParams;
 use crate::ThreadMetadataPatch;
+use crate::ThreadTitleRequest;
 
 const IMAGE_ONLY_USER_MESSAGE_PLACEHOLDER: &str = "[Image]";
 #[cfg(not(test))]
@@ -38,6 +39,12 @@ pub(crate) struct ThreadMetadataSync {
     preview_seen: bool,
     first_user_message_seen: bool,
     title_seen: bool,
+    /// Retained text of the first user message, used to build the LLM title
+    /// prompt and as the guard baseline against clobbering a manual rename.
+    first_user_message: Option<String>,
+    /// Set once the best-effort LLM title task has been dispatched so it never
+    /// fires more than once per live thread.
+    llm_title_dispatched: bool,
     pending_update: Option<ThreadMetadataPatch>,
     pending_update_generation: u64,
     last_touch_persisted_at: Option<Instant>,
@@ -84,6 +91,8 @@ impl ThreadMetadataSync {
             preview_seen: false,
             first_user_message_seen: false,
             title_seen: false,
+            first_user_message: None,
+            llm_title_dispatched: false,
             pending_update: Some(update),
             pending_update_generation: 1,
             last_touch_persisted_at: None,
@@ -103,6 +112,8 @@ impl ThreadMetadataSync {
             preview_seen: false,
             first_user_message_seen: false,
             title_seen: false,
+            first_user_message: None,
+            llm_title_dispatched: false,
             pending_update: None,
             pending_update_generation: 0,
             last_touch_persisted_at: None,
@@ -186,6 +197,50 @@ impl ThreadMetadataSync {
         self.take_pending_update()
     }
 
+    /// Returns a one-shot LLM title request the first time a completed assistant
+    /// turn is observed for a thread that already has a first user message.
+    ///
+    /// Subsequent calls return `None` so the best-effort summarizer never runs
+    /// more than once per live thread.
+    pub(crate) fn take_llm_title_request(
+        &mut self,
+        items: &[RolloutItem],
+    ) -> Option<ThreadTitleRequest> {
+        if self.llm_title_dispatched {
+            return None;
+        }
+        let first_user_message = self.first_user_message.clone()?;
+        let mut first_assistant_message: Option<String> = None;
+        let mut turn_completed = false;
+        for item in items {
+            match item {
+                RolloutItem::EventMsg(EventMsg::TurnComplete(event)) => {
+                    turn_completed = true;
+                    if first_assistant_message.is_none()
+                        && let Some(message) = event.last_agent_message.as_deref()
+                        && !message.trim().is_empty()
+                    {
+                        first_assistant_message = Some(message.trim().to_string());
+                    }
+                }
+                RolloutItem::EventMsg(EventMsg::AgentMessage(event))
+                    if first_assistant_message.is_none() && !event.message.trim().is_empty() =>
+                {
+                    first_assistant_message = Some(event.message.trim().to_string());
+                }
+                _ => {}
+            }
+        }
+        if !turn_completed {
+            return None;
+        }
+        self.llm_title_dispatched = true;
+        Some(ThreadTitleRequest {
+            first_user_message,
+            first_assistant_message,
+        })
+    }
+
     fn observe_items(&mut self, items: &[RolloutItem]) -> Option<ThreadMetadataPatch> {
         self.observe_items_with_update(
             items,
@@ -252,6 +307,7 @@ impl ThreadMetadataSync {
                     if let Some(preview) = user_message_preview(user) {
                         if !self.first_user_message_seen {
                             self.first_user_message_seen = true;
+                            self.first_user_message = Some(preview.clone());
                             update.first_user_message = Some(preview.clone());
                         }
                         if !self.preview_seen {

@@ -20,6 +20,7 @@ use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use tokio::sync::Mutex;
 
 use crate::AppendThreadItemsParams;
@@ -40,6 +41,7 @@ use crate::ThreadStore;
 use crate::ThreadStoreError;
 use crate::ThreadStoreFuture;
 use crate::ThreadStoreResult;
+use crate::ThreadTitleGenerator;
 use crate::UpdateThreadMetadataParams;
 
 /// Local filesystem/SQLite-backed implementation of [`ThreadStore`].
@@ -60,6 +62,10 @@ pub struct LocalThreadStore {
     pub(super) config: LocalThreadStoreConfig,
     live_recorders: Arc<Mutex<HashMap<ThreadId, LiveRecorderEntry>>>,
     state_db: Option<StateDbHandle>,
+    // Optional host-supplied summarizer used to upgrade the rule-based title to
+    // an LLM-generated one. Shared across clones so it can be installed once
+    // after the store is constructed.
+    title_generator: Arc<OnceLock<Arc<dyn ThreadTitleGenerator>>>,
 }
 
 struct LiveRecorderEntry {
@@ -107,6 +113,7 @@ impl LocalThreadStore {
             config,
             live_recorders: Arc::new(Mutex::new(HashMap::new())),
             state_db,
+            title_generator: Arc::new(OnceLock::new()),
         }
     }
 
@@ -240,6 +247,14 @@ impl LocalThreadStore {
 impl ThreadStore for LocalThreadStore {
     fn as_any(&self) -> &dyn std::any::Any {
         self
+    }
+
+    fn set_title_generator(&self, generator: Arc<dyn ThreadTitleGenerator>) {
+        let _ = self.title_generator.set(generator);
+    }
+
+    fn title_generator(&self) -> Option<Arc<dyn ThreadTitleGenerator>> {
+        self.title_generator.get().cloned()
     }
 
     fn create_thread(&self, params: CreateThreadParams) -> ThreadStoreFuture<'_, ()> {
@@ -468,6 +483,84 @@ mod tests {
         );
         assert_eq!(metadata.preview.as_deref(), Some("observed append"));
         assert_eq!(metadata.title, "observed append");
+    }
+
+    #[tokio::test]
+    async fn generated_title_overwrites_rule_based_title_with_empty_name() {
+        // Regression: a brand-new thread keeps its rule-based title equal to the
+        // first user message, which the local store surfaces as `name == None`
+        // (the title is not "distinct" from the preview). The generated-title
+        // guard must treat that empty name as still-auto-derived and apply the
+        // model title, otherwise the LLM title is silently dropped.
+        #[derive(Debug)]
+        struct StubTitleGenerator;
+        impl crate::ThreadTitleGenerator for StubTitleGenerator {
+            fn generate_title<'a>(
+                &'a self,
+                _request: crate::ThreadTitleRequest,
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = Option<String>> + Send + 'a>,
+            > {
+                Box::pin(async { Some("生成的标题".to_string()) })
+            }
+        }
+
+        let home = TempDir::new().expect("temp dir");
+        let config = test_config(home.path());
+        let runtime = codex_state::StateRuntime::init(
+            config.sqlite_home.clone(),
+            config.default_model_provider_id.clone(),
+        )
+        .await
+        .expect("state db should initialize");
+        let store = Arc::new(LocalThreadStore::new(config, Some(runtime.clone())));
+        store.set_title_generator(Arc::new(StubTitleGenerator));
+        let thread_id = ThreadId::default();
+        let live_thread = LiveThread::create(store.clone(), create_thread_params(thread_id))
+            .await
+            .expect("create live thread");
+
+        live_thread
+            .append_items(&[user_message_item("今天有什么新闻？")])
+            .await
+            .expect("append first user message");
+        live_thread
+            .append_items(&[
+                RolloutItem::EventMsg(EventMsg::AgentMessage(AgentMessageEvent {
+                    message: "以下是今天的新闻…".to_string(),
+                    phase: None,
+                    memory_citation: None,
+                })),
+                RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
+                    turn_id: "turn-1".to_string(),
+                    last_agent_message: Some("以下是今天的新闻…".to_string()),
+                    completed_at: None,
+                    duration_ms: None,
+                    time_to_first_token_ms: None,
+                })),
+            ])
+            .await
+            .expect("append assistant turn");
+        live_thread.flush().await.expect("flush thread");
+
+        // The generated title is applied by a detached task; poll until it lands.
+        let mut applied = None;
+        for _ in 0..50 {
+            let thread = store
+                .read_thread(ReadThreadParams {
+                    thread_id,
+                    include_archived: true,
+                    include_history: false,
+                })
+                .await
+                .expect("read thread");
+            if thread.name.as_deref() == Some("生成的标题") {
+                applied = thread.name.clone();
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(applied.as_deref(), Some("生成的标题"));
     }
 
     #[tokio::test]
