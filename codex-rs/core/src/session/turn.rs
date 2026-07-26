@@ -507,7 +507,7 @@ async fn run_hooks_and_record_inputs(
 }
 
 #[instrument(level = "trace", skip_all)]
-async fn build_skills_and_plugins(
+pub(crate) async fn build_skills_and_plugins(
     sess: &Arc<Session>,
     step_context: &StepContext,
     input: &[TurnInput],

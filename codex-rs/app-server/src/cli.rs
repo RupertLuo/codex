@@ -62,6 +62,12 @@ pub struct AppServerServeArgs {
 }
 
 impl AppServerServeArgs {
+    /// Raw `-c key=value` overrides, including ones clap propagated here from a
+    /// sibling subcommand because the flag is global.
+    pub fn raw_config_overrides(&self) -> &[String] {
+        &self.config_overrides.raw_overrides
+    }
+
     pub fn prepend_config_overrides(&mut self, values: impl IntoIterator<Item = String>) {
         let values = values.into_iter().collect::<Vec<_>>();
         self.config_overrides.raw_overrides.splice(0..0, values);
