@@ -500,7 +500,7 @@ mod tests {
 
     impl codex_extension_api::ToolExecutor<codex_tools::ToolCall> for ImageGenerationExtensionExecutor {
         fn tool_name(&self) -> codex_tools::ToolName {
-            codex_tools::ToolName::namespaced("image_gen", "imagegen")
+            codex_tools::ToolName::namespaced(crate::tools::spec_plan::IMAGE_GEN_NAMESPACE, crate::tools::spec_plan::IMAGEGEN_TOOL_NAME)
         }
 
         fn spec(&self) -> codex_tools::ToolSpec {
@@ -571,7 +571,7 @@ mod tests {
             cancellation_token: tokio_util::sync::CancellationToken::new(),
             tracker: Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new())),
             call_id: "call-image".to_string(),
-            tool_name: codex_tools::ToolName::namespaced("image_gen", "imagegen"),
+            tool_name: codex_tools::ToolName::namespaced(crate::tools::spec_plan::IMAGE_GEN_NAMESPACE, crate::tools::spec_plan::IMAGEGEN_TOOL_NAME),
             source: ToolCallSource::Direct,
             payload: ToolPayload::Function {
                 arguments: "{}".to_string(),

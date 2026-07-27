@@ -96,8 +96,16 @@ use tracing::instrument;
 use tracing::warn;
 
 const MULTI_AGENT_V2_NAMESPACE_DESCRIPTION: &str = "Tools for spawning and managing sub-agents.";
-const IMAGE_GEN_NAMESPACE: &str = "image_gen";
-const IMAGEGEN_TOOL_NAME: &str = "imagegen";
+// Names of the standalone extension tools Catalyst registers. Core recognises them by exact name to
+// decide whether to fall back to its own hosted equivalents, so these must track
+// `catalyst-codex/src/search/tool.rs` and `.../image_generation/mod.rs`. When they drift, the
+// standalone tool is no longer detected, core pushes the hosted `{"type":"web_search"}` /
+// `image_generation` spec instead, and every Anthropic-adapter provider fails its first turn with
+// `CATALYST_ADAPTER_CONTENT_UNSUPPORTED` — the adapter cannot represent a provider-native tool.
+pub const WEB_SEARCH_NAMESPACE: &str = "catalyst_web";
+pub const WEB_SEARCH_TOOL_NAME: &str = "run";
+pub const IMAGE_GEN_NAMESPACE: &str = "catalyst_image";
+pub const IMAGEGEN_TOOL_NAME: &str = "imagegen";
 
 type PlannedRuntime = Arc<dyn CoreToolRuntime>;
 
@@ -303,7 +311,7 @@ fn hosted_model_tool_specs(context: &CoreToolPlanContext<'_>) -> Vec<ToolSpec> {
         && context
             .extension_tool_executors
             .iter()
-            .any(|executor| executor.tool_name() == ToolName::namespaced("web", "run"));
+            .any(|executor| executor.tool_name() == ToolName::namespaced(WEB_SEARCH_NAMESPACE, WEB_SEARCH_TOOL_NAME));
     // `Some(Cached/Live/Disabled)` are the options for mode when standalone search is unavailable
     // and the provider supports hosted search. `None` prevents emitting a hosted search tool.
     let web_search_mode = (!standalone_web_search_available
@@ -1031,7 +1039,7 @@ fn append_extension_tool_executors(
 
     for executor in executors.iter().cloned() {
         let tool_name = executor.tool_name();
-        if tool_name == ToolName::namespaced("web", "run")
+        if tool_name == ToolName::namespaced(WEB_SEARCH_NAMESPACE, WEB_SEARCH_TOOL_NAME)
             && (!standalone_web_search_enabled || !web_search_mode_on)
         {
             continue;

@@ -350,7 +350,7 @@ struct WebRunExtensionTool;
 
 impl ToolExecutor<ExtensionToolCall> for WebRunExtensionTool {
     fn tool_name(&self) -> ToolName {
-        ToolName::namespaced("web", "run")
+        ToolName::namespaced(crate::tools::spec_plan::WEB_SEARCH_NAMESPACE, crate::tools::spec_plan::WEB_SEARCH_TOOL_NAME)
     }
 
     fn spec(&self) -> ToolSpec {
@@ -379,7 +379,7 @@ struct ImageGenExtensionTool;
 
 impl ToolExecutor<ExtensionToolCall> for ImageGenExtensionTool {
     fn tool_name(&self) -> ToolName {
-        ToolName::namespaced("image_gen", "imagegen")
+        ToolName::namespaced(crate::tools::spec_plan::IMAGE_GEN_NAMESPACE, crate::tools::spec_plan::IMAGEGEN_TOOL_NAME)
     }
 
     fn spec(&self) -> ToolSpec {

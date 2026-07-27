@@ -133,6 +133,13 @@ pub use thread_manager::ThreadShutdownReport;
 pub use thread_manager::build_models_manager;
 pub use thread_manager::local_agent_graph_store_from_state_db;
 pub use thread_manager::thread_store_from_config;
+/// Names core matches on to detect Catalyst's standalone extension tools. Exported so the crate that
+/// registers them can assert the two sides agree — a silent drift makes core fall back to its hosted
+/// tool specs, which the Anthropic adapter cannot represent.
+pub use tools::spec_plan::IMAGEGEN_TOOL_NAME as STANDALONE_IMAGEGEN_TOOL_NAME;
+pub use tools::spec_plan::IMAGE_GEN_NAMESPACE as STANDALONE_IMAGE_GEN_NAMESPACE;
+pub use tools::spec_plan::WEB_SEARCH_NAMESPACE as STANDALONE_WEB_SEARCH_NAMESPACE;
+pub use tools::spec_plan::WEB_SEARCH_TOOL_NAME as STANDALONE_WEB_SEARCH_TOOL_NAME;
 pub use web_search::web_search_action_detail;
 pub use web_search::web_search_detail;
 pub use windows_sandbox_read_grants::grant_read_root_non_elevated;
