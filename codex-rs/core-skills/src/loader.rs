@@ -15,9 +15,6 @@ use crate::system::system_cache_root_dir;
 use codex_config::ConfigLayerSource;
 use codex_config::ConfigLayerStack;
 use codex_config::ConfigLayerStackOrdering;
-use codex_config::default_project_root_markers;
-use codex_config::merge_toml_values;
-use codex_config::project_root_markers_from_config;
 use codex_exec_server::ExecutorFileSystem;
 use codex_exec_server::LOCAL_FS;
 use codex_protocol::protocol::Product;
@@ -28,7 +25,6 @@ use codex_utils_path_uri::PathUri;
 use codex_utils_plugins::DISCOVERABLE_PLUGIN_MANIFEST_PATHS;
 use codex_utils_plugins::PluginSkillRoot;
 use codex_utils_plugins::plugin_namespace_for_skill_path;
-use dirs::home_dir;
 use futures::future::join_all;
 use serde::Deserialize;
 use std::collections::HashSet;
@@ -40,7 +36,6 @@ use std::path::Component;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
-use toml::Value as TomlValue;
 use tracing::error;
 
 #[derive(Debug, Deserialize)]
@@ -119,7 +114,6 @@ struct ParsedSkillFrontmatter {
 }
 
 const SKILLS_FILENAME: &str = "SKILL.md";
-const AGENTS_DIR_NAME: &str = ".agents";
 const SKILLS_METADATA_DIR: &str = "agents";
 const SKILLS_METADATA_FILENAME: &str = "openai.yaml";
 const SKILLS_DIR_NAME: &str = "skills";
@@ -234,35 +228,18 @@ pub(crate) async fn load_skill_root(root: SkillRoot) -> SkillRootSnapshot {
     }
 }
 
-pub(crate) async fn skill_roots(
+/// Skill roots for a turn.
+///
+/// Neither the user's home directory nor the working directory is consulted: the `.agents/skills`
+/// roots that used them are retired, so a Skill reaches a session only by being configured for it
+/// or shipped with the product.
+pub(crate) fn skill_roots(
     fs: Option<Arc<dyn ExecutorFileSystem>>,
     config_layer_stack: &ConfigLayerStack,
-    cwd: &AbsolutePathBuf,
     plugin_skill_roots: Vec<PluginSkillRoot>,
     extra_skill_roots: Vec<AbsolutePathBuf>,
 ) -> Vec<SkillRoot> {
-    let home_dir =
-        home_dir().and_then(|path| AbsolutePathBuf::from_absolute_path_checked(path).ok());
-    skill_roots_with_home_dir(
-        fs,
-        config_layer_stack,
-        cwd,
-        home_dir.as_ref(),
-        plugin_skill_roots,
-        extra_skill_roots,
-    )
-    .await
-}
-
-async fn skill_roots_with_home_dir(
-    fs: Option<Arc<dyn ExecutorFileSystem>>,
-    config_layer_stack: &ConfigLayerStack,
-    cwd: &AbsolutePathBuf,
-    home_dir: Option<&AbsolutePathBuf>,
-    plugin_skill_roots: Vec<PluginSkillRoot>,
-    extra_skill_roots: Vec<AbsolutePathBuf>,
-) -> Vec<SkillRoot> {
-    let mut roots = skill_roots_from_layer_stack_inner(config_layer_stack, home_dir, fs.clone());
+    let mut roots = skill_roots_from_layer_stack_inner(config_layer_stack, fs);
     roots.extend(plugin_skill_roots.into_iter().map(|root| SkillRoot {
         path: root.path,
         scope: SkillScope::User,
@@ -279,14 +256,12 @@ async fn skill_roots_with_home_dir(
         plugin_namespace: None,
         plugin_root: None,
     }));
-    roots.extend(repo_agents_skill_roots(fs, config_layer_stack, cwd).await);
     dedupe_skill_roots_by_path(&mut roots);
     roots
 }
 
 fn skill_roots_from_layer_stack_inner(
     config_layer_stack: &ConfigLayerStack,
-    home_dir: Option<&AbsolutePathBuf>,
     repo_fs: Option<Arc<dyn ExecutorFileSystem>>,
 ) -> Vec<SkillRoot> {
     let mut roots = Vec::new();
@@ -324,17 +299,9 @@ fn skill_roots_from_layer_stack_inner(
                     plugin_root: None,
                 });
 
-                // `$HOME/.agents/skills` (user-installed skills).
-                if let Some(home_dir) = home_dir {
-                    roots.push(SkillRoot {
-                        path: home_dir.join(AGENTS_DIR_NAME).join(SKILLS_DIR_NAME),
-                        scope: SkillScope::User,
-                        file_system: Arc::clone(&LOCAL_FS),
-                        plugin_id: None,
-                        plugin_namespace: None,
-                        plugin_root: None,
-                    });
-                }
+                // `$HOME/.agents/skills` is deliberately not a root. It is shared with whatever
+                // else on the machine writes there, so honouring it lets Skills the product never
+                // shipped appear in its catalog and its prompt.
 
                 // Embedded system skills are cached under `$CODEX_HOME/skills/.system` and are a
                 // special case (not a config layer).
@@ -368,115 +335,6 @@ fn skill_roots_from_layer_stack_inner(
     }
 
     roots
-}
-
-async fn repo_agents_skill_roots(
-    fs: Option<Arc<dyn ExecutorFileSystem>>,
-    config_layer_stack: &ConfigLayerStack,
-    cwd: &AbsolutePathBuf,
-) -> Vec<SkillRoot> {
-    let Some(fs) = fs else {
-        return Vec::new();
-    };
-    let project_root_markers = project_root_markers_from_stack(config_layer_stack);
-    let project_root = find_project_root(fs.as_ref(), cwd, &project_root_markers).await;
-    let dirs = dirs_between_project_root_and_cwd(cwd, &project_root);
-    let mut roots = Vec::new();
-    for dir in dirs {
-        let agents_skills = dir.join(AGENTS_DIR_NAME).join(SKILLS_DIR_NAME);
-        let agents_skills_uri = PathUri::from_abs_path(&agents_skills);
-        match fs.get_metadata(&agents_skills_uri, /*sandbox*/ None).await {
-            Ok(metadata) if metadata.is_directory => roots.push(SkillRoot {
-                path: agents_skills,
-                scope: SkillScope::Repo,
-                file_system: Arc::clone(&fs),
-                plugin_id: None,
-                plugin_namespace: None,
-                plugin_root: None,
-            }),
-            Ok(_) => {}
-            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-            Err(err) => {
-                tracing::warn!(
-                    "failed to stat repo skills root {}: {err:#}",
-                    agents_skills.display()
-                );
-            }
-        }
-    }
-    roots
-}
-
-fn project_root_markers_from_stack(config_layer_stack: &ConfigLayerStack) -> Vec<String> {
-    let mut merged = TomlValue::Table(toml::map::Map::new());
-    for layer in config_layer_stack.get_layers(
-        ConfigLayerStackOrdering::LowestPrecedenceFirst,
-        /*include_disabled*/ false,
-    ) {
-        if matches!(layer.name, ConfigLayerSource::Project { .. }) {
-            continue;
-        }
-        merge_toml_values(&mut merged, &layer.config);
-    }
-
-    match project_root_markers_from_config(&merged) {
-        Ok(Some(markers)) => markers,
-        Ok(None) => default_project_root_markers(),
-        Err(err) => {
-            tracing::warn!("invalid project_root_markers: {err}");
-            default_project_root_markers()
-        }
-    }
-}
-
-async fn find_project_root(
-    fs: &dyn ExecutorFileSystem,
-    cwd: &AbsolutePathBuf,
-    project_root_markers: &[String],
-) -> AbsolutePathBuf {
-    if project_root_markers.is_empty() {
-        return cwd.clone();
-    }
-
-    for ancestor in cwd.ancestors() {
-        for marker in project_root_markers {
-            let marker_path = ancestor.join(marker);
-            let marker_path_uri = PathUri::from_abs_path(&marker_path);
-            match fs.get_metadata(&marker_path_uri, /*sandbox*/ None).await {
-                Ok(_) => return ancestor,
-                Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-                Err(err) => {
-                    tracing::warn!(
-                        "failed to stat project root marker {}: {err:#}",
-                        marker_path.display()
-                    );
-                }
-            }
-        }
-    }
-
-    cwd.clone()
-}
-
-fn dirs_between_project_root_and_cwd(
-    cwd: &AbsolutePathBuf,
-    project_root: &AbsolutePathBuf,
-) -> Vec<AbsolutePathBuf> {
-    let mut dirs = cwd
-        .ancestors()
-        .scan(false, |done, dir| {
-            if *done {
-                None
-            } else {
-                if &dir == project_root {
-                    *done = true;
-                }
-                Some(dir)
-            }
-        })
-        .collect::<Vec<_>>();
-    dirs.reverse();
-    dirs
 }
 
 fn dedupe_skill_roots_by_path(roots: &mut Vec<SkillRoot>) {
@@ -1270,21 +1128,11 @@ fn extract_frontmatter(contents: &str) -> Option<String> {
     Some(frontmatter_lines.join("\n"))
 }
 #[cfg(test)]
-pub(crate) async fn skill_roots_from_layer_stack(
+pub(crate) fn skill_roots_from_layer_stack(
     fs: Arc<dyn ExecutorFileSystem>,
     config_layer_stack: &ConfigLayerStack,
-    cwd: &AbsolutePathBuf,
-    home_dir: Option<&AbsolutePathBuf>,
 ) -> Vec<SkillRoot> {
-    skill_roots_with_home_dir(
-        Some(fs),
-        config_layer_stack,
-        cwd,
-        home_dir,
-        Vec::new(),
-        Vec::new(),
-    )
-    .await
+    skill_roots(Some(fs), config_layer_stack, Vec::new(), Vec::new())
 }
 
 #[cfg(test)]

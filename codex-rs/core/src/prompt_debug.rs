@@ -76,6 +76,23 @@ pub async fn build_prompt_snapshot_with_runtime_options(
     let thread_store = thread_store_from_config(&config, state_db.clone());
     let installation_id = resolve_installation_id(&config.codex_home).await?;
     let mut extensions_builder = ExtensionRegistryBuilder::<Config>::new();
+    // Provider-backed skills reach a turn only through the skills extension, and only the app
+    // server was installing it. Without this the snapshot silently drops every skill that is not
+    // file-backed — the private catalog most of all — so a dump used to check how a private skill
+    // is presented showed a session in which none exist.
+    let mut skill_providers = codex_skills_extension::SkillProviders::new();
+    for source in runtime_options.skill_provider_sources() {
+        skill_providers = skill_providers.with_provider(source.clone());
+    }
+    codex_skills_extension::install_with_providers(
+        &mut extensions_builder,
+        skill_providers,
+        |config: &Config| codex_skills_extension::SkillsExtensionConfig {
+            include_instructions: config.include_skill_instructions,
+            bundled_skills_enabled: config.bundled_skills_enabled(),
+            orchestrator_skills_enabled: config.orchestrator_skills_enabled,
+        },
+    );
     for extension in runtime_options.runtime_extensions() {
         extension.install(&mut extensions_builder);
     }

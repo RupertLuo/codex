@@ -22,7 +22,6 @@ use toml::Value as TomlValue;
 const REPO_ROOT_CONFIG_DIR_NAME: &str = ".codex";
 
 struct TestConfig {
-    cwd: AbsolutePathBuf,
     config_layer_stack: ConfigLayerStack,
 }
 
@@ -106,9 +105,7 @@ async fn make_config_for_cwd(codex_home: &TempDir, cwd: PathBuf) -> TestConfig {
     ];
     layers.extend(project_layers_for_cwd(&cwd));
 
-    let cwd_abs = cwd.abs();
     TestConfig {
-        cwd: cwd_abs,
         config_layer_stack: ConfigLayerStack::new(
             layers,
             ConfigRequirements::default(),
@@ -119,15 +116,10 @@ async fn make_config_for_cwd(codex_home: &TempDir, cwd: PathBuf) -> TestConfig {
 }
 
 async fn load_skills_for_test(config: &TestConfig) -> SkillLoadOutcome {
-    // Keep unit tests hermetic by never scanning the real `$HOME/.agents/skills`.
+    // These tests are hermetic without opting out of anything: root selection no longer reads the
+    // home or working directory, so there is no `$HOME/.agents/skills` left to scan.
     super::load_skills_from_roots(
-        super::skill_roots_from_layer_stack(
-            Arc::clone(&LOCAL_FS),
-            &config.config_layer_stack,
-            &config.cwd,
-            /*home_dir*/ None,
-        )
-        .await,
+        super::skill_roots_from_layer_stack(Arc::clone(&LOCAL_FS), &config.config_layer_stack),
         /*plugin_skill_snapshots*/ None,
     )
     .await
@@ -179,26 +171,15 @@ async fn skill_roots_from_layer_stack_maps_user_to_user_and_system_cache_and_sys
         ConfigRequirementsToml::default(),
     )?;
 
-    let home_folder_abs = home_folder.abs();
-    let got = skill_roots_from_layer_stack(
-        Arc::clone(&LOCAL_FS),
-        &stack,
-        &home_folder_abs,
-        Some(&home_folder_abs),
-    )
-    .await
-    .into_iter()
-    .map(|root| (root.scope, root.path.to_path_buf()))
-    .collect::<Vec<_>>();
+    let got = skill_roots_from_layer_stack(Arc::clone(&LOCAL_FS), &stack)
+        .into_iter()
+        .map(|root| (root.scope, root.path.to_path_buf()))
+        .collect::<Vec<_>>();
 
     assert_eq!(
         got,
         vec![
             (SkillScope::User, user_folder.join("skills")),
-            (
-                SkillScope::User,
-                home_folder.join(AGENTS_DIR_NAME).join(SKILLS_DIR_NAME)
-            ),
             (
                 SkillScope::System,
                 user_folder.join("skills").join(".system")
@@ -247,28 +228,16 @@ async fn skill_roots_from_layer_stack_includes_disabled_project_layers() -> anyh
         ConfigRequirementsToml::default(),
     )?;
 
-    let home_folder_abs = home_folder.abs();
-    let project_root_abs = project_root.abs();
-    let got = skill_roots_from_layer_stack(
-        Arc::clone(&LOCAL_FS),
-        &stack,
-        &project_root_abs,
-        Some(&home_folder_abs),
-    )
-    .await
-    .into_iter()
-    .map(|root| (root.scope, root.path.to_path_buf()))
-    .collect::<Vec<_>>();
+    let got = skill_roots_from_layer_stack(Arc::clone(&LOCAL_FS), &stack)
+        .into_iter()
+        .map(|root| (root.scope, root.path.to_path_buf()))
+        .collect::<Vec<_>>();
 
     assert_eq!(
         got,
         vec![
             (SkillScope::Repo, dot_codex.join("skills")),
             (SkillScope::User, user_folder.join("skills")),
-            (
-                SkillScope::User,
-                home_folder.join(AGENTS_DIR_NAME).join(SKILLS_DIR_NAME)
-            ),
             (
                 SkillScope::System,
                 user_folder.join("skills").join(".system")
@@ -280,7 +249,7 @@ async fn skill_roots_from_layer_stack_includes_disabled_project_layers() -> anyh
 }
 
 #[tokio::test]
-async fn loads_skills_from_home_agents_dir_for_user_scope() -> anyhow::Result<()> {
+async fn ignores_skills_in_the_home_agents_dir() -> anyhow::Result<()> {
     let tmp = tempfile::tempdir()?;
 
     let home_folder = tmp.path().join("home");
@@ -301,40 +270,24 @@ async fn loads_skills_from_home_agents_dir_for_user_scope() -> anyhow::Result<()
         ConfigRequirementsToml::default(),
     )?;
 
-    let skill_path = write_skill_at(
-        &home_folder.join(AGENTS_DIR_NAME).join(SKILLS_DIR_NAME),
+    write_skill_at(
+        &home_folder.join(".agents").join(SKILLS_DIR_NAME),
         "agents-home",
         "agents-home-skill",
         "from home agents",
     );
 
-    let home_folder_abs = home_folder.abs();
-    let roots = skill_roots_from_layer_stack(
-        Arc::clone(&LOCAL_FS),
-        &stack,
-        &home_folder_abs,
-        Some(&home_folder_abs),
-    )
-    .await;
+    let roots = skill_roots_from_layer_stack(Arc::clone(&LOCAL_FS), &stack);
     let outcome = load_skills_from_roots(roots, /*plugin_skill_snapshots*/ None).await;
     assert!(
         outcome.errors.is_empty(),
         "unexpected errors: {:?}",
         outcome.errors
     );
-    assert_eq!(
-        outcome.skills,
-        vec![SkillMetadata {
-            name: "agents-home-skill".to_string(),
-            description: "from home agents".to_string(),
-            short_description: None,
-            interface: None,
-            dependencies: None,
-            policy: None,
-            path_to_skills_md: normalized(&skill_path),
-            scope: SkillScope::User,
-            plugin_id: None,
-        }]
+    assert!(
+        outcome.skills.is_empty(),
+        "`$HOME/.agents/skills` must not be a Skill root: {:?}",
+        outcome.skills
     );
 
     Ok(())
@@ -1690,13 +1643,13 @@ async fn loads_skills_from_repo_root() {
 }
 
 #[tokio::test]
-async fn loads_skills_from_agents_dir_without_codex_dir() {
+async fn ignores_skills_in_a_repo_agents_dir() {
     let codex_home = tempfile::tempdir().expect("tempdir");
     let repo_dir = tempfile::tempdir().expect("tempdir");
     mark_as_git_repo(repo_dir.path());
 
-    let skill_path = write_skill_at(
-        &repo_dir.path().join(AGENTS_DIR_NAME).join(SKILLS_DIR_NAME),
+    write_skill_at(
+        &repo_dir.path().join(".agents").join(SKILLS_DIR_NAME),
         "agents",
         "agents-skill",
         "from agents",
@@ -1709,19 +1662,12 @@ async fn loads_skills_from_agents_dir_without_codex_dir() {
         "unexpected errors: {:?}",
         outcome.errors
     );
-    assert_eq!(
-        outcome.skills,
-        vec![SkillMetadata {
-            name: "agents-skill".to_string(),
-            description: "from agents".to_string(),
-            short_description: None,
-            interface: None,
-            dependencies: None,
-            policy: None,
-            path_to_skills_md: normalized(&skill_path),
-            scope: SkillScope::Repo,
-            plugin_id: None,
-        }]
+    // Checking out a repository must not hand it a Skill root: `.agents/skills` is shared with
+    // whatever else writes there, and its contents would reach the model as product instructions.
+    assert!(
+        outcome.skills.is_empty(),
+        "a repo `.agents/skills` must not be a Skill root: {:?}",
+        outcome.skills
     );
 }
 
@@ -2146,18 +2092,20 @@ async fn skill_roots_include_admin_with_lowest_priority() {
     let scopes: Vec<SkillScope> = super::skill_roots(
         Some(Arc::clone(&LOCAL_FS)),
         &cfg.config_layer_stack,
-        &cfg.cwd,
         Vec::new(),
         Vec::new(),
     )
-    .await
     .into_iter()
     .map(|root| root.scope)
     .collect();
-    let mut expected = vec![SkillScope::User, SkillScope::System];
-    if home_dir().is_some() {
-        expected.insert(1, SkillScope::User);
-    }
-    expected.push(SkillScope::Admin);
-    assert_eq!(scopes, expected);
+    // No longer conditional on the machine having a home directory: dropping the
+    // `$HOME/.agents/skills` root is what makes this set the same everywhere.
+    assert_eq!(
+        scopes,
+        vec![
+            SkillScope::User,
+            SkillScope::System,
+            SkillScope::Admin
+        ]
+    );
 }
