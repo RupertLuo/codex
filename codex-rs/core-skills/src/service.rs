@@ -155,11 +155,9 @@ impl SkillsService {
         let mut roots = skill_roots(
             fs,
             &input.config_layer_stack,
-            &input.cwd,
             input.effective_skill_roots.clone(),
             self.extra_roots(),
-        )
-        .await;
+        );
         if !input.bundled_skills_enabled {
             roots.retain(|root| root.scope != SkillScope::System);
         }
@@ -183,11 +181,9 @@ impl SkillsService {
         let mut roots = skill_roots(
             fs.clone(),
             &input.config_layer_stack,
-            &input.cwd,
             input.effective_skill_roots.clone(),
             self.extra_roots(),
-        )
-        .await;
+        );
         if !bundled_skills_enabled_from_stack(&input.config_layer_stack) {
             roots.retain(|root| root.scope != SkillScope::System);
         }
