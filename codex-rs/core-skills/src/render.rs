@@ -18,6 +18,7 @@ use codex_utils_output_truncation::approx_token_count;
 const DEFAULT_SKILL_METADATA_CHAR_BUDGET: usize = 8_000;
 const SKILL_METADATA_CONTEXT_WINDOW_PERCENT: usize = 2;
 const MAX_DEFAULT_CONTEXT_SKILL_DESCRIPTION_CHARS: usize = 1_024;
+const FILE_LOCATOR: &str = "file";
 const TRUNCATED_SKILL_DESCRIPTION_SUFFIX: &str = "...";
 const SKILL_DESCRIPTION_TRUNCATION_WARNING_THRESHOLD_CHARS: usize = 100;
 const APPROX_BYTES_PER_TOKEN: usize = 4;
@@ -150,6 +151,41 @@ pub fn default_skill_metadata_budget(context_window: Option<i64>) -> SkillMetada
         .unwrap_or(SkillMetadataBudget::Characters(
             DEFAULT_SKILL_METADATA_CHAR_BUDGET,
         ))
+}
+
+/// One entry a caller wants on the skills list, already resolved to its display form.
+///
+/// The skills extension builds its catalog from providers rather than from the filesystem, so it
+/// cannot hand over [`SkillMetadata`]; this is the shape both paths agree on.
+pub struct BudgetedSkillLine<'a> {
+    pub name: &'a str,
+    pub description: &'a str,
+    /// The word before the locator, e.g. `file` or `custom resource`.
+    pub locator_kind: &'a str,
+    pub path: String,
+}
+
+/// Fit a caller's skill list into `budget`, shortening descriptions before dropping any entry.
+///
+/// This is the same strategy the filesystem path uses, exposed so that a second renderer does not
+/// have to reinvent it — and, having reinvented it once as a flat byte cap that silently dropped
+/// whole skills, does not have to get it wrong again. Returns the rendered lines and a report of
+/// what had to give.
+pub fn render_budgeted_skill_lines(
+    lines: Vec<BudgetedSkillLine<'_>>,
+    budget: SkillMetadataBudget,
+) -> (Vec<String>, SkillRenderReport) {
+    let total_count = lines.len();
+    let skill_lines = lines
+        .iter()
+        .map(|line| SkillLine {
+            name: line.name,
+            description: truncate_default_context_skill_description(line.description),
+            locator: line.locator_kind,
+            path: line.path.clone(),
+        })
+        .collect::<Vec<_>>();
+    render_skill_lines_from_lines(skill_lines, total_count, budget)
 }
 
 pub fn build_available_skills(
@@ -442,6 +478,10 @@ impl SkillRenderReport {
 struct SkillLine<'a> {
     name: &'a str,
     description: Cow<'a, str>,
+    /// What kind of thing `path` names — `file` for a skill on disk, or the locator kind a
+    /// provider uses. Only filesystem skills are rendered here directly; the skills extension
+    /// feeds its own catalog through [`render_budgeted_skill_lines`] and keeps its wording.
+    locator: &'a str,
     path: String,
 }
 
@@ -484,6 +524,7 @@ impl<'a> SkillLine<'a> {
         Self {
             name: skill.name.as_str(),
             description,
+            locator: FILE_LOCATOR,
             path,
         }
     }
@@ -517,19 +558,19 @@ impl<'a> SkillLine<'a> {
 
     fn render_with_description_chars(&self, description_chars: usize) -> String {
         if description_chars == 0 {
-            format!("- {}: (file: {})", self.name, self.path)
+            self.render_with_description("")
         } else {
             let end = self.rendered_description_prefix_len(description_chars);
-            let description = &self.description.as_ref()[..end];
-            format!("- {}: {} (file: {})", self.name, description, self.path)
+            self.render_with_description(&self.description.as_ref()[..end])
         }
     }
 
     fn render_with_description(&self, description: &str) -> String {
+        let Self { name, locator, path, .. } = self;
         if description.is_empty() {
-            format!("- {}: (file: {})", self.name, self.path)
+            format!("- {name}: ({locator}: {path})")
         } else {
-            format!("- {}: {} (file: {})", self.name, description, self.path)
+            format!("- {name}: {description} ({locator}: {path})")
         }
     }
 }

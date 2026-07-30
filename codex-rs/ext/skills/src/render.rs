@@ -1,5 +1,8 @@
 use std::borrow::Cow;
 
+use codex_core_skills::BudgetedSkillLine;
+use codex_core_skills::SkillMetadataBudget;
+use codex_core_skills::render_budgeted_skill_lines;
 use codex_utils_string::take_bytes_at_char_boundary;
 
 use crate::catalog::SkillCatalog;
@@ -7,7 +10,6 @@ use crate::catalog::SkillCatalogEntry;
 use crate::catalog::SkillSourceKind;
 use crate::fragments::AvailableSkillsInstructions;
 
-const MAX_AVAILABLE_SKILLS_BYTES: usize = 8_000;
 const MAX_MAIN_PROMPT_BYTES: usize = 8_000;
 const MAX_CATALOG_SKILL_DESCRIPTION_CHARS: usize = 1_024;
 const TRUNCATED_SKILL_DESCRIPTION_SUFFIX: &str = "...";
@@ -21,36 +23,34 @@ pub(crate) const MAX_SKILL_PATH_BYTES: usize = 1_024;
 )]
 pub(crate) fn available_skills_fragment(
     catalog: &SkillCatalog,
+    budget: SkillMetadataBudget,
     include_skills_usage_instructions: bool,
 ) -> Option<AvailableSkillsInstructions> {
-    let mut total_bytes = 0usize;
-    let mut omitted = 0usize;
-    let mut skill_lines = Vec::new();
-
-    for entry in catalog
+    // Shortening descriptions before dropping entries is the whole point of going through the
+    // shared renderer: a skill the model never sees named cannot be chosen at all, whereas one
+    // with a shortened description still can. This list used to be capped at a flat byte count,
+    // which measured CJK descriptions at three bytes per character and dropped whole skills.
+    let lines = catalog
         .entries
         .iter()
         .filter(|entry| entry.enabled && entry.prompt_visible)
-    {
-        let description = entry
-            .short_description
-            .as_deref()
-            .unwrap_or(entry.description.as_str());
-        let description = truncate_catalog_skill_description(description);
-        let line = render_skill_line(entry, description.as_ref());
-        let next_bytes = total_bytes.saturating_add(line.len());
-        if next_bytes > MAX_AVAILABLE_SKILLS_BYTES {
-            omitted = omitted.saturating_add(1);
-            continue;
-        }
-        total_bytes = next_bytes;
-        skill_lines.push(line);
-    }
+        .map(|entry| BudgetedSkillLine {
+            name: entry.name.as_str(),
+            description: entry
+                .short_description
+                .as_deref()
+                .unwrap_or(entry.description.as_str()),
+            locator_kind: locator_kind(entry),
+            path: entry.rendered_path().to_string(),
+        })
+        .collect::<Vec<_>>();
 
+    let (mut skill_lines, report) = render_budgeted_skill_lines(lines, budget);
     if skill_lines.is_empty() {
         return None;
     }
-    if omitted > 0 {
+    if report.omitted_count > 0 {
+        let omitted = report.omitted_count;
         let skill_word = if omitted == 1 { "skill" } else { "skills" };
         skill_lines.push(format!(
             "- {omitted} additional {skill_word} omitted from this bounded skills list."
@@ -83,19 +83,13 @@ pub(crate) fn truncate_catalog_skill_description(description: &str) -> Cow<'_, s
     Cow::Owned(truncated)
 }
 
-fn render_skill_line(entry: &SkillCatalogEntry, description: &str) -> String {
-    let locator_kind = match &entry.authority.kind {
+/// The word the prompt uses before a skill's locator, so the model knows how to open it.
+fn locator_kind(entry: &SkillCatalogEntry) -> &'static str {
+    match &entry.authority.kind {
         SkillSourceKind::Host => "file",
         SkillSourceKind::Executor => "environment resource",
         SkillSourceKind::Orchestrator => "orchestrator resource",
         SkillSourceKind::Custom(_) => "custom resource",
-    };
-    let name = entry.name.as_str();
-    let path = entry.rendered_path();
-    if description.is_empty() {
-        format!("- {name}: ({locator_kind}: {path})")
-    } else {
-        format!("- {name}: {description} ({locator_kind}: {path})")
     }
 }
 

@@ -1034,3 +1034,94 @@ fn read_request_keys(
         })
         .collect()
 }
+
+/// Every private skill has to reach the prompt, even when their descriptions do not all fit.
+///
+/// The list was once capped at a flat 8000 bytes and dropped whole entries past it. CJK
+/// descriptions cost three bytes per character there, so a real Catalyst catalog lost most of
+/// itself: a skill the model never sees named cannot be chosen, no matter how well it matches.
+/// Shortening descriptions is the acceptable loss; hiding skills is not.
+#[tokio::test]
+async fn a_chinese_private_catalog_reaches_the_prompt_whole() -> TestResult {
+    // Long enough that the old byte cap would have fitted roughly half of them.
+    let description = "梳理产业链上中下游结构、代表公司与关键环节，并交付带来源可追溯的结论。".repeat(4);
+    let names = (0..20)
+        .map(|index| format!("skill-{index:02}"))
+        .collect::<Vec<_>>();
+    let entries = names
+        .iter()
+        .map(|name| {
+            let locator = format!("skill://catalyst-private/{name}/1.0.0/SKILL.md");
+            SkillCatalogEntry::new(
+                SkillPackageId(format!("private/{name}")),
+                SkillAuthority::new(
+                    SkillSourceKind::Custom("catalyst-private".to_string()),
+                    "catalyst-private",
+                ),
+                name.as_str(),
+                description.as_str(),
+                SkillResourceId::new(&locator),
+            )
+            .with_display_path(locator)
+        })
+        .collect::<Vec<_>>();
+
+    let provider = Arc::new(StaticSkillProvider {
+        catalog: SkillCatalog {
+            entries,
+            warnings: Vec::new(),
+        },
+        read_requests: Arc::new(Mutex::new(Vec::new())),
+        list_calls: None,
+        fail_first_list: false,
+    });
+    let providers = SkillProviders::new().with_provider(SkillProviderSource::new(
+        SkillSourceKind::Custom("catalyst-private".to_string()),
+        "catalyst-private",
+        provider,
+    ));
+    let mut builder = ExtensionRegistryBuilder::new();
+    install_with_providers(&mut builder, providers, skills_extension_config);
+    let registry = builder.build();
+    let session_store = ExtensionData::new("session");
+    let thread_store = ExtensionData::new("thread");
+    let config = default_config();
+    registry.thread_lifecycle_contributors()[0]
+        .on_thread_start(ThreadStartInput {
+            config: &config,
+            session_source: &SessionSource::Cli,
+            persistent_thread_state_available: true,
+            environments: &[],
+            session_store: &session_store,
+            thread_store: &thread_store,
+        })
+        .await;
+
+    let fragments = registry.context_contributors()[0]
+        .contribute_thread_context(&session_store, &thread_store)
+        .await;
+    let catalog_fragment = fragments
+        .iter()
+        .map(|fragment| fragment.text())
+        .find(|text| text.contains("### Available skills"))
+        .expect("the thread context carries the skills catalog");
+
+    for name in &names {
+        assert!(
+            catalog_fragment.contains(name.as_str()),
+            "{name} is missing from the skills list"
+        );
+    }
+    assert!(
+        !catalog_fragment.contains("omitted from this bounded skills list"),
+        "no skill should be dropped while their names still fit:\n{catalog_fragment}"
+    );
+    // The locator wording is how the model knows to read this through the provider rather than
+    // reaching for a file tool, so it has to survive the shared renderer.
+    assert!(
+        catalog_fragment.contains("(custom resource: skill://catalyst-private/skill-00/1.0.0/SKILL.md)"),
+        "private locators must stay intact:\n{catalog_fragment}"
+    );
+
+    Ok(())
+}

@@ -1,6 +1,8 @@
 use std::sync::Arc;
 
 use codex_core_skills::HostSkillsSnapshot;
+use codex_core_skills::SkillMetadataBudget;
+use codex_core_skills::default_skill_metadata_budget;
 use codex_core_skills::injection::InjectedHostSkillPrompts;
 use codex_exec_server::LOCAL_ENVIRONMENT_ID;
 use codex_extension_api::ConfigContributor;
@@ -133,10 +135,11 @@ where
             for warning in &catalog.warnings {
                 self.emit_warning(thread_store.level_id(), warning.clone());
             }
-            let include_usage = thread_store
-                .get::<ModelInfo>()
+            let model_info = thread_store.get::<ModelInfo>();
+            let include_usage = model_info
+                .as_ref()
                 .is_some_and(|model_info| model_info.include_skills_usage_instructions);
-            available_skills_fragment(&catalog, include_usage)
+            available_skills_fragment(&catalog, skills_budget(model_info.as_deref()), include_usage)
                 .map(|fragment| PromptFragment::developer_capability(fragment.render()))
                 .into_iter()
                 .collect()
@@ -170,12 +173,13 @@ where
             input
                 .turn_store
                 .insert(ExecutorSkillsStepState(catalog.clone()));
-            let include_usage = input
-                .thread_store
-                .get::<ModelInfo>()
+            let model_info = input.thread_store.get::<ModelInfo>();
+            let include_usage = model_info
+                .as_ref()
                 .is_some_and(|model_info| model_info.include_skills_usage_instructions);
             vec![executor_skills_world_state_section(
                 &catalog,
+                skills_budget(model_info.as_deref()),
                 config.include_instructions,
                 include_usage,
             )]
@@ -253,10 +257,15 @@ where
                     entry.authority.kind != SkillSourceKind::Executor
                         && entry.authority.kind != SkillSourceKind::Orchestrator
                 });
-                let include_usage = thread_store
-                    .get::<ModelInfo>()
+                let model_info = thread_store.get::<ModelInfo>();
+                let include_usage = model_info
+                    .as_ref()
                     .is_some_and(|model_info| model_info.include_skills_usage_instructions);
-                if let Some(fragment) = available_skills_fragment(&turn_catalog, include_usage) {
+                if let Some(fragment) = available_skills_fragment(
+                    &turn_catalog,
+                    skills_budget(model_info.as_deref()),
+                    include_usage,
+                ) {
                     fragments.push(Box::new(fragment));
                 }
             }
@@ -413,6 +422,16 @@ pub fn install<C>(
         SkillProviders::new().with_host_provider(Arc::new(HostSkillProvider::new())),
         config_from_host,
     );
+}
+
+/// How much room this thread's model gives the skills list.
+///
+/// Taken from the same `ModelInfo` the usage-instruction flag comes from. A thread that has not
+/// resolved a model yet falls back to the character budget, which is what the filesystem path
+/// does too — the point is that both paths scale with the window rather than with a fixed count
+/// of bytes.
+fn skills_budget(model_info: Option<&ModelInfo>) -> SkillMetadataBudget {
+    default_skill_metadata_budget(model_info.and_then(|model_info| model_info.context_window))
 }
 
 pub fn install_with_providers<C>(
