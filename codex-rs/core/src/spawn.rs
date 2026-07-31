@@ -52,8 +52,21 @@ pub(crate) struct SpawnChildRequest<'a> {
 /// PowerShell encodes with when it pipes into a native program. `echo '<json with 中文>' | tool`
 /// therefore delivers `?` for every non-ASCII character — the data is destroyed at the pipe,
 /// before the tool ever runs. It silently produced a deck of Chinese slides rendered entirely as
-/// question marks, and it is invisible to anyone developing on PowerShell 7, whose default is
-/// already UTF-8.
+/// question marks, and it is invisible to anyone developing with `pwsh` on PATH, since PowerShell
+/// 7 already defaults to UTF-8.
+///
+/// The target is the console's *input* code page, because that is what the receiving program
+/// decodes redirected stdin with — writing UTF-8 into a code-page-936 console just trades `?` for
+/// mojibake, which is worse for being harder to notice. (`[Console]::OutputEncoding` measures
+/// identically today, since both console code pages default to the same value, but it is the
+/// wrong end of the pipe to aim at.) Forcing the console to UTF-8 with `chcp 65001` does not work
+/// either: PowerShell then leads the stream with a BOM the receiving parser reads as garbage.
+/// Measured end-to-end against a real tool under PowerShell 5.1 with a hidden console, which is
+/// what the desktop app spawns.
+///
+/// This aligns the two ends rather than making any encoding universally correct: text the console
+/// code page cannot represent — Chinese on a Western-locale machine — is still lost. Alignment is
+/// nonetheless strictly better than either default, both of which fail unconditionally.
 ///
 /// This belongs at the spawn boundary rather than in `Shell::derive_exec_args`: that function's
 /// output is also what safety classification, policy matching, and the command shown to the user
@@ -61,10 +74,10 @@ pub(crate) struct SpawnChildRequest<'a> {
 /// turning every read-only Windows command into an approval prompt.
 ///
 /// Each command runs in a fresh `-Command` process, so the assignment has to ride along with the
-/// command; there is no environment variable for it. It is a no-op where the default is already
-/// UTF-8, and `$false` suppresses the BOM that would otherwise lead the first piped bytes.
+/// command; there is no environment variable for it. Command-line arguments are unaffected either
+/// way — Windows passes those as UTF-16 — so this only changes what crosses a pipe.
 fn with_powershell_utf8_piping(program: &std::path::Path, args: Vec<String>) -> Vec<String> {
-    const PROLOGUE: &str = "$OutputEncoding = New-Object System.Text.UTF8Encoding $false; ";
+    const PROLOGUE: &str = "$OutputEncoding = [Console]::InputEncoding; ";
 
     let is_powershell = program
         .file_stem()
@@ -194,9 +207,12 @@ mod powershell_utf8_tests {
         let user_command = out[2].find(command).expect("the command must survive");
         // Order is the whole point: PowerShell pipes as US-ASCII until the variable is assigned.
         assert!(assignment < user_command, "assignment must come first: {}", out[2]);
+        // Specifically the console's *input* encoding — the one the receiving program decodes
+        // stdin with. Hard-coding UTF-8 here reintroduces the bug in a quieter form: UTF-8 bytes
+        // arriving at a code-page-936 console become mojibake rather than `?`.
         assert!(
-            out[2].contains("UTF8Encoding $false"),
-            "a BOM would lead the first piped bytes: {}",
+            out[2].contains("[Console]::InputEncoding"),
+            "must target the encoding the receiving end decodes with: {}",
             out[2],
         );
     }
