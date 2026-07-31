@@ -133,6 +133,9 @@ fn derive_exec_args() {
         shell_type: ShellType::PowerShell,
         shell_path: PathBuf::from("pwsh.exe"),
     };
+    // Deliberately the bare command: safety classification, policy matching, and the command shown
+    // to the user are all derived from this, so the UTF-8 piping fix is applied at the spawn
+    // boundary instead (see `spawn::with_powershell_utf8_piping`).
     assert_eq!(
         test_powershell_shell.derive_exec_args("echo hello", /*use_login_shell*/ false),
         vec!["pwsh.exe", "-NoProfile", "-Command", "echo hello"]
