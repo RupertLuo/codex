@@ -327,16 +327,26 @@ impl ContextManager {
     /// the client should not re-estimate them.
     /// Roughly how many bytes these items would occupy in a request body.
     ///
-    /// Images are counted at the length of their payload and everything else at the length of its
-    /// text. That is the whole point: an image is a couple of thousand tokens and up to a megabyte,
-    /// so a history can be far from its token limit and still be too large to send, and only a
-    /// measure in bytes can tell.
+    /// Images are what this exists to see: one costs a couple of thousand tokens and up to a
+    /// megabyte, so a history can sit far inside its token limit and still be too large to send.
+    ///
+    /// Each image is counted at no more than [`IMAGE_BYTES_AFTER_REENCODING`], because a provider
+    /// that re-encodes oversized images before sending does not put the stored bytes on the wire.
+    /// Counting what history holds would read a single 5.4 MB generated PNG as almost a whole
+    /// request when it leaves as 490 KB, and would compact a thread that had no need of it.
     pub(crate) fn estimated_bytes(&self) -> u64 {
+        /// What an oversized image comes to once re-encoded, measured on a real generated image:
+        /// 2048x1152 lands at 490 KB. Rounded up, and only ever used as a ceiling, so an image
+        /// already smaller than this counts as itself.
+        const IMAGE_BYTES_AFTER_REENCODING: u64 = 600 * 1024;
+
         fn content_bytes(items: &[ContentItem]) -> u64 {
             items
                 .iter()
                 .map(|item| match item {
-                    ContentItem::InputImage { image_url, .. } => image_url.len() as u64,
+                    ContentItem::InputImage { image_url, .. } => {
+                        (image_url.len() as u64).min(IMAGE_BYTES_AFTER_REENCODING)
+                    }
                     ContentItem::InputText { text } | ContentItem::OutputText { text } => {
                         text.len() as u64
                     }
@@ -356,7 +366,7 @@ impl ContextManager {
                             .iter()
                             .map(|item| match item {
                                 FunctionCallOutputContentItem::InputImage { image_url, .. } => {
-                                    image_url.len() as u64
+                                    (image_url.len() as u64).min(IMAGE_BYTES_AFTER_REENCODING)
                                 }
                                 FunctionCallOutputContentItem::InputText { text } => {
                                     text.len() as u64
