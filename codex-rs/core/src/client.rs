@@ -101,6 +101,7 @@ use tokio::sync::oneshot::error::TryRecvError;
 use tokio_tungstenite::tungstenite::Error;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_util::sync::CancellationToken;
+use tracing::info;
 use tracing::instrument;
 use tracing::trace;
 use tracing::warn;
@@ -268,6 +269,7 @@ pub struct ModelClient {
 pub struct ModelClientSession {
     client: ModelClient,
     websocket_session: WebsocketSession,
+    http_session: HttpIncrementalSession,
     /// Turn state for sticky routing.
     ///
     /// This is an `OnceLock` that stores the turn state value received from the server
@@ -285,6 +287,18 @@ pub struct ModelClientSession {
 struct LastResponse {
     response_id: String,
     items_added: Vec<ResponseItem>,
+}
+
+/// What the HTTP path last sent and what came back, so the next request can be a delta.
+///
+/// Deliberately not shared with [`WebsocketSession`]. The websocket's `previous_response_id`
+/// names a response on that connection; the HTTP one names a response the provider is holding.
+/// They mean different things, and a transport fallback mid-thread would otherwise hand one
+/// path's id to the other.
+#[derive(Debug, Default)]
+struct HttpIncrementalSession {
+    last_request: Option<ResponsesApiRequest>,
+    last_response_rx: Option<oneshot::Receiver<LastResponse>>,
 }
 
 #[derive(Debug, Default)]
@@ -318,6 +332,10 @@ fn responses_request_properties_match(
         prompt_cache_key: previous_prompt_cache_key,
         text: previous_text,
         client_metadata: _,
+        // Ignored, like `input`: this is the pointer at the conversation the request continues,
+        // so it differs on every request that uses it and comparing it would report every pair as
+        // mismatched. What has to match is the shape around it, which is everything above.
+        previous_response_id: _,
     } = previous;
     let ResponsesApiRequest {
         model: current_model,
@@ -334,6 +352,7 @@ fn responses_request_properties_match(
         prompt_cache_key: current_prompt_cache_key,
         text: current_text,
         client_metadata: _,
+        previous_response_id: _,
     } = current;
 
     previous_model == current_model
@@ -484,6 +503,9 @@ impl ModelClient {
         ModelClientSession {
             client: self.clone(),
             websocket_session: self.take_cached_websocket_session(),
+            // Starts empty every turn: the first request of a turn carries the whole conversation
+            // and establishes the baseline the rest of the turn extends.
+            http_session: HttpIncrementalSession::default(),
             turn_state: Arc::new(OnceLock::new()),
         }
     }
@@ -913,6 +935,9 @@ impl ModelClient {
             prompt_cache_key,
             text,
             client_metadata: Some(responses_metadata.client_metadata()),
+            // Filled in later, and only when the caller has an incremental request to make: this
+            // builder does not know what was sent last.
+            previous_response_id: None,
         };
         Ok(request)
     }
@@ -1149,9 +1174,37 @@ impl ModelClientSession {
         }
     }
 
+    /// Whether this provider should be sent deltas over HTTP instead of the whole conversation.
+    ///
+    /// Off unless asked for, and asked for per provider rather than globally: sending a delta
+    /// means the provider is holding the conversation for us, which is a decision about that
+    /// provider's retention, not a transport detail. Upstream Codex sends the full input over
+    /// HTTP for exactly this reason.
+    ///
+    /// Reads the environment rather than config so it can be turned on for one build without a
+    /// protocol change; this is expected to become a provider capability once it has run.
+    fn http_incremental_enabled(&self) -> bool {
+        std::env::var("CODEX_HTTP_INCREMENTAL_REQUESTS").is_ok_and(|value| value == "1")
+    }
+
+    /// The previous response, once its stream has finished producing one.
+    ///
+    /// Takes rather than borrows: a `LastResponse` arrives through a oneshot, so it can only be
+    /// read once, and a turn that never completed its stream has none to read.
+    fn take_http_last_response(&mut self) -> Option<LastResponse> {
+        self.http_session.last_response_rx.take()?.try_recv().ok()
+    }
+
+    /// The items this request adds on top of `previous_request` plus what the server already
+    /// returned, or `None` when the two do not line up and the whole conversation has to go again.
+    ///
+    /// Taking the previous request as an argument rather than reading one transport's state is
+    /// what lets both the websocket and HTTP paths use it; the rules below are about the requests,
+    /// not about how they travel.
     fn get_incremental_items(
         &self,
         request: &ResponsesApiRequest,
+        previous_request: Option<&ResponsesApiRequest>,
         last_response: Option<&LastResponse>,
         allow_empty_delta: bool,
     ) -> Option<Vec<ResponseItem>> {
@@ -1160,9 +1213,9 @@ impl ModelClientSession {
         // `input` is a strict
         // extension of the previous known input. Server-returned output items are treated as part
         // of the baseline so we do not resend them.
-        let previous_request = self.websocket_session.last_request.as_ref()?;
+        let previous_request = previous_request?;
         if !responses_request_properties_match(previous_request, request) {
-            trace!("incremental request failed, websocket reuse properties didn't match");
+            trace!("incremental request failed, reuse properties didn't match");
             return None;
         }
 
@@ -1213,6 +1266,7 @@ impl ModelClientSession {
             self.websocket_session.last_response_from_untraced_warmup;
         let Some(incremental_items) = self.get_incremental_items(
             request,
+            self.websocket_session.last_request.as_ref(),
             Some(&last_response),
             /*allow_empty_delta*/ true,
         ) else {
@@ -1375,7 +1429,7 @@ impl ModelClientSession {
         )
     )]
     async fn stream_responses_api(
-        &self,
+        &mut self,
         prompt: &Prompt,
         model_info: &ModelInfo,
         session_telemetry: &SessionTelemetry,
@@ -1424,6 +1478,43 @@ impl ModelClientSession {
                 responses_metadata,
             )?;
             let store = request.store;
+            // Kept whole for the baseline: the delta is computed against what was logically sent,
+            // not against the id-stripped copy that goes on the wire.
+            let full_request_for_baseline = request.clone();
+            let incremental_items = if self.http_incremental_enabled() {
+                let last_response = self.take_http_last_response();
+                self.get_incremental_items(
+                    &request,
+                    self.http_session.last_request.as_ref(),
+                    last_response.as_ref(),
+                    /*allow_empty_delta*/ false,
+                )
+                .and_then(|items| {
+                    last_response
+                        .filter(|response| !response.response_id.is_empty())
+                        .map(|response| (response.response_id, items))
+                })
+            } else {
+                None
+            };
+            if let Some((response_id, items)) = incremental_items {
+                info!(
+                    target: "codex_incremental",
+                    previous_input_items = request.input.len(),
+                    incremental_items = items.len(),
+                    "sending an incremental HTTP request"
+                );
+                request.input = items;
+                request.previous_response_id = Some(response_id);
+            } else if self.http_incremental_enabled() && self.http_session.last_request.is_some() {
+                // Falling back is normal — compaction, a fork, or anything that rewrites history
+                // breaks the strict-prefix rule — but silently falling back on every call would
+                // look exactly like the feature working, so it says which one happened.
+                info!(
+                    target: "codex_incremental",
+                    "falling back to a full HTTP request"
+                );
+            }
             self.client
                 .prepare_response_items_for_request(&mut request.input, store);
             let request_session_telemetry =
@@ -1441,12 +1532,19 @@ impl ModelClientSession {
 
             match stream_result {
                 Ok(stream) => {
-                    let (stream, _) = map_response_stream(
+                    let (stream, last_response_rx) = map_response_stream(
                         stream,
                         request_session_telemetry,
                         inference_trace_attempt,
                         Arc::clone(&self.client.state.provider),
                     );
+                    // The receiver used to be dropped here, which is why the HTTP path could never
+                    // send a delta: without the response id and the items the server added, there
+                    // is nothing to compute one against.
+                    if self.http_incremental_enabled() {
+                        self.http_session.last_request = Some(full_request_for_baseline);
+                        self.http_session.last_response_rx = Some(last_response_rx);
+                    }
                     return Ok(stream);
                 }
                 Err(ApiError::Transport(
