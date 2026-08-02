@@ -1193,8 +1193,17 @@ impl ModelClientSession {
     ///
     /// Takes rather than borrows: a `LastResponse` arrives through a oneshot, so it can only be
     /// read once, and a turn that never completed its stream has none to read.
-    fn take_http_last_response(&mut self) -> Option<LastResponse> {
-        self.http_session.last_response_rx.take()?.try_recv().ok()
+    /// Takes the whole baseline, leaving none behind.
+    ///
+    /// Both halves move together and are only put back by a request that succeeded. Taking just
+    /// the response would leave the request behind if the send then failed, and a request without
+    /// its response computes a delta that does not strip what the server already returned — the
+    /// model's own last output would go a second time. Losing the baseline costs one full resend;
+    /// keeping half of it corrupts the conversation the provider is holding.
+    fn take_http_baseline(&mut self) -> (Option<Box<ResponsesApiRequest>>, Option<LastResponse>) {
+        let taken = std::mem::take(&mut self.http_session);
+        let response = taken.last_response_rx.and_then(|mut rx| rx.try_recv().ok());
+        (taken.last_request, response)
     }
 
     /// Hands this session's baseline to whoever will continue the thread.
@@ -1495,9 +1504,13 @@ impl ModelClientSession {
             // Kept whole for the baseline: the delta is computed against what was logically sent,
             // not against the id-stripped copy that goes on the wire.
             let full_request_for_baseline = request.clone();
+            let (previous_request, last_response) = if model_info.supports_incremental_requests {
+                self.take_http_baseline()
+            } else {
+                (None, None)
+            };
+            let had_baseline = previous_request.is_some();
             let incremental_items = if model_info.supports_incremental_requests {
-                let previous_request = self.http_session.last_request.clone();
-                let last_response = self.take_http_last_response();
                 self.get_incremental_items(
                     &request,
                     previous_request.as_deref(),
@@ -1522,9 +1535,7 @@ impl ModelClientSession {
                 );
                 request.input = items;
                 request.previous_response_id = Some(response_id);
-            } else if model_info.supports_incremental_requests
-                && self.http_session.last_request.is_some()
-            {
+            } else if had_baseline {
                 // Falling back is normal — compaction, a fork, or anything that rewrites history
                 // breaks the strict-prefix rule — but silently falling back on every call would
                 // look exactly like the feature working, so it says which one happened.
@@ -1603,7 +1614,8 @@ impl ModelClientSession {
                         target: "codex_incremental",
                         "the provider no longer has that conversation; resending it in full"
                     );
-                    self.http_session = HttpIncrementalSession::default();
+                    // The baseline was taken at the top of this iteration, so there is nothing
+                    // left to clear — the retry carries the whole history by construction.
                     continue;
                 }
                 Err(err) => {
