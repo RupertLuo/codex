@@ -211,13 +211,6 @@ struct ModelClientState {
     disable_websockets: AtomicBool,
     agent_identity_session_fallback: AgentIdentitySessionFallback,
     cached_websocket_session: StdMutex<WebsocketSession>,
-    /// What the HTTP path last sent and what came back, shared by every turn on this client.
-    ///
-    /// Read and written in place rather than taken and put back the way the websocket session is.
-    /// A turn creates more than one `ModelClientSession` — compaction makes its own — so a
-    /// take/restore dance loses the baseline to whichever one is dropped last, which is exactly
-    /// what stopped the first attempt at this from surviving into the next turn.
-    http_session: StdMutex<HttpIncrementalSession>,
 }
 
 /// Resolved API client setup for a single request attempt.
@@ -276,6 +269,19 @@ pub struct ModelClient {
 pub struct ModelClientSession {
     client: ModelClient,
     websocket_session: WebsocketSession,
+    /// What this session last sent over HTTP and what came back, so its next request can be a
+    /// delta naming the rest with `previous_response_id`.
+    ///
+    /// Session-scoped on purpose, matching the websocket tracking beside it. Compaction builds its
+    /// own `ModelClientSession`, and its request carries the history it is about to throw away —
+    /// the conversation behind its response id still holds all of it, so adopting that id as the
+    /// thread's baseline would hand the model back everything compaction removed. Keeping this per
+    /// session means compaction cannot reach the thread's baseline at all, rather than being
+    /// stopped by a check that happens to reject it.
+    ///
+    /// A turn hands its baseline to the next one explicitly, through
+    /// [`ModelClientSession::take_incremental_baseline`].
+    http_session: HttpIncrementalSession,
     /// Turn state for sticky routing.
     ///
     /// This is an `OnceLock` that stores the turn state value received from the server
@@ -302,7 +308,7 @@ struct LastResponse {
 /// They mean different things, and a transport fallback mid-thread would otherwise hand one
 /// path's id to the other.
 #[derive(Debug, Default)]
-struct HttpIncrementalSession {
+pub struct HttpIncrementalSession {
     last_request: Option<ResponsesApiRequest>,
     last_response_rx: Option<oneshot::Receiver<LastResponse>>,
 }
@@ -464,7 +470,6 @@ impl ModelClient {
                 disable_websockets: AtomicBool::new(false),
                 agent_identity_session_fallback: AgentIdentitySessionFallback::default(),
                 cached_websocket_session: StdMutex::new(WebsocketSession::default()),
-                http_session: StdMutex::new(HttpIncrementalSession::default()),
             }),
             agent_identity_policy,
             prompt_cache_key_override: None,
@@ -510,6 +515,10 @@ impl ModelClient {
         ModelClientSession {
             client: self.clone(),
             websocket_session: self.take_cached_websocket_session(),
+            // Empty: a session that is handed no baseline sends the whole conversation, which is
+            // right for compaction and prewarm and for the first turn of a thread. A turn that
+            // should continue from the previous one is given its baseline explicitly.
+            http_session: HttpIncrementalSession::default(),
             turn_state: Arc::new(OnceLock::new()),
         }
     }
@@ -1178,38 +1187,24 @@ impl ModelClientSession {
         }
     }
 
-    /// Whether this provider should be sent deltas over HTTP instead of the whole conversation.
-    ///
-    /// Off unless asked for, and asked for per provider rather than globally: sending a delta
-    /// means the provider is holding the conversation for us, which is a decision about that
-    /// provider's retention, not a transport detail. Upstream Codex sends the full input over
-    /// HTTP for exactly this reason.
-    ///
-    /// Reads the environment rather than config so it can be turned on for one build without a
-    /// protocol change; this is expected to become a provider capability once it has run.
-    fn http_incremental_enabled(&self) -> bool {
-        std::env::var("CODEX_HTTP_INCREMENTAL_REQUESTS").is_ok_and(|value| value == "1")
-    }
-
     /// The previous response, once its stream has finished producing one.
     ///
     /// Takes rather than borrows: a `LastResponse` arrives through a oneshot, so it can only be
     /// read once, and a turn that never completed its stream has none to read.
     fn take_http_last_response(&mut self) -> Option<LastResponse> {
-        let mut shared = self.http_lock();
-        shared.last_response_rx.take()?.try_recv().ok()
+        self.http_session.last_response_rx.take()?.try_recv().ok()
     }
 
-    fn http_lock(&self) -> std::sync::MutexGuard<'_, HttpIncrementalSession> {
-        self.client
-            .state
-            .http_session
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    /// Hands this session's baseline to whoever will continue the thread.
+    ///
+    /// The receiver inside cannot be cloned, so the baseline moves rather than being copied: a
+    /// turn gives it up when it ends and the next turn is given it when it starts.
+    pub fn take_incremental_baseline(&mut self) -> HttpIncrementalSession {
+        std::mem::take(&mut self.http_session)
     }
 
-    fn http_last_request(&self) -> Option<ResponsesApiRequest> {
-        self.http_lock().last_request.clone()
+    pub fn set_incremental_baseline(&mut self, baseline: HttpIncrementalSession) {
+        self.http_session = baseline;
     }
 
     /// The items this request adds on top of `previous_request` plus what the server already
@@ -1498,8 +1493,8 @@ impl ModelClientSession {
             // Kept whole for the baseline: the delta is computed against what was logically sent,
             // not against the id-stripped copy that goes on the wire.
             let full_request_for_baseline = request.clone();
-            let incremental_items = if self.http_incremental_enabled() {
-                let previous_request = self.http_last_request();
+            let incremental_items = if model_info.supports_incremental_requests {
+                let previous_request = self.http_session.last_request.clone();
                 let last_response = self.take_http_last_response();
                 self.get_incremental_items(
                     &request,
@@ -1524,7 +1519,9 @@ impl ModelClientSession {
                 );
                 request.input = items;
                 request.previous_response_id = Some(response_id);
-            } else if self.http_incremental_enabled() && self.http_last_request().is_some() {
+            } else if model_info.supports_incremental_requests
+                && self.http_session.last_request.is_some()
+            {
                 // Falling back is normal — compaction, a fork, or anything that rewrites history
                 // breaks the strict-prefix rule — but silently falling back on every call would
                 // look exactly like the feature working, so it says which one happened.
@@ -1559,10 +1556,9 @@ impl ModelClientSession {
                     // The receiver used to be dropped here, which is why the HTTP path could never
                     // send a delta: without the response id and the items the server added, there
                     // is nothing to compute one against.
-                    if self.http_incremental_enabled() {
-                        let mut shared = self.http_lock();
-                        shared.last_request = Some(full_request_for_baseline);
-                        shared.last_response_rx = Some(last_response_rx);
+                    if model_info.supports_incremental_requests {
+                        self.http_session.last_request = Some(full_request_for_baseline);
+                        self.http_session.last_response_rx = Some(last_response_rx);
                     }
                     return Ok(stream);
                 }

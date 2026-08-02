@@ -90,6 +90,9 @@ pub fn model_info_from_slug(slug: &str) -> ModelInfo {
         apply_patch_tool_type: None,
         web_search_tool_type: WebSearchToolType::Text,
         truncation_policy: TruncationPolicyConfig::bytes(/*limit*/ 10_000),
+        // Off for anything the catalog does not name: the conversation staying on the provider's
+        // side is something a model opts into, not a default.
+        supports_incremental_requests: false,
         supports_parallel_tool_calls: false,
         supports_image_detail_original: false,
         context_window: Some(272_000),

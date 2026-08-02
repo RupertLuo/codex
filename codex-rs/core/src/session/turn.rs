@@ -149,6 +149,10 @@ pub(crate) async fn run_turn(
 ) -> CodexResult<Option<String>> {
     let mut client_session =
         prewarmed_client_session.unwrap_or_else(|| sess.services.model_client.new_session());
+    // Continue the conversation the provider already holds, if a previous turn left one. Sessions
+    // start without a baseline, so anything that builds its own — compaction, prewarm — sends the
+    // whole history and cannot adopt this thread's id by accident.
+    client_session.set_incremental_baseline(sess.take_http_incremental_baseline().await);
     // TODO(ccunningham): Pre-turn compaction runs before context updates and the
     // new user message are recorded. Estimate pending incoming items (context
     // diffs/full reinjection + user input) and trigger compaction preemptively
@@ -454,6 +458,13 @@ pub(crate) async fn run_turn(
             }
         }
     }
+
+    // Hand the baseline back for the next turn. Only reached when the turn ran to completion —
+    // an early return leaves the thread without one, so the next turn sends the conversation in
+    // full and builds a fresh baseline, which is what a turn that may not have been recorded
+    // cleanly should do anyway.
+    sess.store_http_incremental_baseline(client_session.take_incremental_baseline())
+        .await;
 
     Ok(last_agent_message)
 }

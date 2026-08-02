@@ -29,6 +29,10 @@ pub(crate) struct SessionState {
     pub(crate) latest_rate_limits: Option<RateLimitSnapshot>,
     pub(crate) server_reasoning_included: bool,
     pub(crate) mcp_dependency_prompted: HashSet<String>,
+    /// Handed from one turn's client session to the next, so a delta can name the conversation the
+    /// provider already holds. Lives here rather than on the client because it belongs to the
+    /// thread: compaction and prewarm build their own client sessions and must not inherit it.
+    pub(crate) http_incremental_baseline: crate::client::HttpIncrementalSession,
     pub(crate) additional_context: AdditionalContextStore,
     /// Settings used by the latest regular user turn, used for turn-to-turn
     /// model/realtime handling on subsequent regular turns (including full-context
@@ -66,6 +70,7 @@ impl SessionState {
             latest_rate_limits: None,
             server_reasoning_included: false,
             mcp_dependency_prompted: HashSet::new(),
+            http_incremental_baseline: Default::default(),
             additional_context: AdditionalContextStore::default(),
             previous_turn_settings: None,
             auto_compact_window: AutoCompactWindow::new_with_ids(auto_compact_window_ids),

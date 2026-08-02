@@ -382,6 +382,15 @@ pub struct ModelInfo {
     pub web_search_tool_type: WebSearchToolType,
     pub truncation_policy: TruncationPolicyConfig,
     pub supports_parallel_tool_calls: bool,
+    /// Whether a request for this model may send only what it adds and name the rest with
+    /// `previous_response_id`, instead of the whole conversation every time.
+    ///
+    /// Per model rather than per provider: one provider entry can front several models, and this
+    /// depends on whether that model's backend keeps the conversation. Today only Qwen does —
+    /// measured, including tool calls and images. Defaults to false so a model says so explicitly,
+    /// because turning it on means the backend retains the conversation on our behalf.
+    #[serde(default)]
+    pub supports_incremental_requests: bool,
     #[serde(default)]
     pub supports_image_detail_original: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
