@@ -2248,3 +2248,54 @@ fn text_only_items_unchanged() {
 
     assert_eq!(estimated, raw_len);
 }
+
+/// A history sized in bytes rather than tokens, which is the only way images show up.
+///
+/// Sixty images cost about 120k tokens — comfortably inside a 249k window — and several megabytes,
+/// which no token count can see. This is what decides whether a thread gets compacted before its
+/// first request instead of refused by the provider.
+#[test]
+fn images_are_counted_at_what_they_weigh_after_re_encoding() {
+    fn image_item(payload_bytes: usize) -> ResponseItem {
+        ResponseItem::Message {
+            id: None,
+            role: "user".to_string(),
+            content: vec![ContentItem::InputImage {
+                image_url: format!("data:image/png;base64,{}", "A".repeat(payload_bytes)),
+                detail: Some(DEFAULT_IMAGE_DETAIL),
+            }],
+            phase: None,
+            internal_chat_message_metadata_passthrough: None,
+        }
+    }
+
+    // A generated image is stored as a 2048px PNG — 5.4 MB of base64 — and leaves as 490 KB once
+    // the provider re-encodes it. Counting what is stored would read one image as most of a 6 MiB
+    // request and compact a thread that had no need of it.
+    let mut single = ContextManager::new();
+    single.replace(vec![image_item(5_400_000)]);
+    assert!(
+        single.estimated_bytes() < 1_000_000,
+        "a re-encoded image must not be counted at its stored size, got {}",
+        single.estimated_bytes()
+    );
+
+    // An image already below the ceiling counts as itself, so nothing small is over-estimated.
+    let mut small = ContextManager::new();
+    small.replace(vec![image_item(180_000)]);
+    let small_bytes = small.estimated_bytes();
+    assert!(
+        (150_000..260_000).contains(&small_bytes),
+        "a screenshot should count close to its own size, got {small_bytes}"
+    );
+
+    // And the sum is what matters: enough images cross the limit even though the token count is
+    // nowhere near its own.
+    let mut many = ContextManager::new();
+    many.replace((0..20).map(|_| image_item(5_400_000)).collect());
+    assert!(
+        many.estimated_bytes() > 6_291_456,
+        "twenty images must read as too large to send, got {}",
+        many.estimated_bytes()
+    );
+}
