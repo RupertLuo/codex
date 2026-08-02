@@ -297,6 +297,14 @@ pub struct ResponsesApiRequest {
     pub client_metadata: Option<HashMap<String, String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub access_programs: Option<AccessPrograms>,
+    /// Set only when `input` carries the increment rather than the whole conversation, so the
+    /// server resolves the rest from its own copy.
+    ///
+    /// The websocket path has had this since it existed; over HTTP it is opt-in per provider,
+    /// because it means the provider retains the conversation and not every one of them should be
+    /// asked to.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub previous_response_id: Option<String>,
 }
 
 impl<'a> From<&'a ResponsesApiRequest> for ResponseCreateWsRequest<'a> {
