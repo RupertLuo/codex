@@ -804,6 +804,82 @@ async fn summarize_memories_returns_empty_for_empty_input() {
 }
 
 #[tokio::test]
+async fn model_client_uses_injected_http_transport() -> anyhow::Result<()> {
+    let request_urls = Arc::new(Mutex::new(Vec::new()));
+    let sse_body = concat!(
+        "event: response.created\n",
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-injected\"}}\n\n",
+        "event: response.completed\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-injected\"}}\n\n",
+    );
+
+    let transport = HttpTransportHandle::new(
+        |_request: Request| async {
+            Err::<Response, TransportError>(TransportError::Build(
+                "execute should not be called".to_string(),
+            ))
+        },
+        {
+            let request_urls = Arc::clone(&request_urls);
+            move |request: Request| {
+                let request_urls = Arc::clone(&request_urls);
+                async move {
+                    request_urls
+                        .lock()
+                        .expect("request URL lock")
+                        .push(request.url);
+                    Ok(StreamResponse {
+                        status: StatusCode::OK,
+                        headers: HeaderMap::new(),
+                        bytes: Box::pin(futures::stream::iter([Ok(Bytes::from_static(
+                            sse_body.as_bytes(),
+                        ))])),
+                    })
+                }
+            }
+        },
+    );
+
+    let client = test_model_client(SessionSource::Cli).with_http_transport(transport);
+    let model_info = test_model_info();
+    let session_telemetry = test_session_telemetry();
+    let responses_metadata = test_responses_metadata_for_client(
+        &client,
+        Some("turn-injected"),
+        format!("{}:0", client.state.thread_id),
+        /*parent_thread_id*/ None,
+        TestCodexResponsesRequestKind::Turn,
+    );
+    let mut client_session = client.new_session();
+    let mut stream = client_session
+        .stream_responses_api(
+            &crate::Prompt::default(),
+            &model_info,
+            &session_telemetry,
+            /*effort*/ None,
+            ReasoningSummaryConfig::Auto,
+            /*service_tier*/ None,
+            &responses_metadata,
+            &InferenceTraceContext::disabled(),
+        )
+        .await?;
+
+    let mut completed_response_id = None;
+    while let Some(event) = stream.next().await {
+        if let ResponseEvent::Completed { response_id, .. } = event? {
+            completed_response_id = Some(response_id);
+        }
+    }
+
+    assert_eq!(completed_response_id.as_deref(), Some("resp-injected"));
+    assert_eq!(
+        request_urls.lock().expect("request URL lock").as_slice(),
+        ["https://example.com/v1/responses"]
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn dropped_response_stream_traces_cancelled_partial_output() -> anyhow::Result<()> {
     let temp = TempDir::new()?;
     let attempt = started_inference_attempt(&temp)?;
@@ -1325,4 +1401,37 @@ async fn non_chatgpt_codex_endpoints_omit_attestation_generation() {
         None,
     );
     assert_eq!(attestation_calls.load(Ordering::Relaxed), 0);
+}
+
+/// The exact body DashScope returns for an id it no longer has, and the ones it must not match.
+///
+/// Measured against the live API by sending a well-formed id that was never issued:
+/// `{"code":"InvalidParameter","message":"Not found previous_response_id: resp_..."}`. The retry
+/// this drives resends the whole conversation, so matching too widely turns an ordinary bad
+/// request into a large one that fails the same way — `InvalidParameter` is the code for every
+/// malformed field, which is why the message is what gets read.
+#[test]
+fn only_a_missing_previous_response_triggers_the_full_resend() {
+    fn as_api_error(body: &str) -> ApiError {
+        ApiError::Transport(TransportError::Http {
+            status: StatusCode::BAD_REQUEST,
+            url: None,
+            headers: None,
+            body: Some(body.to_string()),
+        })
+    }
+
+    assert!(super::is_unknown_previous_response(&as_api_error(
+        r#"{"request_id":"ad3301ad","code":"InvalidParameter","message":"Not found previous_response_id: resp_00000000-0000-4000-8000-000000000000."}"#
+    )));
+
+    // Same code, different field: resending the conversation cannot help, and doing so would
+    // double the cost of a request that was going to fail either way.
+    assert!(!super::is_unknown_previous_response(&as_api_error(
+        r#"{"code":"InvalidParameter","message":"Invalid value for parameter temperature."}"#
+    )));
+    // The other measured failure at this status, which has its own handling.
+    assert!(!super::is_unknown_previous_response(&as_api_error(
+        r#"{"code":"BadRequest.TooLarge","message":"Exceeded limit on max bytes to request body : 6291456"}"#
+    )));
 }

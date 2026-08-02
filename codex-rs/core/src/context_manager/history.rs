@@ -443,7 +443,6 @@ impl ContextManager {
                     ContentItem::InputText { text } | ContentItem::OutputText { text } => {
                         text.len() as u64
                     }
-                    _ => 0,
                 })
                 .sum()
         }
