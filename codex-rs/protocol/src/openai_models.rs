@@ -391,6 +391,14 @@ pub struct ModelInfo {
     /// because turning it on means the backend retains the conversation on our behalf.
     #[serde(default)]
     pub supports_incremental_requests: bool,
+    /// Largest request body this model's backend accepts, when it has one worth compacting for.
+    ///
+    /// Separate from the context window because the two run out at different times: text costs
+    /// tokens and few bytes, an image costs about two thousand tokens and up to a megabyte. A
+    /// thread of sixty screenshots sits comfortably inside a 249k window and is nowhere near
+    /// sending inside a 6 MiB body, and only this number can see that.
+    #[serde(default)]
+    pub max_request_body_bytes: Option<u64>,
     #[serde(default)]
     pub supports_image_detail_original: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]

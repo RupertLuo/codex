@@ -1242,6 +1242,17 @@ impl Session {
         state.http_incremental_baseline = baseline;
     }
 
+    /// Roughly how many bytes the history would occupy in a request.
+    ///
+    /// Serialising the history is the honest way to measure it and far too expensive to do every
+    /// turn, so this sums what actually varies: image payloads, which run to hundreds of kilobytes
+    /// each, and text, which does not. It only has to be right enough to fire a threshold that
+    /// already keeps a fifth of the limit in reserve.
+    pub(crate) async fn estimated_history_bytes(&self) -> u64 {
+        let state = self.state.lock().await;
+        state.history.estimated_bytes()
+    }
+
     pub(crate) async fn get_total_token_usage(&self) -> i64 {
         let state = self.state.lock().await;
         state.get_total_token_usage(state.server_reasoning_included())

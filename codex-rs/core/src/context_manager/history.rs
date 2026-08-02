@@ -325,6 +325,54 @@ impl ContextManager {
 
     /// When true, the server already accounted for past reasoning tokens and
     /// the client should not re-estimate them.
+    /// Roughly how many bytes these items would occupy in a request body.
+    ///
+    /// Images are counted at the length of their payload and everything else at the length of its
+    /// text. That is the whole point: an image is a couple of thousand tokens and up to a megabyte,
+    /// so a history can be far from its token limit and still be too large to send, and only a
+    /// measure in bytes can tell.
+    pub(crate) fn estimated_bytes(&self) -> u64 {
+        fn content_bytes(items: &[ContentItem]) -> u64 {
+            items
+                .iter()
+                .map(|item| match item {
+                    ContentItem::InputImage { image_url, .. } => image_url.len() as u64,
+                    ContentItem::InputText { text } | ContentItem::OutputText { text } => {
+                        text.len() as u64
+                    }
+                    _ => 0,
+                })
+                .sum()
+        }
+
+        self.items
+            .iter()
+            .map(|item| match item {
+                ResponseItem::Message { content, .. } => content_bytes(content),
+                ResponseItem::FunctionCallOutput { output, .. }
+                | ResponseItem::CustomToolCallOutput { output, .. } => output
+                    .content_items()
+                    .map(|items| {
+                        items
+                            .iter()
+                            .map(|item| match item {
+                                FunctionCallOutputContentItem::InputImage { image_url, .. } => {
+                                    image_url.len() as u64
+                                }
+                                FunctionCallOutputContentItem::InputText { text } => {
+                                    text.len() as u64
+                                }
+                                _ => 0,
+                            })
+                            .sum()
+                    })
+                    .unwrap_or(0),
+                ResponseItem::FunctionCall { arguments, .. } => arguments.len() as u64,
+                _ => 0,
+            })
+            .fold(0u64, u64::saturating_add)
+    }
+
     pub(crate) fn get_total_token_usage(&self, server_reasoning_included: bool) -> i64 {
         let last_tokens = self
             .token_info

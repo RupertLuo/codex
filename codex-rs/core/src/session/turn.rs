@@ -814,8 +814,14 @@ async fn run_pre_sampling_compact(
     let token_status =
         super::context_window::context_window_token_status(sess.as_ref(), turn_context.as_ref())
             .await;
-    // Compact if the configured auto-compaction budget or usable context window is exhausted.
-    if token_status.token_limit_reached {
+    // Or if the history has grown too large to send, which the token budget cannot see. Images
+    // are the only content that costs far more bytes than tokens, so a thread can sit well inside
+    // its context window and still be impossible to send — most of the weight being tool-fetched
+    // images, which compaction drops. This is the path a thread resumed days later takes: its
+    // first request must carry everything, and without this it would be refused rather than
+    // compacted.
+    let body_limit_reached = over_request_body_budget(sess.as_ref(), turn_context.as_ref()).await;
+    if token_status.token_limit_reached || body_limit_reached {
         // Pre-turn compaction runs before run_turn creates the normal sampling step.
         let step_context = sess.capture_step_context(Arc::clone(turn_context)).await;
         run_auto_compact(
@@ -829,6 +835,25 @@ async fn run_pre_sampling_compact(
         .await?;
     }
     Ok(())
+}
+
+/// Whether the history is close enough to the provider's body limit to compact before sending.
+///
+/// Estimated from the history rather than by building the request: the request is built per call
+/// and this runs once per turn, and an estimate that counts every image's payload is accurate
+/// enough for a threshold that already leaves headroom.
+///
+/// The margin matters. Compaction has to happen before the request is refused, and instructions,
+/// tools and the turn's own new input are all added after this point.
+async fn over_request_body_budget(sess: &Session, turn_context: &TurnContext) -> bool {
+    const BODY_BUDGET_NUMERATOR: u64 = 4;
+    const BODY_BUDGET_DENOMINATOR: u64 = 5;
+
+    let Some(limit) = turn_context.model_info.max_request_body_bytes else {
+        return false;
+    };
+    let estimated = sess.estimated_history_bytes().await;
+    estimated > limit.saturating_mul(BODY_BUDGET_NUMERATOR) / BODY_BUDGET_DENOMINATOR
 }
 
 /// Returns true only when both turns declare compaction compatibility hashes and they differ.
