@@ -211,6 +211,13 @@ struct ModelClientState {
     disable_websockets: AtomicBool,
     agent_identity_session_fallback: AgentIdentitySessionFallback,
     cached_websocket_session: StdMutex<WebsocketSession>,
+    /// What the HTTP path last sent and what came back, shared by every turn on this client.
+    ///
+    /// Read and written in place rather than taken and put back the way the websocket session is.
+    /// A turn creates more than one `ModelClientSession` — compaction makes its own — so a
+    /// take/restore dance loses the baseline to whichever one is dropped last, which is exactly
+    /// what stopped the first attempt at this from surviving into the next turn.
+    http_session: StdMutex<HttpIncrementalSession>,
 }
 
 /// Resolved API client setup for a single request attempt.
@@ -269,7 +276,6 @@ pub struct ModelClient {
 pub struct ModelClientSession {
     client: ModelClient,
     websocket_session: WebsocketSession,
-    http_session: HttpIncrementalSession,
     /// Turn state for sticky routing.
     ///
     /// This is an `OnceLock` that stores the turn state value received from the server
@@ -458,6 +464,7 @@ impl ModelClient {
                 disable_websockets: AtomicBool::new(false),
                 agent_identity_session_fallback: AgentIdentitySessionFallback::default(),
                 cached_websocket_session: StdMutex::new(WebsocketSession::default()),
+                http_session: StdMutex::new(HttpIncrementalSession::default()),
             }),
             agent_identity_policy,
             prompt_cache_key_override: None,
@@ -503,9 +510,6 @@ impl ModelClient {
         ModelClientSession {
             client: self.clone(),
             websocket_session: self.take_cached_websocket_session(),
-            // Starts empty every turn: the first request of a turn carries the whole conversation
-            // and establishes the baseline the rest of the turn extends.
-            http_session: HttpIncrementalSession::default(),
             turn_state: Arc::new(OnceLock::new()),
         }
     }
@@ -1192,7 +1196,20 @@ impl ModelClientSession {
     /// Takes rather than borrows: a `LastResponse` arrives through a oneshot, so it can only be
     /// read once, and a turn that never completed its stream has none to read.
     fn take_http_last_response(&mut self) -> Option<LastResponse> {
-        self.http_session.last_response_rx.take()?.try_recv().ok()
+        let mut shared = self.http_lock();
+        shared.last_response_rx.take()?.try_recv().ok()
+    }
+
+    fn http_lock(&self) -> std::sync::MutexGuard<'_, HttpIncrementalSession> {
+        self.client
+            .state
+            .http_session
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn http_last_request(&self) -> Option<ResponsesApiRequest> {
+        self.http_lock().last_request.clone()
     }
 
     /// The items this request adds on top of `previous_request` plus what the server already
@@ -1482,10 +1499,11 @@ impl ModelClientSession {
             // not against the id-stripped copy that goes on the wire.
             let full_request_for_baseline = request.clone();
             let incremental_items = if self.http_incremental_enabled() {
+                let previous_request = self.http_last_request();
                 let last_response = self.take_http_last_response();
                 self.get_incremental_items(
                     &request,
-                    self.http_session.last_request.as_ref(),
+                    previous_request.as_ref(),
                     last_response.as_ref(),
                     /*allow_empty_delta*/ false,
                 )
@@ -1506,7 +1524,7 @@ impl ModelClientSession {
                 );
                 request.input = items;
                 request.previous_response_id = Some(response_id);
-            } else if self.http_incremental_enabled() && self.http_session.last_request.is_some() {
+            } else if self.http_incremental_enabled() && self.http_last_request().is_some() {
                 // Falling back is normal — compaction, a fork, or anything that rewrites history
                 // breaks the strict-prefix rule — but silently falling back on every call would
                 // look exactly like the feature working, so it says which one happened.
@@ -1542,8 +1560,9 @@ impl ModelClientSession {
                     // send a delta: without the response id and the items the server added, there
                     // is nothing to compute one against.
                     if self.http_incremental_enabled() {
-                        self.http_session.last_request = Some(full_request_for_baseline);
-                        self.http_session.last_response_rx = Some(last_response_rx);
+                        let mut shared = self.http_lock();
+                        shared.last_request = Some(full_request_for_baseline);
+                        shared.last_response_rx = Some(last_response_rx);
                     }
                     return Ok(stream);
                 }
