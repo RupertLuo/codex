@@ -652,7 +652,7 @@ async fn model_client_uses_injected_http_transport() -> anyhow::Result<()> {
         /*parent_thread_id*/ None,
         TestCodexResponsesRequestKind::Turn,
     );
-    let client_session = client.new_session();
+    let mut client_session = client.new_session();
     let mut stream = client_session
         .stream_responses_api(
             &crate::Prompt::default(),
@@ -998,4 +998,37 @@ async fn non_chatgpt_codex_endpoints_omit_attestation_generation() {
         None,
     );
     assert_eq!(attestation_calls.load(Ordering::Relaxed), 0);
+}
+
+/// The exact body DashScope returns for an id it no longer has, and the ones it must not match.
+///
+/// Measured against the live API by sending a well-formed id that was never issued:
+/// `{"code":"InvalidParameter","message":"Not found previous_response_id: resp_..."}`. The retry
+/// this drives resends the whole conversation, so matching too widely turns an ordinary bad
+/// request into a large one that fails the same way — `InvalidParameter` is the code for every
+/// malformed field, which is why the message is what gets read.
+#[test]
+fn only_a_missing_previous_response_triggers_the_full_resend() {
+    fn as_api_error(body: &str) -> ApiError {
+        ApiError::Transport(TransportError::Http {
+            status: StatusCode::BAD_REQUEST,
+            url: None,
+            headers: None,
+            body: Some(body.to_string()),
+        })
+    }
+
+    assert!(super::is_unknown_previous_response(&as_api_error(
+        r#"{"request_id":"ad3301ad","code":"InvalidParameter","message":"Not found previous_response_id: resp_00000000-0000-4000-8000-000000000000."}"#
+    )));
+
+    // Same code, different field: resending the conversation cannot help, and doing so would
+    // double the cost of a request that was going to fail either way.
+    assert!(!super::is_unknown_previous_response(&as_api_error(
+        r#"{"code":"InvalidParameter","message":"Invalid value for parameter temperature."}"#
+    )));
+    // The other measured failure at this status, which has its own handling.
+    assert!(!super::is_unknown_previous_response(&as_api_error(
+        r#"{"code":"BadRequest.TooLarge","message":"Exceeded limit on max bytes to request body : 6291456"}"#
+    )));
 }

@@ -309,7 +309,9 @@ struct LastResponse {
 /// path's id to the other.
 #[derive(Debug, Default)]
 pub struct HttpIncrementalSession {
-    last_request: Option<ResponsesApiRequest>,
+    /// Boxed rather than inlined: `ModelClientSession` is moved by value and already carries one
+    /// request inside its websocket state, so a second one is worth keeping off the stack.
+    last_request: Option<Box<ResponsesApiRequest>>,
     last_response_rx: Option<oneshot::Receiver<LastResponse>>,
 }
 
@@ -1498,7 +1500,7 @@ impl ModelClientSession {
                 let last_response = self.take_http_last_response();
                 self.get_incremental_items(
                     &request,
-                    previous_request.as_ref(),
+                    previous_request.as_deref(),
                     last_response.as_ref(),
                     /*allow_empty_delta*/ false,
                 )
@@ -1510,6 +1512,7 @@ impl ModelClientSession {
             } else {
                 None
             };
+            let sent_incremental = incremental_items.is_some();
             if let Some((response_id, items)) = incremental_items {
                 info!(
                     target: "codex_incremental",
@@ -1557,7 +1560,7 @@ impl ModelClientSession {
                     // send a delta: without the response id and the items the server added, there
                     // is nothing to compute one against.
                     if model_info.supports_incremental_requests {
-                        self.http_session.last_request = Some(full_request_for_baseline);
+                        self.http_session.last_request = Some(Box::new(full_request_for_baseline));
                         self.http_session.last_response_rx = Some(last_response_rx);
                     }
                     return Ok(stream);
@@ -1581,6 +1584,26 @@ impl ModelClientSession {
                         )
                         .await?,
                     );
+                    continue;
+                }
+                Err(err) if sent_incremental && is_unknown_previous_response(&err) => {
+                    // The id named a conversation the provider no longer has: it lasts seven days,
+                    // and one that was swept or belongs elsewhere looks the same. Nothing is wrong
+                    // with the thread, only with the shortcut, so the baseline is dropped and the
+                    // loop sends the whole history once — the same path a thread's first request
+                    // takes, which is why resuming an old conversation needs nothing special.
+                    let response_debug_context =
+                        extract_response_debug_context_from_api_error(&err);
+                    inference_trace_attempt.record_failed(
+                        &err,
+                        response_debug_context.request_id.as_deref(),
+                        /*output_items*/ &[],
+                    );
+                    info!(
+                        target: "codex_incremental",
+                        "the provider no longer has that conversation; resending it in full"
+                    );
+                    self.http_session = HttpIncrementalSession::default();
                     continue;
                 }
                 Err(err) => {
@@ -2004,6 +2027,18 @@ fn add_responses_lite_header(headers: &mut ApiHeaderMap, use_responses_lite: boo
 
 const RESPONSE_STREAM_CHANNEL_CAPACITY: usize = 1600;
 const STREAM_DROPPED_REASON: &str = "response stream dropped before provider terminal event";
+
+/// Whether a failure is the provider saying it does not have the conversation the request named.
+///
+/// Read from the message rather than the code. DashScope answers
+/// `{"code":"InvalidParameter","message":"Not found previous_response_id: ..."}`, and that code
+/// covers every malformed field — retrying on it alone would resend the whole conversation for
+/// errors a resend cannot fix, turning a small failed request into a large one.
+fn is_unknown_previous_response(error: &ApiError) -> bool {
+    let rendered = error.to_string();
+    rendered.contains("previous_response_id")
+        && (rendered.contains("Not found") || rendered.contains("not found"))
+}
 
 fn map_response_stream(
     api_stream: codex_api::ResponseStream,
