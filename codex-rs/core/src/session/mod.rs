@@ -1264,6 +1264,44 @@ impl Session {
         format!("auto-compact-{id}")
     }
 
+    pub(crate) async fn route_realtime_text_input(self: &Arc<Self>, text: String) {
+        handlers::user_input_or_turn_inner(
+            self,
+            Uuid::now_v7().to_string(),
+            Op::UserInput {
+                items: vec![UserInput::Text {
+                    text,
+                    text_elements: Vec::new(),
+                }],
+                final_output_json_schema: None,
+                responsesapi_client_metadata: None,
+                additional_context: Default::default(),
+                thread_settings: Default::default(),
+            },
+            /*client_user_message_id*/ None,
+        )
+        .await;
+    }
+
+    /// Moves the thread's incremental baseline out for a turn to use.
+    ///
+    /// Moved rather than copied: the baseline holds a oneshot receiver for the last response, and
+    /// a turn that takes it owns it until it gives it back. A turn that never gives it back — one
+    /// that failed — leaves the next turn to send the conversation in full, which is correct.
+    pub(crate) async fn take_http_incremental_baseline(
+        &self,
+    ) -> crate::client::HttpIncrementalSession {
+        let mut state = self.state.lock().await;
+        std::mem::take(&mut state.http_incremental_baseline)
+    }
+
+    pub(crate) async fn store_http_incremental_baseline(
+        &self,
+        baseline: crate::client::HttpIncrementalSession,
+    ) {
+        let mut state = self.state.lock().await;
+        state.http_incremental_baseline = baseline;
+    }
     pub(crate) async fn get_total_token_usage(&self) -> i64 {
         let state = self.state.lock().await;
         state.get_total_token_usage(state.server_reasoning_included())
