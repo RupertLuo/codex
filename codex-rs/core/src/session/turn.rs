@@ -285,6 +285,10 @@ pub(crate) async fn run_turn(
                 window_id,
                 CodexResponsesRequestKind::Turn,
             );
+            if !client_session.has_incremental_baseline() {
+                client_session
+                    .set_incremental_baseline(sess.take_http_incremental_baseline().await);
+            }
             run_sampling_request(
                 Arc::clone(&sess),
                 Arc::clone(&step_context),
@@ -459,12 +463,12 @@ pub(crate) async fn run_turn(
         }
     }
 
-    // Hand the baseline back for the next turn. Only reached when the turn ran to completion —
-    // an early return leaves the thread without one, so the next turn sends the conversation in
-    // full and builds a fresh baseline, which is what a turn that may not have been recorded
-    // cleanly should do anyway.
-    sess.store_http_incremental_baseline(client_session.take_incremental_baseline())
-        .await;
+    // A completed response is checkpointed as soon as it arrives, before its tools finish. If no
+    // request completed (for example, a hook stopped the turn), hand the inherited baseline back.
+    if client_session.has_incremental_baseline() {
+        sess.store_http_incremental_baseline(client_session.take_incremental_baseline())
+            .await;
+    }
 
     Ok(last_agent_message)
 }
@@ -2268,6 +2272,15 @@ async fn try_run_sampling_request(
                 end_turn,
                 ..
             } => {
+                if turn_context.model_info.supports_incremental_requests {
+                    // Tool execution and accounting happen after the provider response has
+                    // completed and may be cancelled or fail independently. Checkpoint the
+                    // response now so its id survives even if this future is later dropped.
+                    sess.store_http_incremental_baseline(
+                        client_session.take_incremental_baseline(),
+                    )
+                    .await;
+                }
                 flush_assistant_text_segments_all(
                     &sess,
                     &turn_context,

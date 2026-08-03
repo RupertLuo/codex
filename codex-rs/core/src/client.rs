@@ -1219,6 +1219,10 @@ impl ModelClientSession {
         self.http_session = baseline;
     }
 
+    pub(crate) fn has_incremental_baseline(&self) -> bool {
+        self.http_session.last_request.is_some()
+    }
+
     /// The items this request adds on top of `previous_request` plus what the server already
     /// returned, or `None` when the two do not line up and the whole conversation has to go again.
     ///
