@@ -1153,6 +1153,130 @@ async fn resume_replays_image_tool_outputs_with_detail() {
     );
 }
 
+/// Exercises the real request builder, incremental baseline, and HTTP wire body together.
+///
+/// If tool-image relocation moves below baseline capture again, the first request still looks
+/// correct on the wire but the second cannot match its local prefix and loses `previous_response_id`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn relocated_tool_image_wire_shape_matches_the_incremental_baseline() {
+    let image_url = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==";
+    let call_id = "view-image-cache-call";
+    let thread_id = ThreadId::default();
+    let rollout = vec![
+        RolloutLine {
+            timestamp: "2024-01-01T00:00:00.000Z".to_string(),
+            item: RolloutItem::SessionMeta(SessionMetaLine {
+                meta: SessionMeta {
+                    session_id: thread_id.into(),
+                    id: thread_id,
+                    parent_thread_id: None,
+                    timestamp: "2024-01-01T00:00:00Z".to_string(),
+                    cwd: ".".into(),
+                    originator: "test_originator".to_string(),
+                    cli_version: "test_version".to_string(),
+                    model_provider: Some("test-provider".to_string()),
+                    ..Default::default()
+                },
+                git: None,
+            }),
+        },
+        RolloutLine {
+            timestamp: "2024-01-01T00:00:01.000Z".to_string(),
+            item: RolloutItem::ResponseItem(ResponseItem::FunctionCall {
+                id: None,
+                name: "view_image".to_string(),
+                namespace: None,
+                arguments: "{\"path\":\"/tmp/example.png\"}".to_string(),
+                call_id: call_id.to_string(),
+                internal_chat_message_metadata_passthrough: None,
+            }),
+        },
+        RolloutLine {
+            timestamp: "2024-01-01T00:00:02.000Z".to_string(),
+            item: RolloutItem::ResponseItem(ResponseItem::FunctionCallOutput {
+                id: None,
+                call_id: call_id.to_string(),
+                output: FunctionCallOutputPayload::from_content_items(vec![
+                    FunctionCallOutputContentItem::InputImage {
+                        image_url: image_url.to_string(),
+                        detail: Some(ImageDetail::Original),
+                    },
+                ]),
+                internal_chat_message_metadata_passthrough: None,
+            }),
+        },
+    ];
+    let tmpdir = TempDir::new().unwrap();
+    let session_path = tmpdir.path().join("qwen-tool-image-incremental.jsonl");
+    let mut file = std::fs::File::create(&session_path).unwrap();
+    for line in rollout {
+        writeln!(file, "{}", serde_json::to_string(&line).unwrap()).unwrap();
+    }
+
+    let server = MockServer::start().await;
+    let requests = mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![
+                ev_response_created("resp-image"),
+                ev_completed("resp-image"),
+            ]),
+            sse(vec![
+                ev_response_created("resp-next"),
+                ev_completed("resp-next"),
+            ]),
+        ],
+    )
+    .await;
+    let codex_home = Arc::new(TempDir::new().unwrap());
+    let mut builder =
+        test_codex()
+            .with_model("gpt-5.4")
+            .with_model_info_override("gpt-5.4", |model_info| {
+                model_info.supports_incremental_requests = true;
+                model_info.relocates_tool_output_images = true;
+            });
+    let test = builder
+        .resume(&server, codex_home, session_path)
+        .await
+        .expect("resume tool-image conversation");
+
+    test.submit_turn("first continuation").await.unwrap();
+    test.submit_turn("second continuation").await.unwrap();
+
+    let requests = requests.requests();
+    assert_eq!(requests.len(), 2);
+    let first = requests[0].body_json();
+    let first_input = first["input"].as_array().expect("first request input");
+    let output_index = first_input
+        .iter()
+        .position(|item| item["type"] == "function_call_output" && item["call_id"] == call_id)
+        .expect("view_image output on the wire");
+    assert_eq!(first_input[output_index]["output"], json!([]));
+    assert_eq!(first_input[output_index + 1]["role"], "user");
+    assert_eq!(
+        first_input[output_index + 1]["content"][0]["image_url"],
+        image_url
+    );
+
+    let second = requests[1].body_json();
+    assert_eq!(
+        second["previous_response_id"].as_str(),
+        Some("resp-image"),
+        "the baseline must record the same relocated item sequence that went on the wire"
+    );
+    assert!(
+        second["input"]
+            .as_array()
+            .is_some_and(|items| items.iter().all(|item| item["call_id"] != call_id)),
+        "the relocated prefix must not be resent in the incremental suffix"
+    );
+    assert!(
+        !second.to_string().contains(image_url),
+        "the relocated image must not be resent in the incremental suffix"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn includes_session_id_thread_id_and_model_headers_in_request() {
     skip_if_no_network!();
