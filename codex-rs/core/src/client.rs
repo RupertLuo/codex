@@ -76,6 +76,7 @@ use codex_protocol::ThreadId;
 use codex_protocol::config_types::ReasoningSummary as ReasoningSummaryConfig;
 use codex_protocol::config_types::Verbosity as VerbosityConfig;
 use codex_protocol::models::ContentItem;
+use codex_protocol::models::FunctionCallOutputContentItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::openai_models::ReasoningEffort as ReasoningEffortConfig;
@@ -1501,6 +1502,9 @@ impl ModelClientSession {
                 responses_metadata,
             )?;
             let store = request.store;
+            if model_info.relocates_tool_output_images {
+                relocate_tool_output_images(&mut request.input);
+            }
             // Kept whole for the baseline: the delta is computed against what was logically sent,
             // not against the id-stripped copy that goes on the wire.
             let full_request_for_baseline = request.clone();
@@ -2050,6 +2054,51 @@ fn is_unknown_previous_response(error: &ApiError) -> bool {
     let rendered = error.to_string();
     rendered.contains("previous_response_id")
         && (rendered.contains("Not found") || rendered.contains("not found"))
+}
+
+/// Lift images out of tool results and append each as its own user message.
+///
+/// For backends that do not reliably consume an image from a function call's output. Done here,
+/// while the request is still being assembled, so that the item list this produces is the one the
+/// baseline records and the one the backend receives — a rewrite further down the line would leave
+/// an incremental request naming a conversation with more items in it than we ever counted.
+///
+/// The text of the output stays where it is, so the model still sees which call the image answers.
+fn relocate_tool_output_images(input: &mut Vec<ResponseItem>) {
+    let mut relocated = Vec::with_capacity(input.len());
+    for mut item in std::mem::take(input) {
+        let images = match &mut item {
+            ResponseItem::FunctionCallOutput { output, .. } => output
+                .content_items_mut()
+                .map(|items| {
+                    let mut images = Vec::new();
+                    items.retain(|content| match content {
+                        FunctionCallOutputContentItem::InputImage { image_url, detail } => {
+                            images.push(ContentItem::InputImage {
+                                image_url: image_url.clone(),
+                                detail: *detail,
+                            });
+                            false
+                        }
+                        _ => true,
+                    });
+                    images
+                })
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        };
+        relocated.push(item);
+        if !images.is_empty() {
+            relocated.push(ResponseItem::Message {
+                id: None,
+                role: "user".to_string(),
+                content: images,
+                phase: None,
+                internal_chat_message_metadata_passthrough: None,
+            });
+        }
+    }
+    *input = relocated;
 }
 
 fn map_response_stream(

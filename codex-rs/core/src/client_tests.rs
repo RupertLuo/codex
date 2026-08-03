@@ -1032,3 +1032,81 @@ fn only_a_missing_previous_response_triggers_the_full_resend() {
         r#"{"code":"BadRequest.TooLarge","message":"Exceeded limit on max bytes to request body : 6291456"}"#
     )));
 }
+
+/// The rewrite has to be visible to whatever records what was sent.
+///
+/// It used to run on the way to the wire, after the baseline had already been taken, so a tool
+/// result carrying an image left the backend holding one more item than we had counted. Every
+/// later request then extended a conversation of a different shape than the one it named.
+#[test]
+fn tool_output_image_relocation_is_ordered_and_idempotent() {
+    use codex_protocol::models::ContentItem;
+    use codex_protocol::models::FunctionCallOutputContentItem;
+    use codex_protocol::models::FunctionCallOutputPayload;
+    use codex_protocol::models::ResponseItem;
+
+    let mut input = vec![ResponseItem::FunctionCallOutput {
+        id: None,
+        internal_chat_message_metadata_passthrough: None,
+        call_id: "call-1".to_string(),
+        output: FunctionCallOutputPayload::from_content_items(vec![
+            FunctionCallOutputContentItem::InputText {
+                text: "screenshot taken".to_string(),
+            },
+            FunctionCallOutputContentItem::InputImage {
+                image_url: "data:image/png;base64,YQ==".to_string(),
+                detail: None,
+            },
+            FunctionCallOutputContentItem::InputImage {
+                image_url: "data:image/png;base64,Yg==".to_string(),
+                detail: None,
+            },
+        ]),
+    }];
+
+    super::relocate_tool_output_images(&mut input);
+    let after_first = input.clone();
+    super::relocate_tool_output_images(&mut input);
+
+    assert_eq!(input, after_first, "relocation must be idempotent");
+    assert_eq!(input.len(), 2, "the images travel in one adjacent item");
+    let ResponseItem::FunctionCallOutput { output, .. } = &input[0] else {
+        panic!("the tool result stays first");
+    };
+    assert_eq!(
+        output.content_items().map(|items| items.len()),
+        Some(1),
+        "its text stays so the model can tell which call the image answers"
+    );
+    let ResponseItem::Message { role, content, .. } = &input[1] else {
+        panic!("the image becomes a message");
+    };
+    assert_eq!(role, "user");
+    assert_eq!(content.len(), 2);
+    assert!(matches!(
+        content.as_slice(),
+        [
+            ContentItem::InputImage { image_url: first, .. },
+            ContentItem::InputImage { image_url: second, .. }
+        ] if first.ends_with("YQ==") && second.ends_with("Yg==")
+    ));
+}
+
+/// A tool result with no image is left exactly as it was, so nothing else shifts position.
+#[test]
+fn a_tool_result_without_an_image_is_left_alone() {
+    use codex_protocol::models::FunctionCallOutputPayload;
+    use codex_protocol::models::ResponseItem;
+
+    let original = vec![ResponseItem::FunctionCallOutput {
+        id: None,
+        internal_chat_message_metadata_passthrough: None,
+        call_id: "call-1".to_string(),
+        output: FunctionCallOutputPayload::from_text("Exit code: 0".to_string()),
+    }];
+    let mut input = original.clone();
+
+    super::relocate_tool_output_images(&mut input);
+
+    assert_eq!(input, original);
+}

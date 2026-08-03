@@ -391,6 +391,16 @@ pub struct ModelInfo {
     /// because turning it on means the backend retains the conversation on our behalf.
     #[serde(default)]
     pub supports_incremental_requests: bool,
+    /// Whether an image returned by a tool has to travel as its own user message.
+    ///
+    /// Some backends accept but do not reliably consume an image inside a function call's output,
+    /// and only process it from a message, so the image is lifted out and appended as a user turn.
+    /// This has to happen while the request is being built rather than on its way out: an
+    /// incremental request names the conversation the backend is holding, and the backend holds
+    /// what it was actually sent. A rewrite applied after the baseline is taken leaves the two
+    /// disagreeing about how many items that conversation has.
+    #[serde(default)]
+    pub relocates_tool_output_images: bool,
     /// Largest request body this model's backend accepts, when it has one worth compacting for.
     ///
     /// Separate from the context window because the two run out at different times: text costs
@@ -697,6 +707,9 @@ mod tests {
             apply_patch_tool_type: None,
             web_search_tool_type: WebSearchToolType::Text,
             truncation_policy: TruncationPolicyConfig::bytes(/*limit*/ 10_000),
+            supports_incremental_requests: false,
+            relocates_tool_output_images: false,
+            max_request_body_bytes: None,
             supports_parallel_tool_calls: false,
             supports_image_detail_original: false,
             context_window: None,

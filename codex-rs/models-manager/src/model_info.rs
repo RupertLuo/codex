@@ -93,6 +93,7 @@ pub fn model_info_from_slug(slug: &str) -> ModelInfo {
         // Off for anything the catalog does not name: the conversation staying on the provider's
         // side is something a model opts into, not a default.
         supports_incremental_requests: false,
+        relocates_tool_output_images: false,
         max_request_body_bytes: None,
         supports_parallel_tool_calls: false,
         supports_image_detail_original: false,

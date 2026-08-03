@@ -2,8 +2,9 @@
 
 ## Problem statement
 
-Two independent request-shape changes are causing Qwen requests that use
-`previous_response_id` to lose their cached prefix.
+One local request-shape mismatch deterministically breaks Qwen requests that use
+`previous_response_id`; a separate provider-side multimodal cache limitation can
+still produce cache misses after the local mismatch is fixed.
 
 1. Tool output images are rewritten from one `function_call_output` item into a
    `function_call_output` followed by a user image message. The old Qwen policy
@@ -11,21 +12,30 @@ Two independent request-shape changes are causing Qwen requests that use
    one-to-two-item rewrite after the incremental request baseline has been
    captured. The provider therefore receives an unstable empty output shape and
    the local baseline describes one item while the provider stores two.
-2. The Skills extension emits the complete turn-level skills catalog as a new
-   developer message on every user turn, even when the catalog is unchanged.
-   Qwen treats this repeated developer item as a changed continuation and the
-   first request of the new turn reports zero cached input tokens.
-
 Production logs provide an A/B for the image path. In the failing process the
 incremental tracker recorded one item while the Qwen wire request contained two,
 and every image-only tool result was serialized as `"output":""`. Six of six
 matched image requests reported zero cached tokens. After the image rewrite was
 moved before baseline capture, both tracker and wire request contained
 `["function_call_output", "message"]`, the tool output remained the array
-`"output":[]`, and nine of ten matched image requests reported cached tokens. The
-only miss was the first request of a new turn, where the repeated Skills catalog
-independently explains the miss. Other threads also cache image requests, so the
-user image role itself is not the root cause.
+`"output":[]`, and nine of ten matched image requests reported cached tokens.
+
+Live follow-up testing found a residual Qwen behavior that this structural fix does not solve:
+
+- The Responses schema documents `function_call_output.output` as a string. Qwen sometimes returns
+  HTTP 200 for an OpenAI-style image array in that field, but reports zero `image_tokens` and answers
+  a solid-color probe incorrectly. The same image in an adjacent user message reports 534 image
+  tokens and the correct RGB value. Other attempts reject the tool-output array with HTTP 400.
+- With session cache enabled, a request containing an image can create a large ephemeral cache block
+  and still leave its response id unable to read that block on the next request. In one controlled
+  branch, the post-image id returned zero cached tokens for a text-only follow-up, while the original
+  pre-image id still hit 96,646 cached tokens. Waiting 15 seconds did not change the result.
+- The affected production rollout contains one Codex turn and one Skills catalog insertion. Repeated
+  Skills instructions are therefore not the cause of the continuous post-image misses, and no Skills
+  deduplication change belongs in this fix.
+
+The local fix remains necessary because it makes the baseline identical to the wire request. It
+cannot guarantee that Qwen's provider-side multimodal session cache will hit.
 
 ## Required behavior
 
@@ -37,14 +47,8 @@ user image role itself is not the root cause.
 - Removing images from a function output must retain the output's array shape,
   including an empty array for an image-only result; it must not synthesize an
   empty string.
-- An unchanged turn-level skills catalog must not be appended again on a later
-  user turn in the same thread.
-- A changed turn-level skills catalog must be emitted once, then suppressed again
-  until it changes.
-- Explicitly selected skill instructions remain per-turn input and must never be
-  suppressed by catalog deduplication.
 - No request history may be rewritten and no client session may be reset solely
-  for either fix.
+  for this fix.
 
 ## Design
 
@@ -68,26 +72,6 @@ This keeps three representations identical:
 2. the request saved as the next local baseline;
 3. the item sequence sent to and stored by Qwen.
 
-### Skills catalog deduplication
-
-Extend `SkillsThreadState` with a mutex-protected snapshot of the last rendered
-turn-level catalog. The TurnInput contributor renders the bounded catalog exactly
-as it does today, then performs one atomic compare-and-update operation:
-
-- no previous snapshot or different rendered content: save it and emit the
-  developer fragment;
-- identical rendered content: emit no catalog fragment.
-
-Only the turn-level catalog participates in this state. The one-time thread
-context catalog has different provider coverage, so it does not seed or overwrite
-the turn snapshot. Explicit skill instructions are generated after catalog
-deduplication and remain unaffected.
-
-Comparing the rendered content rather than only a hash avoids collision behavior
-and makes changes in descriptions, locators, ordering, budget truncation, or usage
-instructions observable. The catalog is already bounded, so retaining one copy is
-bounded per thread.
-
 ## Failure-first test strategy
 
 No production implementation is changed until the corresponding regression test
@@ -110,18 +94,6 @@ array in place, then apply the minimal capability flag and pre-baseline relocati
 Re-run the same tests and require them to pass. Also test that text output is
 preserved, multiple images keep their order, and relocation is idempotent.
 
-### RED 2: repeated skills catalog
-
-Use the Skills extension through its contributor interfaces for two consecutive
-turns with the same catalog. Assert that the first turn emits one developer catalog
-and the second emits none. On the current implementation this must fail because
-both turns emit the complete catalog.
-
-After recording the expected failure, add the thread-level compare-and-update
-state and re-run. Add separate tests proving that a changed host catalog is emitted
-once and that explicit skill instructions are still emitted when the catalog is
-suppressed.
-
 ## Verification
 
 The implementation is acceptable only when all of the following evidence exists:
@@ -130,13 +102,13 @@ The implementation is acceptable only when all of the following evidence exists:
    for the intended behavioral mismatch, not because of compilation or setup
    errors.
 2. The same tests pass after the minimal fixes.
-3. The affected core, protocol, model-manager, Skills extension, and private Qwen
-   crate tests pass using repository `just test` commands.
+3. The affected core, protocol, model-manager, and private Qwen crate tests pass
+   using repository test commands.
 4. Formatting and scoped lint/fix checks complete without new warnings.
 5. Captured request bodies show that a Qwen image suffix has the same item kinds in
    the tracker and on the wire.
-6. A two-turn request capture shows no repeated full `<skills_instructions>` item
-   when the catalog is unchanged, while a changed catalog appears exactly once.
+6. The paid live semantic probe remains ignored by default and records that a tool-output image has
+   zero image tokens while the adjacent user-image control is actually processed.
 
 Existing production logs prove the provider cache behavior before and after the
 image request-shape correction. A new paid live Qwen call is optional and requires
@@ -145,7 +117,4 @@ separate authorization; deterministic request-shape tests are mandatory regardle
 ## Scope boundaries
 
 - Do not remove image support or send base64 images as ordinary text.
-- Do not make the deduplication Qwen-specific; repeated stable context is a core
-  model-context defect regardless of provider.
-- Do not suppress selected skill bodies or executor world-state updates.
 - Do not refactor unrelated request, history, or Skills discovery code.
