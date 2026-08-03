@@ -66,11 +66,15 @@ policy normalization remains as a defensive boundary, filters images from the
 array in place, and must not produce another image message when core normalization
 already ran.
 
-This keeps three representations identical:
+This keeps the tool-image item sequence aligned across three representations:
 
 1. the request used to calculate the incremental suffix;
 2. the request saved as the next local baseline;
 3. the item sequence sent to and stored by Qwen.
+
+Later provider normalization may still compress image bytes or remove unrelated unsupported fields;
+the invariant here is the function-output/user-image boundary and its ordering, not byte identity for
+the entire request.
 
 ## Failure-first test strategy
 
@@ -83,11 +87,14 @@ Run the new regression tests against a clean worktree at the current committed
 baseline, not against the dirty primary worktree that already contains a proposed
 image fix. A Qwen policy test asserts that removing the only image leaves
 `"output":[]`; it must fail on the pre-fix policy with actual value
-`"output":""`. A core test drives a Responses request through the real
-incremental request path and a test transport that applies the same late Qwen
-rewrite. It asserts that the provider-visible two-item input is identical to the
-input retained by the incremental baseline. On the pre-fix baseline, this must
-fail because the tracker retains one item while the wire request contains two.
+`"output":""`. The isolated end-to-end RED drove a real Codex/app-server/Qwen
+session through `view_image` and captured the repeated cache misses. The permanent
+core regression resumes a tool-image history, enables both Qwen capabilities, and
+drives two requests through the real session loop and mock Responses HTTP server.
+It checks the relocated two-item wire shape on request one, then proves the saved
+baseline matches by requiring request two to carry `previous_response_id` without
+resending that prefix. Moving relocation below baseline capture makes that second
+assertion fail.
 
 After recording both expected failures, filter policy images from the output
 array in place, then apply the minimal capability flag and pre-baseline relocation.
@@ -98,15 +105,14 @@ preserved, multiple images keep their order, and relocation is idempotent.
 
 The implementation is acceptable only when all of the following evidence exists:
 
-1. Both new regression tests were captured failing on the pre-fix implementation
-   for the intended behavioral mismatch, not because of compilation or setup
-   errors.
+1. The policy RED and isolated end-to-end RED were captured failing for the
+   intended behavioral mismatch, not because of compilation or setup errors.
 2. The same tests pass after the minimal fixes.
 3. The affected core, protocol, model-manager, and private Qwen crate tests pass
    using repository test commands.
 4. Formatting and scoped lint/fix checks complete without new warnings.
-5. Captured request bodies show that a Qwen image suffix has the same item kinds in
-   the tracker and on the wire.
+5. Captured request bodies show the relocated tool-image pair on the first wire
+   request and a `previous_response_id` continuation that does not resend it.
 6. The paid live semantic probe remains ignored by default and records that a tool-output image has
    zero image tokens while the adjacent user-image control is actually processed.
 
