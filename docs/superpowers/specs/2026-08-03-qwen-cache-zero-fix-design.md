@@ -6,21 +6,26 @@ Two independent request-shape changes are causing Qwen requests that use
 `previous_response_id` to lose their cached prefix.
 
 1. Tool output images are rewritten from one `function_call_output` item into a
-   `function_call_output` followed by a user image message. The rewrite currently
-   happens after the incremental request baseline has been captured. The local
-   baseline therefore describes one item while the provider stores two.
+   `function_call_output` followed by a user image message. The old Qwen policy
+   replaces an image-only output array with an empty string and performs the
+   one-to-two-item rewrite after the incremental request baseline has been
+   captured. The provider therefore receives an unstable empty output shape and
+   the local baseline describes one item while the provider stores two.
 2. The Skills extension emits the complete turn-level skills catalog as a new
    developer message on every user turn, even when the catalog is unchanged.
    Qwen treats this repeated developer item as a changed continuation and the
    first request of the new turn reports zero cached input tokens.
 
 Production logs provide an A/B for the image path. In the failing process the
-incremental tracker recorded one item while the Qwen wire request contained two;
-all later requests in that image sequence missed the cache. After the image
-rewrite was moved before baseline capture, both tracker and wire request contained
-`["function_call_output", "message"]`, and image requests plus their successors
-continued to report cached input tokens. Other threads also cache image requests,
-so the user image role itself is not the root cause.
+incremental tracker recorded one item while the Qwen wire request contained two,
+and every image-only tool result was serialized as `"output":""`. Six of six
+matched image requests reported zero cached tokens. After the image rewrite was
+moved before baseline capture, both tracker and wire request contained
+`["function_call_output", "message"]`, the tool output remained the array
+`"output":[]`, and nine of ten matched image requests reported cached tokens. The
+only miss was the first request of a new turn, where the repeated Skills catalog
+independently explains the miss. Other threads also cache image requests, so the
+user image role itself is not the root cause.
 
 ## Required behavior
 
@@ -29,6 +34,9 @@ so the user image role itself is not the root cause.
 - A tool output image must remain visible to Qwen as an adjacent user image
   message because Qwen does not consume the base64 image nested in the tool
   output reliably.
+- Removing images from a function output must retain the output's array shape,
+  including an empty array for an image-only result; it must not synthesize an
+  empty string.
 - An unchanged turn-level skills catalog must not be appended again on a later
   user turn in the same thread.
 - A changed turn-level skills catalog must be emitted once, then suppressed again
@@ -47,10 +55,12 @@ of tool outputs. In the core Responses client, apply the relocation to the full
 request before cloning the request used by the incremental tracker and before
 calculating the incremental suffix. The Qwen model catalog enables the flag.
 
-The relocation is idempotent: it empties image content from the tool output,
-preserves any text output, and inserts one adjacent user message containing the
-images. Qwen policy normalization may still run as a defensive boundary, but it
-must not produce another image message when core normalization already ran.
+The relocation is idempotent: it removes image content from the tool output,
+preserves the remaining content array exactly, and inserts one adjacent user
+message containing the images. An image-only output remains an empty array. Qwen
+policy normalization remains as a defensive boundary, filters images from the
+array in place, and must not produce another image message when core normalization
+already ran.
 
 This keeps three representations identical:
 
@@ -85,18 +95,20 @@ has been observed failing for the expected reason.
 
 ### RED 1: image request shape
 
-Run the new regression test against a clean worktree at the current committed
+Run the new regression tests against a clean worktree at the current committed
 baseline, not against the dirty primary worktree that already contains a proposed
-image fix. The test drives consecutive Responses requests through the real
-incremental request path and a Qwen-style tool-output image rewrite. It asserts
-that the provider-visible two-item suffix is also the suffix retained by the
-incremental baseline. On the pre-fix baseline, the assertion must fail because the
-tracker retains one item while the wire request contains two.
+image fix. A Qwen policy test asserts that removing the only image leaves
+`"output":[]`; it must fail on the pre-fix policy with actual value
+`"output":""`. A core test drives a Responses request through the real
+incremental request path and a test transport that applies the same late Qwen
+rewrite. It asserts that the provider-visible two-item input is identical to the
+input retained by the incremental baseline. On the pre-fix baseline, this must
+fail because the tracker retains one item while the wire request contains two.
 
-After recording the expected failure, apply the minimal capability flag and
-pre-baseline relocation. Re-run the same test and require it to pass. Also test
-that text output is preserved, multiple images keep their order, and relocation is
-idempotent.
+After recording both expected failures, filter policy images from the output
+array in place, then apply the minimal capability flag and pre-baseline relocation.
+Re-run the same tests and require them to pass. Also test that text output is
+preserved, multiple images keep their order, and relocation is idempotent.
 
 ### RED 2: repeated skills catalog
 
