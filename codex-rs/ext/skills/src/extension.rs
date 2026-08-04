@@ -139,10 +139,14 @@ where
             let include_usage = model_info
                 .as_ref()
                 .is_some_and(|model_info| model_info.include_skills_usage_instructions);
-            available_skills_fragment(&catalog, skills_budget(model_info.as_deref()), include_usage)
-                .map(|fragment| PromptFragment::developer_capability(fragment.render()))
-                .into_iter()
-                .collect()
+            available_skills_fragment(
+                &catalog,
+                skills_budget(model_info.as_deref()),
+                include_usage,
+            )
+            .map(|fragment| PromptFragment::developer_capability(fragment.render()))
+            .into_iter()
+            .collect()
         })
     }
 

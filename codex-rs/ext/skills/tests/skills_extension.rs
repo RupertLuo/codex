@@ -1044,7 +1044,8 @@ fn read_request_keys(
 #[tokio::test]
 async fn a_chinese_private_catalog_reaches_the_prompt_whole() -> TestResult {
     // Long enough that the old byte cap would have fitted roughly half of them.
-    let description = "梳理产业链上中下游结构、代表公司与关键环节，并交付带来源可追溯的结论。".repeat(4);
+    let description =
+        "梳理产业链上中下游结构、代表公司与关键环节，并交付带来源可追溯的结论。".repeat(4);
     let names = (0..20)
         .map(|index| format!("skill-{index:02}"))
         .collect::<Vec<_>>();
@@ -1119,7 +1120,8 @@ async fn a_chinese_private_catalog_reaches_the_prompt_whole() -> TestResult {
     // The locator wording is how the model knows to read this through the provider rather than
     // reaching for a file tool, so it has to survive the shared renderer.
     assert!(
-        catalog_fragment.contains("(custom resource: skill://catalyst-private/skill-00/1.0.0/SKILL.md)"),
+        catalog_fragment
+            .contains("(custom resource: skill://catalyst-private/skill-00/1.0.0/SKILL.md)"),
         "private locators must stay intact:\n{catalog_fragment}"
     );
 

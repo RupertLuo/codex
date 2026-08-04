@@ -2102,10 +2102,6 @@ async fn skill_roots_include_admin_with_lowest_priority() {
     // `$HOME/.agents/skills` root is what makes this set the same everywhere.
     assert_eq!(
         scopes,
-        vec![
-            SkillScope::User,
-            SkillScope::System,
-            SkillScope::Admin
-        ]
+        vec![SkillScope::User, SkillScope::System, SkillScope::Admin]
     );
 }

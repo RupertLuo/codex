@@ -498,9 +498,8 @@ mod tests {
             fn generate_title<'a>(
                 &'a self,
                 _request: crate::ThreadTitleRequest,
-            ) -> std::pin::Pin<
-                Box<dyn std::future::Future<Output = Option<String>> + Send + 'a>,
-            > {
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<String>> + Send + 'a>>
+            {
                 Box::pin(async { Some("生成的标题".to_string()) })
             }
         }

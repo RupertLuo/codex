@@ -308,10 +308,9 @@ fn hosted_model_tool_specs(context: &CoreToolPlanContext<'_>) -> Vec<ToolSpec> {
 
     let mut specs = Vec::new();
     let standalone_web_search_available = standalone_web_search_enabled(turn_context)
-        && context
-            .extension_tool_executors
-            .iter()
-            .any(|executor| executor.tool_name() == ToolName::namespaced(WEB_SEARCH_NAMESPACE, WEB_SEARCH_TOOL_NAME));
+        && context.extension_tool_executors.iter().any(|executor| {
+            executor.tool_name() == ToolName::namespaced(WEB_SEARCH_NAMESPACE, WEB_SEARCH_TOOL_NAME)
+        });
     // `Some(Cached/Live/Disabled)` are the options for mode when standalone search is unavailable
     // and the provider supports hosted search. `None` prevents emitting a hosted search tool.
     let web_search_mode = (!standalone_web_search_available

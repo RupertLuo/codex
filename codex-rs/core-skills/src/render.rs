@@ -566,7 +566,12 @@ impl<'a> SkillLine<'a> {
     }
 
     fn render_with_description(&self, description: &str) -> String {
-        let Self { name, locator, path, .. } = self;
+        let Self {
+            name,
+            locator,
+            path,
+            ..
+        } = self;
         if description.is_empty() {
             format!("- {name}: ({locator}: {path})")
         } else {

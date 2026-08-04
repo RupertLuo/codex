@@ -206,7 +206,11 @@ mod powershell_utf8_tests {
             .expect("the assignment must be present");
         let user_command = out[2].find(command).expect("the command must survive");
         // Order is the whole point: PowerShell pipes as US-ASCII until the variable is assigned.
-        assert!(assignment < user_command, "assignment must come first: {}", out[2]);
+        assert!(
+            assignment < user_command,
+            "assignment must come first: {}",
+            out[2]
+        );
         // Specifically the console's *input* encoding — the one the receiving program decodes
         // stdin with. Hard-coding UTF-8 here reintroduces the bug in a quieter form: UTF-8 bytes
         // arriving at a code-page-936 console become mojibake rather than `?`.
