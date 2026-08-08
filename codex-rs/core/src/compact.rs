@@ -88,6 +88,20 @@ pub(crate) fn should_use_remote_compact_task(provider: &ModelProviderInfo) -> bo
     provider.supports_remote_compaction()
 }
 
+async fn resolve_compact_turn_context(
+    sess: &Session,
+    turn_context: &Arc<TurnContext>,
+) -> Arc<TurnContext> {
+    let Some(compact_model) = turn_context.config.compact_model.as_deref() else {
+        return Arc::clone(turn_context);
+    };
+    Arc::new(
+        turn_context
+            .with_model(compact_model.to_string(), &sess.services.models_manager)
+            .await,
+    )
+}
+
 pub(crate) async fn run_inline_auto_compact_task(
     sess: Arc<Session>,
     turn_context: Arc<TurnContext>,
@@ -155,6 +169,7 @@ async fn run_compact_task_inner(
     reason: CompactionReason,
     phase: CompactionPhase,
 ) -> CodexResult<()> {
+    let turn_context = resolve_compact_turn_context(sess.as_ref(), &turn_context).await;
     let compaction_metadata =
         CompactionTurnMetadata::new(trigger, reason, CompactionImplementation::Responses, phase);
     let attempt = CompactionAnalyticsAttempt::begin(
@@ -230,6 +245,9 @@ async fn run_compact_task_inner_impl(
     let initial_input_for_turn: ResponseInputItem = ResponseInputItem::from(input);
 
     let mut history = sess.clone_history().await;
+    history.replace(crate::compact_input::sanitize_for_compaction(
+        history.raw_items(),
+    ));
     history.record_items(
         &[initial_input_for_turn.into()],
         turn_context.model_info.truncation_policy.into(),
