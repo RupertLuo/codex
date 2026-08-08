@@ -391,6 +391,10 @@
         "chatgpt_base_url": {
           "type": "string"
         },
+        "compact_model": {
+          "description": "Model used specifically for local conversation compaction.",
+          "type": "string"
+        },
         "experimental_compact_prompt_file": {
           "$ref": "#/definitions/AbsolutePathBuf"
         },
@@ -4689,6 +4693,10 @@
       ],
       "default": null,
       "description": "Preferred backend for storing CLI auth credentials. file (default): Use a file in the Codex home directory. keyring: Use an OS-specific keyring service. auto: Use the keyring if available, otherwise use a file."
+    },
+    "compact_model": {
+      "description": "Model used specifically for local conversation compaction.",
+      "type": "string"
     },
     "compact_prompt": {
       "description": "Compact prompt used for history compaction.",

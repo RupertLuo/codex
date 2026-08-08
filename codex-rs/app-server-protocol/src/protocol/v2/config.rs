@@ -244,6 +244,8 @@ impl ForcedChatgptWorkspaceIds {
 pub struct Config {
     pub model: Option<String>,
     pub review_model: Option<String>,
+    /// Model used specifically for local conversation compaction.
+    pub compact_model: Option<String>,
     pub model_context_window: Option<i64>,
     pub model_auto_compact_token_limit: Option<i64>,
     pub model_auto_compact_enabled: Option<bool>,

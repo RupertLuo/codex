@@ -1695,6 +1695,7 @@ fn config_granular_approval_policy_is_marked_experimental() {
     let reason = crate::experimental_api::ExperimentalApi::experimental_reason(&Config {
         model: None,
         review_model: None,
+        compact_model: None,
         model_context_window: None,
         model_auto_compact_token_limit: None,
         model_auto_compact_enabled: None,
@@ -1735,6 +1736,7 @@ fn config_approvals_reviewer_is_marked_experimental() {
     let reason = crate::experimental_api::ExperimentalApi::experimental_reason(&Config {
         model: None,
         review_model: None,
+        compact_model: None,
         model_context_window: None,
         model_auto_compact_token_limit: None,
         model_auto_compact_enabled: None,

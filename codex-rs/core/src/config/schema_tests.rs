@@ -87,3 +87,16 @@ fn config_schema_exposes_model_auto_compact_enabled() {
 
     assert!(properties.contains_key("model_auto_compact_enabled"));
 }
+
+#[test]
+fn config_schema_exposes_compact_model() {
+    let schema_json = config_schema_json().expect("serialize config schema");
+    let schema: serde_json::Value =
+        serde_json::from_slice(&schema_json).expect("decode schema json");
+    let properties = schema
+        .get("properties")
+        .expect("ConfigToml properties should exist")
+        .as_object()
+        .expect("ConfigToml properties should be an object");
+    assert!(properties.contains_key("compact_model"));
+}

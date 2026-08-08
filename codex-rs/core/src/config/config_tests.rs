@@ -6968,6 +6968,44 @@ async fn set_model_updates_defaults() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn compact_model_resolves_from_top_level_and_profile() -> std::io::Result<()> {
+    let codex_home = tempfile::TempDir::new()?;
+    std::fs::write(
+        codex_home.path().join(CONFIG_TOML_FILE),
+        r#"compact_model = "deepseek/deepseek-v4-flash""#,
+    )?;
+    let top_level = ConfigBuilder::without_managed_config_for_tests()
+        .codex_home(codex_home.path().to_path_buf())
+        .build()
+        .await?;
+    assert_eq!(
+        top_level.compact_model.as_deref(),
+        Some("deepseek/deepseek-v4-flash")
+    );
+
+    let profile_path = codex_home.path().join("cheap-compact.config.toml");
+    std::fs::write(codex_home.path().join(CONFIG_TOML_FILE), "")?;
+    std::fs::write(
+        &profile_path,
+        r#"compact_model = "deepseek/deepseek-v4-flash""#,
+    )?;
+    let profile = ConfigBuilder::without_managed_config_for_tests()
+        .codex_home(codex_home.path().to_path_buf())
+        .loader_overrides(LoaderOverrides {
+            user_config_path: Some(profile_path.abs()),
+            user_config_profile: Some("cheap-compact".parse().expect("profile-v2 name")),
+            ..LoaderOverrides::without_managed_config_for_tests()
+        })
+        .build()
+        .await?;
+    assert_eq!(
+        profile.compact_model.as_deref(),
+        Some("deepseek/deepseek-v4-flash")
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn for_config_writes_selected_user_config_file() -> anyhow::Result<()> {
     let codex_home = TempDir::new()?;
     let base_config = codex_home.path().join(CONFIG_TOML_FILE);
