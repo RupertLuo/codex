@@ -193,6 +193,9 @@ pub(crate) async fn run_turn(
             sess.store_http_incremental_baseline(client_session.take_incremental_baseline())
                 .await;
         }
+        if matches!(err, CodexErr::TurnAborted) {
+            return Err(err);
+        }
         let error = err.to_codex_protocol_error();
         sess.emit_turn_error_lifecycle(turn_context.as_ref(), error.clone())
             .await;
@@ -505,6 +508,9 @@ pub(crate) async fn run_turn(
                                 client_session.take_incremental_baseline(),
                             )
                             .await;
+                        }
+                        if matches!(err, CodexErr::TurnAborted) {
+                            return Err(err);
                         }
                         let error = err.to_codex_protocol_error();
                         sess.emit_turn_error_lifecycle(turn_context.as_ref(), error.clone())

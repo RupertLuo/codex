@@ -2,6 +2,7 @@ use codex_core::compact::SUMMARY_PREFIX;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
 use codex_protocol::user_input::UserInput;
+use core_test_support::hooks::trust_discovered_hooks;
 use core_test_support::responses::ResponseMock;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
@@ -351,6 +352,119 @@ async fn compact_failure_preserves_incremental_baseline_and_history() {
     assert_eq!(
         follow_up_body["previous_response_id"].as_str(),
         Some("resp-before-failed-compact")
+    );
+    assert!(!follow_up_body.to_string().contains(SUMMARY_PREFIX));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn compact_abort_before_replacement_preserves_incremental_baseline_and_history() {
+    skip_if_no_network!();
+
+    let server = start_mock_server().await;
+    let response_mock = mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![
+                ev_response_created("resp-before-aborted-compact"),
+                ev_assistant_message("first-message", "FIRST_REPLY"),
+                ev_completed("resp-before-aborted-compact"),
+            ]),
+            sse(vec![
+                ev_response_created("resp-after-aborted-compact"),
+                ev_assistant_message("follow-up-message", "FOLLOW_UP_REPLY"),
+                ev_completed("resp-after-aborted-compact"),
+            ]),
+        ],
+    )
+    .await;
+
+    let mut builder = test_codex()
+        .with_pre_build_hook(|home| {
+            let script_path = home.join("abort_auto_compact.py");
+            std::fs::write(
+                &script_path,
+                r#"import json
+import sys
+
+json.load(sys.stdin)
+print(json.dumps({"continue": False, "stopReason": "stop before compact"}))
+"#,
+            )
+            .expect("write pre-compact abort hook script");
+            let hooks = serde_json::json!({
+                "hooks": {
+                    "PreCompact": [{
+                        "matcher": "auto",
+                        "hooks": [{
+                            "type": "command",
+                            "command": format!("python3 \"{}\"", script_path.display()),
+                        }]
+                    }]
+                }
+            });
+            std::fs::write(home.join("hooks.json"), hooks.to_string())
+                .expect("write pre-compact abort hooks config");
+        })
+        .with_model_info_override(FAILED_TURN_MODEL, |model_info| {
+            model_info.comp_hash = Some("aborted-turn-hash".to_string());
+        })
+        .with_model_info_override(ACTIVE_MODEL, |model_info| {
+            model_info.comp_hash = Some("active-turn-hash".to_string());
+            model_info.supports_incremental_requests = true;
+        })
+        .with_config(|config| {
+            config.compact_model = Some(COMPACT_MODEL.to_string());
+            config.compact_prompt = Some(COMPACT_PROMPT.to_string());
+            config.model_provider.name = "Catalyst-compatible test provider".to_string();
+            trust_discovered_hooks(config);
+        });
+    let test = builder
+        .build_with_auto_env(&server)
+        .await
+        .expect("build codex");
+
+    test.submit_turn("FIRST_USER_TURN")
+        .await
+        .expect("submit first user turn");
+
+    test.codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "TURN_THAT_TRIGGERS_ABORTED_COMPACT".to_string(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
+                collaboration_mode: Some(codex_protocol::config_types::CollaborationMode {
+                    mode: codex_protocol::config_types::ModeKind::Default,
+                    settings: codex_protocol::config_types::Settings {
+                        model: FAILED_TURN_MODEL.to_string(),
+                        reasoning_effort: None,
+                        developer_instructions: None,
+                    },
+                }),
+                ..Default::default()
+            },
+        })
+        .await
+        .expect("submit turn that triggers aborted compact");
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::TurnAborted(_))
+    })
+    .await;
+
+    test.submit_turn("FOLLOW_UP_AFTER_ABORTED_COMPACT")
+        .await
+        .expect("submit follow-up after aborted compact");
+
+    assert_eq!(response_mock.requests().len(), 2);
+    let follow_up_body =
+        request_body_containing_user_text(&response_mock, "FOLLOW_UP_AFTER_ABORTED_COMPACT");
+    assert_eq!(
+        follow_up_body["previous_response_id"].as_str(),
+        Some("resp-before-aborted-compact")
     );
     assert!(!follow_up_body.to_string().contains(SUMMARY_PREFIX));
 }
