@@ -89,6 +89,8 @@ const GLOBAL_AGENTS_OVERRIDE_FILENAME: &str = "AGENTS.override.md";
 const NEW_GLOBAL_INSTRUCTIONS: &str = "new global instructions";
 const OLD_GLOBAL_INSTRUCTIONS: &str = "old global instructions";
 const REMOTE_V2_SUMMARY: &str = "global-instructions-remote-v2-summary";
+const ACTIVE_MODEL: &str = "gpt-5.4";
+const COMPACT_MODEL: &str = "deepseek/deepseek-v4-flash";
 
 pub(super) const COMPACT_WARNING_MESSAGE: &str = "Heads up: Long threads and multiple compactions can cause the model to be less accurate. Start a new thread when possible to keep threads small and targeted.";
 
@@ -3579,12 +3581,15 @@ async fn snapshot_request_shape_mid_turn_continuation_compaction() {
 
     let model_provider = non_openai_model_provider(&server);
 
-    let mut builder = test_codex().with_config(move |config| {
-        config.model_provider = model_provider;
-        set_test_compact_prompt(config);
-        config.model_context_window = Some(context_window);
-        config.model_auto_compact_token_limit = Some(limit);
-    });
+    let mut builder = test_codex()
+        .with_model(ACTIVE_MODEL)
+        .with_config(move |config| {
+            config.model_provider = model_provider;
+            set_test_compact_prompt(config);
+            config.compact_model = Some(COMPACT_MODEL.to_string());
+            config.model_context_window = Some(context_window);
+            config.model_auto_compact_token_limit = Some(limit);
+        });
     let codex = builder.build(&server).await.unwrap().codex;
 
     codex
@@ -3631,11 +3636,21 @@ async fn snapshot_request_shape_mid_turn_continuation_compaction() {
         "function call output should be sent before auto compact"
     );
 
-    let auto_compact_body = auto_compact_mock.single_request().body_json().to_string();
+    let auto_compact_body = auto_compact_mock.single_request().body_json();
+    assert_eq!(auto_compact_body["model"], COMPACT_MODEL);
+    assert!(auto_compact_body.get("previous_response_id").is_none());
+    assert_eq!(auto_compact_body["tools"], json!([]));
+    assert!(auto_compact_body.get("text").is_none());
     assert!(
-        body_contains_text(&auto_compact_body, SUMMARIZATION_PROMPT),
+        body_contains_text(&auto_compact_body.to_string(), SUMMARIZATION_PROMPT),
         "mid-turn auto compact request should include the summarization prompt after exceeding 95% (limit {limit})"
     );
+
+    let post_auto_compact_body = post_auto_compact_mock.single_request().body_json();
+    assert_eq!(post_auto_compact_body["model"], ACTIVE_MODEL);
+    let post_auto_compact_body = post_auto_compact_body.to_string();
+    assert!(!post_auto_compact_body.contains("<model_switch>"));
+    assert!(!post_auto_compact_body.contains(COMPACT_MODEL));
 
     insta::assert_snapshot!(
         "mid_turn_compaction_shapes",

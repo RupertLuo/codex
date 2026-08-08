@@ -49,6 +49,7 @@ fn assert_compact_request_shape(compact_body: &Value) {
     assert_eq!(compact_body["model"], COMPACT_MODEL);
     assert!(compact_body.get("previous_response_id").is_none());
     assert_eq!(compact_body["tools"], serde_json::json!([]));
+    assert!(compact_body.get("text").is_none());
 
     let compact_body = compact_body.to_string();
     assert!(!compact_body.contains("data:image/"));
