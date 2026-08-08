@@ -161,6 +161,10 @@ pub(crate) async fn run_turn(
         if matches!(err, CodexErr::TurnAborted) {
             return Err(err);
         }
+        if client_session.has_incremental_baseline() {
+            sess.store_http_incremental_baseline(client_session.take_incremental_baseline())
+                .await;
+        }
         let error = err.to_codex_protocol_error();
         sess.emit_turn_error_lifecycle(turn_context.as_ref(), error.clone())
             .await;
@@ -366,6 +370,12 @@ pub(crate) async fn run_turn(
                     {
                         if matches!(err, CodexErr::TurnAborted) {
                             return Err(err);
+                        }
+                        if client_session.has_incremental_baseline() {
+                            sess.store_http_incremental_baseline(
+                                client_session.take_incremental_baseline(),
+                            )
+                            .await;
                         }
                         let error = err.to_codex_protocol_error();
                         sess.emit_turn_error_lifecycle(turn_context.as_ref(), error.clone())
@@ -1038,6 +1048,7 @@ async fn run_auto_compact(
         run_inline_auto_compact_task(
             Arc::clone(sess),
             Arc::clone(turn_context),
+            client_session,
             initial_context_injection,
             reason,
             phase,

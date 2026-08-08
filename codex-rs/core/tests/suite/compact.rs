@@ -3648,9 +3648,32 @@ async fn snapshot_request_shape_mid_turn_continuation_compaction() {
 
     let post_auto_compact_body = post_auto_compact_mock.single_request().body_json();
     assert_eq!(post_auto_compact_body["model"], ACTIVE_MODEL);
-    let post_auto_compact_body = post_auto_compact_body.to_string();
-    assert!(!post_auto_compact_body.contains("<model_switch>"));
-    assert!(!post_auto_compact_body.contains(COMPACT_MODEL));
+    let post_auto_compact_body_text = post_auto_compact_body.to_string();
+    assert!(!post_auto_compact_body_text.contains("<model_switch>"));
+    assert!(!post_auto_compact_body_text.contains(COMPACT_MODEL));
+
+    let post_auto_compact_input = post_auto_compact_body["input"]
+        .as_array()
+        .expect("post-compact continuation should contain an input array");
+    let canonical_context_index = post_auto_compact_input
+        .iter()
+        .position(|item| item.to_string().contains("<environment_context>"))
+        .expect("post-compact continuation should contain canonical environment context");
+    let last_real_user_index = post_auto_compact_input
+        .iter()
+        .position(|item| item.to_string().contains(FUNCTION_CALL_LIMIT_MSG))
+        .expect("post-compact continuation should contain the last real user message");
+    let summary_index = post_auto_compact_input
+        .iter()
+        .position(|item| {
+            let item = item.to_string();
+            item.contains(SUMMARY_PREFIX) && item.contains(AUTO_SUMMARY_TEXT)
+        })
+        .expect("post-compact continuation should contain the compaction summary");
+    assert!(
+        canonical_context_index < last_real_user_index && last_real_user_index < summary_index,
+        "canonical context, last real user message, and summary must remain in order: {canonical_context_index} < {last_real_user_index} < {summary_index}"
+    );
 
     insta::assert_snapshot!(
         "mid_turn_compaction_shapes",

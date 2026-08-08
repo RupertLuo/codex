@@ -1242,6 +1242,11 @@ impl Session {
         state.http_incremental_baseline = baseline;
     }
 
+    pub(crate) async fn clear_http_incremental_baseline(&self) {
+        let mut state = self.state.lock().await;
+        state.http_incremental_baseline = Default::default();
+    }
+
     /// Roughly how many bytes the history would occupy in a request.
     ///
     /// Serialising the history is the honest way to measure it and far too expensive to do every

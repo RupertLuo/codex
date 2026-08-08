@@ -105,6 +105,7 @@ async fn resolve_compact_turn_context(
 pub(crate) async fn run_inline_auto_compact_task(
     sess: Arc<Session>,
     turn_context: Arc<TurnContext>,
+    active_client_session: &mut ModelClientSession,
     initial_context_injection: InitialContextInjection,
     reason: CompactionReason,
     phase: CompactionPhase,
@@ -125,6 +126,7 @@ pub(crate) async fn run_inline_auto_compact_task(
         sess,
         turn_context,
         input,
+        Some(active_client_session),
         initial_context_injection,
         CompactionTrigger::Auto,
         reason,
@@ -151,6 +153,7 @@ pub(crate) async fn run_compact_task(
         sess.clone(),
         turn_context,
         input,
+        /*active_client_session*/ None,
         InitialContextInjection::DoNotInject,
         CompactionTrigger::Manual,
         CompactionReason::UserRequested,
@@ -164,6 +167,7 @@ async fn run_compact_task_inner(
     sess: Arc<Session>,
     turn_context: Arc<TurnContext>,
     input: Vec<UserInput>,
+    active_client_session: Option<&mut ModelClientSession>,
     initial_context_injection: InitialContextInjection,
     trigger: CompactionTrigger,
     reason: CompactionReason,
@@ -202,6 +206,7 @@ async fn run_compact_task_inner(
         Arc::clone(&turn_context),
         compact_turn_context,
         input,
+        active_client_session,
         initial_context_injection,
         compaction_metadata,
     )
@@ -238,6 +243,7 @@ async fn run_compact_task_inner_impl(
     turn_context: Arc<TurnContext>,
     compact_turn_context: Arc<TurnContext>,
     input: Vec<UserInput>,
+    active_client_session: Option<&mut ModelClientSession>,
     initial_context_injection: InitialContextInjection,
     compaction_metadata: CompactionTurnMetadata,
 ) -> CodexResult<String> {
@@ -257,7 +263,7 @@ async fn run_compact_task_inner_impl(
 
     let max_retries = compact_turn_context.provider.info().stream_max_retries();
     let mut retries = 0;
-    let mut client_session = sess.services.model_client.new_session();
+    let mut compact_client_session = sess.services.model_client.new_session();
     // Reuse one client session so turn-scoped state (sticky routing, websocket incremental
     // request tracking)
     // survives retries within this compact turn.
@@ -285,7 +291,7 @@ async fn run_compact_task_inner_impl(
             &sess,
             turn_context.as_ref(),
             compact_turn_context.as_ref(),
-            &mut client_session,
+            &mut compact_client_session,
             &responses_metadata,
             &prompt,
         )
@@ -388,6 +394,10 @@ async fn run_compact_task_inner_impl(
         compacted_item,
     )
     .await;
+    sess.clear_http_incremental_baseline().await;
+    if let Some(active_client_session) = active_client_session {
+        active_client_session.clear_incremental_baseline();
+    }
     sess.recompute_token_usage(&turn_context).await;
 
     sess.emit_turn_item_completed(&turn_context, compaction_item)
