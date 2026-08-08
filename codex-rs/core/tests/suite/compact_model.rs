@@ -1,6 +1,10 @@
+use codex_core::ThreadManagerRuntimeOptions;
 use codex_core::compact::SUMMARY_PREFIX;
+use codex_core::test_support::CompactCommitTestHook;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
+use codex_protocol::protocol::RolloutItem;
+use codex_protocol::protocol::RolloutLine;
 use codex_protocol::user_input::UserInput;
 use core_test_support::hooks::trust_discovered_hooks;
 use core_test_support::responses::ResponseMock;
@@ -8,15 +12,21 @@ use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
 use core_test_support::responses::ev_completed_with_tokens;
 use core_test_support::responses::ev_response_created;
+use core_test_support::responses::mount_response_sequence;
 use core_test_support::responses::mount_sse_sequence;
 use core_test_support::responses::sse;
 use core_test_support::responses::sse_failed;
+use core_test_support::responses::sse_response;
 use core_test_support::responses::start_mock_server;
 use core_test_support::skip_if_no_network;
 use core_test_support::test_codex::test_codex;
 use core_test_support::wait_for_event;
 use pretty_assertions::assert_eq;
 use serde_json::Value;
+use std::path::Path;
+use std::sync::Arc;
+use std::time::Duration;
+use tempfile::TempDir;
 
 const ACTIVE_MODEL: &str = "gpt-5.4";
 const COMPACT_MODEL: &str = "deepseek/deepseek-v4-flash";
@@ -48,6 +58,37 @@ fn request_body_containing_user_text(mock: &ResponseMock, expected: &str) -> Val
         })
         .unwrap_or_else(|| panic!("request containing user text {expected:?}"))
         .body_json()
+}
+
+fn replacement_history_from_rollout(path: &Path) -> Vec<Value> {
+    let rollout = std::fs::read_to_string(path).expect("read rollout");
+    rollout
+        .lines()
+        .filter_map(|line| serde_json::from_str::<RolloutLine>(line).ok())
+        .filter_map(|line| match line.item {
+            RolloutItem::Compacted(compacted) => compacted.replacement_history,
+            _ => None,
+        })
+        .next_back()
+        .expect("compacted rollout replacement history")
+        .into_iter()
+        .map(|item| {
+            model_visible_value(serde_json::to_value(item).expect("serialize replacement item"))
+        })
+        .collect()
+}
+
+fn model_visible_value(value: Value) -> Value {
+    match value {
+        Value::Array(values) => Value::Array(values.into_iter().map(model_visible_value).collect()),
+        Value::Object(map) => Value::Object(
+            map.into_iter()
+                .filter(|(key, _)| key != "internal_chat_message_metadata_passthrough")
+                .map(|(key, value)| (key, model_visible_value(value)))
+                .collect(),
+        ),
+        other => other,
+    }
 }
 
 fn assert_compact_request_shape(compact_body: &Value) {
@@ -467,4 +508,414 @@ print(json.dumps({"continue": False, "stopReason": "stop before compact"}))
         Some("resp-before-aborted-compact")
     );
     assert!(!follow_up_body.to_string().contains(SUMMARY_PREFIX));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn compact_output_then_terminal_error_preserves_history_and_baseline() {
+    skip_if_no_network!();
+
+    let server = start_mock_server().await;
+    let response_mock = mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![
+                ev_response_created("resp-before-output-error"),
+                ev_assistant_message("first-message", "FIRST_REPLY"),
+                ev_completed("resp-before-output-error"),
+            ]),
+            sse(vec![
+                ev_assistant_message("failed-compact-message", "FAILED_COMPACT_OUTPUT"),
+                serde_json::json!({
+                    "type": "response.failed",
+                    "response": {
+                        "id": "failed-compact-response",
+                        "error": {
+                            "code": "server_error",
+                            "message": "compact provider failed after output"
+                        }
+                    }
+                }),
+            ]),
+            sse(vec![
+                ev_response_created("resp-after-output-error"),
+                ev_assistant_message("follow-up-message", "FOLLOW_UP_REPLY"),
+                ev_completed("resp-after-output-error"),
+            ]),
+        ],
+    )
+    .await;
+
+    let mut builder = test_codex()
+        .with_model(ACTIVE_MODEL)
+        .with_model_info_override(ACTIVE_MODEL, |model_info| {
+            model_info.supports_incremental_requests = true;
+        })
+        .with_config(|config| {
+            config.compact_model = Some(COMPACT_MODEL.to_string());
+            config.compact_prompt = Some(COMPACT_PROMPT.to_string());
+            config.model_provider.name = "Catalyst-compatible test provider".to_string();
+            config.model_provider.stream_max_retries = Some(0);
+        });
+    let test = builder
+        .build_with_auto_env(&server)
+        .await
+        .expect("build codex");
+
+    test.submit_turn("FIRST_USER_TURN")
+        .await
+        .expect("submit first user turn");
+    test.codex
+        .submit(Op::Compact)
+        .await
+        .expect("submit compact operation");
+    wait_for_event(&test.codex, |event| matches!(event, EventMsg::Error(_))).await;
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+
+    test.submit_turn("FOLLOW_UP_AFTER_OUTPUT_ERROR")
+        .await
+        .expect("submit follow-up after output error");
+
+    assert_eq!(response_mock.requests().len(), 3);
+    let follow_up_body =
+        request_body_containing_user_text(&response_mock, "FOLLOW_UP_AFTER_OUTPUT_ERROR");
+    assert_eq!(
+        follow_up_body["previous_response_id"].as_str(),
+        Some("resp-before-output-error")
+    );
+    let follow_up_body = follow_up_body.to_string();
+    assert!(!follow_up_body.contains("FAILED_COMPACT_OUTPUT"));
+    assert!(!follow_up_body.contains(SUMMARY_PREFIX));
+    let rollout = std::fs::read_to_string(test.codex.rollout_path().expect("rollout path"))
+        .expect("read rollout");
+    assert!(!rollout.contains("FAILED_COMPACT_OUTPUT"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn compact_completed_without_assistant_preserves_history_and_baseline() {
+    skip_if_no_network!();
+
+    let server = start_mock_server().await;
+    let response_mock = mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![
+                ev_response_created("resp-before-empty-compact"),
+                ev_assistant_message("first-message", "FIRST_REPLY"),
+                ev_completed("resp-before-empty-compact"),
+            ]),
+            sse(vec![
+                ev_response_created("empty-compact-response"),
+                ev_completed("empty-compact-response"),
+            ]),
+            sse(vec![
+                ev_response_created("resp-after-empty-compact"),
+                ev_assistant_message("follow-up-message", "FOLLOW_UP_REPLY"),
+                ev_completed("resp-after-empty-compact"),
+            ]),
+        ],
+    )
+    .await;
+
+    let mut builder = test_codex()
+        .with_model(ACTIVE_MODEL)
+        .with_model_info_override(ACTIVE_MODEL, |model_info| {
+            model_info.supports_incremental_requests = true;
+        })
+        .with_config(|config| {
+            config.compact_model = Some(COMPACT_MODEL.to_string());
+            config.compact_prompt = Some(COMPACT_PROMPT.to_string());
+            config.model_provider.name = "Catalyst-compatible test provider".to_string();
+            config.model_provider.stream_max_retries = Some(0);
+        });
+    let test = builder
+        .build_with_auto_env(&server)
+        .await
+        .expect("build codex");
+
+    test.submit_turn("FIRST_USER_TURN")
+        .await
+        .expect("submit first user turn");
+    test.codex
+        .submit(Op::Compact)
+        .await
+        .expect("submit compact operation");
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+
+    test.submit_turn("FOLLOW_UP_AFTER_EMPTY_COMPACT")
+        .await
+        .expect("submit follow-up after empty compact");
+
+    assert_eq!(response_mock.requests().len(), 3);
+    let follow_up_body =
+        request_body_containing_user_text(&response_mock, "FOLLOW_UP_AFTER_EMPTY_COMPACT");
+    assert_eq!(
+        follow_up_body["previous_response_id"].as_str(),
+        Some("resp-before-empty-compact")
+    );
+    assert!(!follow_up_body.to_string().contains(SUMMARY_PREFIX));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn interrupt_in_flight_compact_preserves_history_and_incremental_baseline() {
+    skip_if_no_network!();
+
+    let server = start_mock_server().await;
+    let response_mock = mount_response_sequence(
+        &server,
+        vec![
+            sse_response(sse(vec![
+                ev_response_created("resp-before-compact-interrupt"),
+                ev_assistant_message("first-message", "FIRST_REPLY"),
+                ev_completed_with_tokens(
+                    "resp-before-compact-interrupt",
+                    /*total_tokens*/ 500,
+                ),
+            ])),
+            sse_response(sse(vec![
+                ev_assistant_message("compact-message", "INTERRUPTED_COMPACT_OUTPUT"),
+                ev_completed("interrupted-compact-response"),
+            ]))
+            .set_delay(Duration::from_secs(30)),
+            sse_response(sse(vec![
+                ev_response_created("resp-after-compact-interrupt"),
+                ev_assistant_message("follow-up-message", "FOLLOW_UP_REPLY"),
+                ev_completed("resp-after-compact-interrupt"),
+            ])),
+        ],
+    )
+    .await;
+
+    let mut builder = test_codex()
+        .with_model(ACTIVE_MODEL)
+        .with_model_info_override(FAILED_TURN_MODEL, |model_info| {
+            model_info.comp_hash = Some("interrupting-turn-hash".to_string());
+        })
+        .with_model_info_override(ACTIVE_MODEL, |model_info| {
+            model_info.comp_hash = Some("active-turn-hash".to_string());
+            model_info.supports_incremental_requests = true;
+        })
+        .with_config(|config| {
+            config.compact_model = Some(COMPACT_MODEL.to_string());
+            config.compact_prompt = Some(COMPACT_PROMPT.to_string());
+            config.model_provider.name = "Catalyst-compatible test provider".to_string();
+        });
+    let test = builder
+        .build_with_auto_env(&server)
+        .await
+        .expect("build codex");
+
+    test.submit_turn("FIRST_USER_TURN")
+        .await
+        .expect("submit first user turn");
+    test.codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "TURN_THAT_TRIGGERS_INTERRUPTIBLE_COMPACT".to_string(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
+                collaboration_mode: Some(codex_protocol::config_types::CollaborationMode {
+                    mode: codex_protocol::config_types::ModeKind::Default,
+                    settings: codex_protocol::config_types::Settings {
+                        model: FAILED_TURN_MODEL.to_string(),
+                        reasoning_effort: None,
+                        developer_instructions: None,
+                    },
+                }),
+                ..Default::default()
+            },
+        })
+        .await
+        .expect("submit turn that triggers compact");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while response_mock.requests().len() < 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("compact request should reach the provider");
+
+    test.codex
+        .submit(Op::Interrupt)
+        .await
+        .expect("interrupt compact turn");
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::TurnAborted(_))
+    })
+    .await;
+
+    test.submit_turn("FOLLOW_UP_AFTER_COMPACT_INTERRUPT")
+        .await
+        .expect("submit follow-up after compact interrupt");
+
+    assert_eq!(response_mock.requests().len(), 3);
+    let follow_up_body =
+        request_body_containing_user_text(&response_mock, "FOLLOW_UP_AFTER_COMPACT_INTERRUPT");
+    assert_eq!(
+        follow_up_body["previous_response_id"].as_str(),
+        Some("resp-before-compact-interrupt")
+    );
+    let follow_up_body = follow_up_body.to_string();
+    assert!(!follow_up_body.contains("INTERRUPTED_COMPACT_OUTPUT"));
+    assert!(!follow_up_body.contains(SUMMARY_PREFIX));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn compact_commit_survives_forced_parent_abort_and_cold_resume_matches() {
+    skip_if_no_network!();
+
+    let server = start_mock_server().await;
+    let response_mock = mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![
+                ev_response_created("resp-before-commit-abort"),
+                ev_assistant_message("first-message", "FIRST_REPLY"),
+                ev_completed("resp-before-commit-abort"),
+            ]),
+            sse(vec![
+                ev_assistant_message("compact-message", "COMMITTED_COMPACT_SUMMARY"),
+                ev_completed("committed-compact-response"),
+            ]),
+            sse(vec![
+                ev_response_created("resp-after-commit-abort"),
+                ev_assistant_message("live-follow-up-message", "LIVE_FOLLOW_UP_REPLY"),
+                ev_completed("resp-after-commit-abort"),
+            ]),
+            sse(vec![
+                ev_response_created("resp-after-cold-resume"),
+                ev_assistant_message("resumed-follow-up-message", "RESUMED_FOLLOW_UP_REPLY"),
+                ev_completed("resp-after-cold-resume"),
+            ]),
+        ],
+    )
+    .await;
+    let home = Arc::new(TempDir::new().expect("temp codex home"));
+    let commit_hook = CompactCommitTestHook::new();
+    let mut builder = test_codex()
+        .with_home(Arc::clone(&home))
+        .with_runtime_options(
+            ThreadManagerRuntimeOptions::default()
+                .with_compact_commit_test_hook(commit_hook.clone()),
+        )
+        .with_model(ACTIVE_MODEL)
+        .with_model_info_override(ACTIVE_MODEL, |model_info| {
+            model_info.supports_incremental_requests = true;
+        })
+        .with_config(|config| {
+            config.compact_model = Some(COMPACT_MODEL.to_string());
+            config.compact_prompt = Some(COMPACT_PROMPT.to_string());
+            config.model_provider.name = "Catalyst-compatible test provider".to_string();
+        });
+    let test = builder
+        .build_with_auto_env(&server)
+        .await
+        .expect("build codex");
+
+    test.submit_turn("FIRST_USER_TURN")
+        .await
+        .expect("submit first user turn");
+    test.codex
+        .submit(Op::Compact)
+        .await
+        .expect("submit compact operation");
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        commit_hook.wait_until_commit_paused(),
+    )
+    .await
+    .expect("compact commit should reach the deterministic pause");
+
+    test.codex
+        .submit(Op::Interrupt)
+        .await
+        .expect("interrupt compact commit parent");
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        commit_hook.wait_until_parent_wait_dropped(),
+    )
+    .await
+    .expect("compact parent should be forcibly aborted while commit is paused");
+    commit_hook.release_commit();
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::TurnAborted(_))
+    })
+    .await;
+
+    test.submit_turn("LIVE_FOLLOW_UP_AFTER_COMMIT_ABORT")
+        .await
+        .expect("submit live follow-up");
+    let live_body =
+        request_body_containing_user_text(&response_mock, "LIVE_FOLLOW_UP_AFTER_COMMIT_ABORT");
+    assert!(live_body.get("previous_response_id").is_none());
+    assert!(live_body.to_string().contains("COMMITTED_COMPACT_SUMMARY"));
+
+    test.codex.flush_rollout().await.expect("flush rollout");
+    let rollout_path = test.codex.rollout_path().expect("rollout path");
+    let replacement_history = replacement_history_from_rollout(&rollout_path);
+    let live_input = live_body["input"].as_array().expect("live input array");
+    assert_eq!(
+        live_input.get(..replacement_history.len()),
+        Some(replacement_history.as_slice()),
+        "live history should begin with the committed replacement"
+    );
+
+    test.codex
+        .submit(Op::Shutdown)
+        .await
+        .expect("shut down live thread");
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::ShutdownComplete)
+    })
+    .await;
+    let resumed_cwd = test.config.cwd.clone();
+    let mut resume_builder = test_codex()
+        .with_home(Arc::clone(&home))
+        .with_model(ACTIVE_MODEL)
+        .with_model_info_override(ACTIVE_MODEL, |model_info| {
+            model_info.supports_incremental_requests = true;
+        })
+        .with_config(move |config| {
+            config.cwd = resumed_cwd;
+            config.compact_model = Some(COMPACT_MODEL.to_string());
+            config.compact_prompt = Some(COMPACT_PROMPT.to_string());
+            config.model_provider.name = "Catalyst-compatible test provider".to_string();
+        });
+    let resumed = resume_builder
+        .resume(&server, Arc::clone(&home), rollout_path)
+        .await
+        .expect("cold resume compacted thread");
+    resumed
+        .submit_turn("COLD_RESUME_FOLLOW_UP_AFTER_COMMIT_ABORT")
+        .await
+        .expect("submit cold-resume follow-up");
+
+    assert_eq!(response_mock.requests().len(), 4);
+    let resumed_body = request_body_containing_user_text(
+        &response_mock,
+        "COLD_RESUME_FOLLOW_UP_AFTER_COMMIT_ABORT",
+    );
+    assert!(resumed_body.get("previous_response_id").is_none());
+    let resumed_input = resumed_body["input"]
+        .as_array()
+        .expect("resumed input array");
+    assert_eq!(
+        resumed_input.get(..replacement_history.len()),
+        Some(replacement_history.as_slice()),
+        "cold resume should begin with the persisted replacement"
+    );
+    assert_eq!(
+        resumed_input.get(..live_input.len()),
+        Some(live_input.as_slice()),
+        "cold resume should replay the live post-commit structured prefix"
+    );
 }

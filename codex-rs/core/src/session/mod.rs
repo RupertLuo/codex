@@ -32,6 +32,7 @@ use crate::context::PermissionsInstructions;
 use crate::context::PersonalitySpecInstructions;
 use crate::context::RecommendedPluginsInstructions;
 use crate::context::world_state::WorldState;
+use crate::context::world_state::WorldStateSnapshot;
 use crate::current_time::TimeProvider;
 use crate::default_skill_metadata_budget;
 use crate::environment_selection::TurnEnvironmentSnapshot;
@@ -298,6 +299,15 @@ pub(crate) struct PreviousTurnSettings {
     pub(crate) realtime_active: Option<bool>,
 }
 
+pub(crate) struct PreparedCompactionCommit {
+    history: Vec<ResponseItem>,
+    reference_context_item: Option<TurnContextItem>,
+    world_state_baseline: Option<WorldStateSnapshot>,
+    window_number: u64,
+    window_ids: AutoCompactWindowIds,
+    rollout_items: Vec<RolloutItem>,
+}
+
 #[cfg(test)]
 use crate::SkillMetadata;
 use crate::SkillsService;
@@ -445,6 +455,7 @@ pub(crate) struct CodexSpawnArgs {
     pub(crate) analytics_events_client: Option<AnalyticsEventsClient>,
     pub(crate) thread_store: Arc<dyn ThreadStore>,
     pub(crate) http_transport: Option<HttpTransportHandle>,
+    pub(crate) compact_commit_test_hook: Option<crate::compact::CompactCommitTestHook>,
     pub(crate) attestation_provider: Option<Arc<dyn AttestationProvider>>,
     pub(crate) external_time_provider: Option<Arc<dyn TimeProvider>>,
     pub(crate) inherited_multi_agent_version: Option<MultiAgentVersion>,
@@ -534,6 +545,7 @@ impl Codex {
             analytics_events_client,
             thread_store,
             http_transport,
+            compact_commit_test_hook,
             attestation_provider,
             external_time_provider,
             inherited_multi_agent_version,
@@ -703,6 +715,7 @@ impl Codex {
             thread_store,
             parent_rollout_thread_trace,
             http_transport,
+            compact_commit_test_hook,
             attestation_provider,
             external_time_provider,
             multi_agent_version,
@@ -1240,11 +1253,6 @@ impl Session {
     ) {
         let mut state = self.state.lock().await;
         state.http_incremental_baseline = baseline;
-    }
-
-    pub(crate) async fn clear_http_incremental_baseline(&self) {
-        let mut state = self.state.lock().await;
-        state.http_incremental_baseline = Default::default();
     }
 
     /// Roughly how many bytes the history would occupy in a request.
@@ -3058,6 +3066,77 @@ impl Session {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn prepare_compaction_commit(
+        &self,
+        turn_context: &TurnContext,
+        items: Vec<ResponseItem>,
+        reference_context_item: Option<TurnContextItem>,
+        world_state_baseline: Option<Arc<WorldState>>,
+        compacted_item: CompactedItem,
+        window_number: u64,
+        window_ids: AutoCompactWindowIds,
+    ) -> PreparedCompactionCommit {
+        let history = if turn_context.config.features.enabled(Feature::ItemIds) {
+            Self::assign_missing_response_item_ids(Cow::Owned(items)).into_owned()
+        } else {
+            items
+        };
+        let compacted_item = CompactedItem {
+            replacement_history: Some(history.clone()),
+            ..compacted_item
+        };
+        let world_state_baseline = world_state_baseline.map(|world_state| world_state.snapshot());
+        let mut rollout_items = vec![RolloutItem::Compacted(compacted_item)];
+        if let Some(snapshot) = world_state_baseline.as_ref() {
+            rollout_items.push(RolloutItem::WorldState(WorldStateItem::full(
+                snapshot.clone().into_value(),
+            )));
+        }
+        if let Some(turn_context_item) = reference_context_item.as_ref() {
+            rollout_items.push(RolloutItem::TurnContext(turn_context_item.clone()));
+        }
+        PreparedCompactionCommit {
+            history,
+            reference_context_item,
+            world_state_baseline,
+            window_number,
+            window_ids,
+            rollout_items,
+        }
+    }
+
+    // The state guard intentionally covers the append: otherwise a later history mutation can
+    // overtake the replacement batch and make live state diverge from cold-resume replay.
+    #[allow(clippy::await_holding_invalid_type)]
+    pub(crate) async fn commit_prepared_compaction(
+        &self,
+        prepared: PreparedCompactionCommit,
+    ) -> CodexResult<()> {
+        let mut state = self.state.lock().await;
+        if !state.commit_prepared_auto_compact_window_advance(
+            prepared.window_number,
+            prepared.window_ids,
+        ) {
+            return Err(CodexErr::Stream(
+                "compact window changed before the prepared commit".to_string(),
+                None,
+            ));
+        }
+        state.replace_history(prepared.history, prepared.reference_context_item);
+        if let Some(snapshot) = prepared.world_state_baseline {
+            state.history.set_world_state_baseline(snapshot);
+        }
+        state.http_incremental_baseline = Default::default();
+        state.queue_pending_session_start_source(codex_hooks::SessionStartSource::Compact);
+
+        if let Some(hook) = self.services.compact_commit_test_hook.as_ref() {
+            hook.pause_commit().await;
+        }
+        self.persist_rollout_items(&prepared.rollout_items).await;
+        Ok(())
+    }
+
     async fn persist_rollout_response_items(&self, items: &[ResponseItem]) {
         let rollout_items: Vec<RolloutItem> = items
             .iter()
@@ -3175,8 +3254,24 @@ impl Session {
         world_state: &WorldState,
     ) -> Vec<ResponseItem> {
         let mcp = self.services.latest_mcp_runtime();
-        self.build_initial_context_with_world_state_and_mcp(turn_context, world_state, &mcp)
+        self.build_initial_context_with_world_state_and_mcp(turn_context, world_state, &mcp, None)
             .await
+    }
+
+    pub(crate) async fn build_initial_context_with_world_state_for_window(
+        &self,
+        turn_context: &TurnContext,
+        world_state: &WorldState,
+        window_ids: AutoCompactWindowIds,
+    ) -> Vec<ResponseItem> {
+        let mcp = self.services.latest_mcp_runtime();
+        self.build_initial_context_with_world_state_and_mcp(
+            turn_context,
+            world_state,
+            &mcp,
+            Some(window_ids),
+        )
+        .await
     }
 
     async fn build_initial_context_with_world_state_and_mcp(
@@ -3184,6 +3279,7 @@ impl Session {
         turn_context: &TurnContext,
         world_state: &WorldState,
         mcp: &McpRuntimeSnapshot,
+        auto_compact_window_ids_override: Option<AutoCompactWindowIds>,
     ) -> Vec<ResponseItem> {
         let mut developer_sections = Vec::<String>::with_capacity(8);
         let mut contextual_user_sections = Vec::<String>::with_capacity(2);
@@ -3203,7 +3299,7 @@ impl Session {
                 state.session_configuration.collaboration_mode.clone(),
                 state.session_configuration.base_instructions.clone(),
                 state.session_configuration.session_source.clone(),
-                state.auto_compact_window_ids(),
+                auto_compact_window_ids_override.unwrap_or_else(|| state.auto_compact_window_ids()),
             )
         };
         if let Some(model_switch_message) =
@@ -3527,6 +3623,11 @@ impl Session {
         state.advance_auto_compact_window()
     }
 
+    pub(crate) async fn prepare_auto_compact_window_advance(&self) -> (u64, AutoCompactWindowIds) {
+        let state = self.state.lock().await;
+        state.prepare_auto_compact_window_advance()
+    }
+
     pub(crate) async fn request_new_context_window(&self) {
         let mut state = self.state.lock().await;
         state.request_new_context_window();
@@ -3609,6 +3710,7 @@ impl Session {
                     turn_context,
                     world_state.as_ref(),
                     step_context.mcp.as_ref(),
+                    None,
                 )
                 .await;
             let snapshot = world_state.snapshot();
@@ -3675,13 +3777,18 @@ impl Session {
         world_state
     }
 
-    pub(crate) async fn update_token_usage_info(
+    pub(crate) async fn update_compaction_token_usage_info(
         &self,
         turn_context: &TurnContext,
         token_usage: Option<&TokenUsage>,
     ) -> CodexResult<()> {
         let result = self
-            .record_token_usage_info(turn_context, token_usage)
+            .record_token_usage_info_with_options(
+                turn_context,
+                token_usage,
+                /*update_auto_compact_prefill*/ false,
+                /*record_rollout_budget*/ false,
+            )
             .await;
         self.send_token_count_event(turn_context).await;
         result
@@ -3692,20 +3799,42 @@ impl Session {
         turn_context: &TurnContext,
         token_usage: Option<&TokenUsage>,
     ) -> CodexResult<()> {
+        self.record_token_usage_info_with_options(
+            turn_context,
+            token_usage,
+            /*update_auto_compact_prefill*/ true,
+            /*record_rollout_budget*/ true,
+        )
+        .await
+    }
+
+    async fn record_token_usage_info_with_options(
+        &self,
+        turn_context: &TurnContext,
+        token_usage: Option<&TokenUsage>,
+        update_auto_compact_prefill: bool,
+        record_rollout_budget: bool,
+    ) -> CodexResult<()> {
         if let Some(token_usage) = token_usage {
             let token_info = {
                 let mut state = self.state.lock().await;
                 state
                     .update_token_info_from_usage(token_usage, turn_context.model_context_window());
-                if matches!(
-                    turn_context.config.model_auto_compact_token_limit_scope,
-                    AutoCompactTokenLimitScope::BodyAfterPrefix
-                ) {
+                if update_auto_compact_prefill
+                    && matches!(
+                        turn_context.config.model_auto_compact_token_limit_scope,
+                        AutoCompactTokenLimitScope::BodyAfterPrefix
+                    )
+                {
                     state.ensure_auto_compact_window_server_prefill_from_usage(token_usage);
                 }
                 state.token_info()
             };
-            let budget_result = self.record_rollout_budget_usage(token_usage);
+            let budget_result = if record_rollout_budget {
+                self.record_rollout_budget_usage(token_usage)
+            } else {
+                Ok(())
+            };
             if let Some(token_info) = token_info.as_ref() {
                 for contributor in self.services.extensions.token_usage_contributors() {
                     contributor

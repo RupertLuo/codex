@@ -752,6 +752,7 @@ async fn guardian_subagent_does_not_inherit_parent_exec_policy_rules() {
         analytics_events_client: None,
         thread_store,
         http_transport: None,
+        compact_commit_test_hook: None,
         attestation_provider: None,
         external_time_provider: None,
         inherited_multi_agent_version: None,

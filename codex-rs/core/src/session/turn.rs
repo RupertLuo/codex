@@ -157,7 +157,14 @@ pub(crate) async fn run_turn(
     // new user message are recorded. Estimate pending incoming items (context
     // diffs/full reinjection + user input) and trigger compaction preemptively
     // when they would push the thread over the compaction threshold.
-    if let Err(err) = run_pre_sampling_compact(&sess, &turn_context, &mut client_session).await {
+    if let Err(err) = run_pre_sampling_compact(
+        &sess,
+        &turn_context,
+        &mut client_session,
+        &cancellation_token,
+    )
+    .await
+    {
         if client_session.has_incremental_baseline() {
             sess.store_http_incremental_baseline(client_session.take_incremental_baseline())
                 .await;
@@ -362,6 +369,7 @@ pub(crate) async fn run_turn(
                         &sess,
                         Arc::clone(&step_context),
                         &mut client_session,
+                        &cancellation_token,
                         InitialContextInjection::BeforeLastUserMessage(Arc::clone(&world_state)),
                         CompactionReason::ContextLimit,
                         CompactionPhase::MidTurn,
@@ -823,8 +831,10 @@ async fn run_pre_sampling_compact(
     sess: &Arc<Session>,
     turn_context: &Arc<TurnContext>,
     client_session: &mut ModelClientSession,
+    cancellation_token: &CancellationToken,
 ) -> CodexResult<()> {
-    maybe_run_previous_model_inline_compact(sess, turn_context, client_session).await?;
+    maybe_run_previous_model_inline_compact(sess, turn_context, client_session, cancellation_token)
+        .await?;
     let token_status =
         super::context_window::context_window_token_status(sess.as_ref(), turn_context.as_ref())
             .await;
@@ -842,6 +852,7 @@ async fn run_pre_sampling_compact(
             sess,
             step_context,
             client_session,
+            cancellation_token,
             InitialContextInjection::DoNotInject,
             CompactionReason::ContextLimit,
             CompactionPhase::PreTurn,
@@ -886,6 +897,7 @@ async fn maybe_run_previous_model_inline_compact(
     sess: &Arc<Session>,
     turn_context: &Arc<TurnContext>,
     client_session: &mut ModelClientSession,
+    cancellation_token: &CancellationToken,
 ) -> CodexResult<()> {
     let Some(previous_turn_settings) = sess.previous_turn_settings().await else {
         return Ok(());
@@ -909,6 +921,7 @@ async fn maybe_run_previous_model_inline_compact(
             sess,
             step_context,
             client_session,
+            cancellation_token,
             InitialContextInjection::DoNotInject,
             CompactionReason::CompHashChanged,
             CompactionPhase::PreTurn,
@@ -943,6 +956,7 @@ async fn maybe_run_previous_model_inline_compact(
             sess,
             step_context,
             client_session,
+            cancellation_token,
             InitialContextInjection::DoNotInject,
             CompactionReason::ModelDownshift,
             CompactionPhase::PreTurn,
@@ -986,6 +1000,7 @@ async fn run_auto_compact(
     sess: &Arc<Session>,
     step_context: Arc<StepContext>,
     client_session: &mut ModelClientSession,
+    cancellation_token: &CancellationToken,
     initial_context_injection: InitialContextInjection,
     reason: CompactionReason,
     phase: CompactionPhase,
@@ -1049,6 +1064,7 @@ async fn run_auto_compact(
             Arc::clone(sess),
             Arc::clone(turn_context),
             client_session,
+            cancellation_token.child_token(),
             initial_context_injection,
             reason,
             phase,

@@ -131,6 +131,37 @@ async fn clear_missing_nested_config_is_noop() -> Result<()> {
 }
 
 #[tokio::test]
+async fn read_round_trips_compact_model_with_snake_case_wire_key() -> Result<()> {
+    let tmp = tempdir().expect("tempdir");
+    std::fs::write(
+        tmp.path().join(CONFIG_TOML_FILE),
+        "compact_model = \"deepseek/deepseek-v4-flash\"\n",
+    )?;
+
+    let service = ConfigManager::without_managed_config_for_tests(tmp.path().to_path_buf());
+    let read = service
+        .read(ConfigReadParams {
+            include_layers: false,
+            cwd: None,
+        })
+        .await
+        .expect("config read succeeds");
+
+    assert_eq!(
+        read.config.compact_model.as_deref(),
+        Some("deepseek/deepseek-v4-flash")
+    );
+    let wire_value = serde_json::to_value(read).expect("serialize config/read response");
+    assert_eq!(
+        wire_value["config"]["compact_model"],
+        serde_json::json!("deepseek/deepseek-v4-flash")
+    );
+    assert!(wire_value["config"].get("compactModel").is_none());
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn write_value_rejects_legacy_profile_selector() -> Result<()> {
     let tmp = tempdir().expect("tempdir");
     let path = tmp.path().join(CONFIG_TOML_FILE);

@@ -73,12 +73,35 @@ impl AutoCompactWindow {
     }
 
     pub(super) fn advance(&mut self) -> (u64, AutoCompactWindowIds) {
-        self.window_number = self.window_number.saturating_add(1);
-        self.ids.previous_window_id = Some(self.ids.window_id);
-        self.ids.window_id = Uuid::now_v7();
+        let prepared = self.prepare_advance();
+        let committed = self.commit_prepared_advance(prepared.0, prepared.1);
+        debug_assert!(committed, "freshly prepared compact window should commit");
+        prepared
+    }
+
+    pub(super) fn prepare_advance(&self) -> (u64, AutoCompactWindowIds) {
+        let mut ids = self.ids;
+        ids.previous_window_id = Some(ids.window_id);
+        ids.window_id = Uuid::now_v7();
+        (self.window_number.saturating_add(1), ids)
+    }
+
+    pub(super) fn commit_prepared_advance(
+        &mut self,
+        window_number: u64,
+        ids: AutoCompactWindowIds,
+    ) -> bool {
+        if window_number != self.window_number.saturating_add(1)
+            || ids.first_window_id != self.ids.first_window_id
+            || ids.previous_window_id != Some(self.ids.window_id)
+        {
+            return false;
+        }
+        self.window_number = window_number;
+        self.ids = ids;
         self.new_context_window_requested = false;
         self.token_budget_reminder_delivered = false;
-        (self.window_number, self.ids)
+        true
     }
 
     pub(super) fn claim_token_budget_reminder(&mut self) -> bool {

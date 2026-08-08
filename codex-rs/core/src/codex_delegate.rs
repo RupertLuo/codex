@@ -134,6 +134,7 @@ pub(crate) async fn run_codex_thread_interactive(
             .services
             .model_client
             .http_transport_override(),
+        compact_commit_test_hook: None,
         attestation_provider: parent_session.services.attestation_provider.clone(),
         external_time_provider: Some(Arc::clone(&parent_session.services.time_provider)),
         inherited_multi_agent_version: Some(MultiAgentVersion::Disabled),

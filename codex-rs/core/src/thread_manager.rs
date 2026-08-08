@@ -252,6 +252,7 @@ pub struct ThreadManager {
 #[derive(Clone, Debug, Default)]
 pub struct ThreadManagerRuntimeOptions {
     http_transport: Option<HttpTransportHandle>,
+    compact_commit_test_hook: Option<crate::compact::CompactCommitTestHook>,
     model_catalog: Option<ModelsResponse>,
     required_base_instructions: Option<String>,
     runtime_extensions: Vec<Arc<dyn RuntimeExtension<Config>>>,
@@ -263,6 +264,15 @@ pub struct ThreadManagerRuntimeOptions {
 impl ThreadManagerRuntimeOptions {
     pub fn with_http_transport(mut self, http_transport: HttpTransportHandle) -> Self {
         self.http_transport = Some(http_transport);
+        self
+    }
+
+    #[doc(hidden)]
+    pub fn with_compact_commit_test_hook(
+        mut self,
+        hook: crate::compact::CompactCommitTestHook,
+    ) -> Self {
+        self.compact_commit_test_hook = Some(hook);
         self
     }
 
@@ -328,6 +338,7 @@ impl ThreadManagerRuntimeOptions {
 
     pub fn has_process_local_overrides(&self) -> bool {
         self.has_http_transport_override()
+            || self.compact_commit_test_hook.is_some()
             || self.has_model_catalog_override()
             || self.required_base_instructions.is_some()
             || self.has_runtime_extension_override()
@@ -355,6 +366,10 @@ impl ThreadManagerRuntimeOptions {
 
     pub(crate) fn http_transport(&self) -> Option<HttpTransportHandle> {
         self.http_transport.clone()
+    }
+
+    pub(crate) fn compact_commit_test_hook(&self) -> Option<crate::compact::CompactCommitTestHook> {
+        self.compact_commit_test_hook.clone()
     }
 
     pub(crate) fn model_catalog(&self) -> Option<ModelsResponse> {
@@ -1981,6 +1996,7 @@ impl ThreadManagerState {
             analytics_events_client: self.analytics_events_client.clone(),
             thread_store: Arc::clone(&self.thread_store),
             http_transport: self.runtime_options.http_transport(),
+            compact_commit_test_hook: self.runtime_options.compact_commit_test_hook(),
             attestation_provider: self.attestation_provider.clone(),
             external_time_provider: self.external_time_provider.clone(),
             inherited_multi_agent_version: multi_agent_version,
