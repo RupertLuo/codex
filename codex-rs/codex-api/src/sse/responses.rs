@@ -448,6 +448,25 @@ pub fn process_responses_event(
     Ok(None)
 }
 
+fn classify_sse_source_error(message: String) -> ApiError {
+    // Catalyst's direct-provider guards deliberately reject an upstream response when its shape is
+    // outside the runtime contract. That is deterministic client/provider incompatibility, not a
+    // dropped network stream: retrying the same request cannot recover it and otherwise produces a
+    // misleading responseStreamDisconnected error in the desktop UI.
+    const NON_RETRYABLE_PROTOCOL_CODES: &[&str] = &[
+        "CATALYST_DIRECT_RESPONSES_PROTOCOL_INVALID",
+        "CATALYST_ADAPTER_PROTOCOL_INVALID",
+    ];
+    if NON_RETRYABLE_PROTOCOL_CODES
+        .iter()
+        .any(|code| message.contains(code))
+    {
+        ApiError::InvalidRequest { message }
+    } else {
+        ApiError::Stream(message)
+    }
+}
+
 #[cfg(test)]
 pub async fn process_sse(
     stream: ByteStream,
@@ -486,7 +505,9 @@ async fn process_sse_with_treatment(
             Ok(Some(Ok(sse))) => sse,
             Ok(Some(Err(e))) => {
                 debug!("SSE Error: {e:#}");
-                let _ = tx_event.send(Err(ApiError::Stream(e.to_string()))).await;
+                let _ = tx_event
+                    .send(Err(classify_sse_source_error(e.to_string())))
+                    .await;
                 return;
             }
             Ok(None) => {
@@ -813,6 +834,28 @@ mod tests {
                 assert_eq!(msg, "stream closed before response.completed")
             }
             other => panic!("unexpected second event: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn catalyst_protocol_errors_are_non_retryable_invalid_requests() {
+        let stream: ByteStream = Box::pin(stream::iter([Err(TransportError::Network(
+            "CATALYST_DIRECT_RESPONSES_PROTOCOL_INVALID: response protocol error: SSE event type is not supported."
+                .to_string(),
+        ))]));
+        let (tx, mut rx) = mpsc::channel::<Result<ResponseEvent, ApiError>>(8);
+        tokio::spawn(process_sse(
+            stream,
+            tx,
+            idle_timeout(),
+            /*telemetry*/ None,
+        ));
+
+        match rx.recv().await.expect("protocol error event") {
+            Err(ApiError::InvalidRequest { message }) => {
+                assert!(message.contains("CATALYST_DIRECT_RESPONSES_PROTOCOL_INVALID"));
+            }
+            other => panic!("unexpected protocol error: {other:?}"),
         }
     }
 
