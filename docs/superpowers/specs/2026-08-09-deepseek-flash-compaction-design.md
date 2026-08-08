@@ -50,7 +50,8 @@ adapter.
 
 Build the compaction request from a clone of the current model-visible history. Traverse all
 message and tool-output content containers and remove every image content block, including images
-that Qwen relocation stored in adjacent user messages.
+that Qwen relocation stored in adjacent user messages. Replace image-generation result items as
+well so an `ImageGenerationCall.result` payload cannot carry encoded image bytes into DeepSeek.
 
 For each containing history item, replace all removed image blocks with one text block at the
 position of the first removed image:
@@ -132,9 +133,9 @@ the source of truth.
 
 Implementation follows failure-first tests.
 
-1. Sanitizer tests cover user images, relocated tool images, mixed text/image content, multiple
-   images, image-only content, stable ordering, bounded placeholders, and non-mutation of the source
-   history.
+1. Sanitizer tests cover user images, relocated tool images, image-generation results, mixed
+   text/image content, multiple images, image-only content, stable ordering, bounded placeholders,
+   and non-mutation of the source history.
 2. Config tests cover TOML/profile resolution, effective config, app-server round trips, and schema
    generation for `compact_model`.
 3. Local compact integration tests assert that manual and automatic compact requests use
