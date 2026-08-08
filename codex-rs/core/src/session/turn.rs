@@ -158,12 +158,12 @@ pub(crate) async fn run_turn(
     // diffs/full reinjection + user input) and trigger compaction preemptively
     // when they would push the thread over the compaction threshold.
     if let Err(err) = run_pre_sampling_compact(&sess, &turn_context, &mut client_session).await {
-        if matches!(err, CodexErr::TurnAborted) {
-            return Err(err);
-        }
         if client_session.has_incremental_baseline() {
             sess.store_http_incremental_baseline(client_session.take_incremental_baseline())
                 .await;
+        }
+        if matches!(err, CodexErr::TurnAborted) {
+            return Err(err);
         }
         let error = err.to_codex_protocol_error();
         sess.emit_turn_error_lifecycle(turn_context.as_ref(), error.clone())
@@ -368,14 +368,14 @@ pub(crate) async fn run_turn(
                     )
                     .await
                     {
-                        if matches!(err, CodexErr::TurnAborted) {
-                            return Err(err);
-                        }
                         if client_session.has_incremental_baseline() {
                             sess.store_http_incremental_baseline(
                                 client_session.take_incremental_baseline(),
                             )
                             .await;
+                        }
+                        if matches!(err, CodexErr::TurnAborted) {
+                            return Err(err);
                         }
                         let error = err.to_codex_protocol_error();
                         sess.emit_turn_error_lifecycle(turn_context.as_ref(), error.clone())
