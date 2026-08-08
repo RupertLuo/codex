@@ -1,7 +1,10 @@
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use std::time::Instant;
 
 use crate::Prompt;
+use crate::client::HttpIncrementalSession;
 use crate::client::ModelClientSession;
 use crate::client_common::ResponseEvent;
 use crate::context::world_state::WorldState;
@@ -58,10 +61,42 @@ pub use codex_prompts::SUMMARIZATION_PROMPT;
 pub use codex_prompts::SUMMARY_PREFIX;
 const COMPACT_USER_MESSAGE_MAX_TOKENS: usize = 20_000;
 
+/// Move-only ownership of the incremental HTTP baseline across the shielded commit task.
+///
+/// The active turn cannot clone this state because it contains a oneshot receiver. A shared,
+/// take-once slot lets either the child restore it on a normal commit error or the parent restore
+/// it after a [`tokio::task::JoinError`], while success consumes it exactly once.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct CompactCommitBaseline {
+    inner: Arc<std::sync::Mutex<Option<HttpIncrementalSession>>>,
+}
+
+impl CompactCommitBaseline {
+    fn take_from_active(active_client_session: Option<&mut ModelClientSession>) -> Self {
+        Self {
+            inner: Arc::new(std::sync::Mutex::new(
+                active_client_session.map(ModelClientSession::take_incremental_baseline),
+            )),
+        }
+    }
+
+    pub(crate) fn take(&self) -> Option<HttpIncrementalSession> {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+    }
+
+    async fn restore_to_session(&self, sess: &Session) {
+        if let Some(baseline) = self.take() {
+            sess.store_http_incremental_baseline(baseline).await;
+        }
+    }
+}
+
 /// Instance-scoped synchronization used by compaction commit integration tests.
-#[doc(hidden)]
 #[derive(Clone, Debug)]
-pub struct CompactCommitTestHook {
+pub(crate) struct CompactCommitTestHook {
     inner: Arc<CompactCommitTestHookInner>,
 }
 
@@ -70,36 +105,73 @@ struct CompactCommitTestHookInner {
     commit_paused: Semaphore,
     release_commit: Semaphore,
     parent_wait_dropped: Semaphore,
+    commit_completed: Semaphore,
+    panic_commit: AtomicBool,
+    pause_item_started: AtomicBool,
+    item_started_paused: Semaphore,
+    release_item_started: Semaphore,
+    item_started_cancelled: Semaphore,
 }
 
 impl CompactCommitTestHook {
-    #[doc(hidden)]
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             inner: Arc::new(CompactCommitTestHookInner {
                 commit_paused: Semaphore::new(0),
                 release_commit: Semaphore::new(0),
                 parent_wait_dropped: Semaphore::new(0),
+                commit_completed: Semaphore::new(0),
+                panic_commit: AtomicBool::new(false),
+                pause_item_started: AtomicBool::new(false),
+                item_started_paused: Semaphore::new(0),
+                release_item_started: Semaphore::new(0),
+                item_started_cancelled: Semaphore::new(0),
             }),
         }
     }
 
-    #[doc(hidden)]
-    pub async fn wait_until_commit_paused(&self) {
+    pub(crate) async fn wait_until_commit_paused(&self) {
         let Ok(permit) = self.inner.commit_paused.acquire().await else {
             return;
         };
         permit.forget();
     }
 
-    #[doc(hidden)]
-    pub fn release_commit(&self) {
+    pub(crate) fn release_commit(&self) {
         self.inner.release_commit.add_permits(1);
     }
 
-    #[doc(hidden)]
-    pub async fn wait_until_parent_wait_dropped(&self) {
+    pub(crate) fn panic_commit_once(&self) {
+        self.inner.panic_commit.store(true, Ordering::SeqCst);
+    }
+
+    pub(crate) fn pause_item_started_once(&self) {
+        self.inner.pause_item_started.store(true, Ordering::SeqCst);
+    }
+
+    pub(crate) async fn wait_until_item_started_paused(&self) {
+        let Ok(permit) = self.inner.item_started_paused.acquire().await else {
+            return;
+        };
+        permit.forget();
+    }
+
+    pub(crate) async fn wait_until_item_started_cancelled(&self) {
+        let Ok(permit) = self.inner.item_started_cancelled.acquire().await else {
+            return;
+        };
+        permit.forget();
+    }
+
+    pub(crate) async fn wait_until_parent_wait_dropped(&self) {
         let Ok(permit) = self.inner.parent_wait_dropped.acquire().await else {
+            return;
+        };
+        permit.forget();
+    }
+
+    pub(crate) async fn wait_until_commit_completed(&self) {
+        let Ok(permit) = self.inner.commit_completed.acquire().await else {
             return;
         };
         permit.forget();
@@ -118,6 +190,30 @@ impl CompactCommitTestHook {
             hook: self.clone(),
             armed: true,
         }
+    }
+
+    pub(crate) fn should_panic_commit(&self) -> bool {
+        self.inner.panic_commit.swap(false, Ordering::SeqCst)
+    }
+
+    pub(crate) fn notify_commit_completed(&self) {
+        self.inner.commit_completed.add_permits(1);
+    }
+
+    pub(crate) fn take_item_started_pause(&self) -> bool {
+        self.inner.pause_item_started.swap(false, Ordering::SeqCst)
+    }
+
+    pub(crate) async fn pause_item_started(&self) {
+        self.inner.item_started_paused.add_permits(1);
+        let Ok(permit) = self.inner.release_item_started.acquire().await else {
+            return;
+        };
+        permit.forget();
+    }
+
+    pub(crate) fn notify_item_started_cancelled(&self) {
+        self.inner.item_started_cancelled.add_permits(1);
     }
 }
 
@@ -250,14 +346,21 @@ pub(crate) async fn run_compact_task(
     input: Vec<UserInput>,
     cancellation_token: CancellationToken,
 ) -> CodexResult<()> {
+    let started_at = turn_context
+        .turn_timing_state
+        .started_at_unix_secs()
+        .or_cancel(&cancellation_token)
+        .await?;
     let start_event = EventMsg::TurnStarted(TurnStartedEvent {
         turn_id: turn_context.sub_id.clone(),
         trace_id: turn_context.trace_id.clone(),
-        started_at: turn_context.turn_timing_state.started_at_unix_secs().await,
+        started_at,
         model_context_window: turn_context.model_context_window(),
         collaboration_mode_kind: turn_context.collaboration_mode.mode,
     });
-    sess.send_event(&turn_context, start_event).await;
+    sess.send_event(&turn_context, start_event)
+        .or_cancel(&cancellation_token)
+        .await?;
     run_compact_task_inner(
         sess.clone(),
         turn_context,
@@ -314,7 +417,8 @@ async fn run_compact_task_inner(
                     Some(&error),
                     CompactionAnalyticsDetails::default(),
                 )
-                .await;
+                .or_cancel(&cancellation_token)
+                .await?;
             return Err(error);
         }
     }
@@ -324,7 +428,7 @@ async fn run_compact_task_inner(
         compact_turn_context,
         input,
         active_client_session,
-        cancellation_token,
+        cancellation_token.clone(),
         initial_context_injection,
         compaction_metadata,
     )
@@ -332,7 +436,9 @@ async fn run_compact_task_inner(
     let status = compaction_status_from_result(&result);
     let codex_error = result.as_ref().err();
     if result.is_ok() {
-        let post_compact_outcome = run_post_compact_hooks(&sess, &turn_context, trigger).await;
+        let post_compact_outcome = run_post_compact_hooks(&sess, &turn_context, trigger)
+            .or_cancel(&cancellation_token)
+            .await?;
         if let PostCompactHookOutcome::Stopped = post_compact_outcome {
             attempt
                 .track(
@@ -341,7 +447,8 @@ async fn run_compact_task_inner(
                     codex_error,
                     CompactionAnalyticsDetails::default(),
                 )
-                .await;
+                .or_cancel(&cancellation_token)
+                .await?;
             return Err(CodexErr::TurnAborted);
         }
     }
@@ -352,7 +459,8 @@ async fn run_compact_task_inner(
             codex_error,
             CompactionAnalyticsDetails::default(),
         )
-        .await;
+        .or_cancel(&cancellation_token)
+        .await?;
     result.map(|_| ())
 }
 
@@ -371,8 +479,28 @@ async fn run_compact_task_inner_impl(
         return Err(CodexErr::TurnAborted);
     }
     let compaction_item = TurnItem::ContextCompaction(ContextCompactionItem::new());
-    sess.emit_turn_item_started(&turn_context, &compaction_item)
-        .await;
+    let item_started_hook = sess
+        .services
+        .compact_commit_test_hook
+        .as_ref()
+        .filter(|hook| hook.take_item_started_pause())
+        .cloned();
+    let item_started_result = async {
+        if let Some(hook) = item_started_hook.as_ref() {
+            hook.pause_item_started().await;
+        }
+        sess.emit_turn_item_started(&turn_context, &compaction_item)
+            .await;
+    }
+    .or_cancel(&cancellation_token)
+    .await;
+    if item_started_result.is_err()
+        && cancellation_token.is_cancelled()
+        && let Some(hook) = item_started_hook.as_ref()
+    {
+        hook.notify_item_started_cancelled();
+    }
+    item_started_result?;
     let initial_input_for_turn: ResponseInputItem = ResponseInputItem::from(input);
 
     let mut history = sess.clone_history().or_cancel(&cancellation_token).await?;
@@ -432,7 +560,9 @@ async fn run_compact_task_inner_impl(
                 {
                     sess.track_turn_codex_error(turn_context.as_ref(), &e);
                     let event = EventMsg::Error(e.to_error_event(/*message_prefix*/ None));
-                    sess.send_event(&turn_context, event).await;
+                    sess.send_event(&turn_context, event)
+                        .or_cancel(&cancellation_token)
+                        .await?;
                     return Err(e);
                 }
                 break completed_attempt;
@@ -443,7 +573,9 @@ async fn run_compact_task_inner_impl(
             Err(e @ CodexErr::SessionBudgetExceeded) => {
                 sess.track_turn_codex_error(turn_context.as_ref(), &e);
                 let event = EventMsg::Error(e.to_error_event(/*message_prefix*/ None));
-                sess.send_event(&turn_context, event).await;
+                sess.send_event(&turn_context, event)
+                    .or_cancel(&cancellation_token)
+                    .await?;
                 return Err(e);
             }
             Err(e @ CodexErr::ContextWindowExceeded) => {
@@ -456,10 +588,14 @@ async fn run_compact_task_inner_impl(
                     retries = 0;
                     continue;
                 }
-                sess.set_total_tokens_full(turn_context.as_ref()).await;
+                sess.set_total_tokens_full(turn_context.as_ref())
+                    .or_cancel(&cancellation_token)
+                    .await?;
                 sess.track_turn_codex_error(turn_context.as_ref(), &e);
                 let event = EventMsg::Error(e.to_error_event(/*message_prefix*/ None));
-                sess.send_event(&turn_context, event).await;
+                sess.send_event(&turn_context, event)
+                    .or_cancel(&cancellation_token)
+                    .await?;
                 return Err(e);
             }
             Err(e) => {
@@ -480,7 +616,9 @@ async fn run_compact_task_inner_impl(
                 } else {
                     sess.track_turn_codex_error(turn_context.as_ref(), &e);
                     let event = EventMsg::Error(e.to_error_event(/*message_prefix*/ None));
-                    sess.send_event(&turn_context, event).await;
+                    sess.send_event(&turn_context, event)
+                        .or_cancel(&cancellation_token)
+                        .await?;
                     return Err(e);
                 }
             }
@@ -538,17 +676,20 @@ async fn run_compact_task_inner_impl(
         compacted_item,
         window_number,
         window_ids,
+        completed_attempt.token_usage.clone(),
+        completed_attempt.server_reasoning_included,
+        completed_attempt.rate_limits.clone(),
     );
     if cancellation_token.is_cancelled() {
         return Err(CodexErr::TurnAborted);
     }
-    if let Some(active_client_session) = active_client_session {
-        active_client_session.clear_incremental_baseline();
-    }
     let commit_sess = Arc::clone(&sess);
+    let commit_turn_context = Arc::clone(&turn_context);
+    let commit_baseline = CompactCommitBaseline::take_from_active(active_client_session);
+    let child_baseline = commit_baseline.clone();
     let commit_handle = tokio::spawn(async move {
         commit_sess
-            .commit_prepared_compaction(prepared_commit)
+            .commit_prepared_compaction(prepared_commit, child_baseline, commit_turn_context)
             .await
     });
     let mut parent_wait_guard = sess
@@ -560,27 +701,32 @@ async fn run_compact_task_inner_impl(
     if let Some(guard) = parent_wait_guard.as_mut() {
         guard.disarm();
     }
-    commit_result??;
-    if let Some(included) = completed_attempt.server_reasoning_included {
-        sess.set_server_reasoning_included(included).await;
+    let commit_result = match commit_result {
+        Ok(result) => result,
+        Err(err) => {
+            commit_baseline.restore_to_session(sess.as_ref()).await;
+            Err(CodexErr::Io(std::io::Error::other(format!(
+                "compact commit task failed: {err}"
+            ))))
+        }
+    };
+    if let Err(err) = commit_result {
+        sess.track_turn_codex_error(turn_context.as_ref(), &err);
+        let event = EventMsg::Error(err.to_error_event(/*message_prefix*/ None));
+        sess.send_event(&turn_context, event)
+            .or_cancel(&cancellation_token)
+            .await?;
+        return Err(err);
     }
-    for snapshot in completed_attempt.rate_limits {
-        sess.update_rate_limits(turn_context.as_ref(), snapshot)
-            .await;
-    }
-    sess.update_compaction_token_usage_info(
-        turn_context.as_ref(),
-        completed_attempt.token_usage.as_ref(),
-    )
-    .await?;
-    sess.recompute_token_usage(&turn_context).await;
-
     sess.emit_turn_item_completed(&turn_context, compaction_item)
-        .await;
+        .or_cancel(&cancellation_token)
+        .await?;
     let warning = EventMsg::Warning(WarningEvent {
         message: "Heads up: Long threads and multiple compactions can cause the model to be less accurate. Start a new thread when possible to keep threads small and targeted.".to_string(),
     });
-    sess.send_event(&turn_context, warning).await;
+    sess.send_event(&turn_context, warning)
+        .or_cancel(&cancellation_token)
+        .await?;
     Ok(summary_suffix)
 }
 

@@ -1219,10 +1219,6 @@ impl ModelClientSession {
         self.http_session = baseline;
     }
 
-    pub(crate) fn clear_incremental_baseline(&mut self) {
-        self.http_session = HttpIncrementalSession::default();
-    }
-
     pub(crate) fn has_incremental_baseline(&self) -> bool {
         self.http_session.last_request.is_some()
     }

@@ -301,11 +301,17 @@ pub(crate) struct PreviousTurnSettings {
 
 pub(crate) struct PreparedCompactionCommit {
     history: Vec<ResponseItem>,
+    assign_item_ids: bool,
     reference_context_item: Option<TurnContextItem>,
     world_state_baseline: Option<WorldStateSnapshot>,
+    compacted_item: CompactedItem,
     window_number: u64,
     window_ids: AutoCompactWindowIds,
-    rollout_items: Vec<RolloutItem>,
+    token_usage: Option<TokenUsage>,
+    server_reasoning_included: Option<bool>,
+    rate_limits: Vec<RateLimitSnapshot>,
+    model_context_window: Option<i64>,
+    update_auto_compact_prefill: bool,
 }
 
 #[cfg(test)]
@@ -3076,33 +3082,27 @@ impl Session {
         compacted_item: CompactedItem,
         window_number: u64,
         window_ids: AutoCompactWindowIds,
+        token_usage: Option<TokenUsage>,
+        server_reasoning_included: Option<bool>,
+        rate_limits: Vec<RateLimitSnapshot>,
     ) -> PreparedCompactionCommit {
-        let history = if turn_context.config.features.enabled(Feature::ItemIds) {
-            Self::assign_missing_response_item_ids(Cow::Owned(items)).into_owned()
-        } else {
-            items
-        };
-        let compacted_item = CompactedItem {
-            replacement_history: Some(history.clone()),
-            ..compacted_item
-        };
         let world_state_baseline = world_state_baseline.map(|world_state| world_state.snapshot());
-        let mut rollout_items = vec![RolloutItem::Compacted(compacted_item)];
-        if let Some(snapshot) = world_state_baseline.as_ref() {
-            rollout_items.push(RolloutItem::WorldState(WorldStateItem::full(
-                snapshot.clone().into_value(),
-            )));
-        }
-        if let Some(turn_context_item) = reference_context_item.as_ref() {
-            rollout_items.push(RolloutItem::TurnContext(turn_context_item.clone()));
-        }
         PreparedCompactionCommit {
-            history,
+            history: items,
+            assign_item_ids: turn_context.config.features.enabled(Feature::ItemIds),
             reference_context_item,
             world_state_baseline,
+            compacted_item,
             window_number,
             window_ids,
-            rollout_items,
+            token_usage,
+            server_reasoning_included,
+            rate_limits,
+            model_context_window: turn_context.model_context_window(),
+            update_auto_compact_prefill: matches!(
+                turn_context.config.model_auto_compact_token_limit_scope,
+                AutoCompactTokenLimitScope::BodyAfterPrefix
+            ),
         }
     }
 
@@ -3112,29 +3112,157 @@ impl Session {
     pub(crate) async fn commit_prepared_compaction(
         &self,
         prepared: PreparedCompactionCommit,
+        incremental_baseline: compact::CompactCommitBaseline,
+        turn_context: Arc<TurnContext>,
     ) -> CodexResult<()> {
         let mut state = self.state.lock().await;
-        if !state.commit_prepared_auto_compact_window_advance(
+        if !state.can_commit_prepared_auto_compact_window_advance(
             prepared.window_number,
             prepared.window_ids,
         ) {
+            if let Some(baseline) = incremental_baseline.take() {
+                state.http_incremental_baseline = baseline;
+            }
             return Err(CodexErr::Stream(
                 "compact window changed before the prepared commit".to_string(),
                 None,
             ));
         }
-        state.replace_history(prepared.history, prepared.reference_context_item);
-        if let Some(snapshot) = prepared.world_state_baseline {
-            state.history.set_world_state_baseline(snapshot);
+        let history = if prepared.assign_item_ids {
+            Self::assign_missing_response_item_ids(Cow::Owned(prepared.history)).into_owned()
+        } else {
+            prepared.history
+        };
+        let compacted_item = CompactedItem {
+            replacement_history: Some(history.clone()),
+            ..prepared.compacted_item
+        };
+        let mut rollout_items = vec![RolloutItem::Compacted(compacted_item)];
+        if let Some(snapshot) = prepared.world_state_baseline.as_ref() {
+            rollout_items.push(RolloutItem::WorldState(WorldStateItem::full(
+                snapshot.clone().into_value(),
+            )));
         }
-        state.http_incremental_baseline = Default::default();
-        state.queue_pending_session_start_source(codex_hooks::SessionStartSource::Compact);
+        if let Some(turn_context_item) = prepared.reference_context_item.as_ref() {
+            rollout_items.push(RolloutItem::TurnContext(turn_context_item.clone()));
+        }
+
+        let mut replacement = ContextManager::new();
+        replacement.replace(history.clone());
+        let estimated_total_tokens = replacement
+            .estimate_token_count_with_base_instructions(&BaseInstructions {
+                text: state.session_configuration.base_instructions.clone(),
+            })
+            .unwrap_or(0)
+            .max(0);
+        let api_token_info = TokenUsageInfo::new_or_append(
+            &state.token_info(),
+            &prepared.token_usage,
+            prepared.model_context_window,
+        );
+        let mut token_info = api_token_info.clone().unwrap_or(TokenUsageInfo {
+            total_token_usage: TokenUsage::default(),
+            last_token_usage: TokenUsage::default(),
+            model_context_window: prepared.model_context_window,
+        });
+        token_info.last_token_usage = TokenUsage {
+            total_tokens: estimated_total_tokens,
+            ..TokenUsage::default()
+        };
+        if let Some(model_context_window) = prepared.model_context_window {
+            token_info.model_context_window = Some(model_context_window);
+        }
+        let token_info = Some(token_info);
+        let rate_limits = state.rate_limits_after(&prepared.rate_limits);
+        let api_token_count_event = EventMsg::TokenCount(TokenCountEvent {
+            info: api_token_info.clone(),
+            rate_limits: rate_limits.clone(),
+        });
+        let token_count_event = EventMsg::TokenCount(TokenCountEvent {
+            info: token_info.clone(),
+            rate_limits: rate_limits.clone(),
+        });
+        rollout_items.push(RolloutItem::EventMsg(api_token_count_event.clone()));
+        rollout_items.push(RolloutItem::EventMsg(token_count_event.clone()));
 
         if let Some(hook) = self.services.compact_commit_test_hook.as_ref() {
             hook.pause_commit().await;
+            assert!(
+                !hook.should_panic_commit(),
+                "injected compact commit task panic"
+            );
         }
-        self.persist_rollout_items(&prepared.rollout_items).await;
+        if let Err(err) = self.persist_rollout_items_fallible(&rollout_items).await {
+            if let Some(baseline) = incremental_baseline.take() {
+                state.http_incremental_baseline = baseline;
+            }
+            return Err(CodexErr::Io(std::io::Error::other(format!(
+                "failed to persist compact transaction: {err}"
+            ))));
+        }
+
+        let committed = state.commit_prepared_auto_compact_window_advance(
+            prepared.window_number,
+            prepared.window_ids,
+        );
+        debug_assert!(committed, "validated compact window should commit");
+        state.replace_history(history, prepared.reference_context_item);
+        if let Some(snapshot) = prepared.world_state_baseline {
+            state.history.set_world_state_baseline(snapshot);
+        }
+        state.set_token_info(token_info.clone());
+        state.latest_rate_limits = rate_limits;
+        if let Some(included) = prepared.server_reasoning_included {
+            state.set_server_reasoning_included(included);
+        }
+        if prepared.update_auto_compact_prefill {
+            state.set_auto_compact_window_estimated_prefill(estimated_total_tokens);
+        }
+        drop(incremental_baseline.take());
+        state.http_incremental_baseline = Default::default();
+        state.queue_pending_session_start_source(codex_hooks::SessionStartSource::Compact);
+        drop(state);
+
+        if prepared.token_usage.is_some()
+            && let Some(api_token_info) = api_token_info.as_ref()
+        {
+            for contributor in self.services.extensions.token_usage_contributors() {
+                contributor
+                    .on_token_usage(
+                        &self.services.session_extension_data,
+                        &self.services.thread_extension_data,
+                        turn_context.extension_data.as_ref(),
+                        api_token_info,
+                    )
+                    .await;
+            }
+        }
+        self.deliver_persisted_event(turn_context.as_ref(), api_token_count_event)
+            .await;
+        self.deliver_persisted_event(turn_context.as_ref(), token_count_event)
+            .await;
+        if let Some(hook) = self.services.compact_commit_test_hook.as_ref() {
+            hook.notify_commit_completed();
+        }
         Ok(())
+    }
+
+    /// Deliver an event already included in a successful transactional rollout append.
+    async fn deliver_persisted_event(&self, turn_context: &TurnContext, msg: EventMsg) {
+        self.services
+            .rollout_thread_trace
+            .record_codex_turn_event(&turn_context.sub_id, &msg);
+        self.services
+            .rollout_thread_trace
+            .record_tool_call_event(turn_context.sub_id.clone(), &msg);
+        self.services
+            .rollout_thread_trace
+            .record_protocol_event(&msg);
+        self.deliver_event_raw(Event {
+            id: turn_context.sub_id.clone(),
+            msg,
+        })
+        .await;
     }
 
     async fn persist_rollout_response_items(&self, items: &[ResponseItem]) {
@@ -3599,11 +3727,19 @@ impl Session {
 
     #[tracing::instrument(level = "trace", skip_all, fields(item_count = items.len()))]
     pub(crate) async fn persist_rollout_items(&self, items: &[RolloutItem]) {
-        if let Some(live_thread) = self.live_thread()
-            && let Err(e) = live_thread.append_items(items).await
-        {
+        if let Err(e) = self.persist_rollout_items_fallible(items).await {
             error!("failed to record rollout items: {e:#}");
         }
+    }
+
+    async fn persist_rollout_items_fallible(
+        &self,
+        items: &[RolloutItem],
+    ) -> codex_thread_store::ThreadStoreResult<()> {
+        let Some(live_thread) = self.live_thread() else {
+            return Ok(());
+        };
+        live_thread.append_items(items).await
     }
 
     pub(crate) async fn clone_history(&self) -> ContextManager {
@@ -3775,23 +3911,6 @@ impl Session {
         let mut state = self.state.lock().await;
         state.set_reference_context_item(Some(turn_context_item));
         world_state
-    }
-
-    pub(crate) async fn update_compaction_token_usage_info(
-        &self,
-        turn_context: &TurnContext,
-        token_usage: Option<&TokenUsage>,
-    ) -> CodexResult<()> {
-        let result = self
-            .record_token_usage_info_with_options(
-                turn_context,
-                token_usage,
-                /*update_auto_compact_prefill*/ false,
-                /*record_rollout_budget*/ false,
-            )
-            .await;
-        self.send_token_count_event(turn_context).await;
-        result
     }
 
     pub(crate) async fn record_token_usage_info(

@@ -1,11 +1,14 @@
 use codex_core::ThreadManagerRuntimeOptions;
 use codex_core::compact::SUMMARY_PREFIX;
+use codex_core::config::ThreadStoreConfig;
 use codex_core::test_support::CompactCommitTestHook;
+use codex_core::test_support::with_compact_commit_test_hook;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
 use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::RolloutLine;
 use codex_protocol::user_input::UserInput;
+use codex_thread_store::InMemoryThreadStore;
 use core_test_support::hooks::trust_discovered_hooks;
 use core_test_support::responses::ResponseMock;
 use core_test_support::responses::ev_assistant_message;
@@ -511,6 +514,114 @@ print(json.dumps({"continue": False, "stopReason": "stop before compact"}))
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn interrupt_blocked_before_compact_item_started_returns_gracefully() {
+    skip_if_no_network!();
+
+    let server = start_mock_server().await;
+    let response_mock = mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![
+                ev_response_created("resp-before-blocked-item-started"),
+                ev_assistant_message("first-message", "FIRST_REPLY"),
+                ev_completed("resp-before-blocked-item-started"),
+            ]),
+            sse(vec![
+                ev_response_created("resp-after-blocked-item-started"),
+                ev_assistant_message("follow-up-message", "FOLLOW_UP_REPLY"),
+                ev_completed("resp-after-blocked-item-started"),
+            ]),
+        ],
+    )
+    .await;
+    let commit_hook = CompactCommitTestHook::new();
+    let mut builder = test_codex()
+        .with_runtime_options(with_compact_commit_test_hook(
+            ThreadManagerRuntimeOptions::default(),
+            commit_hook.clone(),
+        ))
+        .with_model(ACTIVE_MODEL)
+        .with_model_info_override(FAILED_TURN_MODEL, |model_info| {
+            model_info.comp_hash = Some("blocked-item-started-hash".to_string());
+        })
+        .with_model_info_override(ACTIVE_MODEL, |model_info| {
+            model_info.comp_hash = Some("active-turn-hash".to_string());
+            model_info.supports_incremental_requests = true;
+        })
+        .with_config(|config| {
+            config.compact_model = Some(COMPACT_MODEL.to_string());
+            config.compact_prompt = Some(COMPACT_PROMPT.to_string());
+            config.model_provider.name = "Catalyst-compatible test provider".to_string();
+        });
+    let test = builder
+        .build_with_auto_env(&server)
+        .await
+        .expect("build codex");
+
+    test.submit_turn("FIRST_USER_TURN")
+        .await
+        .expect("submit first user turn");
+    commit_hook.pause_item_started_once();
+    test.codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "TURN_BLOCKED_BEFORE_COMPACT_ITEM_STARTED".to_string(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
+                collaboration_mode: Some(codex_protocol::config_types::CollaborationMode {
+                    mode: codex_protocol::config_types::ModeKind::Default,
+                    settings: codex_protocol::config_types::Settings {
+                        model: FAILED_TURN_MODEL.to_string(),
+                        reasoning_effort: None,
+                        developer_instructions: None,
+                    },
+                }),
+                ..Default::default()
+            },
+        })
+        .await
+        .expect("submit turn blocked before compact ItemStarted");
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        commit_hook.wait_until_item_started_paused(),
+    )
+    .await
+    .expect("compact should pause before ItemStarted");
+
+    test.codex
+        .submit(Op::Interrupt)
+        .await
+        .expect("interrupt blocked compact turn");
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        commit_hook.wait_until_item_started_cancelled(),
+    )
+    .await
+    .expect("ItemStarted wait should observe cancellation before forced task abort");
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::TurnAborted(_))
+    })
+    .await;
+
+    test.submit_turn("FOLLOW_UP_AFTER_BLOCKED_ITEM_STARTED")
+        .await
+        .expect("submit follow-up after blocked ItemStarted");
+
+    assert_eq!(response_mock.requests().len(), 2);
+    let follow_up =
+        request_body_containing_user_text(&response_mock, "FOLLOW_UP_AFTER_BLOCKED_ITEM_STARTED");
+    assert_eq!(
+        follow_up["previous_response_id"].as_str(),
+        Some("resp-before-blocked-item-started")
+    );
+    assert!(!follow_up.to_string().contains(SUMMARY_PREFIX));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn compact_output_then_terminal_error_preserves_history_and_baseline() {
     skip_if_no_network!();
 
@@ -770,6 +881,350 @@ async fn interrupt_in_flight_compact_preserves_history_and_incremental_baseline(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn compact_append_failure_preserves_live_state_and_baseline() {
+    skip_if_no_network!();
+
+    const STORE_ID: &str = "compact-append-failure-preserves-live-state";
+    InMemoryThreadStore::remove_id(STORE_ID);
+    let thread_store = InMemoryThreadStore::for_id(STORE_ID);
+    let server = start_mock_server().await;
+    let response_mock = mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![
+                ev_response_created("resp-before-append-failure"),
+                ev_assistant_message("first-message", "FIRST_REPLY"),
+                ev_completed("resp-before-append-failure"),
+            ]),
+            sse(vec![
+                ev_assistant_message("compact-message", "UNCOMMITTED_COMPACT_SUMMARY"),
+                ev_completed("compact-before-append-failure"),
+            ]),
+            sse(vec![
+                ev_response_created("resp-after-append-failure"),
+                ev_assistant_message("follow-up-message", "FOLLOW_UP_REPLY"),
+                ev_completed("resp-after-append-failure"),
+            ]),
+        ],
+    )
+    .await;
+    let commit_hook = CompactCommitTestHook::new();
+    let mut builder = test_codex()
+        .with_runtime_options(with_compact_commit_test_hook(
+            ThreadManagerRuntimeOptions::default(),
+            commit_hook.clone(),
+        ))
+        .with_model(ACTIVE_MODEL)
+        .with_model_info_override(ACTIVE_MODEL, |model_info| {
+            model_info.supports_incremental_requests = true;
+        })
+        .with_config(|config| {
+            config.experimental_thread_store = ThreadStoreConfig::InMemory {
+                id: STORE_ID.to_string(),
+            };
+            config.compact_model = Some(COMPACT_MODEL.to_string());
+            config.compact_prompt = Some(COMPACT_PROMPT.to_string());
+            config.model_provider.name = "Catalyst-compatible test provider".to_string();
+        });
+    let test = builder
+        .build_with_auto_env(&server)
+        .await
+        .expect("build codex");
+
+    test.submit_turn("FIRST_USER_TURN")
+        .await
+        .expect("submit first user turn");
+    test.codex
+        .submit(Op::Compact)
+        .await
+        .expect("submit compact operation");
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        commit_hook.wait_until_commit_paused(),
+    )
+    .await
+    .expect("compact commit should reach the deterministic pause");
+    thread_store
+        .fail_next_append("injected compact transaction append failure")
+        .await;
+    commit_hook.release_commit();
+
+    let terminal = wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::Error(_) | EventMsg::ItemCompleted(_))
+    })
+    .await;
+    assert!(
+        matches!(terminal, EventMsg::Error(_)),
+        "append failure must surface instead of completing compaction: {terminal:?}"
+    );
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+
+    test.submit_turn("FOLLOW_UP_AFTER_APPEND_FAILURE")
+        .await
+        .expect("submit follow-up after append failure");
+
+    assert_eq!(response_mock.requests().len(), 3);
+    let follow_up_body =
+        request_body_containing_user_text(&response_mock, "FOLLOW_UP_AFTER_APPEND_FAILURE");
+    assert_eq!(
+        follow_up_body["previous_response_id"].as_str(),
+        Some("resp-before-append-failure")
+    );
+    let follow_up_body = follow_up_body.to_string();
+    assert!(!follow_up_body.contains("UNCOMMITTED_COMPACT_SUMMARY"));
+    assert!(!follow_up_body.contains(SUMMARY_PREFIX));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn inline_compact_append_failure_restores_incremental_baseline_once() {
+    skip_if_no_network!();
+
+    const STORE_ID: &str = "inline-compact-append-failure-restores-baseline";
+    InMemoryThreadStore::remove_id(STORE_ID);
+    let thread_store = InMemoryThreadStore::for_id(STORE_ID);
+    let server = start_mock_server().await;
+    let response_mock = mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![
+                ev_response_created("resp-before-inline-append-failure"),
+                ev_assistant_message("first-message", "FIRST_REPLY"),
+                ev_completed("resp-before-inline-append-failure"),
+            ]),
+            sse(vec![
+                ev_assistant_message("compact-message", "UNCOMMITTED_INLINE_SUMMARY"),
+                ev_completed("compact-before-inline-append-failure"),
+            ]),
+            sse(vec![
+                ev_response_created("resp-after-inline-append-failure"),
+                ev_assistant_message("follow-up-message", "FOLLOW_UP_REPLY"),
+                ev_completed("resp-after-inline-append-failure"),
+            ]),
+            sse(vec![
+                ev_response_created("resp-after-second-follow-up"),
+                ev_assistant_message("second-follow-up-message", "SECOND_FOLLOW_UP_REPLY"),
+                ev_completed("resp-after-second-follow-up"),
+            ]),
+        ],
+    )
+    .await;
+    let commit_hook = CompactCommitTestHook::new();
+    let mut builder = test_codex()
+        .with_runtime_options(with_compact_commit_test_hook(
+            ThreadManagerRuntimeOptions::default(),
+            commit_hook.clone(),
+        ))
+        .with_model(ACTIVE_MODEL)
+        .with_model_info_override(FAILED_TURN_MODEL, |model_info| {
+            model_info.comp_hash = Some("failed-turn-hash".to_string());
+        })
+        .with_model_info_override(ACTIVE_MODEL, |model_info| {
+            model_info.comp_hash = Some("active-turn-hash".to_string());
+            model_info.supports_incremental_requests = true;
+        })
+        .with_config(|config| {
+            config.experimental_thread_store = ThreadStoreConfig::InMemory {
+                id: STORE_ID.to_string(),
+            };
+            config.compact_model = Some(COMPACT_MODEL.to_string());
+            config.compact_prompt = Some(COMPACT_PROMPT.to_string());
+            config.model_provider.name = "Catalyst-compatible test provider".to_string();
+        });
+    let test = builder
+        .build_with_auto_env(&server)
+        .await
+        .expect("build codex");
+
+    test.submit_turn("FIRST_USER_TURN")
+        .await
+        .expect("submit first user turn");
+    test.codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "TURN_THAT_TRIGGERS_INLINE_APPEND_FAILURE".to_string(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
+                collaboration_mode: Some(codex_protocol::config_types::CollaborationMode {
+                    mode: codex_protocol::config_types::ModeKind::Default,
+                    settings: codex_protocol::config_types::Settings {
+                        model: FAILED_TURN_MODEL.to_string(),
+                        reasoning_effort: None,
+                        developer_instructions: None,
+                    },
+                }),
+                ..Default::default()
+            },
+        })
+        .await
+        .expect("submit turn that triggers inline compact");
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        commit_hook.wait_until_commit_paused(),
+    )
+    .await
+    .expect("inline compact commit should reach the deterministic pause");
+    thread_store
+        .fail_next_append("injected inline compact transaction append failure")
+        .await;
+    commit_hook.release_commit();
+    wait_for_event(&test.codex, |event| matches!(event, EventMsg::Error(_))).await;
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+
+    test.submit_turn("FOLLOW_UP_AFTER_INLINE_APPEND_FAILURE")
+        .await
+        .expect("submit follow-up after inline append failure");
+    test.submit_turn("SECOND_FOLLOW_UP_AFTER_INLINE_APPEND_FAILURE")
+        .await
+        .expect("submit second follow-up after inline append failure");
+
+    assert_eq!(response_mock.requests().len(), 4);
+    let first_follow_up =
+        request_body_containing_user_text(&response_mock, "FOLLOW_UP_AFTER_INLINE_APPEND_FAILURE");
+    assert_eq!(
+        first_follow_up["previous_response_id"].as_str(),
+        Some("resp-before-inline-append-failure")
+    );
+    assert!(!first_follow_up.to_string().contains(SUMMARY_PREFIX));
+    let second_follow_up = request_body_containing_user_text(
+        &response_mock,
+        "SECOND_FOLLOW_UP_AFTER_INLINE_APPEND_FAILURE",
+    );
+    assert_eq!(
+        second_follow_up["previous_response_id"].as_str(),
+        Some("resp-after-inline-append-failure")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn inline_compact_join_error_restores_incremental_baseline_once() {
+    skip_if_no_network!();
+
+    let server = start_mock_server().await;
+    let response_mock = mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![
+                ev_response_created("resp-before-inline-join-error"),
+                ev_assistant_message("first-message", "FIRST_REPLY"),
+                ev_completed("resp-before-inline-join-error"),
+            ]),
+            sse(vec![
+                ev_assistant_message("compact-message", "UNCOMMITTED_JOIN_ERROR_SUMMARY"),
+                ev_completed("compact-before-inline-join-error"),
+            ]),
+            sse(vec![
+                ev_response_created("resp-after-inline-join-error"),
+                ev_assistant_message("follow-up-message", "FOLLOW_UP_REPLY"),
+                ev_completed("resp-after-inline-join-error"),
+            ]),
+            sse(vec![
+                ev_response_created("resp-after-join-error-second-follow-up"),
+                ev_assistant_message("second-follow-up-message", "SECOND_FOLLOW_UP_REPLY"),
+                ev_completed("resp-after-join-error-second-follow-up"),
+            ]),
+        ],
+    )
+    .await;
+    let commit_hook = CompactCommitTestHook::new();
+    let mut builder = test_codex()
+        .with_runtime_options(with_compact_commit_test_hook(
+            ThreadManagerRuntimeOptions::default(),
+            commit_hook.clone(),
+        ))
+        .with_model(ACTIVE_MODEL)
+        .with_model_info_override(FAILED_TURN_MODEL, |model_info| {
+            model_info.comp_hash = Some("failed-turn-hash".to_string());
+        })
+        .with_model_info_override(ACTIVE_MODEL, |model_info| {
+            model_info.comp_hash = Some("active-turn-hash".to_string());
+            model_info.supports_incremental_requests = true;
+        })
+        .with_config(|config| {
+            config.compact_model = Some(COMPACT_MODEL.to_string());
+            config.compact_prompt = Some(COMPACT_PROMPT.to_string());
+            config.model_provider.name = "Catalyst-compatible test provider".to_string();
+        });
+    let test = builder
+        .build_with_auto_env(&server)
+        .await
+        .expect("build codex");
+
+    test.submit_turn("FIRST_USER_TURN")
+        .await
+        .expect("submit first user turn");
+    test.codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "TURN_THAT_TRIGGERS_INLINE_JOIN_ERROR".to_string(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
+                collaboration_mode: Some(codex_protocol::config_types::CollaborationMode {
+                    mode: codex_protocol::config_types::ModeKind::Default,
+                    settings: codex_protocol::config_types::Settings {
+                        model: FAILED_TURN_MODEL.to_string(),
+                        reasoning_effort: None,
+                        developer_instructions: None,
+                    },
+                }),
+                ..Default::default()
+            },
+        })
+        .await
+        .expect("submit turn that triggers inline compact");
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        commit_hook.wait_until_commit_paused(),
+    )
+    .await
+    .expect("inline compact commit should reach the deterministic pause");
+    commit_hook.panic_commit_once();
+    commit_hook.release_commit();
+    wait_for_event(&test.codex, |event| matches!(event, EventMsg::Error(_))).await;
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+
+    test.submit_turn("FOLLOW_UP_AFTER_INLINE_JOIN_ERROR")
+        .await
+        .expect("submit follow-up after inline join error");
+    test.submit_turn("SECOND_FOLLOW_UP_AFTER_INLINE_JOIN_ERROR")
+        .await
+        .expect("submit second follow-up after inline join error");
+
+    assert_eq!(response_mock.requests().len(), 4);
+    let first_follow_up =
+        request_body_containing_user_text(&response_mock, "FOLLOW_UP_AFTER_INLINE_JOIN_ERROR");
+    assert_eq!(
+        first_follow_up["previous_response_id"].as_str(),
+        Some("resp-before-inline-join-error")
+    );
+    assert!(!first_follow_up.to_string().contains(SUMMARY_PREFIX));
+    let second_follow_up = request_body_containing_user_text(
+        &response_mock,
+        "SECOND_FOLLOW_UP_AFTER_INLINE_JOIN_ERROR",
+    );
+    assert_eq!(
+        second_follow_up["previous_response_id"].as_str(),
+        Some("resp-after-inline-join-error")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn compact_commit_survives_forced_parent_abort_and_cold_resume_matches() {
     skip_if_no_network!();
 
@@ -780,11 +1235,11 @@ async fn compact_commit_survives_forced_parent_abort_and_cold_resume_matches() {
             sse(vec![
                 ev_response_created("resp-before-commit-abort"),
                 ev_assistant_message("first-message", "FIRST_REPLY"),
-                ev_completed("resp-before-commit-abort"),
+                ev_completed_with_tokens("resp-before-commit-abort", /*total_tokens*/ 5_000),
             ]),
             sse(vec![
                 ev_assistant_message("compact-message", "COMMITTED_COMPACT_SUMMARY"),
-                ev_completed("committed-compact-response"),
+                ev_completed_with_tokens("committed-compact-response", /*total_tokens*/ 100),
             ]),
             sse(vec![
                 ev_response_created("resp-after-commit-abort"),
@@ -803,10 +1258,10 @@ async fn compact_commit_survives_forced_parent_abort_and_cold_resume_matches() {
     let commit_hook = CompactCommitTestHook::new();
     let mut builder = test_codex()
         .with_home(Arc::clone(&home))
-        .with_runtime_options(
-            ThreadManagerRuntimeOptions::default()
-                .with_compact_commit_test_hook(commit_hook.clone()),
-        )
+        .with_runtime_options(with_compact_commit_test_hook(
+            ThreadManagerRuntimeOptions::default(),
+            commit_hook.clone(),
+        ))
         .with_model(ACTIVE_MODEL)
         .with_model_info_override(ACTIVE_MODEL, |model_info| {
             model_info.supports_incremental_requests = true;
@@ -815,6 +1270,7 @@ async fn compact_commit_survives_forced_parent_abort_and_cold_resume_matches() {
             config.compact_model = Some(COMPACT_MODEL.to_string());
             config.compact_prompt = Some(COMPACT_PROMPT.to_string());
             config.model_provider.name = "Catalyst-compatible test provider".to_string();
+            config.model_auto_compact_token_limit = Some(4_000);
         });
     let test = builder
         .build_with_auto_env(&server)
@@ -846,18 +1302,42 @@ async fn compact_commit_survives_forced_parent_abort_and_cold_resume_matches() {
     .await
     .expect("compact parent should be forcibly aborted while commit is paused");
     commit_hook.release_commit();
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        commit_hook.wait_until_commit_completed(),
+    )
+    .await
+    .expect("shielded compact commit should finish after its parent is aborted");
     wait_for_event(&test.codex, |event| {
         matches!(event, EventMsg::TurnAborted(_))
     })
     .await;
+
+    let compacted_token_info = test
+        .codex
+        .token_usage_info()
+        .await
+        .expect("live token usage after shielded compact commit");
+    assert_eq!(compacted_token_info.total_token_usage.total_tokens, 5_100);
+    assert!(
+        compacted_token_info.last_token_usage.total_tokens < 4_000,
+        "replacement history must be below the configured compaction threshold: {compacted_token_info:?}"
+    );
 
     test.submit_turn("LIVE_FOLLOW_UP_AFTER_COMMIT_ABORT")
         .await
         .expect("submit live follow-up");
     let live_body =
         request_body_containing_user_text(&response_mock, "LIVE_FOLLOW_UP_AFTER_COMMIT_ABORT");
+    assert_eq!(response_mock.requests().len(), 3);
     assert!(live_body.get("previous_response_id").is_none());
     assert!(live_body.to_string().contains("COMMITTED_COMPACT_SUMMARY"));
+    let live_token_info = test
+        .codex
+        .token_usage_info()
+        .await
+        .expect("live token usage before cold resume");
+    assert_eq!(live_token_info.total_token_usage.total_tokens, 5_100);
 
     test.codex.flush_rollout().await.expect("flush rollout");
     let rollout_path = test.codex.rollout_path().expect("rollout path");
@@ -889,11 +1369,18 @@ async fn compact_commit_survives_forced_parent_abort_and_cold_resume_matches() {
             config.compact_model = Some(COMPACT_MODEL.to_string());
             config.compact_prompt = Some(COMPACT_PROMPT.to_string());
             config.model_provider.name = "Catalyst-compatible test provider".to_string();
+            config.model_auto_compact_token_limit = Some(4_000);
         });
     let resumed = resume_builder
         .resume(&server, Arc::clone(&home), rollout_path)
         .await
         .expect("cold resume compacted thread");
+    let resumed_token_info = resumed
+        .codex
+        .token_usage_info()
+        .await
+        .expect("cold-resumed token usage after shielded compact commit");
+    assert_eq!(resumed_token_info, live_token_info);
     resumed
         .submit_turn("COLD_RESUME_FOLLOW_UP_AFTER_COMMIT_ABORT")
         .await

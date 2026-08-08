@@ -28,6 +28,7 @@ use codex_protocol::protocol::SessionSource;
 use once_cell::sync::Lazy;
 
 use crate::ThreadManager;
+use crate::ThreadManagerRuntimeOptions;
 use crate::config::Config;
 use crate::responses_metadata::CodexResponsesMetadata;
 use crate::responses_metadata::CodexResponsesRequestKind;
@@ -36,8 +37,63 @@ use crate::responses_metadata::subagent_metadata_kind;
 use crate::thread_manager;
 use crate::unified_exec;
 
+/// Instance-scoped synchronization for compaction integration tests.
 #[doc(hidden)]
-pub use crate::compact::CompactCommitTestHook;
+#[derive(Clone, Debug)]
+pub struct CompactCommitTestHook(crate::compact::CompactCommitTestHook);
+
+impl CompactCommitTestHook {
+    pub fn new() -> Self {
+        Self(crate::compact::CompactCommitTestHook::new())
+    }
+
+    pub async fn wait_until_commit_paused(&self) {
+        self.0.wait_until_commit_paused().await;
+    }
+
+    pub fn release_commit(&self) {
+        self.0.release_commit();
+    }
+
+    pub fn panic_commit_once(&self) {
+        self.0.panic_commit_once();
+    }
+
+    pub fn pause_item_started_once(&self) {
+        self.0.pause_item_started_once();
+    }
+
+    pub async fn wait_until_item_started_paused(&self) {
+        self.0.wait_until_item_started_paused().await;
+    }
+
+    pub async fn wait_until_item_started_cancelled(&self) {
+        self.0.wait_until_item_started_cancelled().await;
+    }
+
+    pub async fn wait_until_parent_wait_dropped(&self) {
+        self.0.wait_until_parent_wait_dropped().await;
+    }
+
+    pub async fn wait_until_commit_completed(&self) {
+        self.0.wait_until_commit_completed().await;
+    }
+}
+
+impl Default for CompactCommitTestHook {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Install the compaction synchronization hook without adding a production runtime API.
+#[doc(hidden)]
+pub fn with_compact_commit_test_hook(
+    options: ThreadManagerRuntimeOptions,
+    hook: CompactCommitTestHook,
+) -> ThreadManagerRuntimeOptions {
+    options.with_compact_commit_test_hook_for_tests(hook.0)
+}
 
 static TEST_MODEL_PRESETS: Lazy<Vec<ModelPreset>> = Lazy::new(|| {
     let mut response = bundled_models_response()

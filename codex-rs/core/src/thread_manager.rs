@@ -267,8 +267,7 @@ impl ThreadManagerRuntimeOptions {
         self
     }
 
-    #[doc(hidden)]
-    pub fn with_compact_commit_test_hook(
+    pub(crate) fn with_compact_commit_test_hook_for_tests(
         mut self,
         hook: crate::compact::CompactCommitTestHook,
     ) -> Self {

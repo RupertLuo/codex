@@ -391,6 +391,7 @@ pub struct InMemoryThreadStore {
 #[derive(Default)]
 struct InMemoryThreadStoreState {
     calls: InMemoryThreadStoreCalls,
+    next_append_error: Option<String>,
     created_threads: HashMap<ThreadId, CreateThreadParams>,
     histories: HashMap<ThreadId, Vec<RolloutItem>>,
     metadata_updates: HashMap<ThreadId, ThreadMetadataPatch>,
@@ -417,6 +418,14 @@ impl InMemoryThreadStore {
     /// Returns the calls observed by this store.
     pub async fn calls(&self) -> InMemoryThreadStoreCalls {
         self.state.lock().await.calls.clone()
+    }
+
+    /// Makes the next non-empty append fail before modifying stored history.
+    ///
+    /// This store exists for tests and debug configs; the control lets integration tests exercise
+    /// callers' durable-write error handling without introducing a second store implementation.
+    pub async fn fail_next_append(&self, message: impl Into<String>) {
+        self.state.lock().await.next_append_error = Some(message.into());
     }
 
     async fn create_thread(&self, params: CreateThreadParams) -> ThreadStoreResult<()> {
@@ -488,6 +497,9 @@ impl InMemoryThreadStore {
         }
         let mut state = self.state.lock().await;
         state.calls.append_items += 1;
+        if let Some(message) = state.next_append_error.take() {
+            return Err(ThreadStoreError::Internal { message });
+        }
         state
             .histories
             .entry(params.thread_id)
