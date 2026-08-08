@@ -969,6 +969,9 @@ async fn deferred_executor_compaction_preserves_then_updates_environment_once() 
         .into_iter()
         .filter_map(|line| match line.item {
             RolloutItem::WorldState(item) => Some(item),
+            RolloutItem::Compacted(compacted) => compacted
+                .checkpoint
+                .and_then(|checkpoint| checkpoint.world_state),
             _ => None,
         })
         .collect::<Vec<_>>();

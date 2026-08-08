@@ -7,12 +7,17 @@ use codex_protocol::ThreadId;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::CompactedItem;
+use codex_protocol::protocol::CompactionCheckpoint;
 use codex_protocol::protocol::InitialHistory;
 use codex_protocol::protocol::InterAgentCommunication;
+use codex_protocol::protocol::RateLimitSnapshot;
 use codex_protocol::protocol::ResumedHistory;
 use codex_protocol::protocol::SessionContextWindow;
 use codex_protocol::protocol::SessionMeta;
 use codex_protocol::protocol::SessionMetaLine;
+use codex_protocol::protocol::TokenCountEvent;
+use codex_protocol::protocol::TokenUsage;
+use codex_protocol::protocol::TokenUsageInfo;
 use codex_protocol::protocol::WorldStateItem;
 use pretty_assertions::assert_eq;
 use serde_json::json;
@@ -157,6 +162,104 @@ async fn record_initial_history_restores_world_state_baseline() {
         .await;
 
     assert_eq!(session.clone_history().await.raw_items(), &[]);
+}
+
+#[tokio::test]
+async fn record_initial_history_restores_atomic_compaction_checkpoint() {
+    let (session, turn_context) = make_session_and_context().await;
+    let turn_context = Arc::new(turn_context);
+    let reference_context_item = turn_context.to_turn_context_item();
+    let world_state = build_world_state_from_turn_context(&session, &turn_context).await;
+    let replacement_history = vec![
+        user_message("retained user"),
+        assistant_message("checkpoint summary"),
+    ];
+    let api_token_info = TokenUsageInfo {
+        total_token_usage: TokenUsage {
+            total_tokens: 5_100,
+            ..TokenUsage::default()
+        },
+        last_token_usage: TokenUsage {
+            total_tokens: 100,
+            ..TokenUsage::default()
+        },
+        model_context_window: Some(8_192),
+    };
+    let final_token_info = TokenUsageInfo {
+        last_token_usage: TokenUsage {
+            total_tokens: 240,
+            ..TokenUsage::default()
+        },
+        ..api_token_info.clone()
+    };
+    let rate_limits = RateLimitSnapshot {
+        limit_id: Some("workspace".to_string()),
+        limit_name: None,
+        primary: None,
+        secondary: None,
+        credits: None,
+        individual_limit: None,
+        plan_type: None,
+        rate_limit_reached_type: None,
+    };
+    let first_window_id = Uuid::now_v7();
+    let previous_window_id = Uuid::now_v7();
+    let window_id = Uuid::now_v7();
+    let compacted = CompactedItem {
+        message: "checkpoint summary".to_string(),
+        replacement_history: Some(replacement_history.clone()),
+        window_number: Some(4),
+        first_window_id: Some(first_window_id.to_string()),
+        previous_window_id: Some(previous_window_id.to_string()),
+        window_id: Some(window_id.to_string()),
+        checkpoint: Some(CompactionCheckpoint {
+            checkpoint_id: "checkpoint-resume".to_string(),
+            reference_context_item: Some(reference_context_item.clone()),
+            world_state: Some(WorldStateItem::full(world_state.snapshot().into_value())),
+            api_token_count: TokenCountEvent {
+                info: Some(api_token_info),
+                rate_limits: Some(rate_limits.clone()),
+            },
+            final_token_count: TokenCountEvent {
+                info: Some(final_token_info.clone()),
+                rate_limits: Some(rate_limits.clone()),
+            },
+            server_reasoning_included: true,
+        }),
+    };
+    // A backing writer may retry a fully written record after an ambiguous flush. Replaying the
+    // same checkpoint ID twice must remain idempotent.
+    let rollout_items = vec![
+        RolloutItem::Compacted(compacted.clone()),
+        RolloutItem::Compacted(compacted),
+    ];
+
+    let reconstructed = session
+        .reconstruct_history_from_rollout(&turn_context, &rollout_items)
+        .await;
+    assert_eq!(reconstructed.history, replacement_history);
+    assert_eq!(
+        reconstructed.reference_context_item,
+        Some(reference_context_item.clone())
+    );
+    assert_eq!(reconstructed.window_number, 4);
+    assert_eq!(reconstructed.first_window_id, Some(first_window_id));
+    assert_eq!(reconstructed.previous_window_id, Some(previous_window_id));
+    assert_eq!(reconstructed.window_id, Some(window_id));
+    assert!(reconstructed.world_state_baseline.is_some());
+
+    session
+        .record_initial_history(InitialHistory::Resumed(ResumedHistory {
+            conversation_id: ThreadId::default(),
+            history: Arc::new(rollout_items),
+            rollout_path: Some(PathBuf::from("/tmp/resume.jsonl")),
+        }))
+        .await;
+
+    let state = session.state.lock().await;
+    assert_eq!(state.token_info(), Some(final_token_info));
+    assert_eq!(state.latest_rate_limits, Some(rate_limits));
+    assert!(state.server_reasoning_included());
 }
 
 #[tokio::test]
@@ -927,6 +1030,7 @@ async fn record_initial_history_resumed_rollback_drops_incomplete_user_turn_comp
             first_window_id: None,
             previous_window_id: None,
             window_id: None,
+            checkpoint: None,
         }),
         RolloutItem::EventMsg(EventMsg::ThreadRolledBack(
             codex_protocol::protocol::ThreadRolledBackEvent { num_turns: 1 },
@@ -987,6 +1091,7 @@ async fn record_initial_history_resumed_does_not_seed_reference_context_item_aft
             first_window_id: None,
             previous_window_id: None,
             window_id: None,
+            checkpoint: None,
         }),
     ];
 
@@ -1056,6 +1161,7 @@ async fn reconstruct_history_prefers_compacted_window_over_session_meta() {
             first_window_id: Some(compacted_first_window_id.to_string()),
             previous_window_id: Some(compacted_previous_window_id.to_string()),
             window_id: Some(compacted_window_id.to_string()),
+            checkpoint: None,
         }),
     ];
 
@@ -1091,6 +1197,7 @@ async fn reconstruct_history_replays_world_state_from_latest_compaction_window()
                 first_window_id: None,
                 previous_window_id: None,
                 window_id: None,
+                checkpoint: None,
             }),
             RolloutItem::WorldState(WorldStateItem::full(json!({
                 "environment": {"status": "starting", "cwd": "/workspace"}
@@ -1138,6 +1245,7 @@ async fn reconstruct_history_preserves_legacy_compaction_count_with_session_meta
             first_window_id: None,
             previous_window_id: None,
             window_id: None,
+            checkpoint: None,
         }),
     ];
 
@@ -1165,6 +1273,7 @@ async fn reconstruct_history_legacy_compaction_without_replacement_history_does_
             first_window_id: None,
             previous_window_id: None,
             window_id: None,
+            checkpoint: None,
         }),
     ];
 
@@ -1200,6 +1309,7 @@ async fn reconstruct_history_legacy_compaction_without_replacement_history_clear
             first_window_id: None,
             previous_window_id: None,
             window_id: None,
+            checkpoint: None,
         }),
         RolloutItem::EventMsg(EventMsg::TurnStarted(
             codex_protocol::protocol::TurnStartedEvent {
@@ -1298,6 +1408,7 @@ async fn record_initial_history_resumed_turn_context_after_compaction_reestablis
             first_window_id: None,
             previous_window_id: None,
             window_id: None,
+            checkpoint: None,
         }),
         RolloutItem::TurnContext(previous_context_item),
         RolloutItem::EventMsg(EventMsg::TurnComplete(
@@ -1453,6 +1564,7 @@ async fn record_initial_history_resumed_aborted_turn_without_id_clears_active_tu
             first_window_id: None,
             previous_window_id: None,
             window_id: None,
+            checkpoint: None,
         }),
     ];
 
@@ -1692,6 +1804,7 @@ async fn record_initial_history_resumed_trailing_incomplete_turn_compaction_clea
             first_window_id: None,
             previous_window_id: None,
             window_id: None,
+            checkpoint: None,
         }),
     ];
 
@@ -1860,6 +1973,7 @@ async fn record_initial_history_resumed_replaced_incomplete_compacted_turn_clear
             first_window_id: None,
             previous_window_id: None,
             window_id: None,
+            checkpoint: None,
         }),
         // A newer TurnStarted replaces the incomplete compacted turn without a matching
         // completion/abort for the old one.

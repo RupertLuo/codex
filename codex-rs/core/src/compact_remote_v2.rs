@@ -319,6 +319,7 @@ async fn run_remote_compact_task_inner_impl(
         first_window_id: Some(new_window_ids.first_window_id.to_string()),
         previous_window_id: new_window_ids.previous_window_id.map(|id| id.to_string()),
         window_id: Some(new_window_ids.window_id.to_string()),
+        checkpoint: None,
     };
     compaction_trace.record_installed(&CompactionCheckpointTracePayload {
         input_history: &trace_input_history,

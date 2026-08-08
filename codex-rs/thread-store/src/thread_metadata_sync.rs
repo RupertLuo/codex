@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 #[cfg(test)]
 use std::sync::Arc;
 use std::time::Duration;
@@ -45,6 +46,7 @@ pub(crate) struct ThreadMetadataSync {
     /// Set once the best-effort LLM title task has been dispatched so it never
     /// fires more than once per live thread.
     llm_title_dispatched: bool,
+    seen_compaction_checkpoint_ids: HashSet<String>,
     pending_update: Option<ThreadMetadataPatch>,
     pending_update_generation: u64,
     last_touch_persisted_at: Option<Instant>,
@@ -93,6 +95,7 @@ impl ThreadMetadataSync {
             title_seen: false,
             first_user_message: None,
             llm_title_dispatched: false,
+            seen_compaction_checkpoint_ids: HashSet::new(),
             pending_update: Some(update),
             pending_update_generation: 1,
             last_touch_persisted_at: None,
@@ -114,6 +117,7 @@ impl ThreadMetadataSync {
             title_seen: false,
             first_user_message: None,
             llm_title_dispatched: false,
+            seen_compaction_checkpoint_ids: HashSet::new(),
             pending_update: None,
             pending_update_generation: 0,
             last_touch_persisted_at: None,
@@ -337,12 +341,35 @@ impl ThreadMetadataSync {
                         }
                     }
                 }
+                RolloutItem::Compacted(compacted) => {
+                    let Some(checkpoint) = compacted.checkpoint.as_ref() else {
+                        continue;
+                    };
+                    if !self
+                        .seen_compaction_checkpoint_ids
+                        .insert(checkpoint.checkpoint_id.clone())
+                    {
+                        continue;
+                    }
+                    if let Some(turn_ctx) = checkpoint.reference_context_item.as_ref() {
+                        if !self.cwd_seen {
+                            self.cwd_seen = true;
+                            update.cwd = Some(turn_ctx.cwd.clone().into_path_buf());
+                        }
+                        update.model = Some(turn_ctx.model.clone());
+                        update.reasoning_effort = turn_ctx.effort.clone();
+                        update.approval_mode = Some(turn_ctx.approval_policy);
+                        update.permission_profile = Some(turn_ctx.permission_profile());
+                    }
+                    if let Some(info) = checkpoint.final_token_count.info.as_ref() {
+                        update.token_usage = Some(info.total_token_usage.clone());
+                    }
+                }
                 RolloutItem::SessionMeta(_)
                 | RolloutItem::EventMsg(_)
                 | RolloutItem::ResponseItem(_)
                 | RolloutItem::InterAgentCommunication(_)
                 | RolloutItem::InterAgentCommunicationMetadata { .. }
-                | RolloutItem::Compacted(_)
                 | RolloutItem::WorldState(_) => {}
             }
         }
@@ -444,12 +471,16 @@ fn git_info_patch_from_observation(git_info: GitInfo) -> GitInfoPatch {
 #[cfg(test)]
 mod tests {
     use codex_protocol::protocol::CompactedItem;
+    use codex_protocol::protocol::CompactionCheckpoint;
     use codex_protocol::protocol::SessionMeta;
     use codex_protocol::protocol::SessionMetaLine;
     use codex_protocol::protocol::SessionSource;
     use codex_protocol::protocol::ThreadGoal;
     use codex_protocol::protocol::ThreadGoalStatus;
     use codex_protocol::protocol::ThreadGoalUpdatedEvent;
+    use codex_protocol::protocol::TokenCountEvent;
+    use codex_protocol::protocol::TokenUsage;
+    use codex_protocol::protocol::TokenUsageInfo;
     use codex_protocol::protocol::TurnStartedEvent;
     use codex_protocol::protocol::UserMessageEvent;
     use pretty_assertions::assert_eq;
@@ -551,6 +582,7 @@ mod tests {
             first_window_id: None,
             previous_window_id: None,
             window_id: None,
+            checkpoint: None,
         });
 
         let first = sync
@@ -589,6 +621,51 @@ mod tests {
 
         assert!(update.patch.updated_at.is_some());
         assert!(update.patch.advance_recency_at.is_some());
+    }
+
+    #[test]
+    fn checkpoint_projects_final_token_metadata_once_per_id() {
+        let thread_id = ThreadId::new();
+        let mut sync = ThreadMetadataSync::for_resume(&resume_params(thread_id, Vec::new()));
+        let info = TokenUsageInfo {
+            total_token_usage: TokenUsage {
+                total_tokens: 321,
+                ..TokenUsage::default()
+            },
+            last_token_usage: TokenUsage::default(),
+            model_context_window: Some(4_096),
+        };
+        let token_count = TokenCountEvent {
+            info: Some(info.clone()),
+            rate_limits: None,
+        };
+        let item = RolloutItem::Compacted(CompactedItem {
+            message: "compacted".to_string(),
+            replacement_history: Some(Vec::new()),
+            window_number: Some(1),
+            first_window_id: None,
+            previous_window_id: None,
+            window_id: None,
+            checkpoint: Some(CompactionCheckpoint {
+                checkpoint_id: "checkpoint-id".to_string(),
+                reference_context_item: None,
+                world_state: None,
+                api_token_count: token_count.clone(),
+                final_token_count: token_count,
+                server_reasoning_included: false,
+            }),
+        });
+
+        let first = sync
+            .observe_appended_items(std::slice::from_ref(&item))
+            .expect("first checkpoint projection");
+        assert_eq!(first.patch.token_usage, Some(info.total_token_usage));
+        sync.mark_pending_update_applied(&first);
+
+        let duplicate = sync
+            .observe_appended_items(std::slice::from_ref(&item))
+            .expect("duplicate checkpoint still touches updated_at");
+        assert_eq!(duplicate.patch.token_usage, None);
     }
 
     #[test]

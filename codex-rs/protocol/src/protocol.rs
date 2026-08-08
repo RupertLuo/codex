@@ -2134,7 +2134,7 @@ impl TokenUsageInfo {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, TS)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, JsonSchema, TS)]
 pub struct TokenCountEvent {
     pub info: Option<TokenUsageInfo>,
     pub rate_limits: Option<RateLimitSnapshot>,
@@ -3202,6 +3202,26 @@ pub struct CompactedItem {
     /// UUIDv7 identity of this context window.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub window_id: Option<String>,
+    /// Atomic local-compaction state. Legacy and remote compactions omit this payload.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint: Option<CompactionCheckpoint>,
+}
+
+/// Complete durable state installed by one local compaction transaction.
+///
+/// Keeping this state inside one [`RolloutItem::Compacted`] JSONL record prevents a failed
+/// multi-item append from exposing a replayable prefix. `checkpoint_id` makes an ambiguous append
+/// outcome reconcilable and duplicate records idempotent during replay.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, JsonSchema, TS)]
+pub struct CompactionCheckpoint {
+    pub checkpoint_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reference_context_item: Option<TurnContextItem>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub world_state: Option<WorldStateItem>,
+    pub api_token_count: TokenCountEvent,
+    pub final_token_count: TokenCountEvent,
+    pub server_reasoning_included: bool,
 }
 
 impl From<CompactedItem> for ResponseItem {

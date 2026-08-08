@@ -2,8 +2,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use codex_protocol::ThreadId;
+use codex_protocol::protocol::CompactedItem;
 use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::ThreadMemoryMode;
+use codex_rollout::RolloutPersistenceBatchMeasurement;
 use codex_rollout::RolloutPersistenceTelemetry;
 use codex_rollout::measure_and_filter_rollout_items;
 use codex_rollout::persisted_rollout_items;
@@ -25,6 +27,27 @@ use crate::ThreadTitleGenerator;
 use crate::ThreadTitleRequest;
 use crate::UpdateThreadMetadataParams;
 use crate::thread_metadata_sync::ThreadMetadataSync;
+
+const COMPACTION_CHECKPOINT_RECONCILIATION_ATTEMPTS: usize = 3;
+
+/// Durable outcome of appending one atomic local-compaction checkpoint.
+#[derive(Debug)]
+pub enum CompactionCheckpointAppendOutcome {
+    /// The checkpoint record is durably visible, either from the append result or reconciliation.
+    Committed,
+    /// Durable history was readable and did not contain the checkpoint ID.
+    NotCommitted {
+        append_error: crate::ThreadStoreError,
+    },
+    /// Durable history could not be read after bounded reconciliation attempts.
+    ///
+    /// Callers must not restore an incremental baseline in this state. Restarting/reloading the
+    /// thread converges from whichever complete checkpoint records are actually durable.
+    Ambiguous {
+        append_error: crate::ThreadStoreError,
+        reconciliation_errors: Vec<crate::ThreadStoreError>,
+    },
+}
 
 /// Handle for an active thread's persistence lifecycle.
 ///
@@ -162,32 +185,120 @@ impl LiveThread {
                 items: items.to_vec(),
             })
             .await?;
+        self.finish_durable_append(items, &canonical_items, measurement)
+            .await;
+        Ok(())
+    }
+
+    /// Appends one local-compaction checkpoint record and reconciles an ambiguous store error by
+    /// scanning durable history for its stable ID.
+    ///
+    /// Reconciliation retries reads, never the append itself. This avoids creating duplicates at
+    /// this layer while still tolerating duplicates produced by a backing writer's own retry.
+    pub async fn append_compaction_checkpoint(
+        &self,
+        compacted_item: &CompactedItem,
+    ) -> CompactionCheckpointAppendOutcome {
+        let Some(checkpoint_id) = compacted_item
+            .checkpoint
+            .as_ref()
+            .map(|checkpoint| checkpoint.checkpoint_id.clone())
+        else {
+            return CompactionCheckpointAppendOutcome::NotCommitted {
+                append_error: crate::ThreadStoreError::InvalidRequest {
+                    message: "compaction checkpoint payload is missing".to_string(),
+                },
+            };
+        };
+        let item = RolloutItem::Compacted(compacted_item.clone());
+        let append_error = match self.append_items(std::slice::from_ref(&item)).await {
+            Ok(()) => return CompactionCheckpointAppendOutcome::Committed,
+            Err(err) => err,
+        };
+        let mut reconciliation_errors = Vec::new();
+        for attempt in 0..COMPACTION_CHECKPOINT_RECONCILIATION_ATTEMPTS {
+            match self.load_history(/*include_archived*/ true).await {
+                Ok(history) => {
+                    let committed = history.items.iter().any(|item| {
+                        matches!(
+                            item,
+                            RolloutItem::Compacted(compacted)
+                                if compacted.checkpoint.as_ref().is_some_and(|checkpoint| {
+                                    checkpoint.checkpoint_id == checkpoint_id
+                                })
+                        )
+                    });
+                    if committed {
+                        let items = std::slice::from_ref(&item);
+                        let (canonical_items, measurement) =
+                            if self.persistence_telemetry.is_enabled() {
+                                let (canonical_items, measurement) =
+                                    measure_and_filter_rollout_items(items);
+                                (canonical_items, Some(measurement))
+                            } else {
+                                (persisted_rollout_items(items), None)
+                            };
+                        self.finish_durable_append(items, &canonical_items, measurement)
+                            .await;
+                        return CompactionCheckpointAppendOutcome::Committed;
+                    }
+                    return CompactionCheckpointAppendOutcome::NotCommitted { append_error };
+                }
+                Err(err) => reconciliation_errors.push(err),
+            }
+            if attempt + 1 < COMPACTION_CHECKPOINT_RECONCILIATION_ATTEMPTS {
+                tokio::task::yield_now().await;
+            }
+        }
+        CompactionCheckpointAppendOutcome::Ambiguous {
+            append_error,
+            reconciliation_errors,
+        }
+    }
+
+    async fn finish_durable_append(
+        &self,
+        items: &[RolloutItem],
+        canonical_items: &[RolloutItem],
+        measurement: Option<RolloutPersistenceBatchMeasurement>,
+    ) {
         if let Some(measurement) = measurement.as_ref() {
             self.persistence_telemetry.record_batch(items, measurement);
         }
         if canonical_items.is_empty() {
-            return Ok(());
+            return;
         }
         let update = self
             .metadata_sync
             .lock()
             .await
-            .observe_appended_items(canonical_items.as_slice());
+            .observe_appended_items(canonical_items);
         if let Some(update) = update {
-            self.thread_store
+            let result = self
+                .thread_store
                 .update_thread_metadata(UpdateThreadMetadataParams {
                     thread_id: self.thread_id,
                     patch: update.patch.clone(),
                     include_archived: true,
                 })
-                .await?;
-            self.metadata_sync
-                .lock()
-                .await
-                .mark_pending_update_applied(&update);
+                .await;
+            match result {
+                Ok(_) => {
+                    self.metadata_sync
+                        .lock()
+                        .await
+                        .mark_pending_update_applied(&update);
+                }
+                Err(err) => {
+                    warn!(
+                        thread_id = %self.thread_id,
+                        %err,
+                        "durable append succeeded but thread metadata projection failed; update remains pending"
+                    );
+                }
+            }
         }
         self.maybe_dispatch_llm_title(items).await;
-        Ok(())
     }
 
     /// Best-effort: once the first assistant turn completes, spawn an async task
@@ -433,4 +544,189 @@ fn sanitize_title(raw: &str) -> String {
         )
     });
     trimmed.chars().take(30).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::InMemoryThreadStore;
+    use crate::ThreadPersistenceMetadata;
+    use codex_protocol::models::BaseInstructions;
+    use codex_protocol::protocol::CompactedItem;
+    use codex_protocol::protocol::CompactionCheckpoint;
+    use codex_protocol::protocol::SessionSource;
+    use codex_protocol::protocol::ThreadHistoryMode;
+    use codex_protocol::protocol::TokenCountEvent;
+    use codex_protocol::protocol::TokenUsage;
+    use codex_protocol::protocol::TokenUsageInfo;
+    use pretty_assertions::assert_eq;
+
+    fn create_params(thread_id: ThreadId) -> CreateThreadParams {
+        CreateThreadParams {
+            session_id: thread_id.into(),
+            thread_id,
+            extra_config: None,
+            forked_from_id: None,
+            parent_thread_id: None,
+            source: SessionSource::Exec,
+            thread_source: None,
+            originator: "live-thread-checkpoint-test".to_string(),
+            base_instructions: BaseInstructions::default(),
+            dynamic_tools: Vec::new(),
+            selected_capability_roots: Vec::new(),
+            multi_agent_version: None,
+            history_mode: ThreadHistoryMode::Legacy,
+            initial_window_id: uuid::Uuid::now_v7().to_string(),
+            metadata: ThreadPersistenceMetadata {
+                cwd: None,
+                model_provider: "test-provider".to_string(),
+                memory_mode: ThreadMemoryMode::Enabled,
+            },
+        }
+    }
+
+    fn checkpoint(checkpoint_id: &str) -> CompactedItem {
+        let info = TokenUsageInfo {
+            total_token_usage: TokenUsage {
+                total_tokens: 100,
+                ..TokenUsage::default()
+            },
+            last_token_usage: TokenUsage {
+                total_tokens: 25,
+                ..TokenUsage::default()
+            },
+            model_context_window: Some(4_096),
+        };
+        let token_count = TokenCountEvent {
+            info: Some(info),
+            rate_limits: None,
+        };
+        CompactedItem {
+            message: "summary".to_string(),
+            replacement_history: Some(Vec::new()),
+            window_number: Some(1),
+            first_window_id: None,
+            previous_window_id: None,
+            window_id: None,
+            checkpoint: Some(CompactionCheckpoint {
+                checkpoint_id: checkpoint_id.to_string(),
+                reference_context_item: None,
+                world_state: None,
+                api_token_count: token_count.clone(),
+                final_token_count: token_count,
+                server_reasoning_included: true,
+            }),
+        }
+    }
+
+    async fn live_thread() -> (Arc<InMemoryThreadStore>, LiveThread, ThreadId) {
+        let thread_id = ThreadId::default();
+        let store = Arc::new(InMemoryThreadStore::default());
+        let live_thread = LiveThread::create(store.clone(), create_params(thread_id))
+            .await
+            .expect("create live thread");
+        (store, live_thread, thread_id)
+    }
+
+    #[tokio::test]
+    async fn checkpoint_append_reconciles_present_id_as_committed() {
+        let (store, live_thread, thread_id) = live_thread().await;
+        let checkpoint = checkpoint("checkpoint-present");
+        store
+            .fail_next_append_after_items(1, "ambiguous append after durable record")
+            .await;
+
+        let outcome = live_thread.append_compaction_checkpoint(&checkpoint).await;
+
+        assert!(matches!(
+            outcome,
+            CompactionCheckpointAppendOutcome::Committed
+        ));
+        let history = store
+            .load_history(LoadThreadHistoryParams {
+                thread_id,
+                include_archived: true,
+            })
+            .await
+            .expect("load reconciled history");
+        assert_eq!(
+            history
+                .items
+                .iter()
+                .filter(|item| matches!(
+                    item,
+                    RolloutItem::Compacted(item)
+                        if item.checkpoint.as_ref().map(|checkpoint| checkpoint.checkpoint_id.as_str())
+                            == Some("checkpoint-present")
+                ))
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn checkpoint_append_reconciles_absent_id_as_not_committed() {
+        let (store, live_thread, thread_id) = live_thread().await;
+        store
+            .fail_next_append("failure before checkpoint write")
+            .await;
+
+        let outcome = live_thread
+            .append_compaction_checkpoint(&checkpoint("checkpoint-absent"))
+            .await;
+
+        assert!(matches!(
+            outcome,
+            CompactionCheckpointAppendOutcome::NotCommitted { .. }
+        ));
+        let history = store
+            .load_history(LoadThreadHistoryParams {
+                thread_id,
+                include_archived: true,
+            })
+            .await
+            .expect("load history");
+        assert!(history.items.iter().all(|item| !matches!(
+            item,
+            RolloutItem::Compacted(item) if item.checkpoint.is_some()
+        )));
+    }
+
+    #[tokio::test]
+    async fn checkpoint_append_reports_ambiguous_after_bounded_reconciliation() {
+        let (store, live_thread, _thread_id) = live_thread().await;
+        store.fail_next_append("ambiguous backing append").await;
+        store
+            .fail_next_history_loads(10, "history unavailable during reconciliation")
+            .await;
+
+        let outcome = live_thread
+            .append_compaction_checkpoint(&checkpoint("checkpoint-unknown"))
+            .await;
+
+        assert!(matches!(
+            outcome,
+            CompactionCheckpointAppendOutcome::Ambiguous { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn metadata_failure_after_durable_checkpoint_is_retryable_not_append_failure() {
+        let (store, live_thread, _thread_id) = live_thread().await;
+        store
+            .fail_next_metadata_update("metadata projection unavailable")
+            .await;
+
+        let outcome = live_thread
+            .append_compaction_checkpoint(&checkpoint("checkpoint-metadata"))
+            .await;
+
+        assert!(matches!(
+            outcome,
+            CompactionCheckpointAppendOutcome::Committed
+        ));
+        assert_eq!(store.calls().await.update_thread_metadata, 1);
+        live_thread.persist().await.expect("retry pending metadata");
+        assert_eq!(store.calls().await.update_thread_metadata, 2);
+    }
 }

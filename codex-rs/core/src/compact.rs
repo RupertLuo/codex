@@ -667,6 +667,7 @@ async fn run_compact_task_inner_impl(
         first_window_id: Some(window_ids.first_window_id.to_string()),
         previous_window_id: window_ids.previous_window_id.map(|id| id.to_string()),
         window_id: Some(window_ids.window_id.to_string()),
+        checkpoint: None,
     };
     let prepared_commit = sess.prepare_compaction_commit(
         turn_context.as_ref(),

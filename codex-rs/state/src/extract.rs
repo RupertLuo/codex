@@ -24,7 +24,17 @@ pub fn apply_rollout_item(
         RolloutItem::ResponseItem(item) => apply_response_item(metadata, item),
         RolloutItem::InterAgentCommunication(_)
         | RolloutItem::InterAgentCommunicationMetadata { .. } => {}
-        RolloutItem::Compacted(_) => {}
+        RolloutItem::Compacted(compacted) => {
+            if let Some(checkpoint) = compacted.checkpoint.as_ref() {
+                if let Some(turn_context) = checkpoint.reference_context_item.as_ref() {
+                    apply_turn_context(metadata, turn_context);
+                }
+                apply_event_msg(
+                    metadata,
+                    &EventMsg::TokenCount(checkpoint.final_token_count.clone()),
+                );
+            }
+        }
         RolloutItem::WorldState(_) => {}
     }
     if metadata.model_provider.is_empty() {
@@ -36,6 +46,7 @@ pub fn apply_rollout_item(
 pub fn rollout_item_affects_thread_metadata(item: &RolloutItem) -> bool {
     match item {
         RolloutItem::SessionMeta(_) | RolloutItem::TurnContext(_) => true,
+        RolloutItem::Compacted(compacted) => compacted.checkpoint.is_some(),
         RolloutItem::EventMsg(
             EventMsg::TokenCount(_) | EventMsg::UserMessage(_) | EventMsg::ThreadGoalUpdated(_),
         ) => true,
@@ -43,7 +54,6 @@ pub fn rollout_item_affects_thread_metadata(item: &RolloutItem) -> bool {
         | RolloutItem::ResponseItem(_)
         | RolloutItem::InterAgentCommunication(_)
         | RolloutItem::InterAgentCommunicationMetadata { .. }
-        | RolloutItem::Compacted(_)
         | RolloutItem::WorldState(_) => false,
     }
 }
@@ -169,6 +179,8 @@ mod tests {
     use codex_protocol::models::ResponseItem;
     use codex_protocol::openai_models::ReasoningEffort;
     use codex_protocol::protocol::AskForApproval;
+    use codex_protocol::protocol::CompactedItem;
+    use codex_protocol::protocol::CompactionCheckpoint;
     use codex_protocol::protocol::EventMsg;
     use codex_protocol::protocol::RolloutItem;
     use codex_protocol::protocol::SandboxPolicy;
@@ -179,6 +191,9 @@ mod tests {
     use codex_protocol::protocol::ThreadGoalStatus;
     use codex_protocol::protocol::ThreadGoalUpdatedEvent;
     use codex_protocol::protocol::ThreadHistoryMode;
+    use codex_protocol::protocol::TokenCountEvent;
+    use codex_protocol::protocol::TokenUsage;
+    use codex_protocol::protocol::TokenUsageInfo;
     use codex_protocol::protocol::TurnContextItem;
     use codex_protocol::protocol::USER_MESSAGE_BEGIN;
     use codex_protocol::protocol::UserMessageEvent;
@@ -554,6 +569,43 @@ mod tests {
         assert_eq!(metadata.model, None);
         assert_eq!(metadata.reasoning_effort, None);
         assert_eq!(metadata.history_mode, ThreadHistoryMode::Paginated);
+    }
+
+    #[test]
+    fn compaction_checkpoint_sets_final_token_metadata() {
+        let mut metadata = metadata_for_test();
+        let token_count = TokenCountEvent {
+            info: Some(TokenUsageInfo {
+                total_token_usage: TokenUsage {
+                    total_tokens: 321,
+                    ..TokenUsage::default()
+                },
+                last_token_usage: TokenUsage::default(),
+                model_context_window: Some(4_096),
+            }),
+            rate_limits: None,
+        };
+        let item = RolloutItem::Compacted(CompactedItem {
+            message: "summary".to_string(),
+            replacement_history: Some(Vec::new()),
+            window_number: Some(1),
+            first_window_id: None,
+            previous_window_id: None,
+            window_id: None,
+            checkpoint: Some(CompactionCheckpoint {
+                checkpoint_id: "checkpoint-metadata".to_string(),
+                reference_context_item: None,
+                world_state: None,
+                api_token_count: token_count.clone(),
+                final_token_count: token_count,
+                server_reasoning_included: false,
+            }),
+        });
+
+        apply_rollout_item(&mut metadata, &item, "test-provider");
+
+        assert_eq!(metadata.tokens_used, 321);
+        assert!(super::rollout_item_affects_thread_metadata(&item));
     }
 
     fn metadata_for_test() -> ThreadMetadata {

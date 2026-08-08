@@ -3411,6 +3411,7 @@ mod tests {
                 first_window_id: None,
                 previous_window_id: None,
                 window_id: None,
+                checkpoint: None,
             }),
             RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
                 turn_id: "turn-compact".into(),

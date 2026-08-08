@@ -2,6 +2,7 @@ use super::*;
 use crate::context::world_state::WorldStateSnapshot;
 use crate::context_manager::is_user_turn_boundary;
 use codex_protocol::protocol::SessionContextWindow;
+use std::collections::HashSet;
 use uuid::Uuid;
 
 // Return value of `Session::reconstruct_history_from_rollout`, bundling the rebuilt history with
@@ -51,6 +52,7 @@ struct ActiveReplaySegment<'a> {
     world_state_replay: Vec<&'a RolloutItem>,
     base_replacement_history: Option<&'a [ResponseItem]>,
     window: Option<ReconstructedWindow>,
+    has_compaction_checkpoint: bool,
 }
 
 fn turn_ids_are_compatible(active_turn_id: Option<&str>, item_turn_id: Option<&str>) -> bool {
@@ -92,7 +94,9 @@ fn finalize_active_segment<'a>(
     }
 
     // `previous_turn_settings` come from the newest surviving user turn that established them.
-    if previous_turn_settings.is_none() && active_segment.counts_as_user_turn {
+    if previous_turn_settings.is_none()
+        && (active_segment.counts_as_user_turn || active_segment.has_compaction_checkpoint)
+    {
         *previous_turn_settings = active_segment.previous_turn_settings;
     }
 
@@ -100,6 +104,7 @@ fn finalize_active_segment<'a>(
     // from a surviving compaction that explicitly cleared that baseline.
     if matches!(reference_context_item, TurnReferenceContextItem::NeverSet)
         && (active_segment.counts_as_user_turn
+            || active_segment.has_compaction_checkpoint
             || matches!(
                 active_segment.reference_context_item,
                 TurnReferenceContextItem::Cleared
@@ -150,13 +155,40 @@ impl Session {
         // Reverse replay accumulates rollout items into the newest in-progress turn segment until
         // we hit its matching `TurnStarted`, at which point the segment can be finalized.
         let mut active_segment: Option<ActiveReplaySegment<'_>> = None;
+        let mut seen_compaction_checkpoint_ids = HashSet::new();
 
         for (index, item) in rollout_items.iter().enumerate().rev() {
             match item {
                 RolloutItem::Compacted(compacted) => {
+                    if let Some(checkpoint) = compacted.checkpoint.as_ref()
+                        && !seen_compaction_checkpoint_ids.insert(checkpoint.checkpoint_id.as_str())
+                    {
+                        continue;
+                    }
                     let active_segment =
                         active_segment.get_or_insert_with(ActiveReplaySegment::default);
                     active_segment.world_state_replay.push(item);
+                    if let Some(checkpoint) = compacted.checkpoint.as_ref() {
+                        active_segment.has_compaction_checkpoint = true;
+                        if let Some(reference_context_item) =
+                            checkpoint.reference_context_item.as_ref()
+                        {
+                            active_segment.previous_turn_settings = Some(PreviousTurnSettings {
+                                model: reference_context_item.model.clone(),
+                                comp_hash: reference_context_item.comp_hash.clone(),
+                                realtime_active: reference_context_item.realtime_active,
+                            });
+                            if matches!(
+                                active_segment.reference_context_item,
+                                TurnReferenceContextItem::NeverSet
+                            ) {
+                                active_segment.reference_context_item =
+                                    TurnReferenceContextItem::Latest(Box::new(
+                                        reference_context_item.clone(),
+                                    ));
+                            }
+                        }
+                    }
                     if active_segment.window.is_none()
                         && let Some(window_number) = compacted.window_number
                     {
@@ -306,10 +338,18 @@ impl Session {
             );
         }
 
+        let mut fallback_checkpoint_ids = HashSet::new();
         let fallback_window_number = u64::try_from(
             rollout_items
                 .iter()
-                .filter(|item| matches!(item, RolloutItem::Compacted(_)))
+                .filter(|item| match item {
+                    RolloutItem::Compacted(compacted) => {
+                        compacted.checkpoint.as_ref().is_none_or(|checkpoint| {
+                            fallback_checkpoint_ids.insert(checkpoint.checkpoint_id.as_str())
+                        })
+                    }
+                    _ => false,
+                })
                 .count(),
         )
         .unwrap_or(u64::MAX);
@@ -390,7 +430,30 @@ impl Session {
         let mut world_state_baseline: Option<WorldStateSnapshot> = None;
         for item in world_state_replay {
             match item {
-                RolloutItem::Compacted(_) => world_state_baseline = None,
+                RolloutItem::Compacted(compacted) => {
+                    world_state_baseline = None;
+                    if let Some(world_state) = compacted
+                        .checkpoint
+                        .as_ref()
+                        .and_then(|checkpoint| checkpoint.world_state.as_ref())
+                    {
+                        if world_state.full {
+                            world_state_baseline =
+                                match serde_json::from_value(world_state.state.clone()) {
+                                    Ok(snapshot) => Some(snapshot),
+                                    Err(err) => {
+                                        tracing::warn!(
+                                            %err,
+                                            "failed to restore checkpoint world-state snapshot"
+                                        );
+                                        None
+                                    }
+                                };
+                        } else {
+                            tracing::warn!("ignored non-full world-state in compaction checkpoint");
+                        }
+                    }
+                }
                 RolloutItem::WorldState(world_state) if world_state.full => {
                     world_state_baseline = match serde_json::from_value(world_state.state.clone()) {
                         Ok(snapshot) => Some(snapshot),

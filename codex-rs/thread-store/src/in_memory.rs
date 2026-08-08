@@ -391,7 +391,14 @@ pub struct InMemoryThreadStore {
 #[derive(Default)]
 struct InMemoryThreadStoreState {
     calls: InMemoryThreadStoreCalls,
+    #[cfg(any(test, feature = "test-support"))]
     next_append_error: Option<String>,
+    #[cfg(any(test, feature = "test-support"))]
+    next_append_error_after_items: Option<(usize, String)>,
+    #[cfg(any(test, feature = "test-support"))]
+    next_history_load_errors: Option<(usize, String)>,
+    #[cfg(any(test, feature = "test-support"))]
+    next_metadata_update_error: Option<String>,
     created_threads: HashMap<ThreadId, CreateThreadParams>,
     histories: HashMap<ThreadId, Vec<RolloutItem>>,
     metadata_updates: HashMap<ThreadId, ThreadMetadataPatch>,
@@ -424,8 +431,32 @@ impl InMemoryThreadStore {
     ///
     /// This store exists for tests and debug configs; the control lets integration tests exercise
     /// callers' durable-write error handling without introducing a second store implementation.
+    #[cfg(any(test, feature = "test-support"))]
     pub async fn fail_next_append(&self, message: impl Into<String>) {
         self.state.lock().await.next_append_error = Some(message.into());
+    }
+
+    /// Makes the next non-empty append persist at most `item_count` canonical records, then fail.
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn fail_next_append_after_items(
+        &self,
+        item_count: usize,
+        message: impl Into<String>,
+    ) {
+        self.state.lock().await.next_append_error_after_items = Some((item_count, message.into()));
+    }
+
+    /// Makes the next `count` history loads fail.
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn fail_next_history_loads(&self, count: usize, message: impl Into<String>) {
+        self.state.lock().await.next_history_load_errors =
+            (count > 0).then(|| (count, message.into()));
+    }
+
+    /// Makes the next metadata projection update fail.
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn fail_next_metadata_update(&self, message: impl Into<String>) {
+        self.state.lock().await.next_metadata_update_error = Some(message.into());
     }
 
     async fn create_thread(&self, params: CreateThreadParams) -> ThreadStoreResult<()> {
@@ -497,7 +528,17 @@ impl InMemoryThreadStore {
         }
         let mut state = self.state.lock().await;
         state.calls.append_items += 1;
+        #[cfg(any(test, feature = "test-support"))]
         if let Some(message) = state.next_append_error.take() {
+            return Err(ThreadStoreError::Internal { message });
+        }
+        #[cfg(any(test, feature = "test-support"))]
+        if let Some((item_count, message)) = state.next_append_error_after_items.take() {
+            state
+                .histories
+                .entry(params.thread_id)
+                .or_default()
+                .extend(canonical_items.into_iter().take(item_count));
             return Err(ThreadStoreError::Internal { message });
         }
         state
@@ -514,6 +555,15 @@ impl InMemoryThreadStore {
     ) -> ThreadStoreResult<StoredThreadHistory> {
         let mut state = self.state.lock().await;
         state.calls.load_history += 1;
+        #[cfg(any(test, feature = "test-support"))]
+        if let Some((remaining, message)) = state.next_history_load_errors.as_mut() {
+            let message = message.clone();
+            *remaining = remaining.saturating_sub(1);
+            if *remaining == 0 {
+                state.next_history_load_errors = None;
+            }
+            return Err(ThreadStoreError::Internal { message });
+        }
         let items =
             state
                 .histories
@@ -584,6 +634,10 @@ impl InMemoryThreadStore {
     ) -> ThreadStoreResult<StoredThread> {
         let mut state = self.state.lock().await;
         state.calls.update_thread_metadata += 1;
+        #[cfg(any(test, feature = "test-support"))]
+        if let Some(message) = state.next_metadata_update_error.take() {
+            return Err(ThreadStoreError::Internal { message });
+        }
         if let Some(name) = params.patch.name.clone() {
             state.names.insert(params.thread_id, name);
         }

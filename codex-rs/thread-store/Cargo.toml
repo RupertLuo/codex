@@ -12,6 +12,9 @@ doctest = false
 [lints]
 workspace = true
 
+[features]
+test-support = []
+
 [dependencies]
 chrono = { workspace = true, features = ["serde"] }
 codex-git-utils = { workspace = true }

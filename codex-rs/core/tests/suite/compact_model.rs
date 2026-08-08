@@ -3,12 +3,15 @@ use codex_core::compact::SUMMARY_PREFIX;
 use codex_core::config::ThreadStoreConfig;
 use codex_core::test_support::CompactCommitTestHook;
 use codex_core::test_support::with_compact_commit_test_hook;
+use codex_protocol::protocol::CompactedItem;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
 use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::RolloutLine;
 use codex_protocol::user_input::UserInput;
 use codex_thread_store::InMemoryThreadStore;
+use codex_thread_store::LoadThreadHistoryParams;
+use codex_thread_store::ThreadStore;
 use core_test_support::hooks::trust_discovered_hooks;
 use core_test_support::responses::ResponseMock;
 use core_test_support::responses::ev_assistant_message;
@@ -22,6 +25,8 @@ use core_test_support::responses::sse_failed;
 use core_test_support::responses::sse_response;
 use core_test_support::responses::start_mock_server;
 use core_test_support::skip_if_no_network;
+use core_test_support::test_codex::TestCodex;
+use core_test_support::test_codex::TestCodexBuilder;
 use core_test_support::test_codex::test_codex;
 use core_test_support::wait_for_event;
 use pretty_assertions::assert_eq;
@@ -36,6 +41,74 @@ const COMPACT_MODEL: &str = "deepseek/deepseek-v4-flash";
 const COMPACT_PROMPT: &str = "Summarize the conversation as durable text state.";
 const FAILED_TURN_MODEL: &str = "gpt-5.3-codex";
 const IMAGE_URL: &str = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==";
+
+fn in_memory_atomic_compact_builder(
+    store_id: &'static str,
+    commit_hook: CompactCommitTestHook,
+) -> TestCodexBuilder {
+    test_codex()
+        .with_runtime_options(with_compact_commit_test_hook(
+            ThreadManagerRuntimeOptions::default(),
+            commit_hook,
+        ))
+        .with_model(ACTIVE_MODEL)
+        .with_model_info_override(ACTIVE_MODEL, |model_info| {
+            model_info.supports_incremental_requests = true;
+        })
+        .with_config(move |config| {
+            config.experimental_thread_store = ThreadStoreConfig::InMemory {
+                id: store_id.to_string(),
+            };
+            config.compact_model = Some(COMPACT_MODEL.to_string());
+            config.compact_prompt = Some(COMPACT_PROMPT.to_string());
+            config.model_provider.name = "Catalyst-compatible test provider".to_string();
+        })
+}
+
+async fn only_atomic_compaction_checkpoint(
+    test: &TestCodex,
+    thread_store: &InMemoryThreadStore,
+) -> CompactedItem {
+    let history = ThreadStore::load_history(
+        thread_store,
+        LoadThreadHistoryParams {
+            thread_id: test.session_configured.thread_id,
+            include_archived: true,
+        },
+    )
+    .await
+    .expect("load durable thread history");
+    let checkpoint_positions = history
+        .items
+        .iter()
+        .enumerate()
+        .filter_map(|(index, item)| match item {
+            RolloutItem::Compacted(compacted) if compacted.checkpoint.is_some() => Some(index),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        checkpoint_positions.len(),
+        1,
+        "compaction transaction must be one durable checkpoint record"
+    );
+    let checkpoint_index = checkpoint_positions[0];
+    assert!(
+        history.items.iter().skip(checkpoint_index + 1).all(|item| {
+            !matches!(
+                item,
+                RolloutItem::TurnContext(_)
+                    | RolloutItem::WorldState(_)
+                    | RolloutItem::EventMsg(EventMsg::TokenCount(_))
+            )
+        }),
+        "checkpoint state must not leak into trailing companion records"
+    );
+    let RolloutItem::Compacted(compacted) = &history.items[checkpoint_index] else {
+        unreachable!("checkpoint position only records compacted items")
+    };
+    compacted.clone()
+}
 
 fn compact_request_body(mock: &ResponseMock) -> Value {
     mock.requests()
@@ -976,6 +1049,275 @@ async fn compact_append_failure_preserves_live_state_and_baseline() {
     let follow_up_body = follow_up_body.to_string();
     assert!(!follow_up_body.contains("UNCOMMITTED_COMPACT_SUMMARY"));
     assert!(!follow_up_body.contains(SUMMARY_PREFIX));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn compact_post_record_append_error_reconciles_as_committed() {
+    skip_if_no_network!();
+
+    const STORE_ID: &str = "compact-post-record-error-reconciles";
+    InMemoryThreadStore::remove_id(STORE_ID);
+    let thread_store = InMemoryThreadStore::for_id(STORE_ID);
+    let server = start_mock_server().await;
+    let response_mock = mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![
+                ev_response_created("resp-before-post-record-error"),
+                ev_assistant_message("first-message", "FIRST_REPLY"),
+                ev_completed_with_tokens("resp-before-post-record-error", 5_000),
+            ]),
+            sse(vec![
+                ev_assistant_message("compact-message", "RECONCILED_COMPACT_SUMMARY"),
+                ev_completed_with_tokens("compact-post-record-error", 100),
+            ]),
+            sse(vec![
+                ev_response_created("resp-after-post-record-error"),
+                ev_assistant_message("follow-up-message", "FOLLOW_UP_REPLY"),
+                ev_completed("resp-after-post-record-error"),
+            ]),
+        ],
+    )
+    .await;
+    let commit_hook = CompactCommitTestHook::new();
+    let mut builder = in_memory_atomic_compact_builder(STORE_ID, commit_hook.clone());
+    let test = builder
+        .build_with_auto_env(&server)
+        .await
+        .expect("build codex");
+
+    test.submit_turn("FIRST_USER_TURN")
+        .await
+        .expect("submit first user turn");
+    test.codex
+        .submit(Op::Compact)
+        .await
+        .expect("submit compact operation");
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        commit_hook.wait_until_commit_paused(),
+    )
+    .await
+    .expect("compact commit should reach the deterministic pause");
+    thread_store
+        .fail_next_append_after_items(1, "injected error after durable checkpoint record")
+        .await;
+    commit_hook.release_commit();
+
+    let terminal = wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::Error(_) | EventMsg::ItemCompleted(_))
+    })
+    .await;
+    assert!(
+        matches!(terminal, EventMsg::ItemCompleted(_)),
+        "a durable checkpoint discovered by reconciliation must commit: {terminal:?}"
+    );
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+
+    let compacted = only_atomic_compaction_checkpoint(&test, &thread_store).await;
+    let checkpoint = compacted.checkpoint.expect("nested checkpoint state");
+    assert!(!checkpoint.checkpoint_id.is_empty());
+    let api_token_info = checkpoint
+        .api_token_count
+        .info
+        .expect("API checkpoint token usage");
+    assert_eq!(api_token_info.total_token_usage.total_tokens, 5_100);
+    assert_eq!(api_token_info.last_token_usage.total_tokens, 100);
+    assert_eq!(
+        checkpoint
+            .final_token_count
+            .info
+            .expect("final checkpoint token usage")
+            .total_token_usage
+            .total_tokens,
+        5_100
+    );
+
+    test.submit_turn("FOLLOW_UP_AFTER_RECONCILED_COMPACT")
+        .await
+        .expect("submit follow-up after reconciled compact");
+
+    assert_eq!(response_mock.requests().len(), 3);
+    let follow_up =
+        request_body_containing_user_text(&response_mock, "FOLLOW_UP_AFTER_RECONCILED_COMPACT");
+    assert!(follow_up.get("previous_response_id").is_none());
+    assert!(follow_up.to_string().contains("RECONCILED_COMPACT_SUMMARY"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn compact_metadata_projection_failure_is_best_effort() {
+    skip_if_no_network!();
+
+    const STORE_ID: &str = "compact-metadata-projection-failure";
+    InMemoryThreadStore::remove_id(STORE_ID);
+    let thread_store = InMemoryThreadStore::for_id(STORE_ID);
+    let server = start_mock_server().await;
+    let response_mock = mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![
+                ev_response_created("resp-before-metadata-failure"),
+                ev_assistant_message("first-message", "FIRST_REPLY"),
+                ev_completed("resp-before-metadata-failure"),
+            ]),
+            sse(vec![
+                ev_assistant_message("compact-message", "METADATA_FAILURE_COMPACT_SUMMARY"),
+                ev_completed("compact-metadata-failure"),
+            ]),
+            sse(vec![
+                ev_response_created("resp-after-metadata-failure"),
+                ev_assistant_message("follow-up-message", "FOLLOW_UP_REPLY"),
+                ev_completed("resp-after-metadata-failure"),
+            ]),
+        ],
+    )
+    .await;
+    let commit_hook = CompactCommitTestHook::new();
+    let mut builder = in_memory_atomic_compact_builder(STORE_ID, commit_hook.clone());
+    let test = builder
+        .build_with_auto_env(&server)
+        .await
+        .expect("build codex");
+
+    test.submit_turn("FIRST_USER_TURN")
+        .await
+        .expect("submit first user turn");
+    test.codex
+        .submit(Op::Compact)
+        .await
+        .expect("submit compact operation");
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        commit_hook.wait_until_commit_paused(),
+    )
+    .await
+    .expect("compact commit should reach the deterministic pause");
+    thread_store
+        .fail_next_metadata_update("injected metadata projection failure")
+        .await;
+    commit_hook.release_commit();
+
+    let terminal = wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::Error(_) | EventMsg::ItemCompleted(_))
+    })
+    .await;
+    assert!(
+        matches!(terminal, EventMsg::ItemCompleted(_)),
+        "metadata projection must not turn a durable commit into failure: {terminal:?}"
+    );
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+
+    only_atomic_compaction_checkpoint(&test, &thread_store).await;
+    test.submit_turn("FOLLOW_UP_AFTER_METADATA_FAILURE")
+        .await
+        .expect("submit follow-up after metadata failure");
+
+    assert_eq!(response_mock.requests().len(), 3);
+    let follow_up =
+        request_body_containing_user_text(&response_mock, "FOLLOW_UP_AFTER_METADATA_FAILURE");
+    assert!(follow_up.get("previous_response_id").is_none());
+    assert!(
+        follow_up
+            .to_string()
+            .contains("METADATA_FAILURE_COMPACT_SUMMARY")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ambiguous_compact_persistence_drops_stale_incremental_baseline() {
+    skip_if_no_network!();
+
+    const STORE_ID: &str = "ambiguous-compact-persistence";
+    InMemoryThreadStore::remove_id(STORE_ID);
+    let thread_store = InMemoryThreadStore::for_id(STORE_ID);
+    let server = start_mock_server().await;
+    let response_mock = mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![
+                ev_response_created("resp-before-ambiguous-commit"),
+                ev_assistant_message("first-message", "FIRST_REPLY"),
+                ev_completed("resp-before-ambiguous-commit"),
+            ]),
+            sse(vec![
+                ev_assistant_message("compact-message", "AMBIGUOUS_COMPACT_SUMMARY"),
+                ev_completed("compact-ambiguous-commit"),
+            ]),
+            sse(vec![
+                ev_response_created("resp-after-ambiguous-commit"),
+                ev_assistant_message("follow-up-message", "FOLLOW_UP_REPLY"),
+                ev_completed("resp-after-ambiguous-commit"),
+            ]),
+        ],
+    )
+    .await;
+    let commit_hook = CompactCommitTestHook::new();
+    let mut builder = in_memory_atomic_compact_builder(STORE_ID, commit_hook.clone());
+    let test = builder
+        .build_with_auto_env(&server)
+        .await
+        .expect("build codex");
+
+    test.submit_turn("FIRST_USER_TURN")
+        .await
+        .expect("submit first user turn");
+    test.codex
+        .submit(Op::Compact)
+        .await
+        .expect("submit compact operation");
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        commit_hook.wait_until_commit_paused(),
+    )
+    .await
+    .expect("compact commit should reach the deterministic pause");
+    let loads_before = thread_store.calls().await.load_history;
+    thread_store
+        .fail_next_append_after_items(1, "injected uncertain durable append")
+        .await;
+    thread_store
+        .fail_next_history_loads(3, "injected reconciliation read failure")
+        .await;
+    commit_hook.release_commit();
+
+    let terminal = wait_for_event(&test.codex, |event| matches!(event, EventMsg::Error(_))).await;
+    let EventMsg::Error(error) = terminal else {
+        unreachable!("event filter guarantees an error")
+    };
+    assert!(
+        error.message.contains("persistence outcome is uncertain"),
+        "ambiguous durability needs a distinct fatal error: {}",
+        error.message
+    );
+    assert!(error.message.contains("restart"));
+    assert_eq!(
+        thread_store.calls().await.load_history - loads_before,
+        3,
+        "reconciliation attempts must be bounded"
+    );
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+
+    only_atomic_compaction_checkpoint(&test, &thread_store).await;
+    test.submit_turn("FOLLOW_UP_AFTER_AMBIGUOUS_COMPACT")
+        .await
+        .expect("submit follow-up after ambiguous compact");
+
+    assert_eq!(response_mock.requests().len(), 3);
+    let follow_up =
+        request_body_containing_user_text(&response_mock, "FOLLOW_UP_AFTER_AMBIGUOUS_COMPACT");
+    assert!(
+        follow_up.get("previous_response_id").is_none(),
+        "the stale pre-compact response id must never be reused after ambiguous persistence"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

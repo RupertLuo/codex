@@ -1176,6 +1176,7 @@ async fn spawn_agent_fork_strips_parent_usage_hints_from_compacted_history() {
                 first_window_id: None,
                 previous_window_id: None,
                 window_id: None,
+                checkpoint: None,
             }),
             RolloutItem::TurnContext(turn_context.to_turn_context_item()),
             RolloutItem::ResponseItem(spawn_agent_call(&parent_spawn_call_id)),

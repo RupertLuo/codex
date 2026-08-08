@@ -268,6 +268,35 @@ async fn load_rollout_items_ignores_unknown_fork_source_history_mode() -> std::i
 }
 
 #[tokio::test]
+async fn load_rollout_items_does_not_replay_truncated_final_checkpoint_line() -> std::io::Result<()>
+{
+    let home = TempDir::new().expect("temp dir");
+    let uuid = Uuid::new_v4();
+    let rollout_path = write_session_file(home.path(), "2025-01-03T12-00-00", uuid)?;
+    let mut file = fs::OpenOptions::new().append(true).open(&rollout_path)?;
+    write!(
+        file,
+        r#"{{"timestamp":"2025-01-03T12:00:02Z","type":"compacted","payload":{{"message":"summary","checkpoint":{{"checkpoint_id":"truncated-checkpoint""#
+    )?;
+    drop(file);
+
+    let (items, loaded_thread_id, parse_errors) =
+        RolloutRecorder::load_rollout_items(&rollout_path).await?;
+
+    assert_eq!(
+        loaded_thread_id,
+        Some(ThreadId::from_string(&uuid.to_string()).expect("thread id"))
+    );
+    assert_eq!(parse_errors, 1);
+    assert_eq!(items.len(), 2);
+    assert!(items.iter().all(|item| !matches!(
+        item,
+        RolloutItem::Compacted(compacted) if compacted.checkpoint.is_some()
+    )));
+    Ok(())
+}
+
+#[tokio::test]
 async fn load_rollout_items_preserves_legacy_guardian_assessment_lines() -> std::io::Result<()> {
     let home = TempDir::new().expect("temp dir");
     let rollout_path = home.path().join("rollout.jsonl");

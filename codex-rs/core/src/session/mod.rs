@@ -113,6 +113,7 @@ use codex_protocol::openai_models::ModelPreset;
 use codex_protocol::permissions::FileSystemSandboxPolicy;
 use codex_protocol::permissions::NetworkSandboxPolicy;
 use codex_protocol::protocol::AdditionalContextEntry;
+use codex_protocol::protocol::CompactionCheckpoint;
 use codex_protocol::protocol::FileChange;
 use codex_protocol::protocol::HasLegacyEvent;
 use codex_protocol::protocol::InterAgentCommunication;
@@ -148,6 +149,7 @@ use codex_rollout_trace::ThreadTraceContext;
 use codex_sandboxing::policy_transforms::intersect_permission_profiles;
 use codex_shell_command::parse_command::parse_command;
 use codex_terminal_detection::user_agent;
+use codex_thread_store::CompactionCheckpointAppendOutcome;
 use codex_thread_store::CreateThreadParams;
 use codex_thread_store::LiveThread;
 use codex_thread_store::LiveThreadInitGuard;
@@ -1395,10 +1397,7 @@ impl Session {
 
                 // Seed usage info from the recorded rollout so UIs can show token counts
                 // immediately on resume/fork.
-                if let Some(info) = Self::last_token_info_from_rollout(&rollout_items) {
-                    let mut state = self.state.lock().await;
-                    state.set_token_info(Some(info));
-                }
+                self.restore_resume_checkpoint_state(&rollout_items).await;
 
                 // Defer seeding the session's initial context until the first turn starts so
                 // turn/start overrides can be merged before we write to the rollout.
@@ -1420,10 +1419,7 @@ impl Session {
 
                 // Seed usage info from the recorded rollout so UIs can show token counts
                 // immediately on resume/fork.
-                if let Some(info) = Self::last_token_info_from_rollout(&rollout_items) {
-                    let mut state = self.state.lock().await;
-                    state.set_token_info(Some(info));
-                }
+                self.restore_resume_checkpoint_state(&rollout_items).await;
 
                 // If persisting, persist all rollout items as-is (the store filters).
                 if !rollout_items.is_empty() {
@@ -1522,9 +1518,35 @@ impl Session {
         state.set_auto_compact_window_estimated_prefill(tokens);
     }
 
-    fn last_token_info_from_rollout(rollout_items: &[RolloutItem]) -> Option<TokenUsageInfo> {
+    async fn restore_resume_checkpoint_state(&self, rollout_items: &[RolloutItem]) {
+        let token_count = Self::last_token_count_from_rollout(rollout_items);
+        let server_reasoning_included = rollout_items.iter().rev().find_map(|item| match item {
+            RolloutItem::Compacted(compacted) => compacted
+                .checkpoint
+                .as_ref()
+                .map(|checkpoint| checkpoint.server_reasoning_included),
+            _ => None,
+        });
+        if token_count.is_none() && server_reasoning_included.is_none() {
+            return;
+        }
+        let mut state = self.state.lock().await;
+        if let Some(token_count) = token_count {
+            state.set_token_info(token_count.info);
+            state.latest_rate_limits = token_count.rate_limits;
+        }
+        if let Some(included) = server_reasoning_included {
+            state.set_server_reasoning_included(included);
+        }
+    }
+
+    fn last_token_count_from_rollout(rollout_items: &[RolloutItem]) -> Option<TokenCountEvent> {
         rollout_items.iter().rev().find_map(|item| match item {
-            RolloutItem::EventMsg(EventMsg::TokenCount(ev)) => ev.info.clone(),
+            RolloutItem::EventMsg(EventMsg::TokenCount(ev)) => Some(ev.clone()),
+            RolloutItem::Compacted(compacted) => compacted
+                .checkpoint
+                .as_ref()
+                .map(|checkpoint| checkpoint.final_token_count.clone()),
             _ => None,
         })
     }
@@ -3133,20 +3155,6 @@ impl Session {
         } else {
             prepared.history
         };
-        let compacted_item = CompactedItem {
-            replacement_history: Some(history.clone()),
-            ..prepared.compacted_item
-        };
-        let mut rollout_items = vec![RolloutItem::Compacted(compacted_item)];
-        if let Some(snapshot) = prepared.world_state_baseline.as_ref() {
-            rollout_items.push(RolloutItem::WorldState(WorldStateItem::full(
-                snapshot.clone().into_value(),
-            )));
-        }
-        if let Some(turn_context_item) = prepared.reference_context_item.as_ref() {
-            rollout_items.push(RolloutItem::TurnContext(turn_context_item.clone()));
-        }
-
         let mut replacement = ContextManager::new();
         replacement.replace(history.clone());
         let estimated_total_tokens = replacement
@@ -3174,16 +3182,35 @@ impl Session {
         }
         let token_info = Some(token_info);
         let rate_limits = state.rate_limits_after(&prepared.rate_limits);
-        let api_token_count_event = EventMsg::TokenCount(TokenCountEvent {
+        let api_token_count = TokenCountEvent {
             info: api_token_info.clone(),
             rate_limits: rate_limits.clone(),
-        });
-        let token_count_event = EventMsg::TokenCount(TokenCountEvent {
+        };
+        let final_token_count = TokenCountEvent {
             info: token_info.clone(),
             rate_limits: rate_limits.clone(),
-        });
-        rollout_items.push(RolloutItem::EventMsg(api_token_count_event.clone()));
-        rollout_items.push(RolloutItem::EventMsg(token_count_event.clone()));
+        };
+        let api_token_count_event = EventMsg::TokenCount(api_token_count.clone());
+        let token_count_event = EventMsg::TokenCount(final_token_count.clone());
+        let server_reasoning_included = prepared
+            .server_reasoning_included
+            .unwrap_or_else(|| state.server_reasoning_included());
+        let checkpoint_id = Uuid::now_v7().to_string();
+        let compacted_item = CompactedItem {
+            replacement_history: Some(history.clone()),
+            checkpoint: Some(CompactionCheckpoint {
+                checkpoint_id: checkpoint_id.clone(),
+                reference_context_item: prepared.reference_context_item.clone(),
+                world_state: prepared
+                    .world_state_baseline
+                    .as_ref()
+                    .map(|snapshot| WorldStateItem::full(snapshot.clone().into_value())),
+                api_token_count,
+                final_token_count,
+                server_reasoning_included,
+            }),
+            ..prepared.compacted_item
+        };
 
         if let Some(hook) = self.services.compact_commit_test_hook.as_ref() {
             hook.pause_commit().await;
@@ -3192,13 +3219,34 @@ impl Session {
                 "injected compact commit task panic"
             );
         }
-        if let Err(err) = self.persist_rollout_items_fallible(&rollout_items).await {
-            if let Some(baseline) = incremental_baseline.take() {
-                state.http_incremental_baseline = baseline;
+        match self.persist_compaction_checkpoint(&compacted_item).await {
+            CompactionCheckpointAppendOutcome::Committed => {}
+            CompactionCheckpointAppendOutcome::NotCommitted { append_error } => {
+                if let Some(baseline) = incremental_baseline.take() {
+                    state.http_incremental_baseline = baseline;
+                }
+                return Err(CodexErr::Io(std::io::Error::other(format!(
+                    "failed to persist compact transaction: {append_error}"
+                ))));
             }
-            return Err(CodexErr::Io(std::io::Error::other(format!(
-                "failed to persist compact transaction: {err}"
-            ))));
+            CompactionCheckpointAppendOutcome::Ambiguous {
+                append_error,
+                reconciliation_errors,
+            } => {
+                drop(incremental_baseline.take());
+                state.http_incremental_baseline = Default::default();
+                let reconciliation_errors = reconciliation_errors
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                return Err(CodexErr::Fatal(format!(
+                    "compaction checkpoint persistence outcome is uncertain for checkpoint \
+                     {checkpoint_id}; restart or reload the thread before relying on live state \
+                     (append error: {append_error}; reconciliation errors: \
+                     {reconciliation_errors})"
+                )));
+            }
         }
 
         let committed = state.commit_prepared_auto_compact_window_advance(
@@ -3212,9 +3260,7 @@ impl Session {
         }
         state.set_token_info(token_info.clone());
         state.latest_rate_limits = rate_limits;
-        if let Some(included) = prepared.server_reasoning_included {
-            state.set_server_reasoning_included(included);
-        }
+        state.set_server_reasoning_included(server_reasoning_included);
         if prepared.update_auto_compact_prefill {
             state.set_auto_compact_window_estimated_prefill(estimated_total_tokens);
         }
@@ -3742,6 +3788,18 @@ impl Session {
         live_thread.append_items(items).await
     }
 
+    async fn persist_compaction_checkpoint(
+        &self,
+        compacted_item: &CompactedItem,
+    ) -> CompactionCheckpointAppendOutcome {
+        let Some(live_thread) = self.live_thread() else {
+            return CompactionCheckpointAppendOutcome::Committed;
+        };
+        live_thread
+            .append_compaction_checkpoint(compacted_item)
+            .await
+    }
+
     pub(crate) async fn clone_history(&self) -> ContextManager {
         let state = self.state.lock().await;
         state.clone_history()
@@ -3800,6 +3858,7 @@ impl Session {
                 first_window_id: Some(window_ids.first_window_id.to_string()),
                 previous_window_id: window_ids.previous_window_id.map(|id| id.to_string()),
                 window_id: Some(window_ids.window_id.to_string()),
+                checkpoint: None,
             },
         )
         .await;
