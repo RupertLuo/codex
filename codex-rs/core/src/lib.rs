@@ -19,6 +19,8 @@ pub use responses_metadata::CodexResponsesMetadata;
 pub use session::SteerInputError;
 pub use turn_metadata::detached_memory_responses_metadata;
 mod codex_thread;
+#[allow(dead_code)]
+mod compact_input;
 mod compact_remote;
 mod compact_remote_v2;
 mod compact_token_budget;
