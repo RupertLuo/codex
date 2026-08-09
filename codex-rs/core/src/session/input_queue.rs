@@ -123,6 +123,13 @@ impl InputQueue {
         turn_state.pending_input.items.clear();
     }
 
+    pub(crate) async fn clear_for_persistence_quarantine(&self, active_turn: Option<&ActiveTurn>) {
+        if let Some(active_turn) = active_turn {
+            self.clear_pending(active_turn).await;
+        }
+        self.mailbox_pending_mails.lock().await.clear();
+    }
+
     pub(crate) async fn defer_mailbox_delivery_to_next_turn(
         &self,
         active_turn: &Mutex<Option<ActiveTurn>>,

@@ -20,6 +20,7 @@ use crate::ReadThreadParams;
 use crate::ResumeThreadParams;
 use crate::StoredThread;
 use crate::StoredThreadHistory;
+use crate::ThreadMetadataMutationGate;
 use crate::ThreadMetadataPatch;
 use crate::ThreadStore;
 use crate::ThreadStoreResult;
@@ -60,6 +61,7 @@ pub struct LiveThread {
     thread_store: Arc<dyn ThreadStore>,
     metadata_sync: Arc<Mutex<ThreadMetadataSync>>,
     persistence_telemetry: RolloutPersistenceTelemetry,
+    metadata_mutation_gate: Option<Arc<dyn ThreadMetadataMutationGate>>,
 }
 
 /// Owns a live thread while session initialization is still fallible.
@@ -124,6 +126,7 @@ impl LiveThread {
             thread_store,
             metadata_sync: Arc::new(Mutex::new(metadata_sync)),
             persistence_telemetry: RolloutPersistenceTelemetry::new(thread_id),
+            metadata_mutation_gate: None,
         })
     }
 
@@ -160,7 +163,17 @@ impl LiveThread {
             thread_store,
             metadata_sync: Arc::new(Mutex::new(metadata_sync)),
             persistence_telemetry: RolloutPersistenceTelemetry::new(thread_id),
+            metadata_mutation_gate: None,
         })
+    }
+
+    /// Installs the host lifecycle gate used by detached title metadata updates.
+    pub fn with_metadata_mutation_gate(
+        mut self,
+        gate: Arc<dyn ThreadMetadataMutationGate>,
+    ) -> Self {
+        self.metadata_mutation_gate = Some(gate);
+        self
     }
 
     #[tracing::instrument(
@@ -321,6 +334,7 @@ impl LiveThread {
             generator,
             self.thread_id,
             request,
+            self.metadata_mutation_gate.clone(),
         );
     }
 
@@ -469,6 +483,7 @@ fn spawn_llm_title_task(
     generator: Arc<dyn ThreadTitleGenerator>,
     thread_id: ThreadId,
     request: ThreadTitleRequest,
+    metadata_mutation_gate: Option<Arc<dyn ThreadMetadataMutationGate>>,
 ) {
     let Ok(handle) = tokio::runtime::Handle::try_current() else {
         return;
@@ -482,6 +497,15 @@ fn spawn_llm_title_task(
             .filter(|title| !title.is_empty())
         else {
             return;
+        };
+        let _mutation_permit = match metadata_mutation_gate {
+            Some(gate) => {
+                let Some(permit) = gate.acquire().await else {
+                    return;
+                };
+                Some(permit)
+            }
+            None => None,
         };
         match thread_store
             .read_thread(ReadThreadParams {
@@ -552,14 +576,228 @@ mod tests {
     use crate::InMemoryThreadStore;
     use crate::ThreadPersistenceMetadata;
     use codex_protocol::models::BaseInstructions;
+    use codex_protocol::protocol::AgentMessageEvent;
     use codex_protocol::protocol::CompactedItem;
     use codex_protocol::protocol::CompactionCheckpoint;
+    use codex_protocol::protocol::EventMsg;
     use codex_protocol::protocol::SessionSource;
     use codex_protocol::protocol::ThreadHistoryMode;
     use codex_protocol::protocol::TokenCountEvent;
     use codex_protocol::protocol::TokenUsage;
     use codex_protocol::protocol::TokenUsageInfo;
+    use codex_protocol::protocol::TurnCompleteEvent;
+    use codex_protocol::protocol::UserMessageEvent;
     use pretty_assertions::assert_eq;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::Ordering;
+
+    #[derive(Debug)]
+    struct StubTitleGenerator;
+
+    impl ThreadTitleGenerator for StubTitleGenerator {
+        fn generate_title<'a>(
+            &'a self,
+            _request: ThreadTitleRequest,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<String>> + Send + 'a>>
+        {
+            Box::pin(async { Some("generated title".to_string()) })
+        }
+    }
+
+    #[derive(Debug)]
+    struct TrackingMutationGate {
+        allow: bool,
+        acquire_attempted: Arc<AtomicBool>,
+        permit_held: Arc<AtomicBool>,
+        permit_released: Arc<AtomicBool>,
+    }
+
+    struct TrackingMutationPermit {
+        permit_held: Arc<AtomicBool>,
+        permit_released: Arc<AtomicBool>,
+    }
+
+    impl Drop for TrackingMutationPermit {
+        fn drop(&mut self) {
+            self.permit_held.store(false, Ordering::SeqCst);
+            self.permit_released.store(true, Ordering::SeqCst);
+        }
+    }
+
+    impl crate::ThreadMetadataMutationPermit for TrackingMutationPermit {}
+
+    impl ThreadMetadataMutationGate for TrackingMutationGate {
+        fn acquire<'a>(&'a self) -> crate::ThreadMetadataMutationPermitFuture<'a> {
+            Box::pin(async move {
+                self.acquire_attempted.store(true, Ordering::SeqCst);
+                if !self.allow {
+                    return None;
+                }
+                self.permit_held.store(true, Ordering::SeqCst);
+                Some(Box::new(TrackingMutationPermit {
+                    permit_held: Arc::clone(&self.permit_held),
+                    permit_released: Arc::clone(&self.permit_released),
+                })
+                    as Box<dyn crate::ThreadMetadataMutationPermit>)
+            })
+        }
+    }
+
+    struct PermitObservingThreadStore {
+        inner: Arc<InMemoryThreadStore>,
+        permit_held: Arc<AtomicBool>,
+        title_read_while_held: AtomicBool,
+        title_update_seen: AtomicBool,
+        title_update_while_held: AtomicBool,
+    }
+
+    impl PermitObservingThreadStore {
+        fn new(permit_held: Arc<AtomicBool>) -> Self {
+            Self {
+                inner: Arc::new(InMemoryThreadStore::default()),
+                permit_held,
+                title_read_while_held: AtomicBool::new(false),
+                title_update_seen: AtomicBool::new(false),
+                title_update_while_held: AtomicBool::new(false),
+            }
+        }
+    }
+
+    impl ThreadStore for PermitObservingThreadStore {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
+        fn set_title_generator(&self, generator: Arc<dyn ThreadTitleGenerator>) {
+            self.inner.set_title_generator(generator);
+        }
+
+        fn title_generator(&self) -> Option<Arc<dyn ThreadTitleGenerator>> {
+            self.inner.title_generator()
+        }
+
+        fn create_thread(&self, params: CreateThreadParams) -> crate::ThreadStoreFuture<'_, ()> {
+            ThreadStore::create_thread(self.inner.as_ref(), params)
+        }
+
+        fn resume_thread(&self, params: ResumeThreadParams) -> crate::ThreadStoreFuture<'_, ()> {
+            ThreadStore::resume_thread(self.inner.as_ref(), params)
+        }
+
+        fn append_items(
+            &self,
+            params: AppendThreadItemsParams,
+        ) -> crate::ThreadStoreFuture<'_, ()> {
+            ThreadStore::append_items(self.inner.as_ref(), params)
+        }
+
+        fn persist_thread(&self, thread_id: ThreadId) -> crate::ThreadStoreFuture<'_, ()> {
+            ThreadStore::persist_thread(self.inner.as_ref(), thread_id)
+        }
+
+        fn flush_thread(&self, thread_id: ThreadId) -> crate::ThreadStoreFuture<'_, ()> {
+            ThreadStore::flush_thread(self.inner.as_ref(), thread_id)
+        }
+
+        fn shutdown_thread(&self, thread_id: ThreadId) -> crate::ThreadStoreFuture<'_, ()> {
+            ThreadStore::shutdown_thread(self.inner.as_ref(), thread_id)
+        }
+
+        fn discard_thread(&self, thread_id: ThreadId) -> crate::ThreadStoreFuture<'_, ()> {
+            ThreadStore::discard_thread(self.inner.as_ref(), thread_id)
+        }
+
+        fn load_history(
+            &self,
+            params: LoadThreadHistoryParams,
+        ) -> crate::ThreadStoreFuture<'_, StoredThreadHistory> {
+            ThreadStore::load_history(self.inner.as_ref(), params)
+        }
+
+        fn read_thread(
+            &self,
+            params: ReadThreadParams,
+        ) -> crate::ThreadStoreFuture<'_, StoredThread> {
+            self.title_read_while_held
+                .store(self.permit_held.load(Ordering::SeqCst), Ordering::SeqCst);
+            ThreadStore::read_thread(self.inner.as_ref(), params)
+        }
+
+        fn read_thread_by_rollout_path(
+            &self,
+            params: crate::ReadThreadByRolloutPathParams,
+        ) -> crate::ThreadStoreFuture<'_, StoredThread> {
+            ThreadStore::read_thread_by_rollout_path(self.inner.as_ref(), params)
+        }
+
+        fn list_threads(
+            &self,
+            params: crate::ListThreadsParams,
+        ) -> crate::ThreadStoreFuture<'_, crate::ThreadPage> {
+            ThreadStore::list_threads(self.inner.as_ref(), params)
+        }
+
+        fn update_thread_metadata(
+            &self,
+            params: UpdateThreadMetadataParams,
+        ) -> crate::ThreadStoreFuture<'_, StoredThread> {
+            if params.patch.title.as_deref() == Some("generated title") {
+                self.title_update_seen.store(true, Ordering::SeqCst);
+                self.title_update_while_held
+                    .store(self.permit_held.load(Ordering::SeqCst), Ordering::SeqCst);
+            }
+            ThreadStore::update_thread_metadata(self.inner.as_ref(), params)
+        }
+
+        fn archive_thread(
+            &self,
+            params: crate::ArchiveThreadParams,
+        ) -> crate::ThreadStoreFuture<'_, ()> {
+            ThreadStore::archive_thread(self.inner.as_ref(), params)
+        }
+
+        fn unarchive_thread(
+            &self,
+            params: crate::ArchiveThreadParams,
+        ) -> crate::ThreadStoreFuture<'_, StoredThread> {
+            ThreadStore::unarchive_thread(self.inner.as_ref(), params)
+        }
+
+        fn delete_thread(
+            &self,
+            params: crate::DeleteThreadParams,
+        ) -> crate::ThreadStoreFuture<'_, ()> {
+            ThreadStore::delete_thread(self.inner.as_ref(), params)
+        }
+    }
+
+    fn user_message_item(message: &str) -> RolloutItem {
+        RolloutItem::EventMsg(EventMsg::UserMessage(UserMessageEvent {
+            client_id: None,
+            message: message.to_string(),
+            images: None,
+            local_images: Vec::new(),
+            text_elements: Vec::new(),
+            ..Default::default()
+        }))
+    }
+
+    fn completed_assistant_turn(message: &str) -> Vec<RolloutItem> {
+        vec![
+            RolloutItem::EventMsg(EventMsg::AgentMessage(AgentMessageEvent {
+                message: message.to_string(),
+                phase: None,
+                memory_citation: None,
+            })),
+            RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
+                turn_id: "title-turn".to_string(),
+                last_agent_message: Some(message.to_string()),
+                completed_at: None,
+                duration_ms: None,
+                time_to_first_token_ms: None,
+            })),
+        ]
+    }
 
     fn create_params(thread_id: ThreadId) -> CreateThreadParams {
         CreateThreadParams {
@@ -728,5 +966,103 @@ mod tests {
         assert_eq!(store.calls().await.update_thread_metadata, 1);
         live_thread.persist().await.expect("retry pending metadata");
         assert_eq!(store.calls().await.update_thread_metadata, 2);
+    }
+
+    #[tokio::test]
+    async fn generated_title_holds_mutation_permit_across_read_and_update() {
+        let permit_held = Arc::new(AtomicBool::new(false));
+        let acquire_attempted = Arc::new(AtomicBool::new(false));
+        let permit_released = Arc::new(AtomicBool::new(false));
+        let gate = Arc::new(TrackingMutationGate {
+            allow: true,
+            acquire_attempted: Arc::clone(&acquire_attempted),
+            permit_held: Arc::clone(&permit_held),
+            permit_released: Arc::clone(&permit_released),
+        });
+        let store = Arc::new(PermitObservingThreadStore::new(Arc::clone(&permit_held)));
+        store.set_title_generator(Arc::new(StubTitleGenerator));
+        let thread_id = ThreadId::default();
+        let live_thread = LiveThread::create(store.clone(), create_params(thread_id))
+            .await
+            .expect("create live thread")
+            .with_metadata_mutation_gate(gate);
+
+        live_thread
+            .append_items(&[user_message_item("opening question")])
+            .await
+            .expect("append first user message");
+        let updates_before_title = store.inner.calls().await.update_thread_metadata;
+        live_thread
+            .append_items(&completed_assistant_turn("opening answer"))
+            .await
+            .expect("append completed assistant turn");
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !store.title_update_seen.load(Ordering::SeqCst)
+                || !permit_released.load(Ordering::SeqCst)
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("generated title update should complete");
+
+        assert!(acquire_attempted.load(Ordering::SeqCst));
+        assert!(store.title_read_while_held.load(Ordering::SeqCst));
+        assert!(store.title_update_while_held.load(Ordering::SeqCst));
+        assert!(permit_released.load(Ordering::SeqCst));
+        assert!(!permit_held.load(Ordering::SeqCst));
+        assert!(
+            store.inner.calls().await.update_thread_metadata > updates_before_title,
+            "the guarded title path must perform an actual metadata update"
+        );
+    }
+
+    #[tokio::test]
+    async fn denied_title_mutation_permit_skips_store_access() {
+        let permit_held = Arc::new(AtomicBool::new(false));
+        let acquire_attempted = Arc::new(AtomicBool::new(false));
+        let permit_released = Arc::new(AtomicBool::new(false));
+        let gate = Arc::new(TrackingMutationGate {
+            allow: false,
+            acquire_attempted: Arc::clone(&acquire_attempted),
+            permit_held: Arc::clone(&permit_held),
+            permit_released: Arc::clone(&permit_released),
+        });
+        let store = Arc::new(PermitObservingThreadStore::new(Arc::clone(&permit_held)));
+        store.set_title_generator(Arc::new(StubTitleGenerator));
+        let thread_id = ThreadId::default();
+        let live_thread = LiveThread::create(store.clone(), create_params(thread_id))
+            .await
+            .expect("create live thread")
+            .with_metadata_mutation_gate(gate);
+
+        live_thread
+            .append_items(&[user_message_item("opening question")])
+            .await
+            .expect("append first user message");
+        let calls_before_title = store.inner.calls().await;
+        live_thread
+            .append_items(&completed_assistant_turn("opening answer"))
+            .await
+            .expect("append completed assistant turn");
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !acquire_attempted.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("detached title task should consult the mutation gate");
+        tokio::task::yield_now().await;
+
+        let calls_after_title = store.inner.calls().await;
+        assert_eq!(
+            calls_after_title.read_thread,
+            calls_before_title.read_thread
+        );
+        assert!(!store.title_update_seen.load(Ordering::SeqCst));
+        assert!(!permit_held.load(Ordering::SeqCst));
+        assert!(!permit_released.load(Ordering::SeqCst));
     }
 }

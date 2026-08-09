@@ -56,6 +56,7 @@ use http::header::AUTHORIZATION;
 use serde_json::json;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use tokio::sync::Mutex;
 use tokio::sync::Semaphore;
@@ -96,9 +97,16 @@ struct RealtimeStartTestHookInner {
     pause_after_gate: AtomicBool,
     after_gate_paused: Semaphore,
     release_after_gate: Semaphore,
+    pause_close_before_gate: AtomicBool,
+    close_before_gate_paused: Semaphore,
+    release_close_before_gate: Semaphore,
+    pause_close_after_claim: AtomicBool,
+    close_after_claim_paused: Semaphore,
+    release_close_after_claim: Semaphore,
 }
 
 impl RealtimeStartTestHook {
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn new() -> Self {
         Self {
             inner: Arc::new(RealtimeStartTestHookInner {
@@ -108,14 +116,22 @@ impl RealtimeStartTestHook {
                 pause_after_gate: AtomicBool::new(false),
                 after_gate_paused: Semaphore::new(0),
                 release_after_gate: Semaphore::new(0),
+                pause_close_before_gate: AtomicBool::new(false),
+                close_before_gate_paused: Semaphore::new(0),
+                release_close_before_gate: Semaphore::new(0),
+                pause_close_after_claim: AtomicBool::new(false),
+                close_after_claim_paused: Semaphore::new(0),
+                release_close_after_claim: Semaphore::new(0),
             }),
         }
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn pause_before_gate_once(&self) {
         self.inner.pause_before_gate.store(true, Ordering::SeqCst);
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) async fn wait_until_before_gate_paused(&self) {
         let Ok(permit) = self.inner.before_gate_paused.acquire().await else {
             return;
@@ -123,14 +139,17 @@ impl RealtimeStartTestHook {
         permit.forget();
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn release_before_gate(&self) {
         self.inner.release_before_gate.add_permits(1);
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn pause_after_gate_once(&self) {
         self.inner.pause_after_gate.store(true, Ordering::SeqCst);
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) async fn wait_until_after_gate_paused(&self) {
         let Ok(permit) = self.inner.after_gate_paused.acquire().await else {
             return;
@@ -138,8 +157,49 @@ impl RealtimeStartTestHook {
         permit.forget();
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn release_after_gate(&self) {
         self.inner.release_after_gate.add_permits(1);
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn pause_close_before_gate_once(&self) {
+        self.inner
+            .pause_close_before_gate
+            .store(true, Ordering::SeqCst);
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) async fn wait_until_close_before_gate_paused(&self) {
+        let Ok(permit) = self.inner.close_before_gate_paused.acquire().await else {
+            return;
+        };
+        permit.forget();
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn release_close_before_gate(&self) {
+        self.inner.release_close_before_gate.add_permits(1);
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn pause_close_after_claim_once(&self) {
+        self.inner
+            .pause_close_after_claim
+            .store(true, Ordering::SeqCst);
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) async fn wait_until_close_after_claim_paused(&self) {
+        let Ok(permit) = self.inner.close_after_claim_paused.acquire().await else {
+            return;
+        };
+        permit.forget();
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn release_close_after_claim(&self) {
+        self.inner.release_close_after_claim.add_permits(1);
     }
 
     pub(crate) async fn pause_before_gate_if_requested(&self) {
@@ -163,8 +223,39 @@ impl RealtimeStartTestHook {
         };
         permit.forget();
     }
+
+    pub(crate) async fn pause_close_before_gate_if_requested(&self) {
+        if !self
+            .inner
+            .pause_close_before_gate
+            .swap(false, Ordering::SeqCst)
+        {
+            return;
+        }
+        self.inner.close_before_gate_paused.add_permits(1);
+        let Ok(permit) = self.inner.release_close_before_gate.acquire().await else {
+            return;
+        };
+        permit.forget();
+    }
+
+    pub(crate) async fn pause_close_after_claim_if_requested(&self) {
+        if !self
+            .inner
+            .pause_close_after_claim
+            .swap(false, Ordering::SeqCst)
+        {
+            return;
+        }
+        self.inner.close_after_claim_paused.add_permits(1);
+        let Ok(permit) = self.inner.release_close_after_claim.acquire().await else {
+            return;
+        };
+        permit.forget();
+    }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl Default for RealtimeStartTestHook {
     fn default() -> Self {
         Self::new()
@@ -176,6 +267,7 @@ enum RealtimeConversationEnd {
     Requested,
     TransportClosed,
     Error,
+    PersistenceQuarantine,
 }
 
 enum RealtimeFanoutTaskStop {
@@ -184,7 +276,8 @@ enum RealtimeFanoutTaskStop {
 }
 
 pub(crate) struct RealtimeConversationManager {
-    state: Mutex<Option<ConversationState>>,
+    state: Mutex<Option<ManagedConversationState>>,
+    next_close_token: AtomicU64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -335,6 +428,47 @@ struct ConversationState {
     realtime_active: Arc<AtomicBool>,
 }
 
+enum ManagedConversationState {
+    Active(ConversationState),
+    Closing(RealtimeClosingState),
+}
+
+impl ManagedConversationState {
+    fn active(&self) -> Option<&ConversationState> {
+        match self {
+            Self::Active(state) => Some(state),
+            Self::Closing(_) => None,
+        }
+    }
+
+    fn active_mut(&mut self) -> Option<&mut ConversationState> {
+        match self {
+            Self::Active(state) => Some(state),
+            Self::Closing(_) => None,
+        }
+    }
+}
+
+struct RealtimeClosingState {
+    token: u64,
+    sub_id: String,
+    end: RealtimeConversationEnd,
+    realtime_active: Arc<AtomicBool>,
+    in_progress: bool,
+}
+
+struct RealtimeCloseClaim {
+    token: u64,
+    sub_id: String,
+    end: RealtimeConversationEnd,
+    conversation: Option<ConversationState>,
+}
+
+enum RealtimeCloseTarget<'a> {
+    Current,
+    Expected(&'a Arc<AtomicBool>),
+}
+
 struct RealtimeStart {
     sub_id: String,
     api_provider: ApiProvider,
@@ -360,6 +494,7 @@ impl RealtimeConversationManager {
     pub(crate) fn new() -> Self {
         Self {
             state: Mutex::new(None),
+            next_close_token: AtomicU64::new(1),
         }
     }
 
@@ -367,6 +502,7 @@ impl RealtimeConversationManager {
         let state = self.state.lock().await;
         state
             .as_ref()
+            .and_then(ManagedConversationState::active)
             .and_then(|state| state.realtime_active.load(Ordering::Relaxed).then_some(()))
     }
 
@@ -374,7 +510,7 @@ impl RealtimeConversationManager {
         let state = self.state.lock().await;
         matches!(
             state.as_ref(),
-            Some(state)
+            Some(ManagedConversationState::Active(state))
                 if state.realtime_active.load(Ordering::Relaxed)
                     && state.session_kind == RealtimeSessionKind::V2
         )
@@ -383,7 +519,17 @@ impl RealtimeConversationManager {
     async fn start(&self, start: RealtimeStart) -> CodexResult<RealtimeStartOutput> {
         let previous_state = {
             let mut guard = self.state.lock().await;
-            guard.take()
+            match guard.take() {
+                Some(ManagedConversationState::Active(state)) => Some(state),
+                Some(closing @ ManagedConversationState::Closing(_)) => {
+                    *guard = Some(closing);
+                    return Err(CodexErr::InvalidRequest(
+                        "conversation close persistence is pending; retry close before starting a new conversation"
+                            .to_string(),
+                    ));
+                }
+                None => None,
+            }
         };
         if let Some(state) = previous_state {
             stop_conversation_state(state, RealtimeFanoutTaskStop::Abort).await;
@@ -483,7 +629,7 @@ impl RealtimeConversationManager {
         };
 
         let mut guard = self.state.lock().await;
-        *guard = Some(ConversationState {
+        *guard = Some(ManagedConversationState::Active(ConversationState {
             sub_id,
             audio_tx,
             text_tx,
@@ -492,7 +638,7 @@ impl RealtimeConversationManager {
             input_task: task,
             fanout_task: None,
             realtime_active: Arc::clone(&realtime_active),
-        });
+        }));
         Ok(RealtimeStartOutput {
             realtime_active,
             events_rx,
@@ -508,7 +654,9 @@ impl RealtimeConversationManager {
         let mut fanout_task = Some(fanout_task);
         {
             let mut guard = self.state.lock().await;
-            if let Some(state) = guard.as_mut()
+            if let Some(state) = guard
+                .as_mut()
+                .and_then(ManagedConversationState::active_mut)
                 && Arc::ptr_eq(&state.realtime_active, realtime_active)
             {
                 state.fanout_task = fanout_task.take();
@@ -521,24 +669,85 @@ impl RealtimeConversationManager {
         }
     }
 
-    pub(crate) async fn finish_if_active(&self, realtime_active: &Arc<AtomicBool>) {
-        let state = {
-            let mut guard = self.state.lock().await;
-            match guard.as_ref() {
-                Some(state) if Arc::ptr_eq(&state.realtime_active, realtime_active) => guard.take(),
-                _ => None,
-            }
+    async fn claim_close(
+        &self,
+        target: RealtimeCloseTarget<'_>,
+        event_sub_id: Option<&str>,
+        end: RealtimeConversationEnd,
+    ) -> Option<RealtimeCloseClaim> {
+        let mut guard = self.state.lock().await;
+        let matches_target = |realtime_active: &Arc<AtomicBool>| match target {
+            RealtimeCloseTarget::Current => true,
+            RealtimeCloseTarget::Expected(expected) => Arc::ptr_eq(realtime_active, expected),
         };
 
-        if let Some(state) = state {
-            stop_conversation_state(state, RealtimeFanoutTaskStop::Detach).await;
+        let active_matches = guard
+            .as_ref()
+            .and_then(ManagedConversationState::active)
+            .is_some_and(|state| matches_target(&state.realtime_active));
+        if active_matches {
+            let Some(ManagedConversationState::Active(state)) = guard.take() else {
+                unreachable!("active close target must remain active while manager is locked");
+            };
+            let token = self.next_close_token.fetch_add(1, Ordering::Relaxed);
+            let sub_id = event_sub_id.unwrap_or(&state.sub_id).to_string();
+            let realtime_active = Arc::clone(&state.realtime_active);
+            *guard = Some(ManagedConversationState::Closing(RealtimeClosingState {
+                token,
+                sub_id: sub_id.clone(),
+                end,
+                realtime_active,
+                in_progress: true,
+            }));
+            return Some(RealtimeCloseClaim {
+                token,
+                sub_id,
+                end,
+                conversation: Some(state),
+            });
+        }
+
+        let Some(ManagedConversationState::Closing(closing)) = guard.as_mut() else {
+            return None;
+        };
+        if closing.in_progress || !matches_target(&closing.realtime_active) {
+            return None;
+        }
+        closing.in_progress = true;
+        Some(RealtimeCloseClaim {
+            token: closing.token,
+            sub_id: closing.sub_id.clone(),
+            end: closing.end,
+            conversation: None,
+        })
+    }
+
+    async fn complete_close(&self, token: u64) {
+        let mut guard = self.state.lock().await;
+        if matches!(
+            guard.as_ref(),
+            Some(ManagedConversationState::Closing(closing)) if closing.token == token
+        ) {
+            guard.take();
+        }
+    }
+
+    async fn release_close_for_retry(&self, token: u64) {
+        let mut guard = self.state.lock().await;
+        if let Some(ManagedConversationState::Closing(closing)) = guard.as_mut()
+            && closing.token == token
+        {
+            closing.in_progress = false;
         }
     }
 
     pub(crate) async fn audio_in(&self, frame: RealtimeAudioFrame) -> CodexResult<()> {
         let sender = {
             let guard = self.state.lock().await;
-            guard.as_ref().map(|state| state.audio_tx.clone())
+            guard
+                .as_ref()
+                .and_then(ManagedConversationState::active)
+                .map(|state| state.audio_tx.clone())
         };
 
         let Some(sender) = sender else {
@@ -564,6 +773,7 @@ impl RealtimeConversationManager {
             let guard = self.state.lock().await;
             guard
                 .as_ref()
+                .and_then(ManagedConversationState::active)
                 .map(|state| (state.text_tx.clone(), state.session_kind))
         };
 
@@ -591,7 +801,7 @@ impl RealtimeConversationManager {
     ) -> CodexResult<()> {
         let handoff = {
             let guard = self.state.lock().await;
-            let Some(state) = guard.as_ref() else {
+            let Some(state) = guard.as_ref().and_then(ManagedConversationState::active) else {
                 return Err(CodexErr::InvalidRequest(
                     "conversation is not running".to_string(),
                 ));
@@ -671,7 +881,7 @@ impl RealtimeConversationManager {
 
         let handoff = {
             let guard = self.state.lock().await;
-            let Some(state) = guard.as_ref() else {
+            let Some(state) = guard.as_ref().and_then(ManagedConversationState::active) else {
                 return Err(CodexErr::InvalidRequest(
                     "conversation is not running".to_string(),
                 ));
@@ -692,7 +902,10 @@ impl RealtimeConversationManager {
     pub(crate) async fn handoff_complete(&self) -> CodexResult<()> {
         let handoff = {
             let guard = self.state.lock().await;
-            guard.as_ref().map(|state| state.handoff.clone())
+            guard
+                .as_ref()
+                .and_then(ManagedConversationState::active)
+                .map(|state| state.handoff.clone())
         };
         let Some(handoff) = handoff else {
             return Ok(());
@@ -731,7 +944,10 @@ impl RealtimeConversationManager {
     pub(crate) async fn clear_active_handoff(&self) {
         let handoff = {
             let guard = self.state.lock().await;
-            guard.as_ref().map(|state| state.handoff.clone())
+            guard
+                .as_ref()
+                .and_then(ManagedConversationState::active)
+                .map(|state| state.handoff.clone())
         };
         if let Some(handoff) = handoff {
             *handoff.active_handoff.lock().await = None;
@@ -742,27 +958,20 @@ impl RealtimeConversationManager {
     pub(crate) async fn shutdown(&self) -> CodexResult<()> {
         let state = {
             let mut guard = self.state.lock().await;
-            guard.take()
+            match guard.take() {
+                Some(ManagedConversationState::Active(state)) => Some(state),
+                Some(closing @ ManagedConversationState::Closing(_)) => {
+                    *guard = Some(closing);
+                    None
+                }
+                None => None,
+            }
         };
 
         if let Some(state) = state {
             stop_conversation_state(state, RealtimeFanoutTaskStop::Abort).await;
         }
         Ok(())
-    }
-
-    async fn shutdown_for_persistence_quarantine(&self) -> CodexResult<Option<String>> {
-        let state = {
-            let mut guard = self.state.lock().await;
-            guard.take()
-        };
-
-        let Some(state) = state else {
-            return Ok(None);
-        };
-        let sub_id = state.sub_id.clone();
-        stop_conversation_state(state, RealtimeFanoutTaskStop::Abort).await;
-        Ok(Some(sub_id))
     }
 }
 
@@ -785,6 +994,10 @@ async fn stop_conversation_state(
     }
 }
 
+#[allow(
+    clippy::await_holding_invalid_type,
+    reason = "the lifecycle capability intentionally spans realtime start; it is acquired before manager/store locks and is never reacquired"
+)]
 pub(crate) async fn handle_start(
     sess: &Arc<Session>,
     sub_id: String,
@@ -1091,6 +1304,10 @@ fn validate_realtime_voice(version: RealtimeWsVersion, voice: RealtimeVoice) -> 
     )))
 }
 
+#[allow(
+    clippy::await_holding_invalid_type,
+    reason = "the natural-close task intentionally holds one lifecycle capability across manager claim and durable close, with lifecycle-first lock order"
+)]
 async fn handle_start_inner(
     sess: &Arc<Session>,
     lifecycle: &tokio::sync::MutexGuard<'_, crate::session::session::PersistenceLifecycle>,
@@ -1207,18 +1424,37 @@ async fn handle_start_inner(
                 )))
                 .await;
         }
-        if fanout_realtime_active.swap(false, Ordering::Relaxed) {
+        if fanout_realtime_active.load(Ordering::Relaxed) {
             match end {
                 RealtimeConversationEnd::TransportClosed => {
                     info!("realtime conversation transport closed");
                 }
-                RealtimeConversationEnd::Requested | RealtimeConversationEnd::Error => {}
+                RealtimeConversationEnd::Requested
+                | RealtimeConversationEnd::Error
+                | RealtimeConversationEnd::PersistenceQuarantine => {}
             }
-            sess_clone
-                .conversation
-                .finish_if_active(&fanout_realtime_active)
-                .await;
-            send_realtime_conversation_closed(&sess_clone, sub_id, end).await;
+            if let Some(hook) = sess_clone.services.realtime_start_test_hook.as_ref() {
+                hook.pause_close_before_gate_if_requested().await;
+            }
+            match sess_clone.acquire_persistence_side_effect().await {
+                Ok(lifecycle) => {
+                    if let Err(err) = close_realtime_conversation_with_guard(
+                        &sess_clone,
+                        &lifecycle,
+                        RealtimeCloseTarget::Expected(&fanout_realtime_active),
+                        Some(&sub_id),
+                        end,
+                        RealtimeFanoutTaskStop::Detach,
+                    )
+                    .await
+                    {
+                        error!("failed to persist natural realtime close: {err}");
+                    }
+                }
+                Err(err) => {
+                    debug!("natural realtime close lost to persistence quarantine: {err}");
+                }
+            }
         }
     });
     sess.conversation
@@ -1377,8 +1613,27 @@ pub(crate) async fn handle_speech(
     }
 }
 
-pub(crate) async fn handle_close(sess: &Arc<Session>, sub_id: String) {
-    end_realtime_conversation(sess, sub_id, RealtimeConversationEnd::Requested).await;
+#[allow(
+    clippy::await_holding_invalid_type,
+    reason = "explicit close intentionally holds one lifecycle capability across manager claim and durable close, with lifecycle-first lock order"
+)]
+pub(crate) async fn handle_close(sess: &Arc<Session>, sub_id: String) -> CodexResult<()> {
+    if let Some(hook) = sess.services.realtime_start_test_hook.as_ref() {
+        hook.pause_close_before_gate_if_requested().await;
+    }
+    let lifecycle = sess
+        .acquire_persistence_side_effect()
+        .await
+        .map_err(|err| CodexErr::InvalidRequest(err.to_string()))?;
+    close_realtime_conversation_with_guard(
+        sess,
+        &lifecycle,
+        RealtimeCloseTarget::Current,
+        Some(&sub_id),
+        RealtimeConversationEnd::Requested,
+        RealtimeFanoutTaskStop::Abort,
+    )
+    .await
 }
 
 fn spawn_realtime_input_task(input: RealtimeInputTask) -> JoinHandle<()> {
@@ -1906,55 +2161,69 @@ async fn send_conversation_error(
     .await;
 }
 
-async fn end_realtime_conversation(
-    sess: &Arc<Session>,
-    sub_id: String,
+async fn close_realtime_conversation_with_guard(
+    sess: &Session,
+    lifecycle: &tokio::sync::MutexGuard<'_, crate::session::session::PersistenceLifecycle>,
+    target: RealtimeCloseTarget<'_>,
+    event_sub_id: Option<&str>,
     end: RealtimeConversationEnd,
-) {
-    let _ = sess.conversation.shutdown().await;
-    send_realtime_conversation_closed(sess, sub_id, end).await;
+    fanout_task_stop: RealtimeFanoutTaskStop,
+) -> CodexResult<()> {
+    let Some(mut claim) = sess
+        .conversation
+        .claim_close(target, event_sub_id, end)
+        .await
+    else {
+        return Ok(());
+    };
+    if let Some(conversation) = claim.conversation.take() {
+        stop_conversation_state(conversation, fanout_task_stop).await;
+    }
+    if let Some(hook) = sess.services.realtime_start_test_hook.as_ref() {
+        hook.pause_close_after_claim_if_requested().await;
+    }
+
+    let event = Event {
+        id: claim.sub_id,
+        msg: EventMsg::RealtimeConversationClosed(RealtimeConversationClosedEvent {
+            reason: Some(realtime_close_reason(claim.end).to_string()),
+        }),
+    };
+    if let Err(err) = sess
+        .try_send_event_raw_with_persistence_guard(lifecycle, event)
+        .await
+    {
+        sess.conversation.release_close_for_retry(claim.token).await;
+        return Err(CodexErr::Io(std::io::Error::other(format!(
+            "failed to persist realtime Closed event: {err}"
+        ))));
+    }
+    sess.conversation.complete_close(claim.token).await;
+    Ok(())
 }
 
 pub(crate) async fn close_for_persistence_quarantine(
     sess: &Session,
     lifecycle: &tokio::sync::MutexGuard<'_, crate::session::session::PersistenceLifecycle>,
 ) -> CodexResult<()> {
-    let Some(sub_id) = sess
-        .conversation
-        .shutdown_for_persistence_quarantine()
-        .await?
-    else {
-        return Ok(());
-    };
-    sess.send_event_raw_with_persistence_guard(
+    close_realtime_conversation_with_guard(
+        sess,
         lifecycle,
-        Event {
-            id: sub_id,
-            msg: EventMsg::RealtimeConversationClosed(RealtimeConversationClosedEvent {
-                reason: Some("persistence_quarantine".to_string()),
-            }),
-        },
+        RealtimeCloseTarget::Current,
+        None,
+        RealtimeConversationEnd::PersistenceQuarantine,
+        RealtimeFanoutTaskStop::Abort,
     )
-    .await;
-    Ok(())
+    .await
 }
 
-async fn send_realtime_conversation_closed(
-    sess: &Session,
-    sub_id: String,
-    end: RealtimeConversationEnd,
-) {
-    let reason = match end {
-        RealtimeConversationEnd::Requested => Some("requested".to_string()),
-        RealtimeConversationEnd::TransportClosed => Some("transport_closed".to_string()),
-        RealtimeConversationEnd::Error => Some("error".to_string()),
-    };
-
-    sess.send_event_raw(Event {
-        id: sub_id,
-        msg: EventMsg::RealtimeConversationClosed(RealtimeConversationClosedEvent { reason }),
-    })
-    .await;
+fn realtime_close_reason(end: RealtimeConversationEnd) -> &'static str {
+    match end {
+        RealtimeConversationEnd::Requested => "requested",
+        RealtimeConversationEnd::TransportClosed => "transport_closed",
+        RealtimeConversationEnd::Error => "error",
+        RealtimeConversationEnd::PersistenceQuarantine => "persistence_quarantine",
+    }
 }
 
 #[cfg(test)]

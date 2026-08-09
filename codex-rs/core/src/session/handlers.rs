@@ -8,6 +8,7 @@ use codex_otel::set_parent_from_w3c_trace_context;
 use codex_protocol::protocol::Submission;
 use tracing::Instrument;
 use tracing::debug_span;
+use tracing::error;
 use tracing::info_span;
 
 use crate::session::SteerInputError;
@@ -180,6 +181,10 @@ async fn thread_settings_applied_event(sess: &Session) -> EventMsg {
     })
 }
 
+#[allow(
+    clippy::await_holding_invalid_type,
+    reason = "the lifecycle capability intentionally spans settings, queue mutation, and task registration; it is acquired before all nested locks"
+)]
 pub(super) async fn user_input_or_turn_inner(
     sess: &Arc<Session>,
     sub_id: String,
@@ -196,6 +201,17 @@ pub(super) async fn user_input_or_turn_inner(
     else {
         unreachable!();
     };
+    if let Some(hook) = sess.services.compact_commit_test_hook.as_ref() {
+        hook.pause_task_start_before_gate_if_requested().await;
+    }
+    let lifecycle = match sess.acquire_persistence_side_effect().await {
+        Ok(lifecycle) => lifecycle,
+        Err(err) => {
+            sess.deliver_persistence_quarantine_error(&sub_id, err.to_string())
+                .await;
+            return;
+        }
+    };
     let emit_thread_settings_applied = thread_settings != ThreadSettingsOverrides::default();
     let mut updates = if emit_thread_settings_applied {
         thread_settings_update(sess, thread_settings).await
@@ -204,21 +220,28 @@ pub(super) async fn user_input_or_turn_inner(
     };
     updates.final_output_json_schema = Some(final_output_json_schema);
 
-    let Ok(current_context) = sess.new_turn_with_sub_id(sub_id.clone(), updates).await else {
+    let Ok(current_context) = sess
+        .new_turn_with_sub_id_with_persistence_guard(&lifecycle, sub_id.clone(), updates)
+        .await
+    else {
         // new_turn_with_sub_id already emits the error event.
         return;
     };
     if emit_thread_settings_applied {
-        sess.send_event_raw(Event {
-            id: sub_id.clone(),
-            msg: thread_settings_applied_event(sess).await,
-        })
+        sess.send_event_raw_with_persistence_guard(
+            &lifecycle,
+            Event {
+                id: sub_id.clone(),
+                msg: thread_settings_applied_event(sess).await,
+            },
+        )
         .await;
     }
-    sess.maybe_emit_model_warnings_for_turn(current_context.as_ref())
+    sess.maybe_emit_model_warnings_for_turn_with_guard(&lifecycle, current_context.as_ref())
         .await;
     match sess
-        .steer_input(
+        .steer_input_with_persistence_guard(
+            &lifecycle,
             items.clone(),
             additional_context.clone(),
             /*expected_turn_id*/ None,
@@ -257,7 +280,8 @@ pub(super) async fn user_input_or_turn_inner(
                     client_id: client_user_message_id,
                 });
             }
-            sess.spawn_task(
+            sess.spawn_task_with_persistence_guard(
+                &lifecycle,
                 Arc::clone(&current_context),
                 task_input,
                 crate::tasks::RegularTask::new(),
@@ -265,10 +289,13 @@ pub(super) async fn user_input_or_turn_inner(
             .await;
         }
         Err(err) => {
-            sess.send_event_raw(Event {
-                id: sub_id,
-                msg: EventMsg::Error(err.to_error_event()),
-            })
+            sess.send_event_raw_with_persistence_guard(
+                &lifecycle,
+                Event {
+                    id: sub_id,
+                    msg: EventMsg::Error(err.to_error_event()),
+                },
+            )
             .await;
         }
     }
@@ -276,18 +303,35 @@ pub(super) async fn user_input_or_turn_inner(
 
 /// Queues an inter-agent message, then lets the shared pending-work scheduler
 /// decide whether an idle session should start a regular turn.
+#[allow(
+    clippy::await_holding_invalid_type,
+    reason = "mailbox enqueue and optional task registration are one lifecycle-owned transaction with lifecycle-first lock order"
+)]
 pub async fn inter_agent_communication(
     sess: &Arc<Session>,
     sub_id: String,
     communication: InterAgentCommunication,
 ) {
+    if let Some(hook) = sess.services.compact_commit_test_hook.as_ref() {
+        hook.pause_task_start_before_gate_if_requested().await;
+    }
+    let lifecycle = match sess.acquire_persistence_side_effect().await {
+        Ok(lifecycle) => lifecycle,
+        Err(err) => {
+            sess.deliver_persistence_quarantine_error(&sub_id, err.to_string())
+                .await;
+            return;
+        }
+    };
     let trigger_turn = communication.trigger_turn;
     sess.input_queue
         .enqueue_mailbox_communication(communication)
         .await;
     if trigger_turn {
-        sess.maybe_start_turn_for_pending_work_with_sub_id(sub_id)
-            .await;
+        sess.maybe_start_turn_for_pending_work_with_sub_id_and_persistence_guard(
+            &lifecycle, sub_id,
+        )
+        .await;
     }
 }
 
@@ -552,6 +596,10 @@ pub async fn thread_rollback(sess: &Arc<Session>, sub_id: String, num_turns: u32
     .await;
 }
 
+#[allow(
+    clippy::await_holding_invalid_type,
+    reason = "the lifecycle capability intentionally covers the bounded persist/flush/metadata transaction and precedes store access"
+)]
 pub(super) async fn persist_thread_memory_mode_update(
     sess: &Arc<Session>,
     mode: ThreadMemoryMode,
@@ -768,7 +816,11 @@ pub(super) async fn submission_loop(
                     false
                 }
                 Op::RealtimeConversationClose => {
-                    handle_realtime_conversation_close(&sess, sub.id.clone()).await;
+                    if let Err(err) =
+                        handle_realtime_conversation_close(&sess, sub.id.clone()).await
+                    {
+                        error!("failed to close realtime conversation: {err}");
+                    }
                     false
                 }
                 Op::RealtimeConversationListVoices => {

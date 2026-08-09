@@ -50,13 +50,39 @@ pub(crate) struct Session {
     /// Serializes persistence and realtime-start side effects with the transition to quarantine.
     /// Once quarantined, only creating a new session from durable history can resolve which
     /// checkpoint actually committed.
-    pub(super) persistence_lifecycle: Mutex<PersistenceLifecycle>,
+    pub(super) persistence_lifecycle: Arc<Mutex<PersistenceLifecycle>>,
 }
 
 #[derive(Debug)]
 pub(crate) enum PersistenceLifecycle {
     Writable,
     Quarantined(String),
+}
+
+#[derive(Debug)]
+struct SessionThreadMetadataMutationGate {
+    persistence_lifecycle: Arc<Mutex<PersistenceLifecycle>>,
+}
+
+struct SessionThreadMetadataMutationPermit {
+    _guard: tokio::sync::OwnedMutexGuard<PersistenceLifecycle>,
+}
+
+impl codex_thread_store::ThreadMetadataMutationPermit for SessionThreadMetadataMutationPermit {}
+
+impl codex_thread_store::ThreadMetadataMutationGate for SessionThreadMetadataMutationGate {
+    fn acquire<'a>(&'a self) -> codex_thread_store::ThreadMetadataMutationPermitFuture<'a> {
+        Box::pin(async move {
+            let guard = Arc::clone(&self.persistence_lifecycle).lock_owned().await;
+            match &*guard {
+                PersistenceLifecycle::Writable => Some(Box::new(
+                    SessionThreadMetadataMutationPermit { _guard: guard },
+                )
+                    as Box<dyn codex_thread_store::ThreadMetadataMutationPermit>),
+                PersistenceLifecycle::Quarantined(_) => None,
+            }
+        })
+    }
 }
 
 fn initial_auto_compact_window_ids(initial_history: &InitialHistory) -> AutoCompactWindowIds {
@@ -614,6 +640,11 @@ impl Session {
             thread_id.to_string(),
             thread_extension_init,
         );
+        let persistence_lifecycle = Arc::new(Mutex::new(PersistenceLifecycle::Writable));
+        let thread_metadata_mutation_gate: Arc<dyn codex_thread_store::ThreadMetadataMutationGate> =
+            Arc::new(SessionThreadMetadataMutationGate {
+                persistence_lifecycle: Arc::clone(&persistence_lifecycle),
+            });
         // Kick off independent async setup tasks in parallel to reduce startup latency.
         //
         // - initialize thread persistence with new or resumed session info
@@ -654,7 +685,9 @@ impl Session {
                                 },
                             },
                         };
-                        LiveThread::create(Arc::clone(&thread_store), params).await?
+                        LiveThread::create(Arc::clone(&thread_store), params)
+                            .await?
+                            .with_metadata_mutation_gate(Arc::clone(&thread_metadata_mutation_gate))
                     }
                     InitialHistory::Resumed(resumed_history) => {
                         let params = ResumeThreadParams {
@@ -672,7 +705,9 @@ impl Session {
                                 },
                             },
                         };
-                        LiveThread::resume(Arc::clone(&thread_store), params).await?
+                        LiveThread::resume(Arc::clone(&thread_store), params)
+                            .await?
+                            .with_metadata_mutation_gate(Arc::clone(&thread_metadata_mutation_gate))
                     }
                 };
                 Ok(Some(live_thread))
@@ -1188,7 +1223,7 @@ impl Session {
                 guardian_review_session: GuardianReviewSessionManager::default(),
                 services,
                 next_internal_sub_id: AtomicU64::new(0),
-                persistence_lifecycle: Mutex::new(PersistenceLifecycle::Writable),
+                persistence_lifecycle: Arc::clone(&persistence_lifecycle),
             });
             if let Some(network_policy_decider_session) = network_policy_decider_session {
                 let mut guard = network_policy_decider_session.write().await;

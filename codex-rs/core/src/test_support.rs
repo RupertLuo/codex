@@ -1,8 +1,7 @@
 //! Test-only helpers exposed for cross-crate integration tests.
 //!
-//! Production code should not depend on this module.
-//! We prefer this to using a crate feature to avoid building multiple
-//! permutations of the crate.
+//! Production code should not depend on this module. Synchronization hooks and direct state
+//! helpers are available only to unit tests or builds that explicitly enable `test-support`.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -27,8 +26,10 @@ use codex_protocol::openai_models::ModelPreset;
 use codex_protocol::protocol::SessionSource;
 use once_cell::sync::Lazy;
 
+#[cfg(any(test, feature = "test-support"))]
 use crate::CodexThread;
 use crate::ThreadManager;
+#[cfg(any(test, feature = "test-support"))]
 use crate::ThreadManagerRuntimeOptions;
 use crate::config::Config;
 use crate::responses_metadata::CodexResponsesMetadata;
@@ -39,10 +40,12 @@ use crate::thread_manager;
 use crate::unified_exec;
 
 /// Instance-scoped synchronization for compaction integration tests.
+#[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
 #[derive(Clone, Debug)]
 pub struct CompactCommitTestHook(crate::compact::CompactCommitTestHook);
 
+#[cfg(any(test, feature = "test-support"))]
 impl CompactCommitTestHook {
     pub fn new() -> Self {
         Self(crate::compact::CompactCommitTestHook::new())
@@ -79,8 +82,21 @@ impl CompactCommitTestHook {
     pub async fn wait_until_commit_completed(&self) {
         self.0.wait_until_commit_completed().await;
     }
+
+    pub fn pause_task_start_before_gate_once(&self) {
+        self.0.pause_task_start_before_gate_once();
+    }
+
+    pub async fn wait_until_task_start_before_gate_paused(&self) {
+        self.0.wait_until_task_start_before_gate_paused().await;
+    }
+
+    pub fn release_task_start_before_gate(&self) {
+        self.0.release_task_start_before_gate();
+    }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl Default for CompactCommitTestHook {
     fn default() -> Self {
         Self::new()
@@ -88,6 +104,7 @@ impl Default for CompactCommitTestHook {
 }
 
 /// Install the compaction synchronization hook without adding a production runtime API.
+#[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
 pub fn with_compact_commit_test_hook(
     options: ThreadManagerRuntimeOptions,
@@ -97,10 +114,12 @@ pub fn with_compact_commit_test_hook(
 }
 
 /// Instance-scoped synchronization for realtime lifecycle integration tests.
+#[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
 #[derive(Clone, Debug)]
 pub struct RealtimeStartTestHook(crate::realtime_conversation::RealtimeStartTestHook);
 
+#[cfg(any(test, feature = "test-support"))]
 impl RealtimeStartTestHook {
     pub fn new() -> Self {
         Self(crate::realtime_conversation::RealtimeStartTestHook::new())
@@ -129,8 +148,33 @@ impl RealtimeStartTestHook {
     pub fn release_after_gate(&self) {
         self.0.release_after_gate();
     }
+
+    pub fn pause_close_before_gate_once(&self) {
+        self.0.pause_close_before_gate_once();
+    }
+
+    pub async fn wait_until_close_before_gate_paused(&self) {
+        self.0.wait_until_close_before_gate_paused().await;
+    }
+
+    pub fn release_close_before_gate(&self) {
+        self.0.release_close_before_gate();
+    }
+
+    pub fn pause_close_after_claim_once(&self) {
+        self.0.pause_close_after_claim_once();
+    }
+
+    pub async fn wait_until_close_after_claim_paused(&self) {
+        self.0.wait_until_close_after_claim_paused().await;
+    }
+
+    pub fn release_close_after_claim(&self) {
+        self.0.release_close_after_claim();
+    }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl Default for RealtimeStartTestHook {
     fn default() -> Self {
         Self::new()
@@ -138,6 +182,7 @@ impl Default for RealtimeStartTestHook {
 }
 
 /// Install the realtime synchronization hook without adding a production runtime API.
+#[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
 pub fn with_realtime_start_test_hook(
     options: ThreadManagerRuntimeOptions,
@@ -147,6 +192,7 @@ pub fn with_realtime_start_test_hook(
 }
 
 /// Snapshot of the state direct injection APIs must leave untouched on rejection.
+#[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DirectMutationTestSnapshot {
@@ -155,6 +201,7 @@ pub struct DirectMutationTestSnapshot {
     pub has_pending_input: bool,
 }
 
+#[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
 pub async fn direct_mutation_test_snapshot(thread: &CodexThread) -> DirectMutationTestSnapshot {
     let (history_len, has_active_turn, has_pending_input) =
@@ -166,6 +213,24 @@ pub async fn direct_mutation_test_snapshot(thread: &CodexThread) -> DirectMutati
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub async fn conversation_history_for_test(
+    thread: &CodexThread,
+) -> Vec<codex_protocol::models::ResponseItem> {
+    thread.conversation_history_for_test().await
+}
+
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub async fn inject_no_new_turn_for_test(
+    thread: &CodexThread,
+    items: Vec<codex_protocol::models::ResponseItem>,
+) {
+    thread.inject_no_new_turn_for_test(items).await;
+}
+
+#[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
 pub async fn clear_reference_context_item_for_direct_mutation_test(thread: &CodexThread) {
     thread

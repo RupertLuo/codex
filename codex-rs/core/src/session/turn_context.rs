@@ -571,8 +571,27 @@ impl Session {
         }
     }
 
+    #[cfg(test)]
+    #[allow(
+        clippy::await_holding_invalid_type,
+        reason = "the test wrapper intentionally carries the lifecycle capability through the bounded settings transaction with lifecycle-first lock order"
+    )]
     pub(crate) async fn new_turn_with_sub_id(
         &self,
+        sub_id: String,
+        updates: SessionSettingsUpdate,
+    ) -> CodexResult<Arc<TurnContext>> {
+        let lifecycle = self
+            .acquire_persistence_side_effect()
+            .await
+            .map_err(|err| CodexErr::Fatal(err.to_string()))?;
+        self.new_turn_with_sub_id_with_persistence_guard(&lifecycle, sub_id, updates)
+            .await
+    }
+
+    pub(crate) async fn new_turn_with_sub_id_with_persistence_guard(
+        &self,
+        lifecycle: &tokio::sync::MutexGuard<'_, super::session::PersistenceLifecycle>,
         sub_id: String,
         updates: SessionSettingsUpdate,
     ) -> CodexResult<Arc<TurnContext>> {
@@ -613,13 +632,16 @@ impl Session {
                 Ok(update) => update,
                 Err(err) => {
                     let message = err.to_string();
-                    self.send_event_raw(Event {
-                        id: sub_id.clone(),
-                        msg: EventMsg::Error(ErrorEvent {
-                            message: message.clone(),
-                            codex_error_info: Some(CodexErrorInfo::BadRequest),
-                        }),
-                    })
+                    self.send_event_raw_with_persistence_guard(
+                        lifecycle,
+                        Event {
+                            id: sub_id.clone(),
+                            msg: EventMsg::Error(ErrorEvent {
+                                message: message.clone(),
+                                codex_error_info: Some(CodexErrorInfo::BadRequest),
+                            }),
+                        },
+                    )
                     .await;
                     return Err(CodexErr::InvalidRequest(message));
                 }

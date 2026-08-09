@@ -268,6 +268,7 @@ impl ThreadManagerRuntimeOptions {
         self
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn with_compact_commit_test_hook_for_tests(
         mut self,
         hook: crate::compact::CompactCommitTestHook,
@@ -276,6 +277,7 @@ impl ThreadManagerRuntimeOptions {
         self
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn with_realtime_start_test_hook_for_tests(
         mut self,
         hook: crate::realtime_conversation::RealtimeStartTestHook,
@@ -353,6 +355,7 @@ impl ThreadManagerRuntimeOptions {
             || self.has_runtime_extension_override()
             || !self.agent_spawner_runtime_extension_factories.is_empty()
             || !self.skill_provider_sources.is_empty()
+            || self.title_generator.is_some()
     }
 
     pub fn required_base_instructions(&self) -> Option<&str> {
@@ -590,6 +593,9 @@ impl ThreadManager {
     ) -> Self {
         let codex_home = config.codex_home.clone();
         let restriction_product = session_source.restriction_product();
+        if let Some(title_generator) = runtime_options.title_generator() {
+            thread_store.set_title_generator(title_generator);
+        }
         let (thread_created_tx, _) = broadcast::channel(THREAD_CREATED_CHANNEL_CAPACITY);
         let plugins_manager = Arc::new(PluginsManager::new_with_options(
             codex_home.to_path_buf(),

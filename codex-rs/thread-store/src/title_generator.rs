@@ -25,3 +25,20 @@ pub trait ThreadTitleGenerator: Send + Sync + std::fmt::Debug {
         request: ThreadTitleRequest,
     ) -> Pin<Box<dyn Future<Output = Option<String>> + Send + 'a>>;
 }
+
+/// Owned capability authorizing one detached thread-metadata mutation sequence.
+///
+/// Implementations keep the capability alive until it is dropped, allowing a host lifecycle gate
+/// to cover every store access in a read-check-update transaction without borrowing the session.
+pub trait ThreadMetadataMutationPermit: Send {}
+
+/// Object-safe future returned while acquiring a detached metadata-mutation permit.
+pub type ThreadMetadataMutationPermitFuture<'a> =
+    Pin<Box<dyn Future<Output = Option<Box<dyn ThreadMetadataMutationPermit>>> + Send + 'a>>;
+
+/// Host-owned lifecycle boundary for detached thread-metadata mutations.
+pub trait ThreadMetadataMutationGate: Send + Sync + std::fmt::Debug {
+    /// Acquires an owned mutation capability, or returns `None` when mutations are permanently
+    /// disabled for the thread lifecycle.
+    fn acquire<'a>(&'a self) -> ThreadMetadataMutationPermitFuture<'a>;
+}

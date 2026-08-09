@@ -31,6 +31,10 @@ impl Session {
         self.inject_if_running_with_guard(&lifecycle, input).await
     }
 
+    #[allow(
+        clippy::await_holding_invalid_type,
+        reason = "active-turn identity and pending-input mutation must remain atomic; the caller already holds lifecycle and this helper never reacquires it"
+    )]
     async fn inject_if_running_with_guard(
         &self,
         _lifecycle: &tokio::sync::MutexGuard<'_, crate::session::session::PersistenceLifecycle>,
@@ -61,6 +65,10 @@ impl Session {
     /// start a turn when user/client-triggered work is queued, any task is still
     /// active, or the session is currently in Plan mode. Active Review tasks are
     /// covered by the active-task check because Review turns are not steerable.
+    #[allow(
+        clippy::await_holding_invalid_type,
+        reason = "idle reservation, queue checks, and task registration are one lifecycle-owned transaction with lifecycle-first lock order"
+    )]
     pub(crate) async fn try_start_turn_if_idle(
         self: &Arc<Self>,
         input: Vec<ResponseItem>,
@@ -173,27 +181,28 @@ impl Session {
     }
 
     /// Injects items into active work, or records them without starting a turn.
+    #[allow(
+        clippy::await_holding_invalid_type,
+        reason = "active-turn selection and durable-first history installation are one lifecycle-owned transaction with lifecycle-first lock order"
+    )]
     pub(crate) async fn inject_no_new_turn(
         &self,
         items: Vec<ResponseItem>,
         current_turn_context: Option<&TurnContext>,
     ) {
-        let items = match self.inject_if_running(items).await {
-            Ok(()) => return,
-            Err(err) if err.reason() == InjectIfRunningRejectionReason::NoActiveTurn => {
-                err.into_input()
-            }
+        if let Some(hook) = self.services.compact_commit_test_hook.as_ref() {
+            hook.pause_task_start_before_gate_if_requested().await;
+        }
+        let lifecycle = match self.acquire_persistence_side_effect().await {
+            Ok(lifecycle) => lifecycle,
             Err(_) => return,
         };
-        let default_turn_context;
-        let turn_context = match current_turn_context {
-            Some(turn_context) => turn_context,
-            None => {
-                default_turn_context = self.new_default_turn().await;
-                default_turn_context.as_ref()
-            }
-        };
-        self.record_conversation_items(turn_context, &items).await;
+        if let Err(err) = self
+            .inject_no_new_turn_with_guard(&lifecycle, items, current_turn_context)
+            .await
+        {
+            tracing::error!("failed to inject conversation items: {err:#}");
+        }
     }
 
     pub(crate) async fn inject_no_new_turn_with_guard(
@@ -201,9 +210,9 @@ impl Session {
         lifecycle: &tokio::sync::MutexGuard<'_, crate::session::session::PersistenceLifecycle>,
         items: Vec<ResponseItem>,
         current_turn_context: Option<&TurnContext>,
-    ) {
+    ) -> codex_thread_store::ThreadStoreResult<()> {
         let items = match self.inject_if_running_with_guard(lifecycle, items).await {
-            Ok(()) => return,
+            Ok(()) => return Ok(()),
             Err(err) => err.into_input(),
         };
         let default_turn_context;
@@ -214,7 +223,7 @@ impl Session {
                 default_turn_context.as_ref()
             }
         };
-        self.record_conversation_items_with_persistence_guard(lifecycle, turn_context, &items)
-            .await;
+        self.try_record_conversation_items_with_guard(lifecycle, turn_context, &items)
+            .await
     }
 }

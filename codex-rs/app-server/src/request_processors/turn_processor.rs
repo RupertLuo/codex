@@ -946,6 +946,13 @@ impl TurnRequestProcessor {
                         None,
                         Some(AnalyticsJsonRpcError::Input(InputError::Empty)),
                     ),
+                    SteerInputError::PersistenceQuarantined { message } => (
+                        message,
+                        None,
+                        Some(AnalyticsJsonRpcError::TurnSteer(
+                            TurnSteerRequestError::NoActiveTurn,
+                        )),
+                    ),
                 };
                 let mut error = invalid_request(message);
                 error.data = data;

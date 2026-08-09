@@ -1,4 +1,5 @@
 use codex_core::InjectIfRunningRejectionReason;
+use codex_core::SteerInputError;
 use codex_core::ThreadManagerRuntimeOptions;
 use codex_core::TryStartTurnIfIdleRejectionReason;
 use codex_core::compact::SUMMARY_PREFIX;
@@ -7,15 +8,20 @@ use codex_core::test_support::CompactCommitTestHook;
 use codex_core::test_support::RealtimeStartTestHook;
 use codex_core::test_support::auth_manager_from_auth;
 use codex_core::test_support::clear_reference_context_item_for_direct_mutation_test;
+use codex_core::test_support::conversation_history_for_test;
 use codex_core::test_support::direct_mutation_test_snapshot;
+use codex_core::test_support::inject_no_new_turn_for_test;
 use codex_core::test_support::with_compact_commit_test_hook;
 use codex_core::test_support::with_realtime_start_test_hook;
 use codex_login::CodexAuth;
+use codex_protocol::AgentPath;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::AgentMessageEvent;
 use codex_protocol::protocol::CompactedItem;
 use codex_protocol::protocol::ConversationStartParams;
+use codex_protocol::protocol::ConversationTextParams;
+use codex_protocol::protocol::ConversationTextRole;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::InitialHistory;
 use codex_protocol::protocol::Op;
@@ -29,6 +35,8 @@ use codex_protocol::user_input::UserInput;
 use codex_thread_store::InMemoryThreadStore;
 use codex_thread_store::LoadThreadHistoryParams;
 use codex_thread_store::ThreadStore;
+use codex_thread_store::ThreadTitleGenerator;
+use codex_thread_store::ThreadTitleRequest;
 use core_test_support::hooks::trust_discovered_hooks;
 use core_test_support::responses::ResponseMock;
 use core_test_support::responses::ev_assistant_message;
@@ -54,12 +62,68 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 use tempfile::TempDir;
+use tokio::sync::Semaphore;
 
 const ACTIVE_MODEL: &str = "gpt-5.4";
 const COMPACT_MODEL: &str = "deepseek/deepseek-v4-flash";
 const COMPACT_PROMPT: &str = "Summarize the conversation as durable text state.";
 const FAILED_TURN_MODEL: &str = "gpt-5.3-codex";
 const IMAGE_URL: &str = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==";
+
+#[derive(Debug)]
+struct BlockingTitleGenerator {
+    started: Semaphore,
+    release: Semaphore,
+    returned: Semaphore,
+}
+
+impl BlockingTitleGenerator {
+    fn new() -> Self {
+        Self {
+            started: Semaphore::new(0),
+            release: Semaphore::new(0),
+            returned: Semaphore::new(0),
+        }
+    }
+
+    async fn wait_until_started(&self) {
+        self.started
+            .acquire()
+            .await
+            .expect("title generator started semaphore should remain open")
+            .forget();
+    }
+
+    fn release(&self) {
+        self.release.add_permits(1);
+    }
+
+    async fn wait_until_returned(&self) {
+        self.returned
+            .acquire()
+            .await
+            .expect("title generator returned semaphore should remain open")
+            .forget();
+    }
+}
+
+impl ThreadTitleGenerator for BlockingTitleGenerator {
+    fn generate_title<'a>(
+        &'a self,
+        _request: ThreadTitleRequest,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<String>> + Send + 'a>> {
+        Box::pin(async move {
+            self.started.add_permits(1);
+            self.release
+                .acquire()
+                .await
+                .expect("title generator release semaphore should remain open")
+                .forget();
+            self.returned.add_permits(1);
+            Some("TITLE_MUST_NOT_APPLY_AFTER_QUARANTINE".to_string())
+        })
+    }
+}
 
 fn injected_assistant_item(text: &str) -> ResponseItem {
     ResponseItem::Message {
@@ -152,6 +216,30 @@ async fn start_realtime_race_server() -> core_test_support::responses::WebSocket
         vec![],
     ]])
     .await
+}
+
+async fn start_realtime_natural_close_server() -> core_test_support::responses::WebSocketTestServer
+{
+    start_websocket_server(vec![vec![
+        vec![json!({
+            "type": "session.updated",
+            "session": { "id": "sess_natural_close_race", "instructions": "backend prompt" }
+        })],
+        vec![],
+    ]])
+    .await
+}
+
+fn realtime_closed_count(items: &[RolloutItem]) -> usize {
+    items
+        .iter()
+        .filter(|item| {
+            matches!(
+                item,
+                RolloutItem::EventMsg(EventMsg::RealtimeConversationClosed(_))
+            )
+        })
+        .count()
 }
 
 async fn only_atomic_compaction_checkpoint(
@@ -274,6 +362,49 @@ fn assert_normal_request_shape(normal_body: &Value) {
     let normal_body = normal_body.to_string();
     assert!(!normal_body.contains("<model_switch>"));
     assert!(!normal_body.contains(COMPACT_MODEL));
+}
+
+async fn wait_for_ambiguous_compact_owner_to_settle(test: &TestCodex) {
+    let compact_error = tokio::time::timeout(
+        Duration::from_secs(5),
+        wait_for_event(&test.codex, |event| {
+            matches!(
+                event,
+                EventMsg::Error(error)
+                    if error.message.contains("persistence outcome is uncertain")
+            )
+        }),
+    )
+    .await
+    .expect("ambiguous compact should report its fatal persistence error");
+    assert!(
+        matches!(compact_error, EventMsg::Error(_)),
+        "event filter guarantees the compact fatal error"
+    );
+
+    // TurnComplete is delivered just before the task boundary clears active_turn. Wait on the
+    // actual state transition so snapshots cannot attribute the compact owner's normal cleanup to
+    // the operation deliberately paused before the lifecycle gate.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if !direct_mutation_test_snapshot(&test.codex)
+                .await
+                .has_active_turn
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("ambiguous compact owner should clear its active turn");
+
+    let flush_error = test
+        .codex
+        .flush_rollout()
+        .await
+        .expect_err("ambiguous compact should quarantine the session");
+    assert!(flush_error.to_string().contains("quarantined"));
 }
 
 async fn assert_ambiguous_session_quarantined_then_reload_succeeds(
@@ -1528,6 +1659,691 @@ async fn ambiguous_compact_persistence_quarantines_until_reload() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn user_input_waiting_before_start_gate_cannot_mutate_after_quarantine() {
+    skip_if_no_network!();
+
+    const STORE_ID: &str = "ambiguous-compact-user-input-before-start-gate";
+    InMemoryThreadStore::remove_id(STORE_ID);
+    let thread_store = InMemoryThreadStore::for_id(STORE_ID);
+    let server = start_mock_server().await;
+    let response_mock = mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![
+                ev_response_created("resp-before-user-input-race"),
+                ev_assistant_message("first-message", "FIRST_REPLY"),
+                ev_completed("resp-before-user-input-race"),
+            ]),
+            sse(vec![
+                ev_assistant_message("compact-message", "UNCOMMITTED_RACE_SUMMARY"),
+                ev_completed("compact-user-input-race"),
+            ]),
+        ],
+    )
+    .await;
+    let commit_hook = CompactCommitTestHook::new();
+    let mut builder = in_memory_atomic_compact_builder(STORE_ID, commit_hook.clone());
+    let test = builder
+        .build_with_auto_env(&server)
+        .await
+        .expect("build codex");
+
+    test.submit_turn("FIRST_USER_TURN")
+        .await
+        .expect("submit first user turn");
+    test.codex
+        .submit(Op::Compact)
+        .await
+        .expect("submit compact operation");
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        commit_hook.wait_until_commit_paused(),
+    )
+    .await
+    .expect("compact commit should pause before lifecycle ownership");
+
+    commit_hook.pause_task_start_before_gate_once();
+    let racing_turn_id = test
+        .codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "USER_INPUT_WAITING_BEFORE_START_GATE".to_string(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: Default::default(),
+        })
+        .await
+        .expect("submit racing user input");
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        commit_hook.wait_until_task_start_before_gate_paused(),
+    )
+    .await
+    .expect("user input should pause immediately before the lifecycle gate");
+
+    thread_store
+        .fail_next_append("injected checkpoint failure before durable write")
+        .await;
+    thread_store
+        .fail_next_history_loads(3, "injected reconciliation read failure")
+        .await;
+    commit_hook.release_commit();
+    wait_for_ambiguous_compact_owner_to_settle(&test).await;
+
+    let state_after_quarantine = direct_mutation_test_snapshot(&test.codex).await;
+    let calls_after_quarantine = thread_store.calls().await;
+    let requests_after_quarantine = response_mock.requests().len();
+    commit_hook.release_task_start_before_gate();
+
+    let terminal = tokio::time::timeout(
+        Duration::from_secs(5),
+        wait_for_event(&test.codex, |event| {
+            matches!(event, EventMsg::Error(_))
+                || matches!(
+                    event,
+                    EventMsg::TurnStarted(started) if started.turn_id == racing_turn_id
+                )
+        }),
+    )
+    .await
+    .expect("resumed user input should terminate explicitly");
+    assert!(
+        matches!(terminal, EventMsg::Error(ref error) if error.message.contains("quarantined")),
+        "quarantine must win before any turn starts: {terminal:?}"
+    );
+    assert_eq!(
+        direct_mutation_test_snapshot(&test.codex).await,
+        state_after_quarantine,
+        "resumed user input must not reserve a turn or queue input"
+    );
+    assert_eq!(
+        thread_store.calls().await,
+        calls_after_quarantine,
+        "resumed user input must not append after quarantine"
+    );
+    assert_eq!(
+        response_mock.requests().len(),
+        requests_after_quarantine,
+        "resumed user input must not start an HTTP model request"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn public_steer_waiting_before_gate_cannot_revive_start_first_quarantine_cleanup() {
+    skip_if_no_network!();
+
+    const STORE_ID: &str = "ambiguous-compact-public-steer-before-gate";
+    InMemoryThreadStore::remove_id(STORE_ID);
+    let thread_store = InMemoryThreadStore::for_id(STORE_ID);
+    let server = start_mock_server().await;
+    let response_mock = mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![
+                ev_response_created("resp-before-public-steer-race"),
+                ev_assistant_message("first-message", "FIRST_REPLY"),
+                ev_completed("resp-before-public-steer-race"),
+            ]),
+            sse(vec![
+                ev_assistant_message("compact-message", "UNCOMMITTED_STEER_SUMMARY"),
+                ev_completed("compact-public-steer-race"),
+            ]),
+        ],
+    )
+    .await;
+    let commit_hook = CompactCommitTestHook::new();
+    let mut builder = in_memory_atomic_compact_builder(STORE_ID, commit_hook.clone());
+    let test = builder
+        .build_with_auto_env(&server)
+        .await
+        .expect("build codex");
+
+    test.submit_turn("FIRST_USER_TURN")
+        .await
+        .expect("submit first user turn");
+    test.codex
+        .submit(Op::Compact)
+        .await
+        .expect("submit compact operation");
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        commit_hook.wait_until_commit_paused(),
+    )
+    .await
+    .expect("compact commit should pause before lifecycle ownership");
+
+    test.codex
+        .submit(Op::Interrupt)
+        .await
+        .expect("interrupt compact parent while detached commit remains paused");
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        commit_hook.wait_until_parent_wait_dropped(),
+    )
+    .await
+    .expect("compact parent should drop while detached commit remains paused");
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::TurnAborted(_))
+    })
+    .await;
+
+    let active_turn_id = test
+        .codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "START_WINS_BEFORE_AMBIGUOUS_QUARANTINE".to_string(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: Default::default(),
+        })
+        .await
+        .expect("submit start-first user input");
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        wait_for_event(&test.codex, |event| {
+            matches!(event, EventMsg::TurnStarted(started) if started.turn_id == active_turn_id)
+        }),
+    )
+    .await
+    .expect("new regular turn should start before quarantine");
+
+    commit_hook.pause_task_start_before_gate_once();
+    let codex = Arc::clone(&test.codex);
+    let expected_turn_id = active_turn_id.clone();
+    let steer_task = tokio::spawn(async move {
+        codex
+            .steer_input(
+                vec![UserInput::Text {
+                    text: "STEER_WAITING_BEFORE_GATE".to_string(),
+                    text_elements: Vec::new(),
+                }],
+                Default::default(),
+                Some(expected_turn_id.as_str()),
+                None,
+                None,
+            )
+            .await
+    });
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        commit_hook.wait_until_task_start_before_gate_paused(),
+    )
+    .await
+    .expect("public steer should pause before lifecycle ownership");
+
+    thread_store
+        .fail_next_append("injected checkpoint failure before durable write")
+        .await;
+    thread_store
+        .fail_next_history_loads(3, "injected reconciliation read failure")
+        .await;
+    commit_hook.release_commit();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match test.codex.flush_rollout().await {
+                Err(err) if err.to_string().contains("quarantined") => break,
+                _ => tokio::task::yield_now().await,
+            }
+        }
+    })
+    .await
+    .expect("ambiguous checkpoint should quarantine and clean the active task");
+
+    let state_after_quarantine = direct_mutation_test_snapshot(&test.codex).await;
+    assert!(
+        !state_after_quarantine.has_active_turn && !state_after_quarantine.has_pending_input,
+        "start-first quarantine must raw-cancel active and pending turn state: {state_after_quarantine:?}"
+    );
+    let calls_after_quarantine = thread_store.calls().await;
+    let requests_after_quarantine = response_mock.requests().len();
+    commit_hook.release_task_start_before_gate();
+    let steer_error = steer_task
+        .await
+        .expect("public steer task should not panic")
+        .expect_err("public steer must reject after quarantine");
+    assert!(
+        matches!(
+            steer_error,
+            SteerInputError::PersistenceQuarantined { ref message }
+                if message.contains("quarantined")
+        ),
+        "public steer should explain the lifecycle quarantine: {steer_error:?}"
+    );
+    assert_eq!(
+        direct_mutation_test_snapshot(&test.codex).await,
+        state_after_quarantine,
+        "rejected steer must not revive or queue work"
+    );
+    assert_eq!(thread_store.calls().await, calls_after_quarantine);
+    assert_eq!(response_mock.requests().len(), requests_after_quarantine);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn trigger_mailbox_waiting_before_gate_cannot_enqueue_or_start_after_quarantine() {
+    skip_if_no_network!();
+
+    const STORE_ID: &str = "ambiguous-compact-trigger-mailbox-before-gate";
+    InMemoryThreadStore::remove_id(STORE_ID);
+    let thread_store = InMemoryThreadStore::for_id(STORE_ID);
+    let server = start_mock_server().await;
+    let response_mock = mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![
+                ev_response_created("resp-before-trigger-mailbox-race"),
+                ev_assistant_message("first-message", "FIRST_REPLY"),
+                ev_completed("resp-before-trigger-mailbox-race"),
+            ]),
+            sse(vec![
+                ev_assistant_message("compact-message", "UNCOMMITTED_MAILBOX_SUMMARY"),
+                ev_completed("compact-trigger-mailbox-race"),
+            ]),
+        ],
+    )
+    .await;
+    let commit_hook = CompactCommitTestHook::new();
+    let mut builder = in_memory_atomic_compact_builder(STORE_ID, commit_hook.clone());
+    let test = builder
+        .build_with_auto_env(&server)
+        .await
+        .expect("build codex");
+
+    test.submit_turn("FIRST_USER_TURN")
+        .await
+        .expect("submit first user turn");
+    test.codex
+        .submit(Op::Compact)
+        .await
+        .expect("submit compact operation");
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        commit_hook.wait_until_commit_paused(),
+    )
+    .await
+    .expect("compact commit should pause before lifecycle ownership");
+
+    commit_hook.pause_task_start_before_gate_once();
+    test.codex
+        .submit(Op::InterAgentCommunication {
+            communication: codex_protocol::protocol::InterAgentCommunication::new(
+                AgentPath::try_from("/root/worker").expect("valid worker path"),
+                AgentPath::root(),
+                Vec::new(),
+                "TRIGGER_MAIL_WAITING_BEFORE_GATE".to_string(),
+                /*trigger_turn*/ true,
+            ),
+        })
+        .await
+        .expect("submit trigger-turn mailbox mail");
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        commit_hook.wait_until_task_start_before_gate_paused(),
+    )
+    .await
+    .expect("trigger mailbox handler should pause before lifecycle ownership");
+
+    thread_store
+        .fail_next_append("injected checkpoint failure before durable write")
+        .await;
+    thread_store
+        .fail_next_history_loads(3, "injected reconciliation read failure")
+        .await;
+    commit_hook.release_commit();
+    wait_for_ambiguous_compact_owner_to_settle(&test).await;
+
+    let state_after_quarantine = direct_mutation_test_snapshot(&test.codex).await;
+    let calls_after_quarantine = thread_store.calls().await;
+    let requests_after_quarantine = response_mock.requests().len();
+    commit_hook.release_task_start_before_gate();
+    let terminal = tokio::time::timeout(
+        Duration::from_secs(5),
+        wait_for_event(&test.codex, |event| matches!(event, EventMsg::Error(_))),
+    )
+    .await
+    .expect("mailbox rejection should be delivered explicitly");
+    assert!(
+        matches!(terminal, EventMsg::Error(ref error) if error.message.contains("quarantined"))
+    );
+    assert_eq!(
+        direct_mutation_test_snapshot(&test.codex).await,
+        state_after_quarantine,
+        "rejected trigger mail must not enqueue or reserve a turn"
+    );
+    assert_eq!(thread_store.calls().await, calls_after_quarantine);
+    assert_eq!(response_mock.requests().len(), requests_after_quarantine);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ordinary_history_append_failure_leaves_live_and_cold_history_unchanged() {
+    skip_if_no_network!();
+
+    const STORE_ID: &str = "ordinary-history-append-failure-durable-first";
+    InMemoryThreadStore::remove_id(STORE_ID);
+    let thread_store = InMemoryThreadStore::for_id(STORE_ID);
+    let server = start_mock_server().await;
+    mount_sse_sequence(
+        &server,
+        vec![sse(vec![
+            ev_response_created("resp-before-history-append-failure"),
+            ev_assistant_message("first-message", "FIRST_REPLY"),
+            ev_completed("resp-before-history-append-failure"),
+        ])],
+    )
+    .await;
+    let mut builder = test_codex().with_model(ACTIVE_MODEL).with_config(|config| {
+        config.experimental_thread_store = ThreadStoreConfig::InMemory {
+            id: STORE_ID.to_string(),
+        };
+    });
+    let test = builder
+        .build_with_auto_env(&server)
+        .await
+        .expect("build codex");
+    test.submit_turn("FIRST_USER_TURN")
+        .await
+        .expect("submit first user turn");
+
+    let live_before = conversation_history_for_test(&test.codex).await;
+    let durable_before = ThreadStore::load_history(
+        thread_store.as_ref(),
+        LoadThreadHistoryParams {
+            thread_id: test.session_configured.thread_id,
+            include_archived: true,
+        },
+    )
+    .await
+    .expect("load durable history before append failure");
+    thread_store
+        .fail_next_append("injected ordinary history append failure")
+        .await;
+    let _ = test
+        .codex
+        .inject_response_items(vec![injected_assistant_item(
+            "MUST_NOT_EXIST_AFTER_APPEND_FAILURE",
+        )])
+        .await;
+
+    assert_eq!(
+        conversation_history_for_test(&test.codex).await,
+        live_before,
+        "failed durable append must not install live conversation history"
+    );
+    let durable_after = ThreadStore::load_history(
+        thread_store.as_ref(),
+        LoadThreadHistoryParams {
+            thread_id: test.session_configured.thread_id,
+            include_archived: true,
+        },
+    )
+    .await
+    .expect("load durable history after append failure");
+    assert_eq!(
+        serde_json::to_value(&durable_after.items).expect("serialize durable history after"),
+        serde_json::to_value(&durable_before.items).expect("serialize durable history before"),
+        "failed history transaction must not leave raw-only durable companions"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn inject_no_active_turn_waiting_before_gate_matches_cold_history_after_quarantine() {
+    skip_if_no_network!();
+
+    const STORE_ID: &str = "inject-no-active-turn-before-history-gate";
+    InMemoryThreadStore::remove_id(STORE_ID);
+    let thread_store = InMemoryThreadStore::for_id(STORE_ID);
+    let server = start_mock_server().await;
+    mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![
+                ev_response_created("resp-before-inject-no-active-race"),
+                ev_assistant_message("first-message", "FIRST_REPLY"),
+                ev_completed("resp-before-inject-no-active-race"),
+            ]),
+            sse(vec![
+                ev_assistant_message("compact-message", "UNCOMMITTED_INJECT_SUMMARY"),
+                ev_completed("compact-inject-no-active-race"),
+            ]),
+        ],
+    )
+    .await;
+    let commit_hook = CompactCommitTestHook::new();
+    let mut builder = in_memory_atomic_compact_builder(STORE_ID, commit_hook.clone());
+    let test = builder
+        .build_with_auto_env(&server)
+        .await
+        .expect("build codex");
+    test.submit_turn("FIRST_USER_TURN")
+        .await
+        .expect("submit first user turn");
+    test.codex
+        .submit(Op::Compact)
+        .await
+        .expect("submit compact operation");
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        commit_hook.wait_until_commit_paused(),
+    )
+    .await
+    .expect("compact commit should pause before lifecycle ownership");
+    test.codex
+        .submit(Op::Interrupt)
+        .await
+        .expect("interrupt compact parent");
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        commit_hook.wait_until_parent_wait_dropped(),
+    )
+    .await
+    .expect("compact parent should drop while detached commit remains paused");
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::TurnAborted(_))
+    })
+    .await;
+
+    commit_hook.pause_task_start_before_gate_once();
+    let codex = Arc::clone(&test.codex);
+    let inject_task = tokio::spawn(async move {
+        inject_no_new_turn_for_test(
+            &codex,
+            vec![injected_assistant_item(
+                "INJECT_MUST_NOT_EXIST_AFTER_QUARANTINE",
+            )],
+        )
+        .await;
+    });
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        commit_hook.wait_until_task_start_before_gate_paused(),
+    )
+    .await
+    .expect("NoActiveTurn injection should pause before lifecycle ownership");
+
+    thread_store
+        .fail_next_append("injected checkpoint failure before durable write")
+        .await;
+    thread_store
+        .fail_next_history_loads(3, "injected reconciliation read failure")
+        .await;
+    commit_hook.release_commit();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match test.codex.flush_rollout().await {
+                Err(err) if err.to_string().contains("quarantined") => break,
+                _ => tokio::task::yield_now().await,
+            }
+        }
+    })
+    .await
+    .expect("not-durable ambiguous checkpoint should quarantine");
+    let live_after_quarantine = conversation_history_for_test(&test.codex).await;
+    let durable_history = ThreadStore::load_history(
+        thread_store.as_ref(),
+        LoadThreadHistoryParams {
+            thread_id: test.session_configured.thread_id,
+            include_archived: true,
+        },
+    )
+    .await
+    .expect("load durable history after quarantine");
+    commit_hook.release_task_start_before_gate();
+    inject_task.await.expect("injection task should not panic");
+    assert_eq!(
+        conversation_history_for_test(&test.codex).await,
+        live_after_quarantine,
+        "rejected NoActiveTurn injection must leave live history unchanged"
+    );
+
+    let thread_id = test.session_configured.thread_id;
+    test.codex
+        .shutdown_and_wait()
+        .await
+        .expect("shutdown quarantined session");
+    test.thread_manager.remove_thread(&thread_id).await;
+    let resumed = test
+        .thread_manager
+        .resume_thread_with_history(
+            test.config.clone(),
+            InitialHistory::Resumed(ResumedHistory {
+                conversation_id: thread_id,
+                history: Arc::new(durable_history.items),
+                rollout_path: None,
+            }),
+            auth_manager_from_auth(CodexAuth::from_api_key("dummy")),
+            None,
+            false,
+        )
+        .await
+        .expect("cold resume from durable history");
+    assert_eq!(
+        conversation_history_for_test(&resumed.thread).await,
+        live_after_quarantine,
+        "quarantined live history must equal a true cold reconstruction"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn detached_title_generator_cannot_read_or_update_metadata_after_quarantine() {
+    skip_if_no_network!();
+
+    const STORE_ID: &str = "detached-title-generator-quarantine-gate";
+    InMemoryThreadStore::remove_id(STORE_ID);
+    let thread_store = InMemoryThreadStore::for_id(STORE_ID);
+    let server = start_mock_server().await;
+    mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![
+                ev_response_created("resp-before-title-race"),
+                ev_assistant_message("first-message", "FIRST_REPLY"),
+                ev_completed("resp-before-title-race"),
+            ]),
+            sse(vec![
+                ev_assistant_message("compact-message", "UNCOMMITTED_TITLE_SUMMARY"),
+                ev_completed("compact-title-race"),
+            ]),
+        ],
+    )
+    .await;
+    let commit_hook = CompactCommitTestHook::new();
+    let title_generator = Arc::new(BlockingTitleGenerator::new());
+    let runtime_options =
+        with_compact_commit_test_hook(ThreadManagerRuntimeOptions::default(), commit_hook.clone())
+            .with_title_generator(title_generator.clone());
+    let mut builder = test_codex()
+        .with_runtime_options(runtime_options)
+        .with_model(ACTIVE_MODEL)
+        .with_model_info_override(ACTIVE_MODEL, |model_info| {
+            model_info.supports_incremental_requests = true;
+        })
+        .with_config(|config| {
+            config.experimental_thread_store = ThreadStoreConfig::InMemory {
+                id: STORE_ID.to_string(),
+            };
+            config.compact_model = Some(COMPACT_MODEL.to_string());
+            config.compact_prompt = Some(COMPACT_PROMPT.to_string());
+            config.model_provider.name = "Catalyst-compatible test provider".to_string();
+        });
+    let test = builder
+        .build_with_auto_env(&server)
+        .await
+        .expect("build codex");
+    test.submit_turn("FIRST_USER_TURN")
+        .await
+        .expect("submit first user turn");
+    tokio::time::timeout(Duration::from_secs(5), title_generator.wait_until_started())
+        .await
+        .expect("real title generator should start after the first assistant turn");
+
+    test.codex
+        .submit(Op::Compact)
+        .await
+        .expect("submit compact operation");
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        commit_hook.wait_until_commit_paused(),
+    )
+    .await
+    .expect("compact commit should pause before lifecycle ownership");
+    thread_store
+        .fail_next_append("injected checkpoint failure before durable write")
+        .await;
+    thread_store
+        .fail_next_history_loads(3, "injected reconciliation read failure")
+        .await;
+    commit_hook.release_commit();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match test.codex.flush_rollout().await {
+                Err(err) if err.to_string().contains("quarantined") => break,
+                _ => tokio::task::yield_now().await,
+            }
+        }
+    })
+    .await
+    .expect("ambiguous checkpoint should quarantine before title generation resumes");
+
+    let calls_after_quarantine = thread_store.calls().await;
+    title_generator.release();
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        title_generator.wait_until_returned(),
+    )
+    .await
+    .expect("blocked title generator should return after release");
+    tokio::time::timeout(Duration::from_millis(250), async {
+        loop {
+            let calls = thread_store.calls().await;
+            if calls.read_thread != calls_after_quarantine.read_thread
+                || calls.update_thread_metadata != calls_after_quarantine.update_thread_metadata
+            {
+                panic!(
+                    "detached title task crossed quarantine: before={calls_after_quarantine:?}, after={calls:?}"
+                );
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect_err("counter observation window should end without metadata access");
+    let calls_after_release = thread_store.calls().await;
+    assert_eq!(
+        calls_after_release.read_thread, calls_after_quarantine.read_thread,
+        "quarantined title task must not read thread metadata"
+    );
+    assert_eq!(
+        calls_after_release.update_thread_metadata, calls_after_quarantine.update_thread_metadata,
+        "quarantined title task must not update thread metadata"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ambiguous_compaction_linearizes_after_in_flight_append_and_blocks_later_appends() {
     skip_if_no_network!();
 
@@ -1911,6 +2727,443 @@ async fn realtime_that_linearizes_first_is_closed_by_later_ambiguous_checkpoint(
         1,
         "the first-linearized realtime start should connect exactly once before quarantine closes it"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn realtime_quarantine_first_close_has_one_live_and_durable_winner() {
+    skip_if_no_network!();
+
+    const STORE_ID: &str = "ambiguous-compact-realtime-quarantine-close-winner";
+    InMemoryThreadStore::remove_id(STORE_ID);
+    let thread_store = InMemoryThreadStore::for_id(STORE_ID);
+    let response_server = start_mock_server().await;
+    let realtime_server = start_realtime_race_server().await;
+    mount_sse_sequence(
+        &response_server,
+        vec![
+            sse(vec![
+                ev_response_created("resp-before-quarantine-close-race"),
+                ev_assistant_message("first-message", "FIRST_REPLY"),
+                ev_completed("resp-before-quarantine-close-race"),
+            ]),
+            sse(vec![
+                ev_assistant_message("compact-message", "QUARANTINE_CLOSE_RACE_SUMMARY"),
+                ev_completed("compact-quarantine-close-race"),
+            ]),
+        ],
+    )
+    .await;
+    let commit_hook = CompactCommitTestHook::new();
+    let realtime_hook = RealtimeStartTestHook::new();
+    let mut builder = in_memory_atomic_compact_realtime_builder(
+        STORE_ID,
+        commit_hook.clone(),
+        realtime_hook.clone(),
+        realtime_server.uri().to_string(),
+    );
+    let test = builder
+        .build_with_auto_env(&response_server)
+        .await
+        .expect("build codex");
+
+    test.submit_turn("FIRST_USER_TURN")
+        .await
+        .expect("submit first user turn");
+    test.codex
+        .submit(Op::RealtimeConversationStart(realtime_start_params()))
+        .await
+        .expect("start realtime conversation");
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::RealtimeConversationStarted(_))
+    })
+    .await;
+    test.codex
+        .submit(Op::Compact)
+        .await
+        .expect("submit compact operation");
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        commit_hook.wait_until_commit_paused(),
+    )
+    .await
+    .expect("compact commit should pause before lifecycle ownership");
+
+    realtime_hook.pause_close_before_gate_once();
+    test.codex
+        .submit(Op::RealtimeConversationClose)
+        .await
+        .expect("submit explicit realtime close");
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        realtime_hook.wait_until_close_before_gate_paused(),
+    )
+    .await
+    .expect("explicit close should pause before lifecycle ownership");
+
+    thread_store
+        .fail_next_append("injected checkpoint failure before durable write")
+        .await;
+    thread_store
+        .fail_next_history_loads(3, "injected reconciliation read failure")
+        .await;
+    commit_hook.release_commit();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match test.codex.flush_rollout().await {
+                Err(err) if err.to_string().contains("quarantined") => break,
+                _ => tokio::task::yield_now().await,
+            }
+        }
+    })
+    .await
+    .expect("ambiguous checkpoint should quarantine the session");
+    let first_closed = wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::RealtimeConversationClosed(_))
+    })
+    .await;
+    assert!(matches!(
+        first_closed,
+        EventMsg::RealtimeConversationClosed(ref event)
+            if event.reason.as_deref() == Some("persistence_quarantine")
+    ));
+
+    realtime_hook.release_close_before_gate();
+    let duplicate_closed = tokio::time::timeout(
+        Duration::from_millis(250),
+        wait_for_event(&test.codex, |event| {
+            matches!(event, EventMsg::RealtimeConversationClosed(_))
+        }),
+    )
+    .await;
+    assert!(
+        duplicate_closed.is_err(),
+        "quarantine and explicit close must not both deliver Closed: {duplicate_closed:?}"
+    );
+
+    let durable_history = ThreadStore::load_history(
+        thread_store.as_ref(),
+        LoadThreadHistoryParams {
+            thread_id: test.session_configured.thread_id,
+            include_archived: true,
+        },
+    )
+    .await
+    .expect("load durable history after close race");
+    assert_eq!(realtime_closed_count(&durable_history.items), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn realtime_explicit_first_close_has_one_live_and_durable_winner() {
+    skip_if_no_network!();
+
+    const STORE_ID: &str = "ambiguous-compact-realtime-explicit-close-winner";
+    InMemoryThreadStore::remove_id(STORE_ID);
+    let thread_store = InMemoryThreadStore::for_id(STORE_ID);
+    let response_server = start_mock_server().await;
+    let realtime_server = start_realtime_race_server().await;
+    mount_sse_sequence(
+        &response_server,
+        vec![
+            sse(vec![
+                ev_response_created("resp-before-explicit-close-race"),
+                ev_assistant_message("first-message", "FIRST_REPLY"),
+                ev_completed("resp-before-explicit-close-race"),
+            ]),
+            sse(vec![
+                ev_assistant_message("compact-message", "EXPLICIT_CLOSE_RACE_SUMMARY"),
+                ev_completed("compact-explicit-close-race"),
+            ]),
+        ],
+    )
+    .await;
+    let commit_hook = CompactCommitTestHook::new();
+    let realtime_hook = RealtimeStartTestHook::new();
+    let mut builder = in_memory_atomic_compact_realtime_builder(
+        STORE_ID,
+        commit_hook.clone(),
+        realtime_hook,
+        realtime_server.uri().to_string(),
+    );
+    let test = builder
+        .build_with_auto_env(&response_server)
+        .await
+        .expect("build codex");
+
+    test.submit_turn("FIRST_USER_TURN")
+        .await
+        .expect("submit first user turn");
+    test.codex
+        .submit(Op::RealtimeConversationStart(realtime_start_params()))
+        .await
+        .expect("start realtime conversation");
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::RealtimeConversationStarted(_))
+    })
+    .await;
+    test.codex
+        .submit(Op::Compact)
+        .await
+        .expect("submit compact operation");
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        commit_hook.wait_until_commit_paused(),
+    )
+    .await
+    .expect("compact commit should pause before lifecycle ownership");
+
+    test.codex
+        .submit(Op::RealtimeConversationClose)
+        .await
+        .expect("submit explicit realtime close");
+    let first_closed = wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::RealtimeConversationClosed(_))
+    })
+    .await;
+    assert!(matches!(
+        first_closed,
+        EventMsg::RealtimeConversationClosed(ref event)
+            if event.reason.as_deref() == Some("requested")
+    ));
+
+    thread_store
+        .fail_next_append("injected checkpoint failure before durable write")
+        .await;
+    thread_store
+        .fail_next_history_loads(3, "injected reconciliation read failure")
+        .await;
+    commit_hook.release_commit();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match test.codex.flush_rollout().await {
+                Err(err) if err.to_string().contains("quarantined") => break,
+                _ => tokio::task::yield_now().await,
+            }
+        }
+    })
+    .await
+    .expect("ambiguous checkpoint should quarantine after explicit close");
+
+    let duplicate_closed = tokio::time::timeout(
+        Duration::from_millis(250),
+        wait_for_event(&test.codex, |event| {
+            matches!(event, EventMsg::RealtimeConversationClosed(_))
+        }),
+    )
+    .await;
+    assert!(
+        duplicate_closed.is_err(),
+        "later quarantine must not deliver another Closed: {duplicate_closed:?}"
+    );
+    let durable_history = ThreadStore::load_history(
+        thread_store.as_ref(),
+        LoadThreadHistoryParams {
+            thread_id: test.session_configured.thread_id,
+            include_archived: true,
+        },
+    )
+    .await
+    .expect("load durable history after explicit-first close race");
+    assert_eq!(realtime_closed_count(&durable_history.items), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn realtime_natural_and_explicit_close_share_one_durable_winner() {
+    skip_if_no_network!();
+
+    const STORE_ID: &str = "realtime-natural-explicit-close-winner";
+    InMemoryThreadStore::remove_id(STORE_ID);
+    let thread_store = InMemoryThreadStore::for_id(STORE_ID);
+    let response_server = start_mock_server().await;
+    let realtime_server = start_realtime_natural_close_server().await;
+    let commit_hook = CompactCommitTestHook::new();
+    let realtime_hook = RealtimeStartTestHook::new();
+    realtime_hook.pause_close_after_claim_once();
+    let mut builder = in_memory_atomic_compact_realtime_builder(
+        STORE_ID,
+        commit_hook,
+        realtime_hook.clone(),
+        realtime_server.uri().to_string(),
+    );
+    let test = builder
+        .build_with_auto_env(&response_server)
+        .await
+        .expect("build codex");
+
+    test.codex
+        .submit(Op::RealtimeConversationStart(realtime_start_params()))
+        .await
+        .expect("start realtime conversation");
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::RealtimeConversationStarted(_))
+    })
+    .await;
+    wait_for_event(&test.codex, |event| {
+        matches!(
+            event,
+            EventMsg::RealtimeConversationRealtime(RealtimeConversationRealtimeEvent {
+                payload: RealtimeEvent::SessionUpdated { .. },
+            })
+        )
+    })
+    .await;
+    test.codex
+        .submit(Op::RealtimeConversationText(ConversationTextParams {
+            text: "trigger natural transport close".to_string(),
+            role: ConversationTextRole::User,
+        }))
+        .await
+        .expect("send final realtime request");
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        realtime_hook.wait_until_close_after_claim_paused(),
+    )
+    .await
+    .expect("natural close should pause after claiming the active conversation");
+
+    test.codex
+        .submit(Op::RealtimeConversationClose)
+        .await
+        .expect("race explicit close against natural close");
+    realtime_hook.release_close_after_claim();
+
+    let first_closed = wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::RealtimeConversationClosed(_))
+    })
+    .await;
+    assert!(matches!(
+        first_closed,
+        EventMsg::RealtimeConversationClosed(ref event)
+            if event.reason.as_deref() == Some("transport_closed")
+                || event.reason.as_deref() == Some("requested")
+    ));
+    let duplicate_closed = tokio::time::timeout(
+        Duration::from_millis(250),
+        wait_for_event(&test.codex, |event| {
+            matches!(event, EventMsg::RealtimeConversationClosed(_))
+        }),
+    )
+    .await;
+    assert!(
+        duplicate_closed.is_err(),
+        "natural and explicit close must not both deliver Closed: {duplicate_closed:?}"
+    );
+
+    let durable_history = ThreadStore::load_history(
+        thread_store.as_ref(),
+        LoadThreadHistoryParams {
+            thread_id: test.session_configured.thread_id,
+            include_archived: true,
+        },
+    )
+    .await
+    .expect("load durable history after natural close race");
+    assert_eq!(realtime_closed_count(&durable_history.items), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn realtime_closed_append_failure_is_not_delivered_and_is_retryable() {
+    skip_if_no_network!();
+
+    const STORE_ID: &str = "realtime-close-append-failure-retry";
+    InMemoryThreadStore::remove_id(STORE_ID);
+    let thread_store = InMemoryThreadStore::for_id(STORE_ID);
+    let response_server = start_mock_server().await;
+    let realtime_server = start_realtime_race_server().await;
+    let commit_hook = CompactCommitTestHook::new();
+    let realtime_hook = RealtimeStartTestHook::new();
+    let mut builder = in_memory_atomic_compact_realtime_builder(
+        STORE_ID,
+        commit_hook,
+        realtime_hook,
+        realtime_server.uri().to_string(),
+    );
+    let test = builder
+        .build_with_auto_env(&response_server)
+        .await
+        .expect("build codex");
+
+    test.codex
+        .submit(Op::RealtimeConversationStart(realtime_start_params()))
+        .await
+        .expect("start realtime conversation");
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::RealtimeConversationStarted(_))
+    })
+    .await;
+    wait_for_event(&test.codex, |event| {
+        matches!(
+            event,
+            EventMsg::RealtimeConversationRealtime(RealtimeConversationRealtimeEvent {
+                payload: RealtimeEvent::SessionUpdated { .. },
+            })
+        )
+    })
+    .await;
+
+    let appends_before_close = thread_store.calls().await.append_items;
+    thread_store
+        .fail_next_append("injected Closed append failure")
+        .await;
+    test.codex
+        .submit(Op::RealtimeConversationClose)
+        .await
+        .expect("submit first explicit close");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if thread_store.calls().await.append_items > appends_before_close {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("first Closed append should reach the store and fail");
+
+    let premature_closed = tokio::time::timeout(
+        Duration::from_millis(250),
+        wait_for_event(&test.codex, |event| {
+            matches!(event, EventMsg::RealtimeConversationClosed(_))
+        }),
+    )
+    .await;
+    assert!(
+        premature_closed.is_err(),
+        "a failed Closed append must not produce a live-only event: {premature_closed:?}"
+    );
+    let history_after_failure = ThreadStore::load_history(
+        thread_store.as_ref(),
+        LoadThreadHistoryParams {
+            thread_id: test.session_configured.thread_id,
+            include_archived: true,
+        },
+    )
+    .await
+    .expect("load history after failed close");
+    assert_eq!(realtime_closed_count(&history_after_failure.items), 0);
+
+    test.codex
+        .submit(Op::RealtimeConversationClose)
+        .await
+        .expect("retry explicit close");
+    let closed = wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::RealtimeConversationClosed(_))
+    })
+    .await;
+    assert!(matches!(
+        closed,
+        EventMsg::RealtimeConversationClosed(ref event)
+            if event.reason.as_deref() == Some("requested")
+    ));
+    let history_after_retry = ThreadStore::load_history(
+        thread_store.as_ref(),
+        LoadThreadHistoryParams {
+            thread_id: test.session_configured.thread_id,
+            include_archived: true,
+        },
+    )
+    .await
+    .expect("load history after retried close");
+    assert_eq!(realtime_closed_count(&history_after_retry.items), 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

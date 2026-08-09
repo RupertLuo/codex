@@ -97,6 +97,7 @@ pub fn should_persist_event_msg(ev: &EventMsg) -> bool {
         | EventMsg::TurnComplete(_)
         | EventMsg::WebSearchEnd(_)
         | EventMsg::ImageGenerationEnd(_)
+        | EventMsg::RealtimeConversationClosed(_)
         | EventMsg::SubAgentActivity(_) => true,
         EventMsg::ItemCompleted(event) => {
             // These items have no equivalent raw ResponseItem or legacy event,
@@ -124,7 +125,6 @@ pub fn should_persist_event_msg(ev: &EventMsg) -> bool {
         | EventMsg::RealtimeConversationStarted(_)
         | EventMsg::RealtimeConversationSdp(_)
         | EventMsg::RealtimeConversationRealtime(_)
-        | EventMsg::RealtimeConversationClosed(_)
         | EventMsg::SafetyBuffering(_)
         | EventMsg::ModelReroute(_)
         | EventMsg::ModelVerification(_)
@@ -166,5 +166,20 @@ pub fn should_persist_event_msg(ev: &EventMsg) -> bool {
         | EventMsg::CollabWaitingBegin(_)
         | EventMsg::CollabCloseBegin(_)
         | EventMsg::CollabResumeBegin(_) => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use codex_protocol::protocol::RealtimeConversationClosedEvent;
+
+    #[test]
+    fn realtime_closed_is_durable_lifecycle_state() {
+        assert!(should_persist_event_msg(
+            &EventMsg::RealtimeConversationClosed(RealtimeConversationClosedEvent {
+                reason: Some("requested".to_string()),
+            })
+        ));
     }
 }

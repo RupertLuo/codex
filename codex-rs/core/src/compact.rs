@@ -111,9 +111,13 @@ struct CompactCommitTestHookInner {
     item_started_paused: Semaphore,
     release_item_started: Semaphore,
     item_started_cancelled: Semaphore,
+    pause_task_start_before_gate: AtomicBool,
+    task_start_before_gate_paused: Semaphore,
+    release_task_start_before_gate: Semaphore,
 }
 
 impl CompactCommitTestHook {
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn new() -> Self {
         Self {
             inner: Arc::new(CompactCommitTestHookInner {
@@ -126,10 +130,14 @@ impl CompactCommitTestHook {
                 item_started_paused: Semaphore::new(0),
                 release_item_started: Semaphore::new(0),
                 item_started_cancelled: Semaphore::new(0),
+                pause_task_start_before_gate: AtomicBool::new(false),
+                task_start_before_gate_paused: Semaphore::new(0),
+                release_task_start_before_gate: Semaphore::new(0),
             }),
         }
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) async fn wait_until_commit_paused(&self) {
         let Ok(permit) = self.inner.commit_paused.acquire().await else {
             return;
@@ -137,18 +145,22 @@ impl CompactCommitTestHook {
         permit.forget();
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn release_commit(&self) {
         self.inner.release_commit.add_permits(1);
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn panic_commit_once(&self) {
         self.inner.panic_commit.store(true, Ordering::SeqCst);
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn pause_item_started_once(&self) {
         self.inner.pause_item_started.store(true, Ordering::SeqCst);
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) async fn wait_until_item_started_paused(&self) {
         let Ok(permit) = self.inner.item_started_paused.acquire().await else {
             return;
@@ -156,6 +168,7 @@ impl CompactCommitTestHook {
         permit.forget();
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) async fn wait_until_item_started_cancelled(&self) {
         let Ok(permit) = self.inner.item_started_cancelled.acquire().await else {
             return;
@@ -163,6 +176,7 @@ impl CompactCommitTestHook {
         permit.forget();
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) async fn wait_until_parent_wait_dropped(&self) {
         let Ok(permit) = self.inner.parent_wait_dropped.acquire().await else {
             return;
@@ -170,6 +184,7 @@ impl CompactCommitTestHook {
         permit.forget();
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) async fn wait_until_commit_completed(&self) {
         let Ok(permit) = self.inner.commit_completed.acquire().await else {
             return;
@@ -215,8 +230,44 @@ impl CompactCommitTestHook {
     pub(crate) fn notify_item_started_cancelled(&self) {
         self.inner.item_started_cancelled.add_permits(1);
     }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn pause_task_start_before_gate_once(&self) {
+        self.inner
+            .pause_task_start_before_gate
+            .store(true, Ordering::SeqCst);
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) async fn wait_until_task_start_before_gate_paused(&self) {
+        let Ok(permit) = self.inner.task_start_before_gate_paused.acquire().await else {
+            return;
+        };
+        permit.forget();
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn release_task_start_before_gate(&self) {
+        self.inner.release_task_start_before_gate.add_permits(1);
+    }
+
+    pub(crate) async fn pause_task_start_before_gate_if_requested(&self) {
+        if !self
+            .inner
+            .pause_task_start_before_gate
+            .swap(false, Ordering::SeqCst)
+        {
+            return;
+        }
+        self.inner.task_start_before_gate_paused.add_permits(1);
+        let Ok(permit) = self.inner.release_task_start_before_gate.acquire().await else {
+            return;
+        };
+        permit.forget();
+    }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl Default for CompactCommitTestHook {
     fn default() -> Self {
         Self::new()

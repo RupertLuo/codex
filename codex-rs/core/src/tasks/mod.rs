@@ -311,36 +311,45 @@ where
 }
 
 impl Session {
+    #[allow(
+        clippy::await_holding_invalid_type,
+        reason = "replacement cleanup and task registration are one lifecycle-owned transaction with lifecycle-first lock order"
+    )]
     pub async fn spawn_task<T: SessionTask>(
         self: &Arc<Self>,
         turn_context: Arc<TurnContext>,
         input: Vec<TurnInput>,
         task: T,
     ) {
-        if self
-            .reject_if_persistence_quarantined(turn_context.sub_id.as_str())
-            .await
-        {
-            return;
+        if let Some(hook) = self.services.compact_commit_test_hook.as_ref() {
+            hook.pause_task_start_before_gate_if_requested().await;
         }
-        self.abort_all_tasks(TurnAbortReason::Replaced).await;
-        self.clear_connector_selection().await;
-        self.start_task(turn_context, input, task).await;
+        let lifecycle = match self.acquire_persistence_side_effect().await {
+            Ok(lifecycle) => lifecycle,
+            Err(err) => {
+                self.deliver_persistence_quarantine_error(
+                    turn_context.sub_id.as_str(),
+                    err.to_string(),
+                )
+                .await;
+                return;
+            }
+        };
+        self.spawn_task_with_persistence_guard(&lifecycle, turn_context, input, task)
+            .await;
     }
 
-    pub(crate) async fn start_task<T: SessionTask>(
+    pub(crate) async fn spawn_task_with_persistence_guard<T: SessionTask>(
         self: &Arc<Self>,
+        lifecycle: &tokio::sync::MutexGuard<'_, crate::session::session::PersistenceLifecycle>,
         turn_context: Arc<TurnContext>,
         input: Vec<TurnInput>,
         task: T,
     ) {
-        if self
-            .reject_if_persistence_quarantined(turn_context.sub_id.as_str())
-            .await
-        {
-            return;
-        }
-        self.start_task_with_persistence_capability(turn_context, input, task)
+        self.abort_all_tasks_for_replacement_with_persistence_guard(lifecycle)
+            .await;
+        self.clear_connector_selection().await;
+        self.start_task_with_persistence_guard(lifecycle, turn_context, input, task)
             .await;
     }
 
@@ -490,7 +499,8 @@ impl Session {
     /// This helper generates a fresh sub-id for the synthetic turn before delegating to the
     /// explicit-sub-id variant.
     pub(crate) async fn maybe_start_turn_for_pending_work(self: &Arc<Self>) {
-        self.maybe_start_turn_for_pending_work_with_sub_id(uuid::Uuid::new_v4().to_string())
+        let sub_id = uuid::Uuid::new_v4().to_string();
+        self.maybe_start_turn_for_pending_work_with_sub_id(sub_id)
             .await;
     }
 
@@ -499,16 +509,36 @@ impl Session {
     ///
     /// The turn is created only when there is mailbox mail marked with `trigger_turn`, and only
     /// if the session is currently idle.
+    #[allow(
+        clippy::await_holding_invalid_type,
+        reason = "mailbox validation, idle reservation, and task registration are one lifecycle-owned transaction with lifecycle-first lock order"
+    )]
     pub(crate) async fn maybe_start_turn_for_pending_work_with_sub_id(
         self: &Arc<Self>,
         sub_id: String,
     ) {
-        if self
-            .reject_if_persistence_quarantined(sub_id.as_str())
-            .await
-        {
-            return;
+        if let Some(hook) = self.services.compact_commit_test_hook.as_ref() {
+            hook.pause_task_start_before_gate_if_requested().await;
         }
+        let lifecycle = match self.acquire_persistence_side_effect().await {
+            Ok(lifecycle) => lifecycle,
+            Err(err) => {
+                self.deliver_persistence_quarantine_error(&sub_id, err.to_string())
+                    .await;
+                return;
+            }
+        };
+        self.maybe_start_turn_for_pending_work_with_sub_id_and_persistence_guard(
+            &lifecycle, sub_id,
+        )
+        .await;
+    }
+
+    pub(crate) async fn maybe_start_turn_for_pending_work_with_sub_id_and_persistence_guard(
+        self: &Arc<Self>,
+        lifecycle: &tokio::sync::MutexGuard<'_, crate::session::session::PersistenceLifecycle>,
+        sub_id: String,
+    ) {
         if !self.input_queue.has_trigger_turn_mailbox_items().await {
             return;
         }
@@ -522,9 +552,81 @@ impl Session {
         }
 
         let turn_context = self.new_default_turn_with_sub_id(sub_id).await;
-        self.maybe_emit_model_warnings_for_turn(turn_context.as_ref())
+        self.maybe_emit_model_warnings_for_turn_with_guard(lifecycle, turn_context.as_ref())
             .await;
-        self.start_task(turn_context, Vec::new(), RegularTask::new())
+        self.start_task_with_persistence_guard(
+            lifecycle,
+            turn_context,
+            Vec::new(),
+            RegularTask::new(),
+        )
+        .await;
+    }
+
+    async fn abort_all_tasks_for_replacement_with_persistence_guard(
+        self: &Arc<Self>,
+        lifecycle: &tokio::sync::MutexGuard<'_, crate::session::session::PersistenceLifecycle>,
+    ) {
+        let Some(mut active_turn) = self.take_active_turn().await else {
+            return;
+        };
+        let Some(task) = active_turn.task.take() else {
+            return;
+        };
+        let turn_context = Arc::clone(&task.turn_context);
+        self.handle_task_abort_for_replacement_with_persistence_guard(lifecycle, task)
+            .await;
+        self.emit_turn_abort_lifecycle(
+            TurnAbortReason::Replaced,
+            turn_context.extension_data.as_ref(),
+        )
+        .await;
+        self.input_queue.clear_pending(&active_turn).await;
+    }
+
+    #[allow(
+        clippy::await_holding_invalid_type,
+        reason = "quarantine cleanup keeps active-turn inspection and pending-input clearing atomic after lifecycle ownership, without reverse acquisition"
+    )]
+    pub(crate) async fn cancel_active_task_for_persistence_quarantine(
+        &self,
+        transition_owner_turn_id: &str,
+    ) {
+        let mut active = self.active_turn.lock().await;
+        let transition_owner_is_active = active
+            .as_ref()
+            .and_then(|active_turn| active_turn.task.as_ref())
+            .is_some_and(|task| task.turn_context.sub_id == transition_owner_turn_id);
+        if transition_owner_is_active {
+            // The task that discovered the ambiguous checkpoint must remain alive long enough to
+            // return the fatal persistence error to its normal task boundary. It cannot perform
+            // any further durable work because the lifecycle is already quarantined, but its
+            // queued input must still be discarded.
+            self.input_queue
+                .clear_for_persistence_quarantine(active.as_ref())
+                .await;
+            return;
+        }
+
+        let mut active_turn = active.take();
+        drop(active);
+        if let Some(task) = active_turn
+            .as_mut()
+            .and_then(|active_turn| active_turn.task.take())
+        {
+            task.cancellation_token.cancel();
+            task.turn_context
+                .turn_metadata_state
+                .cancel_git_enrichment_task();
+            task.handle.abort();
+            self.services
+                .guardian_rejection_circuit_breaker
+                .lock()
+                .await
+                .clear_turn(&task.turn_context.sub_id);
+        }
+        self.input_queue
+            .clear_for_persistence_quarantine(active_turn.as_ref())
             .await;
     }
 
@@ -863,6 +965,72 @@ impl Session {
             .unified_exec_manager
             .terminate_process(process_id)
             .await
+    }
+
+    async fn handle_task_abort_for_replacement_with_persistence_guard(
+        self: &Arc<Self>,
+        lifecycle: &tokio::sync::MutexGuard<'_, crate::session::session::PersistenceLifecycle>,
+        task: RunningTask,
+    ) {
+        let sub_id = task.turn_context.sub_id.clone();
+        if task.cancellation_token.is_cancelled() {
+            return;
+        }
+
+        trace!(task_kind = ?task.kind, sub_id, "aborting running task for replacement");
+        task.cancellation_token.cancel();
+        task.turn_context
+            .turn_metadata_state
+            .cancel_git_enrichment_task();
+        let session_task = Arc::clone(&task.task);
+
+        select! {
+            _ = task.done.notified() => {
+            },
+            _ = tokio::time::sleep(Duration::from_millis(GRACEFULL_INTERRUPTION_TIMEOUT_MS)) => {
+                warn!("task {sub_id} didn't complete gracefully after {}ms", GRACEFULL_INTERRUPTION_TIMEOUT_MS);
+            }
+        }
+
+        task.handle.abort();
+        let session_ctx = Arc::new(SessionTaskContext::new(
+            Arc::clone(self),
+            Arc::clone(&task.turn_extension_data),
+        ));
+        session_task
+            .abort(session_ctx, Arc::clone(&task.turn_context))
+            .await;
+
+        let (completed_at, duration_ms) = task
+            .turn_context
+            .turn_timing_state
+            .completed_at_and_duration_ms()
+            .await;
+        self.services
+            .analytics_events_client
+            .track_turn_profile(TurnProfileFact {
+                turn_id: task.turn_context.sub_id.clone(),
+                profile: task.turn_context.turn_timing_state.complete_profile(),
+            });
+        self.send_event_with_persistence_guard(
+            lifecycle,
+            task.turn_context.as_ref(),
+            EventMsg::TurnAborted(TurnAbortedEvent {
+                turn_id: Some(task.turn_context.sub_id.clone()),
+                reason: TurnAbortReason::Replaced,
+                completed_at,
+                duration_ms,
+            }),
+        )
+        .await;
+        self.services
+            .guardian_rejection_circuit_breaker
+            .lock()
+            .await
+            .clear_turn(&task.turn_context.sub_id);
+        if let Err(err) = self.flush_rollout_with_guard(lifecycle).await {
+            warn!("failed to flush rollout after emitting terminal turn event: {err}");
+        }
     }
 
     async fn handle_task_abort(self: &Arc<Self>, task: RunningTask, reason: TurnAbortReason) {

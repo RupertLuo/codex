@@ -255,6 +255,7 @@ pub enum SteerInputError {
     ExpectedTurnMismatch { expected: String, actual: String },
     ActiveTurnNotSteerable { turn_kind: NonSteerableTurnKind },
     EmptyInput,
+    PersistenceQuarantined { message: String },
 }
 
 impl SteerInputError {
@@ -283,6 +284,10 @@ impl SteerInputError {
             Self::EmptyInput => ErrorEvent {
                 message: "input must not be empty".to_string(),
                 codex_error_info: Some(CodexErrorInfo::BadRequest),
+            },
+            Self::PersistenceQuarantined { message } => ErrorEvent {
+                message: message.clone(),
+                codex_error_info: Some(CodexErrorInfo::Other),
             },
         }
     }
@@ -1215,6 +1220,12 @@ impl Session {
         let Some(message) = self.persistence_quarantine_reason().await else {
             return false;
         };
+        self.deliver_persistence_quarantine_error(sub_id, message)
+            .await;
+        true
+    }
+
+    pub(crate) async fn deliver_persistence_quarantine_error(&self, sub_id: &str, message: String) {
         let event = Event {
             id: sub_id.to_string(),
             msg: EventMsg::Error(ErrorEvent {
@@ -1227,7 +1238,6 @@ impl Session {
             .record_protocol_event(&event.msg);
         // Quarantine forbids additional rollout writes, including persistence of this error.
         self.deliver_event_raw(event).await;
-        true
     }
 
     pub(crate) fn live_thread_for_persistence(
@@ -1244,6 +1254,10 @@ impl Session {
 
     /// Flush rollout writes and return the final durability-barrier result.
     #[instrument(name = "session.flush_rollout", level = "trace", skip_all)]
+    #[allow(
+        clippy::await_holding_invalid_type,
+        reason = "the lifecycle capability intentionally remains held through the durability barrier and precedes store access"
+    )]
     pub(crate) async fn flush_rollout(&self) -> std::io::Result<()> {
         let lifecycle = self
             .acquire_persistence_side_effect()
@@ -1263,6 +1277,10 @@ impl Session {
         }
     }
 
+    #[allow(
+        clippy::await_holding_invalid_type,
+        reason = "the lifecycle capability intentionally remains held through materialization and precedes store access"
+    )]
     pub(crate) async fn try_ensure_rollout_materialized(&self) -> std::io::Result<()> {
         let _lifecycle = self
             .acquire_persistence_side_effect()
@@ -2140,6 +2158,25 @@ impl Session {
         self.deliver_event_raw(event).await;
     }
 
+    /// Persists one raw event before exposing it to live consumers.
+    ///
+    /// Unlike the ordinary best-effort sender, failure is returned and the event is not delivered.
+    /// Callers use this for lifecycle transitions whose live and cold-replay views must agree.
+    pub(crate) async fn try_send_event_raw_with_persistence_guard(
+        &self,
+        lifecycle: &tokio::sync::MutexGuard<'_, PersistenceLifecycle>,
+        event: Event,
+    ) -> codex_thread_store::ThreadStoreResult<()> {
+        let rollout_items = vec![RolloutItem::EventMsg(event.msg.clone())];
+        self.persist_rollout_items_with_guard(lifecycle, &rollout_items)
+            .await?;
+        self.services
+            .rollout_thread_trace
+            .record_protocol_event(&event.msg);
+        self.deliver_event_raw(event).await;
+        Ok(())
+    }
+
     async fn deliver_event_raw(&self, event: Event) {
         // Record the last known agent status.
         if let Some(status) = agent_status_from_event(&event.msg) {
@@ -2989,23 +3026,28 @@ impl Session {
     }
 
     #[tracing::instrument(level = "trace", skip_all, fields(item_count = items.len()))]
+    #[allow(
+        clippy::await_holding_invalid_type,
+        reason = "durable append and live history installation are one lifecycle-owned transaction with lifecycle-first lock order"
+    )]
     pub(crate) async fn record_conversation_items(
         &self,
         turn_context: &TurnContext,
         items: &[ResponseItem],
     ) {
-        let items = self.prepare_conversation_items_for_history(turn_context, items);
-        let items = items.as_ref();
+        let lifecycle = match self.acquire_persistence_side_effect().await {
+            Ok(lifecycle) => lifecycle,
+            Err(err) => {
+                error!("failed to record conversation items: {err:#}");
+                return;
+            }
+        };
+        if let Err(err) = self
+            .try_record_conversation_items_with_guard(&lifecycle, turn_context, items)
+            .await
         {
-            let mut state = self.state.lock().await;
-            state.current_time_reminder.note_recorded_items(items);
-            state.record_items(
-                items.iter(),
-                turn_context.model_info.truncation_policy.into(),
-            );
+            error!("failed to record conversation items: {err:#}");
         }
-        self.persist_rollout_response_items(items).await;
-        self.send_raw_response_items(turn_context, items).await;
     }
 
     pub(crate) async fn record_conversation_items_with_persistence_guard(
@@ -3014,8 +3056,32 @@ impl Session {
         turn_context: &TurnContext,
         items: &[ResponseItem],
     ) {
+        if let Err(err) = self
+            .try_record_conversation_items_with_guard(lifecycle, turn_context, items)
+            .await
+        {
+            error!("failed to record conversation items: {err:#}");
+        }
+    }
+
+    async fn try_record_conversation_items_with_guard(
+        &self,
+        lifecycle: &tokio::sync::MutexGuard<'_, PersistenceLifecycle>,
+        turn_context: &TurnContext,
+        items: &[ResponseItem],
+    ) -> codex_thread_store::ThreadStoreResult<()> {
         let items = self.prepare_conversation_items_for_history(turn_context, items);
         let items = items.as_ref();
+        let raw_events = items
+            .iter()
+            .cloned()
+            .map(|item| EventMsg::RawResponseItem(RawResponseItemEvent { item }))
+            .collect::<Vec<_>>();
+        let mut rollout_items = Vec::with_capacity(items.len() + raw_events.len());
+        rollout_items.extend(items.iter().cloned().map(RolloutItem::ResponseItem));
+        rollout_items.extend(raw_events.iter().cloned().map(RolloutItem::EventMsg));
+        self.persist_rollout_items_with_guard(lifecycle, &rollout_items)
+            .await?;
         {
             let mut state = self.state.lock().await;
             state.current_time_reminder.note_recorded_items(items);
@@ -3024,10 +3090,10 @@ impl Session {
                 turn_context.model_info.truncation_policy.into(),
             );
         }
-        self.persist_rollout_response_items_with_guard(lifecycle, items)
-            .await;
-        self.send_raw_response_items_with_guard(lifecycle, turn_context, items)
-            .await;
+        for event in raw_events {
+            self.deliver_persisted_event(turn_context, event).await;
+        }
+        Ok(())
     }
 
     pub(crate) async fn record_step_world_state_if_changed(
@@ -3426,6 +3492,8 @@ impl Session {
                 // lifecycle gate still exposes Quarantined, but never await shutdown while holding
                 // SessionState.
                 drop(state);
+                self.cancel_active_task_for_persistence_quarantine(&turn_context.sub_id)
+                    .await;
                 if let Err(err) = crate::realtime_conversation::close_for_persistence_quarantine(
                     self,
                     &persistence_lifecycle,
@@ -3503,33 +3571,6 @@ impl Session {
         .await;
     }
 
-    async fn persist_rollout_response_items(&self, items: &[ResponseItem]) {
-        let rollout_items: Vec<RolloutItem> = items
-            .iter()
-            .cloned()
-            .map(RolloutItem::ResponseItem)
-            .collect();
-        self.persist_rollout_items(&rollout_items).await;
-    }
-
-    async fn persist_rollout_response_items_with_guard(
-        &self,
-        lifecycle: &tokio::sync::MutexGuard<'_, PersistenceLifecycle>,
-        items: &[ResponseItem],
-    ) {
-        let rollout_items = items
-            .iter()
-            .cloned()
-            .map(RolloutItem::ResponseItem)
-            .collect::<Vec<_>>();
-        if let Err(err) = self
-            .persist_rollout_items_with_guard(lifecycle, &rollout_items)
-            .await
-        {
-            error!("failed to record rollout items: {err:#}");
-        }
-    }
-
     pub fn enabled(&self, feature: Feature) -> bool {
         self.features.enabled(feature)
     }
@@ -3574,22 +3615,6 @@ impl Session {
     async fn send_raw_response_items(&self, turn_context: &TurnContext, items: &[ResponseItem]) {
         for item in items {
             self.send_event(
-                turn_context,
-                EventMsg::RawResponseItem(RawResponseItemEvent { item: item.clone() }),
-            )
-            .await;
-        }
-    }
-
-    async fn send_raw_response_items_with_guard(
-        &self,
-        lifecycle: &tokio::sync::MutexGuard<'_, PersistenceLifecycle>,
-        turn_context: &TurnContext,
-        items: &[ResponseItem],
-    ) {
-        for item in items {
-            self.send_event_with_persistence_guard(
-                lifecycle,
                 turn_context,
                 EventMsg::RawResponseItem(RawResponseItemEvent { item: item.clone() }),
             )
@@ -4004,6 +4029,10 @@ impl Session {
         }
     }
 
+    #[allow(
+        clippy::await_holding_invalid_type,
+        reason = "the lifecycle capability intentionally remains held through the bounded append and precedes store access"
+    )]
     async fn persist_rollout_items_fallible(
         &self,
         items: &[RolloutItem],
@@ -4122,6 +4151,7 @@ impl Session {
         state.reference_context_item()
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) async fn clear_reference_context_item_for_direct_mutation_test(&self) {
         self.state.lock().await.set_reference_context_item(None);
     }
@@ -4488,6 +4518,39 @@ impl Session {
     )]
     pub async fn steer_input(
         &self,
+        input: Vec<UserInput>,
+        additional_context: BTreeMap<String, AdditionalContextEntry>,
+        expected_turn_id: Option<&str>,
+        client_user_message_id: Option<String>,
+        responsesapi_client_metadata: Option<HashMap<String, String>>,
+    ) -> Result<String, SteerInputError> {
+        if let Some(hook) = self.services.compact_commit_test_hook.as_ref() {
+            hook.pause_task_start_before_gate_if_requested().await;
+        }
+        let lifecycle = self
+            .acquire_persistence_side_effect()
+            .await
+            .map_err(|err| SteerInputError::PersistenceQuarantined {
+                message: err.to_string(),
+            })?;
+        self.steer_input_with_persistence_guard(
+            &lifecycle,
+            input,
+            additional_context,
+            expected_turn_id,
+            client_user_message_id,
+            responsesapi_client_metadata,
+        )
+        .await
+    }
+
+    #[allow(
+        clippy::await_holding_invalid_type,
+        reason = "active-turn identity, context merge, and pending-input update must remain atomic; the lifecycle capability is supplied by the caller"
+    )]
+    pub(crate) async fn steer_input_with_persistence_guard(
+        &self,
+        _lifecycle: &tokio::sync::MutexGuard<'_, PersistenceLifecycle>,
         input: Vec<UserInput>,
         additional_context: BTreeMap<String, AdditionalContextEntry>,
         expected_turn_id: Option<&str>,

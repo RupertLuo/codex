@@ -40,6 +40,7 @@ use crate::ThreadStore;
 use crate::ThreadStoreError;
 use crate::ThreadStoreFuture;
 use crate::ThreadStoreResult;
+use crate::ThreadTitleGenerator;
 use crate::UpdateThreadMetadataParams;
 use crate::error::reject_paginated_history_mode;
 use crate::types::canonical_history_mode_from_rollout_items;
@@ -443,6 +444,7 @@ impl InMemoryAppendBlocker {
 #[derive(Default)]
 pub struct InMemoryThreadStore {
     state: tokio::sync::Mutex<InMemoryThreadStoreState>,
+    title_generator: OnceLock<Arc<dyn ThreadTitleGenerator>>,
 }
 
 #[derive(Default)]
@@ -759,6 +761,14 @@ impl InMemoryThreadStore {
 impl ThreadStore for InMemoryThreadStore {
     fn as_any(&self) -> &dyn std::any::Any {
         self
+    }
+
+    fn set_title_generator(&self, generator: Arc<dyn ThreadTitleGenerator>) {
+        let _ = self.title_generator.set(generator);
+    }
+
+    fn title_generator(&self) -> Option<Arc<dyn ThreadTitleGenerator>> {
+        self.title_generator.get().cloned()
     }
 
     fn create_thread(&self, params: CreateThreadParams) -> ThreadStoreFuture<'_, ()> {

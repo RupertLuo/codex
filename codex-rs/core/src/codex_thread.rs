@@ -506,6 +506,7 @@ impl CodexThread {
         self.codex.session.token_usage_info().await
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) async fn direct_mutation_test_snapshot(&self) -> (usize, bool, bool) {
         let history_len = self.codex.session.clone_history().await.raw_items().len();
         let has_active_turn = self.codex.session.active_turn.lock().await.is_some();
@@ -518,6 +519,25 @@ impl CodexThread {
         (history_len, has_active_turn, has_pending_input)
     }
 
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) async fn conversation_history_for_test(&self) -> Vec<ResponseItem> {
+        self.codex
+            .session
+            .clone_history()
+            .await
+            .raw_items()
+            .to_vec()
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) async fn inject_no_new_turn_for_test(&self, items: Vec<ResponseItem>) {
+        self.codex
+            .session
+            .inject_no_new_turn(items, /*current_turn_context*/ None)
+            .await;
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) async fn clear_reference_context_item_for_direct_mutation_test(&self) {
         self.codex
             .session
@@ -541,6 +561,10 @@ impl CodexThread {
     }
 
     /// Record raw Responses API items without starting a new turn.
+    #[allow(
+        clippy::await_holding_invalid_type,
+        reason = "context preparation and durable-first history injection are one lifecycle-owned transaction with lifecycle-first lock order"
+    )]
     pub async fn inject_response_items(&self, items: Vec<ResponseItem>) -> CodexResult<()> {
         if items.is_empty() {
             return Err(CodexErr::InvalidRequest(
@@ -574,7 +598,8 @@ impl CodexThread {
         self.codex
             .session
             .inject_no_new_turn_with_guard(&lifecycle, items, Some(turn_context.as_ref()))
-            .await;
+            .await
+            .map_err(|err| CodexErr::Io(std::io::Error::other(err.to_string())))?;
         self.codex
             .session
             .flush_rollout_with_guard(&lifecycle)
@@ -633,6 +658,10 @@ impl CodexThread {
             .await
     }
 
+    #[allow(
+        clippy::await_holding_invalid_type,
+        reason = "the lifecycle capability intentionally remains held through the metadata store mutation and precedes store access"
+    )]
     pub async fn update_thread_metadata(
         &self,
         patch: ThreadMetadataPatch,
@@ -657,6 +686,10 @@ impl CodexThread {
     }
 
     /// Appends rollout items through the live thread so derived metadata stays in sync.
+    #[allow(
+        clippy::await_holding_invalid_type,
+        reason = "the lifecycle capability intentionally remains held through the rollout append and precedes store access"
+    )]
     pub async fn append_rollout_items(&self, items: &[RolloutItem]) -> ThreadStoreResult<()> {
         let _lifecycle = self
             .codex
