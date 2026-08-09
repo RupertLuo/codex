@@ -23,6 +23,7 @@ use codex_app_server_protocol::TurnStartResponse;
 use codex_app_server_protocol::UserInput as V2UserInput;
 use codex_core::test_support::all_model_presets;
 use codex_protocol::config_types::SERVICE_TIER_DEFAULT_REQUEST_VALUE;
+use codex_protocol::openai_models::ReasoningEffort;
 use core_test_support::responses;
 use pretty_assertions::assert_eq;
 use serde_json::Value;
@@ -318,6 +319,7 @@ async fn turn_start_settings_override_emits_thread_settings_updated() -> Result<
                 text_elements: Vec::new(),
             }],
             model: Some("mock-model-3".to_string()),
+            effort: Some(ReasoningEffort::XHigh),
             ..Default::default()
         })
         .await?;
@@ -332,6 +334,7 @@ async fn turn_start_settings_override_emits_thread_settings_updated() -> Result<
     let updated = read_thread_settings_updated(&mut mcp).await?;
     assert_eq!(updated.thread_id, thread.id);
     assert_eq!(updated.thread_settings.model, "mock-model-3");
+    assert_eq!(updated.thread_settings.effort, Some(ReasoningEffort::XHigh));
 
     timeout(
         DEFAULT_TIMEOUT,
