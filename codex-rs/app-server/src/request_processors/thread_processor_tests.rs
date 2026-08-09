@@ -186,6 +186,41 @@ mod thread_processor_behavior_tests {
     }
 
     #[test]
+    fn preview_from_transaction_only_rollout_uses_first_winning_user_message() {
+        use codex_protocol::models::ContentItem;
+        use codex_protocol::models::ResponseItem;
+        use codex_protocol::protocol::RolloutItem;
+        use codex_protocol::protocol::RolloutTransaction;
+
+        let user_item = |text: &str| {
+            RolloutItem::ResponseItem(ResponseItem::Message {
+                id: None,
+                role: "user".to_string(),
+                content: vec![ContentItem::InputText {
+                    text: text.to_string(),
+                }],
+                phase: None,
+                internal_chat_message_metadata_passthrough: None,
+            })
+        };
+        let items = vec![
+            RolloutItem::Transaction(RolloutTransaction {
+                transaction_id: "preview-transaction".to_string(),
+                items: vec![RolloutItem::Transaction(RolloutTransaction {
+                    transaction_id: "nested-preview".to_string(),
+                    items: vec![user_item("FIRST_WINNING_PREVIEW")],
+                })],
+            }),
+            RolloutItem::Transaction(RolloutTransaction {
+                transaction_id: "nested-preview".to_string(),
+                items: vec![user_item("LOSING_DUPLICATE_PREVIEW")],
+            }),
+        ];
+
+        assert_eq!(preview_from_rollout_items(&items), "FIRST_WINNING_PREVIEW");
+    }
+
+    #[test]
     fn validate_dynamic_tools_accepts_sanitizable_input_schema() {
         let tools = vec![dynamic_tool(
             /*namespace*/ None,

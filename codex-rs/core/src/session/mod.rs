@@ -134,6 +134,7 @@ use codex_protocol::protocol::TurnEnvironmentSelection;
 use codex_protocol::protocol::TurnEnvironmentSelections;
 use codex_protocol::protocol::W3cTraceContext;
 use codex_protocol::protocol::WorldStateItem;
+use codex_protocol::protocol::flatten_rollout_items;
 use codex_protocol::request_permissions::PermissionGrantScope;
 use codex_protocol::request_permissions::RequestPermissionProfile;
 use codex_protocol::request_permissions::RequestPermissionsArgs;
@@ -142,6 +143,8 @@ use codex_protocol::request_permissions::RequestPermissionsResponse;
 use codex_protocol::request_user_input::RequestUserInputArgs;
 use codex_protocol::request_user_input::RequestUserInputResponse;
 use codex_rmcp_client::ElicitationResponse;
+use codex_rollout::RolloutTransactionBuildError;
+use codex_rollout::build_rollout_transaction;
 use codex_rollout::state_db;
 use codex_rollout_trace::AgentResultTracePayload;
 use codex_rollout_trace::ThreadStartedTraceMetadata;
@@ -149,6 +152,7 @@ use codex_rollout_trace::ThreadTraceContext;
 use codex_sandboxing::policy_transforms::intersect_permission_profiles;
 use codex_shell_command::parse_command::parse_command;
 use codex_terminal_detection::user_agent;
+use codex_thread_store::AtomicAppendOutcome;
 use codex_thread_store::CompactionCheckpointAppendOutcome;
 use codex_thread_store::CreateThreadParams;
 use codex_thread_store::LiveThread;
@@ -499,6 +503,7 @@ pub(crate) const INITIAL_SUBMIT_ID: &str = "";
 pub(crate) const SUBMISSION_CHANNEL_CAPACITY: usize = 512;
 const CYBER_VERIFY_URL: &str = "https://chatgpt.com/cyber";
 const CYBER_SAFETY_URL: &str = "https://developers.openai.com/codex/concepts/cyber-safety";
+const ORDINARY_HISTORY_TRANSACTION_APPEND_ATTEMPTS: usize = 3;
 
 impl Codex {
     /// Spawn a new [`Codex`] and initialize the session.
@@ -1200,7 +1205,14 @@ impl Session {
         }
     }
 
-    fn quarantine_persistence(lifecycle: &mut PersistenceLifecycle, reason: String) {
+    pub(crate) async fn is_persistence_uncertain_fatal(&self, error: &CodexErr) -> bool {
+        let CodexErr::Fatal(reason) = error else {
+            return false;
+        };
+        self.persistence_quarantine_reason().await.as_deref() == Some(reason.as_str())
+    }
+
+    pub(crate) fn quarantine_persistence(lifecycle: &mut PersistenceLifecycle, reason: String) {
         if matches!(lifecycle, PersistenceLifecycle::Writable) {
             *lifecycle = PersistenceLifecycle::Quarantined(reason);
         }
@@ -1436,7 +1448,10 @@ impl Session {
         state.clear_connector_selection();
     }
 
-    async fn record_initial_history(&self, conversation_history: InitialHistory) {
+    async fn record_initial_history(
+        &self,
+        conversation_history: InitialHistory,
+    ) -> CodexResult<()> {
         let is_subagent = {
             let state = self.state.lock().await;
             state
@@ -1461,7 +1476,7 @@ impl Session {
                 let rollout_items = resumed_history.history;
                 let previous_turn_settings = self
                     .apply_rollout_reconstruction(&turn_context, &rollout_items)
-                    .await;
+                    .await?;
 
                 // If resuming, warn when the last recorded model differs from the current one.
                 let curr: &str = turn_context.model_info.slug.as_str();
@@ -1485,7 +1500,7 @@ impl Session {
 
                 // Seed usage info from the recorded rollout so UIs can show token counts
                 // immediately on resume/fork.
-                self.restore_resume_checkpoint_state(&rollout_items).await;
+                self.restore_resume_checkpoint_state(&rollout_items).await?;
 
                 // Defer seeding the session's initial context until the first turn starts so
                 // turn/start overrides can be merged before we write to the rollout.
@@ -1503,11 +1518,11 @@ impl Session {
                     }
                 }
                 self.apply_rollout_reconstruction(&turn_context, &rollout_items)
-                    .await;
+                    .await?;
 
                 // Seed usage info from the recorded rollout so UIs can show token counts
                 // immediately on resume/fork.
-                self.restore_resume_checkpoint_state(&rollout_items).await;
+                self.restore_resume_checkpoint_state(&rollout_items).await?;
 
                 // If persisting, persist all rollout items as-is (the store filters).
                 if !rollout_items.is_empty() {
@@ -1523,6 +1538,7 @@ impl Session {
                 }
             }
         }
+        Ok(())
     }
 
     #[instrument(
@@ -1537,7 +1553,7 @@ impl Session {
         &self,
         turn_context: &TurnContext,
         rollout_items: &[RolloutItem],
-    ) -> Option<PreviousTurnSettings> {
+    ) -> CodexResult<Option<PreviousTurnSettings>> {
         let rollout_reconstruction::RolloutReconstruction {
             mut history,
             previous_turn_settings,
@@ -1549,7 +1565,12 @@ impl Session {
             window_id,
         } = self
             .reconstruct_history_from_rollout(turn_context, rollout_items)
-            .await;
+            .await
+            .map_err(|err| {
+                CodexErr::Fatal(format!(
+                    "cannot resume or fork corrupt rollout transaction history: {err}"
+                ))
+            })?;
         // Keep the recorded rollout unchanged. Prepare its reconstructed history before
         // installing it, so legacy images are processed once for this resume or fork and
         // will be processed again if the rollout is reconstructed in a future session.
@@ -1587,7 +1608,7 @@ impl Session {
             self.set_auto_compact_window_estimated_prefill_for_scope(turn_context, prefix_tokens)
                 .await;
         }
-        previous_turn_settings
+        Ok(previous_turn_settings)
     }
 
     async fn set_auto_compact_window_estimated_prefill_for_scope(
@@ -1606,9 +1627,26 @@ impl Session {
         state.set_auto_compact_window_estimated_prefill(tokens);
     }
 
-    async fn restore_resume_checkpoint_state(&self, rollout_items: &[RolloutItem]) {
-        let token_count = Self::last_token_count_from_rollout(rollout_items);
-        let server_reasoning_included = rollout_items.iter().rev().find_map(|item| match item {
+    async fn restore_resume_checkpoint_state(
+        &self,
+        rollout_items: &[RolloutItem],
+    ) -> CodexResult<()> {
+        let logical_items = flatten_rollout_items(rollout_items)
+            .map_err(|err| {
+                CodexErr::Fatal(format!(
+                    "cannot restore checkpoint state from corrupt rollout transaction history: {err}"
+                ))
+            })?
+            .into_items();
+        let token_count = logical_items.iter().rev().find_map(|item| match *item {
+            RolloutItem::EventMsg(EventMsg::TokenCount(ev)) => Some(ev.clone()),
+            RolloutItem::Compacted(compacted) => compacted
+                .checkpoint
+                .as_ref()
+                .map(|checkpoint| checkpoint.final_token_count.clone()),
+            _ => None,
+        });
+        let server_reasoning_included = logical_items.iter().rev().find_map(|item| match *item {
             RolloutItem::Compacted(compacted) => compacted
                 .checkpoint
                 .as_ref()
@@ -1616,7 +1654,7 @@ impl Session {
             _ => None,
         });
         if token_count.is_none() && server_reasoning_included.is_none() {
-            return;
+            return Ok(());
         }
         let mut state = self.state.lock().await;
         if let Some(token_count) = token_count {
@@ -1626,17 +1664,7 @@ impl Session {
         if let Some(included) = server_reasoning_included {
             state.set_server_reasoning_included(included);
         }
-    }
-
-    fn last_token_count_from_rollout(rollout_items: &[RolloutItem]) -> Option<TokenCountEvent> {
-        rollout_items.iter().rev().find_map(|item| match item {
-            RolloutItem::EventMsg(EventMsg::TokenCount(ev)) => Some(ev.clone()),
-            RolloutItem::Compacted(compacted) => compacted
-                .checkpoint
-                .as_ref()
-                .map(|checkpoint| checkpoint.final_token_count.clone()),
-            _ => None,
-        })
+        Ok(())
     }
 
     async fn previous_turn_settings(&self) -> Option<PreviousTurnSettings> {
@@ -2158,23 +2186,12 @@ impl Session {
         self.deliver_event_raw(event).await;
     }
 
-    /// Persists one raw event before exposing it to live consumers.
-    ///
-    /// Unlike the ordinary best-effort sender, failure is returned and the event is not delivered.
-    /// Callers use this for lifecycle transitions whose live and cold-replay views must agree.
-    pub(crate) async fn try_send_event_raw_with_persistence_guard(
-        &self,
-        lifecycle: &tokio::sync::MutexGuard<'_, PersistenceLifecycle>,
-        event: Event,
-    ) -> codex_thread_store::ThreadStoreResult<()> {
-        let rollout_items = vec![RolloutItem::EventMsg(event.msg.clone())];
-        self.persist_rollout_items_with_guard(lifecycle, &rollout_items)
-            .await?;
+    /// Delivers an event already included in a committed stable-identity rollout transaction.
+    pub(crate) async fn deliver_persisted_event_raw(&self, event: Event) {
         self.services
             .rollout_thread_trace
             .record_protocol_event(&event.msg);
         self.deliver_event_raw(event).await;
-        Ok(())
     }
 
     async fn deliver_event_raw(&self, event: Event) {
@@ -3035,41 +3052,58 @@ impl Session {
         turn_context: &TurnContext,
         items: &[ResponseItem],
     ) {
-        let lifecycle = match self.acquire_persistence_side_effect().await {
-            Ok(lifecycle) => lifecycle,
-            Err(err) => {
-                error!("failed to record conversation items: {err:#}");
-                return;
-            }
-        };
         if let Err(err) = self
-            .try_record_conversation_items_with_guard(&lifecycle, turn_context, items)
+            .try_record_conversation_items(turn_context, items)
             .await
         {
             error!("failed to record conversation items: {err:#}");
         }
     }
 
-    pub(crate) async fn record_conversation_items_with_persistence_guard(
+    pub(crate) async fn try_record_conversation_items(
         &self,
-        lifecycle: &tokio::sync::MutexGuard<'_, PersistenceLifecycle>,
         turn_context: &TurnContext,
         items: &[ResponseItem],
-    ) {
-        if let Err(err) = self
-            .try_record_conversation_items_with_guard(lifecycle, turn_context, items)
+    ) -> codex_thread_store::ThreadStoreResult<()> {
+        let mut lifecycle = match self.acquire_persistence_side_effect().await {
+            Ok(lifecycle) => lifecycle,
+            Err(err) => {
+                return Err(codex_thread_store::ThreadStoreError::InvalidRequest {
+                    message: err.to_string(),
+                });
+            }
+        };
+        self.try_record_conversation_items_with_guard(&mut lifecycle, turn_context, items)
             .await
-        {
-            error!("failed to record conversation items: {err:#}");
-        }
     }
 
     async fn try_record_conversation_items_with_guard(
         &self,
-        lifecycle: &tokio::sync::MutexGuard<'_, PersistenceLifecycle>,
+        lifecycle: &mut tokio::sync::MutexGuard<'_, PersistenceLifecycle>,
         turn_context: &TurnContext,
         items: &[ResponseItem],
     ) -> codex_thread_store::ThreadStoreResult<()> {
+        self.try_record_conversation_items_with_guard_and_prefix(
+            lifecycle,
+            turn_context,
+            items,
+            &[],
+        )
+        .await
+    }
+
+    async fn try_record_conversation_items_with_guard_and_prefix(
+        &self,
+        lifecycle: &mut tokio::sync::MutexGuard<'_, PersistenceLifecycle>,
+        turn_context: &TurnContext,
+        items: &[ResponseItem],
+        transaction_prefix: &[RolloutItem],
+    ) -> codex_thread_store::ThreadStoreResult<()> {
+        if let PersistenceLifecycle::Quarantined(reason) = &**lifecycle {
+            return Err(codex_thread_store::ThreadStoreError::InvalidRequest {
+                message: reason.clone(),
+            });
+        }
         let items = self.prepare_conversation_items_for_history(turn_context, items);
         let items = items.as_ref();
         let raw_events = items
@@ -3077,11 +3111,81 @@ impl Session {
             .cloned()
             .map(|item| EventMsg::RawResponseItem(RawResponseItemEvent { item }))
             .collect::<Vec<_>>();
-        let mut rollout_items = Vec::with_capacity(items.len() + raw_events.len());
+        let mut rollout_items =
+            Vec::with_capacity(transaction_prefix.len() + items.len() + raw_events.len());
+        rollout_items.extend_from_slice(transaction_prefix);
         rollout_items.extend(items.iter().cloned().map(RolloutItem::ResponseItem));
         rollout_items.extend(raw_events.iter().cloned().map(RolloutItem::EventMsg));
-        self.persist_rollout_items_with_guard(lifecycle, &rollout_items)
-            .await?;
+        let transaction_id = Uuid::now_v7().to_string();
+        let transaction = match build_rollout_transaction(transaction_id.clone(), &rollout_items) {
+            Ok(RolloutItem::Transaction(transaction)) => Some(transaction),
+            Err(RolloutTransactionBuildError::EmptyTransaction) => None,
+            Err(err) => {
+                return Err(codex_thread_store::ThreadStoreError::InvalidRequest {
+                    message: format!("failed to build rollout transaction: {err}"),
+                });
+            }
+            Ok(_) => unreachable!("rollout transaction builder must return a transaction"),
+        };
+        if let Some(transaction) = transaction {
+            for attempt in 0..ORDINARY_HISTORY_TRANSACTION_APPEND_ATTEMPTS {
+                match self
+                    .persist_rollout_transaction_with_guard(lifecycle, &transaction)
+                    .await
+                {
+                    AtomicAppendOutcome::Committed => break,
+                    AtomicAppendOutcome::NotCommitted {
+                        append_error: _append_error,
+                    } if attempt + 1 < ORDINARY_HISTORY_TRANSACTION_APPEND_ATTEMPTS => {
+                        tokio::task::yield_now().await;
+                        continue;
+                    }
+                    AtomicAppendOutcome::NotCommitted { append_error } => {
+                        let quarantine_reason = format!(
+                            "thread is quarantined because ordinary history transaction \
+                             {transaction_id} could not be persisted after \
+                             {ORDINARY_HISTORY_TRANSACTION_APPEND_ATTEMPTS} attempts; restart or \
+                             reload the thread before continuing (last append error: \
+                             {append_error})"
+                        );
+                        self.quarantine_after_ordinary_history_failure(
+                            lifecycle,
+                            turn_context,
+                            quarantine_reason.clone(),
+                        )
+                        .await;
+                        return Err(codex_thread_store::ThreadStoreError::InvalidRequest {
+                            message: quarantine_reason,
+                        });
+                    }
+                    AtomicAppendOutcome::Ambiguous {
+                        append_error,
+                        reconciliation_errors,
+                    } => {
+                        let reconciliation_errors = reconciliation_errors
+                            .iter()
+                            .map(ToString::to_string)
+                            .collect::<Vec<_>>()
+                            .join("; ");
+                        let quarantine_reason = format!(
+                            "thread is quarantined because ordinary history transaction persistence \
+                         outcome is uncertain for transaction {transaction_id}; restart or reload \
+                         the thread before continuing (append error: {append_error}; \
+                         reconciliation errors: {reconciliation_errors})"
+                        );
+                        self.quarantine_after_ordinary_history_failure(
+                            lifecycle,
+                            turn_context,
+                            quarantine_reason.clone(),
+                        )
+                        .await;
+                        return Err(codex_thread_store::ThreadStoreError::InvalidRequest {
+                            message: quarantine_reason,
+                        });
+                    }
+                }
+            }
+        }
         {
             let mut state = self.state.lock().await;
             state.current_time_reminder.note_recorded_items(items);
@@ -3096,11 +3200,37 @@ impl Session {
         Ok(())
     }
 
+    async fn quarantine_after_ordinary_history_failure(
+        &self,
+        lifecycle: &mut tokio::sync::MutexGuard<'_, PersistenceLifecycle>,
+        turn_context: &TurnContext,
+        quarantine_reason: String,
+    ) {
+        Self::quarantine_persistence(lifecycle, quarantine_reason.clone());
+        self.cancel_active_task_for_persistence_quarantine(&turn_context.sub_id)
+            .await;
+        if let Err(err) =
+            crate::realtime_conversation::close_for_persistence_quarantine(self, lifecycle).await
+        {
+            warn!(
+                "failed to close realtime conversation during ordinary persistence quarantine: {err}"
+            );
+        }
+        self.deliver_persistence_quarantine_error(&turn_context.sub_id, quarantine_reason)
+            .await;
+    }
+
     pub(crate) async fn record_step_world_state_if_changed(
         &self,
         previous_world_state: &Arc<WorldState>,
         step_context: &step_context::StepContext,
-    ) -> Arc<WorldState> {
+    ) -> codex_thread_store::ThreadStoreResult<Arc<WorldState>> {
+        let mut lifecycle = self
+            .acquire_persistence_side_effect()
+            .await
+            .map_err(|err| codex_thread_store::ThreadStoreError::InvalidRequest {
+                message: err.to_string(),
+            })?;
         let turn_context = step_context.turn.as_ref();
         // Render model-visible state from the same step used to build and run tools.
         let world_state = Arc::new(self.build_world_state_for_step(step_context).await);
@@ -3114,7 +3244,17 @@ impl Session {
             world_state.render_diff(&previous_snapshot),
         );
         if !items.is_empty() {
-            self.record_conversation_items(turn_context, &items).await;
+            self.try_record_conversation_items_with_guard(&mut lifecycle, turn_context, &items)
+                .await?;
+        }
+        // Record the patch after the context it describes is durable, while retaining the same
+        // lifecycle capability across both writes and the final live baseline commit.
+        if let Some(world_state_item) = world_state_item {
+            self.persist_rollout_items_with_guard(
+                &lifecycle,
+                &[RolloutItem::WorldState(world_state_item)],
+            )
+            .await?;
         }
 
         // ContextManager remembers this for later turns; run_turn owns the live value.
@@ -3123,12 +3263,7 @@ impl Session {
             .await
             .history
             .set_world_state_baseline(world_state_snapshot);
-        // Record the patch after the context it describes is present in model history.
-        if let Some(world_state_item) = world_state_item {
-            self.persist_rollout_items(&[RolloutItem::WorldState(world_state_item)])
-                .await;
-        }
-        world_state
+        Ok(world_state)
     }
 
     /// Captures one request-scoped view of dynamic state.
@@ -3181,30 +3316,29 @@ impl Session {
         turn_context: &TurnContext,
         mut communication: InterAgentCommunication,
     ) {
+        let mut lifecycle = match self.acquire_persistence_side_effect().await {
+            Ok(lifecycle) => lifecycle,
+            Err(err) => {
+                error!("failed to record inter-agent communication: {err:#}");
+                return;
+            }
+        };
         communication.set_turn_id_if_missing(&turn_context.sub_id);
         let response_item = communication.to_model_input_item();
-        let items = self.prepare_conversation_items_for_history(
-            turn_context,
-            std::slice::from_ref(&response_item),
-        );
-        let items = items.as_ref();
-        let response_item = items[0].clone();
+        let transaction_prefix = [RolloutItem::InterAgentCommunicationMetadata {
+            trigger_turn: communication.trigger_turn,
+        }];
+        if let Err(err) = self
+            .try_record_conversation_items_with_guard_and_prefix(
+                &mut lifecycle,
+                turn_context,
+                std::slice::from_ref(&response_item),
+                &transaction_prefix,
+            )
+            .await
         {
-            let mut state = self.state.lock().await;
-            state.current_time_reminder.note_recorded_items(items);
-            state.record_items(
-                items.iter(),
-                turn_context.model_info.truncation_policy.into(),
-            );
+            error!("failed to record inter-agent communication: {err:#}");
         }
-        self.persist_rollout_items(&[
-            RolloutItem::InterAgentCommunicationMetadata {
-                trigger_turn: communication.trigger_turn,
-            },
-            RolloutItem::ResponseItem(response_item),
-        ])
-        .await;
-        self.send_raw_response_items(turn_context, items).await;
     }
 
     async fn maybe_warn_on_server_model_mismatch(
@@ -3496,7 +3630,7 @@ impl Session {
                     .await;
                 if let Err(err) = crate::realtime_conversation::close_for_persistence_quarantine(
                     self,
-                    &persistence_lifecycle,
+                    &mut persistence_lifecycle,
                 )
                 .await
                 {
@@ -3611,17 +3745,6 @@ impl Session {
         self.set_multi_agent_version_if_unset(selected)
     }
 
-    #[tracing::instrument(level = "trace", skip_all, fields(item_count = items.len()))]
-    async fn send_raw_response_items(&self, turn_context: &TurnContext, items: &[ResponseItem]) {
-        for item in items {
-            self.send_event(
-                turn_context,
-                EventMsg::RawResponseItem(RawResponseItemEvent { item: item.clone() }),
-            )
-            .await;
-        }
-    }
-
     async fn build_turn_context_contribution_items(
         &self,
         turn_context: &TurnContext,
@@ -3679,8 +3802,14 @@ impl Session {
         world_state: &WorldState,
     ) -> Vec<ResponseItem> {
         let mcp = self.services.latest_mcp_runtime();
-        self.build_initial_context_with_world_state_and_mcp(turn_context, world_state, &mcp, None)
-            .await
+        self.build_initial_context_with_world_state_and_mcp(
+            turn_context,
+            world_state,
+            &mcp,
+            None,
+            /*lifecycle*/ None,
+        )
+        .await
     }
 
     pub(crate) async fn build_initial_context_with_world_state_for_window(
@@ -3695,6 +3824,7 @@ impl Session {
             world_state,
             &mcp,
             Some(window_ids),
+            /*lifecycle*/ None,
         )
         .await
     }
@@ -3705,6 +3835,7 @@ impl Session {
         world_state: &WorldState,
         mcp: &McpRuntimeSnapshot,
         auto_compact_window_ids_override: Option<AutoCompactWindowIds>,
+        lifecycle: Option<&tokio::sync::MutexGuard<'_, PersistenceLifecycle>>,
     ) -> Vec<ResponseItem> {
         let mut developer_sections = Vec::<String>::with_capacity(8);
         let mut contextual_user_sections = Vec::<String>::with_capacity(2);
@@ -3825,13 +3956,18 @@ impl Session {
                     turn_context.model_info.include_skills_usage_instructions,
                 );
                 if let Some(warning_message) = warning_message {
-                    self.send_event_raw(Event {
+                    let event = Event {
                         id: String::new(),
                         msg: EventMsg::Warning(WarningEvent {
                             message: warning_message,
                         }),
-                    })
-                    .await;
+                    };
+                    if let Some(lifecycle) = lifecycle {
+                        self.send_event_raw_with_persistence_guard(lifecycle, event)
+                            .await;
+                    } else {
+                        self.send_event_raw(event).await;
+                    }
                 }
                 developer_sections.push(skills_instructions.render());
             }
@@ -4049,13 +4185,29 @@ impl Session {
 
     async fn persist_rollout_items_with_guard(
         &self,
-        _lifecycle: &tokio::sync::MutexGuard<'_, PersistenceLifecycle>,
+        lifecycle: &tokio::sync::MutexGuard<'_, PersistenceLifecycle>,
         items: &[RolloutItem],
     ) -> codex_thread_store::ThreadStoreResult<()> {
+        if let PersistenceLifecycle::Quarantined(reason) = &**lifecycle {
+            return Err(codex_thread_store::ThreadStoreError::InvalidRequest {
+                message: reason.clone(),
+            });
+        }
         let Some(live_thread) = self.live_thread() else {
             return Ok(());
         };
         live_thread.append_items(items).await
+    }
+
+    pub(crate) async fn persist_rollout_transaction_with_guard(
+        &self,
+        _lifecycle: &tokio::sync::MutexGuard<'_, PersistenceLifecycle>,
+        transaction: &codex_protocol::protocol::RolloutTransaction,
+    ) -> AtomicAppendOutcome {
+        let Some(live_thread) = self.live_thread() else {
+            return AtomicAppendOutcome::Committed;
+        };
+        live_thread.append_transaction(transaction).await
     }
 
     async fn persist_compaction_checkpoint(
@@ -4174,30 +4326,60 @@ impl Session {
         &self,
         step_context: &StepContext,
     ) -> Arc<WorldState> {
-        self.record_context_updates_and_set_reference_context_item_impl(
-            step_context,
-            /*lifecycle*/ None,
-        )
-        .await
+        let mut lifecycle = match self.acquire_persistence_side_effect().await {
+            Ok(lifecycle) => lifecycle,
+            Err(err) => {
+                error!("failed to acquire context-update persistence gate: {err:#}");
+                return Arc::new(self.build_world_state_for_step(step_context).await);
+            }
+        };
+        let (world_state, result) = self
+            .record_context_updates_and_set_reference_context_item_impl(
+                step_context,
+                &mut lifecycle,
+            )
+            .await;
+        if let Err(err) = result {
+            error!("failed to record context updates: {err:#}");
+        }
+        world_state
+    }
+
+    pub(crate) async fn try_record_context_updates_and_set_reference_context_item(
+        &self,
+        step_context: &StepContext,
+    ) -> codex_thread_store::ThreadStoreResult<Arc<WorldState>> {
+        let mut lifecycle = self
+            .acquire_persistence_side_effect()
+            .await
+            .map_err(|err| codex_thread_store::ThreadStoreError::InvalidRequest {
+                message: err.to_string(),
+            })?;
+        let (world_state, result) = self
+            .record_context_updates_and_set_reference_context_item_impl(
+                step_context,
+                &mut lifecycle,
+            )
+            .await;
+        result.map(|()| world_state)
     }
 
     pub(crate) async fn record_context_updates_and_set_reference_context_item_with_guard(
         &self,
-        lifecycle: &tokio::sync::MutexGuard<'_, PersistenceLifecycle>,
+        lifecycle: &mut tokio::sync::MutexGuard<'_, PersistenceLifecycle>,
         step_context: &StepContext,
-    ) -> Arc<WorldState> {
-        self.record_context_updates_and_set_reference_context_item_impl(
-            step_context,
-            Some(lifecycle),
-        )
-        .await
+    ) -> codex_thread_store::ThreadStoreResult<Arc<WorldState>> {
+        let (world_state, result) = self
+            .record_context_updates_and_set_reference_context_item_impl(step_context, lifecycle)
+            .await;
+        result.map(|()| world_state)
     }
 
     async fn record_context_updates_and_set_reference_context_item_impl(
         &self,
         step_context: &StepContext,
-        lifecycle: Option<&tokio::sync::MutexGuard<'_, PersistenceLifecycle>>,
-    ) -> Arc<WorldState> {
+        lifecycle: &mut tokio::sync::MutexGuard<'_, PersistenceLifecycle>,
+    ) -> (Arc<WorldState>, codex_thread_store::ThreadStoreResult<()>) {
         let turn_context = step_context.turn.as_ref();
         let reference_context_item = {
             let state = self.state.lock().await;
@@ -4207,6 +4389,7 @@ impl Session {
         let turn_context_changed = reference_context_item.as_ref() != Some(&turn_context_item);
         let should_inject_full_context = reference_context_item.is_none();
         let world_state = Arc::new(self.build_world_state_for_step(step_context).await);
+        let world_state_snapshot = world_state.snapshot();
         // Full initial context resets the baseline; later turns persist only its changes.
         let (mut context_items, world_state_item) = if should_inject_full_context {
             let context_items = self
@@ -4215,17 +4398,14 @@ impl Session {
                     world_state.as_ref(),
                     step_context.mcp.as_ref(),
                     None,
+                    Some(&*lifecycle),
                 )
                 .await;
-            let snapshot = world_state.snapshot();
-            self.state
-                .lock()
-                .await
-                .history
-                .set_world_state_baseline(snapshot.clone());
             (
                 context_items,
-                Some(WorldStateItem::full(snapshot.into_value())),
+                Some(WorldStateItem::full(
+                    world_state_snapshot.clone().into_value(),
+                )),
             )
         } else {
             // Steady-state path: append only built-in context diffs here; turn-scoped extension
@@ -4234,9 +4414,10 @@ impl Session {
                 .build_settings_update_items(reference_context_item.as_ref(), turn_context)
                 .await;
             let (world_state_items, world_state_item) = {
-                let mut state = self.state.lock().await;
-                let (fragments, rollout_item) =
-                    state.history.update_world_state(world_state.as_ref());
+                let state = self.state.lock().await;
+                let (fragments, rollout_item) = state
+                    .history
+                    .preview_world_state_update(world_state.as_ref());
                 (
                     crate::context_manager::updates::merge_contextual_fragments(fragments),
                     rollout_item,
@@ -4254,58 +4435,50 @@ impl Session {
         // A snapshot can change without producing model-visible or TurnContext updates.
         let only_world_state_changed = !turn_context_changed && context_items.is_empty();
         if only_world_state_changed && world_state_item.is_none() {
-            return world_state;
+            return (world_state, Ok(()));
         }
-        if !context_items.is_empty() {
-            if let Some(lifecycle) = lifecycle {
-                self.record_conversation_items_with_persistence_guard(
-                    lifecycle,
-                    turn_context,
-                    &context_items,
-                )
-                .await;
-            } else {
-                self.record_conversation_items(turn_context, &context_items)
-                    .await;
-            }
+        if !context_items.is_empty()
+            && let Err(err) = self
+                .try_record_conversation_items_with_guard(lifecycle, turn_context, &context_items)
+                .await
+        {
+            return (world_state, Err(err));
         }
         // Persist state only after any model-visible context generated from it.
         if let Some(world_state_item) = world_state_item {
             let items = [RolloutItem::WorldState(world_state_item)];
-            if let Some(lifecycle) = lifecycle {
-                if let Err(err) = self
-                    .persist_rollout_items_with_guard(lifecycle, &items)
-                    .await
-                {
-                    error!("failed to record rollout items: {err:#}");
-                }
-            } else {
-                self.persist_rollout_items(&items).await;
-            }
-        }
-        // A snapshot-only change does not require a duplicate TurnContext record.
-        if only_world_state_changed {
-            return world_state;
-        }
-        // Persist one `TurnContextItem` per real user turn so resume/lazy replay can recover the
-        // latest durable baseline even when this turn emitted no model-visible context diffs.
-        let items = [RolloutItem::TurnContext(turn_context_item.clone())];
-        if let Some(lifecycle) = lifecycle {
             if let Err(err) = self
                 .persist_rollout_items_with_guard(lifecycle, &items)
                 .await
             {
-                error!("failed to record rollout items: {err:#}");
+                return (world_state, Err(err));
             }
-        } else {
-            self.persist_rollout_items(&items).await;
+        }
+        // A snapshot-only change does not require a duplicate TurnContext record.
+        if only_world_state_changed {
+            self.state
+                .lock()
+                .await
+                .history
+                .set_world_state_baseline(world_state_snapshot);
+            return (world_state, Ok(()));
+        }
+        // Persist one `TurnContextItem` per real user turn so resume/lazy replay can recover the
+        // latest durable baseline even when this turn emitted no model-visible context diffs.
+        let items = [RolloutItem::TurnContext(turn_context_item.clone())];
+        if let Err(err) = self
+            .persist_rollout_items_with_guard(lifecycle, &items)
+            .await
+        {
+            return (world_state, Err(err));
         }
 
         // Advance the persisted-settings baseline even when this turn emitted no model-visible
         // context items.
         let mut state = self.state.lock().await;
         state.set_reference_context_item(Some(turn_context_item));
-        world_state
+        state.history.set_world_state_baseline(world_state_snapshot);
+        (world_state, Ok(()))
     }
 
     pub(crate) async fn record_token_usage_info(
@@ -4461,8 +4634,13 @@ impl Session {
         response_item: ResponseItem,
     ) {
         // Add to conversation history and persist response item to rollout.
-        self.record_conversation_items(turn_context, std::slice::from_ref(&response_item))
-            .await;
+        if let Err(err) = self
+            .try_record_conversation_items(turn_context, std::slice::from_ref(&response_item))
+            .await
+        {
+            error!("failed to record response item before emitting turn item: {err:#}");
+            return;
+        }
 
         // Derive a turn item and emit lifecycle events if applicable.
         if let Some(item) = parse_turn_item(&response_item) {
@@ -4481,8 +4659,13 @@ impl Session {
         // UI-only `text_elements` are preserved. `ResponseItem::Message` does not carry
         // those spans, and `record_response_item_and_emit_turn_item` would drop them.
         let response_item = self.response_item_from_user_input(input.to_vec());
-        self.record_conversation_items(turn_context, std::slice::from_ref(&response_item))
-            .await;
+        if let Err(err) = self
+            .try_record_conversation_items(turn_context, std::slice::from_ref(&response_item))
+            .await
+        {
+            error!("failed to record user prompt before emitting turn item: {err:#}");
+            return;
+        }
         let mut user_message_item = UserMessageItem::new(input);
         user_message_item.client_id = client_id;
         let turn_item = TurnItem::UserMessage(user_message_item);

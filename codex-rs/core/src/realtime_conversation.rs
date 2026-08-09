@@ -50,6 +50,9 @@ use codex_protocol::protocol::RealtimeHandoffRequested;
 use codex_protocol::protocol::RealtimeOutputModality;
 use codex_protocol::protocol::RealtimeVoice;
 use codex_protocol::protocol::RealtimeVoicesList;
+use codex_protocol::protocol::RolloutItem;
+use codex_rollout::build_rollout_transaction;
+use codex_thread_store::AtomicAppendOutcome;
 use http::HeaderMap;
 use http::HeaderValue;
 use http::header::AUTHORIZATION;
@@ -65,6 +68,7 @@ use tracing::debug;
 use tracing::error;
 use tracing::info;
 use tracing::warn;
+use uuid::Uuid;
 
 const AUDIO_IN_QUEUE_CAPACITY: usize = 256;
 const TEXT_IN_QUEUE_CAPACITY: usize = 64;
@@ -82,6 +86,7 @@ const REALTIME_V2_STEER_ACKNOWLEDGEMENT: &str =
     "This was sent to steer the previous background agent task.";
 const REALTIME_ACTIVE_RESPONSE_ERROR_PREFIX: &str =
     "Conversation already has an active response in progress:";
+const PERSISTENCE_QUARANTINE_CLOSE_APPEND_ATTEMPTS: usize = 3;
 
 /// Instance-scoped synchronization used by realtime lifecycle integration tests.
 #[derive(Clone, Debug)]
@@ -451,6 +456,7 @@ impl ManagedConversationState {
 
 struct RealtimeClosingState {
     token: u64,
+    transaction_id: String,
     sub_id: String,
     end: RealtimeConversationEnd,
     realtime_active: Arc<AtomicBool>,
@@ -459,8 +465,12 @@ struct RealtimeClosingState {
 
 struct RealtimeCloseClaim {
     token: u64,
+    transaction_id: String,
     sub_id: String,
+    /// The persisted reason belongs to the first close winner, while a later quarantine caller
+    /// may upgrade the retry/retention policy for that same stable transaction.
     end: RealtimeConversationEnd,
+    quarantine_policy: bool,
     conversation: Option<ConversationState>,
 }
 
@@ -504,6 +514,14 @@ impl RealtimeConversationManager {
             .as_ref()
             .and_then(ManagedConversationState::active)
             .and_then(|state| state.realtime_active.load(Ordering::Relaxed).then_some(()))
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) async fn close_pending_for_test(&self) -> bool {
+        matches!(
+            self.state.lock().await.as_ref(),
+            Some(ManagedConversationState::Closing(_))
+        )
     }
 
     pub(crate) async fn is_running_v2(&self) -> bool {
@@ -690,10 +708,12 @@ impl RealtimeConversationManager {
                 unreachable!("active close target must remain active while manager is locked");
             };
             let token = self.next_close_token.fetch_add(1, Ordering::Relaxed);
+            let transaction_id = Uuid::now_v7().to_string();
             let sub_id = event_sub_id.unwrap_or(&state.sub_id).to_string();
             let realtime_active = Arc::clone(&state.realtime_active);
             *guard = Some(ManagedConversationState::Closing(RealtimeClosingState {
                 token,
+                transaction_id: transaction_id.clone(),
                 sub_id: sub_id.clone(),
                 end,
                 realtime_active,
@@ -701,8 +721,10 @@ impl RealtimeConversationManager {
             }));
             return Some(RealtimeCloseClaim {
                 token,
+                transaction_id,
                 sub_id,
                 end,
+                quarantine_policy: end == RealtimeConversationEnd::PersistenceQuarantine,
                 conversation: Some(state),
             });
         }
@@ -716,8 +738,10 @@ impl RealtimeConversationManager {
         closing.in_progress = true;
         Some(RealtimeCloseClaim {
             token: closing.token,
+            transaction_id: closing.transaction_id.clone(),
             sub_id: closing.sub_id.clone(),
             end: closing.end,
+            quarantine_policy: end == RealtimeConversationEnd::PersistenceQuarantine,
             conversation: None,
         })
     }
@@ -1437,10 +1461,10 @@ async fn handle_start_inner(
                 hook.pause_close_before_gate_if_requested().await;
             }
             match sess_clone.acquire_persistence_side_effect().await {
-                Ok(lifecycle) => {
+                Ok(mut lifecycle) => {
                     if let Err(err) = close_realtime_conversation_with_guard(
                         &sess_clone,
-                        &lifecycle,
+                        &mut lifecycle,
                         RealtimeCloseTarget::Expected(&fanout_realtime_active),
                         Some(&sub_id),
                         end,
@@ -1621,13 +1645,13 @@ pub(crate) async fn handle_close(sess: &Arc<Session>, sub_id: String) -> CodexRe
     if let Some(hook) = sess.services.realtime_start_test_hook.as_ref() {
         hook.pause_close_before_gate_if_requested().await;
     }
-    let lifecycle = sess
+    let mut lifecycle = sess
         .acquire_persistence_side_effect()
         .await
         .map_err(|err| CodexErr::InvalidRequest(err.to_string()))?;
     close_realtime_conversation_with_guard(
         sess,
-        &lifecycle,
+        &mut lifecycle,
         RealtimeCloseTarget::Current,
         Some(&sub_id),
         RealtimeConversationEnd::Requested,
@@ -2163,7 +2187,7 @@ async fn send_conversation_error(
 
 async fn close_realtime_conversation_with_guard(
     sess: &Session,
-    lifecycle: &tokio::sync::MutexGuard<'_, crate::session::session::PersistenceLifecycle>,
+    lifecycle: &mut tokio::sync::MutexGuard<'_, crate::session::session::PersistenceLifecycle>,
     target: RealtimeCloseTarget<'_>,
     event_sub_id: Option<&str>,
     end: RealtimeConversationEnd,
@@ -2184,27 +2208,94 @@ async fn close_realtime_conversation_with_guard(
     }
 
     let event = Event {
-        id: claim.sub_id,
+        id: claim.sub_id.clone(),
         msg: EventMsg::RealtimeConversationClosed(RealtimeConversationClosedEvent {
             reason: Some(realtime_close_reason(claim.end).to_string()),
         }),
     };
-    if let Err(err) = sess
-        .try_send_event_raw_with_persistence_guard(lifecycle, event)
-        .await
-    {
-        sess.conversation.release_close_for_retry(claim.token).await;
-        return Err(CodexErr::Io(std::io::Error::other(format!(
-            "failed to persist realtime Closed event: {err}"
-        ))));
+    let transaction = match build_rollout_transaction(
+        claim.transaction_id.clone(),
+        &[RolloutItem::EventMsg(event.msg.clone())],
+    ) {
+        Ok(RolloutItem::Transaction(transaction)) => transaction,
+        Ok(_) => unreachable!("rollout transaction builder must return a transaction"),
+        Err(err) => {
+            if !claim.quarantine_policy {
+                sess.conversation.release_close_for_retry(claim.token).await;
+            }
+            return Err(CodexErr::InvalidRequest(format!(
+                "failed to build realtime close transaction: {err}"
+            )));
+        }
+    };
+    let append_attempts = if claim.quarantine_policy {
+        PERSISTENCE_QUARANTINE_CLOSE_APPEND_ATTEMPTS
+    } else {
+        1
+    };
+    for attempt in 0..append_attempts {
+        match sess
+            .persist_rollout_transaction_with_guard(lifecycle, &transaction)
+            .await
+        {
+            AtomicAppendOutcome::Committed => {
+                sess.deliver_persisted_event_raw(event).await;
+                sess.conversation.complete_close(claim.token).await;
+                return Ok(());
+            }
+            AtomicAppendOutcome::NotCommitted { append_error } => {
+                if attempt + 1 < append_attempts {
+                    tokio::task::yield_now().await;
+                    continue;
+                }
+                if !claim.quarantine_policy {
+                    sess.conversation.release_close_for_retry(claim.token).await;
+                }
+                return Err(CodexErr::Io(std::io::Error::other(format!(
+                    "failed to persist realtime Closed event after {append_attempts} attempt(s): \
+                     {append_error}"
+                ))));
+            }
+            AtomicAppendOutcome::Ambiguous {
+                append_error,
+                reconciliation_errors,
+            } => {
+                let reconciliation_errors = reconciliation_errors
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                let quarantine_reason = format!(
+                    "thread is quarantined because realtime close persistence outcome is \
+                     uncertain for transaction {}; restart or reload the thread before \
+                     continuing (append error: {append_error}; reconciliation errors: \
+                     {reconciliation_errors})",
+                    claim.transaction_id
+                );
+                let transitioned_to_quarantine = matches!(
+                    &**lifecycle,
+                    crate::session::session::PersistenceLifecycle::Writable
+                );
+                Session::quarantine_persistence(lifecycle, quarantine_reason.clone());
+                sess.cancel_active_task_for_persistence_quarantine(&claim.sub_id)
+                    .await;
+                if transitioned_to_quarantine {
+                    sess.deliver_persistence_quarantine_error(
+                        &claim.sub_id,
+                        quarantine_reason.clone(),
+                    )
+                    .await;
+                }
+                return Err(CodexErr::Fatal(quarantine_reason));
+            }
+        }
     }
-    sess.conversation.complete_close(claim.token).await;
-    Ok(())
+    unreachable!("realtime close append attempts must be non-zero")
 }
 
 pub(crate) async fn close_for_persistence_quarantine(
     sess: &Session,
-    lifecycle: &tokio::sync::MutexGuard<'_, crate::session::session::PersistenceLifecycle>,
+    lifecycle: &mut tokio::sync::MutexGuard<'_, crate::session::session::PersistenceLifecycle>,
 ) -> CodexResult<()> {
     close_realtime_conversation_with_guard(
         sess,

@@ -2066,16 +2066,24 @@ async fn resume_candidate_matches_cwd(
     }
 
     if let Ok((items, _, _)) = RolloutRecorder::load_rollout_items(rollout_path).await
-        && let Some(latest_turn_context_cwd) = items.iter().rev().find_map(|item| match item {
-            RolloutItem::TurnContext(turn_context) => Some(&turn_context.cwd),
-            RolloutItem::SessionMeta(_)
-            | RolloutItem::ResponseItem(_)
-            | RolloutItem::InterAgentCommunication(_)
-            | RolloutItem::InterAgentCommunicationMetadata { .. }
-            | RolloutItem::Compacted(_)
-            | RolloutItem::WorldState(_)
-            | RolloutItem::EventMsg(_) => None,
-        })
+        && let Ok(flattened) = codex_protocol::protocol::flatten_rollout_items(&items)
+        && let Some(latest_turn_context_cwd) =
+            flattened
+                .items()
+                .iter()
+                .rev()
+                .copied()
+                .find_map(|item| match item {
+                    RolloutItem::TurnContext(turn_context) => Some(&turn_context.cwd),
+                    RolloutItem::SessionMeta(_)
+                    | RolloutItem::ResponseItem(_)
+                    | RolloutItem::InterAgentCommunication(_)
+                    | RolloutItem::InterAgentCommunicationMetadata { .. }
+                    | RolloutItem::Compacted(_)
+                    | RolloutItem::WorldState(_)
+                    | RolloutItem::Transaction(_)
+                    | RolloutItem::EventMsg(_) => None,
+                })
     {
         return cwd_matches(latest_turn_context_cwd.as_path(), cwd);
     }

@@ -14,6 +14,7 @@ use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::SandboxPolicy;
 use codex_protocol::protocol::SessionMetaLine;
 use codex_protocol::protocol::SessionSource;
+use codex_protocol::protocol::flatten_rollout_items;
 use codex_state::BackfillState;
 use codex_state::BackfillStats;
 use codex_state::BackfillStatus;
@@ -66,16 +67,29 @@ pub fn builder_from_items(
     items: &[RolloutItem],
     rollout_path: &Path,
 ) -> Option<ThreadMetadataBuilder> {
-    if let Some(session_meta) = items.iter().find_map(|item| match item {
-        RolloutItem::SessionMeta(meta_line) => Some(meta_line),
-        RolloutItem::ResponseItem(_)
-        | RolloutItem::InterAgentCommunication(_)
-        | RolloutItem::InterAgentCommunicationMetadata { .. }
-        | RolloutItem::Compacted(_)
-        | RolloutItem::TurnContext(_)
-        | RolloutItem::WorldState(_)
-        | RolloutItem::EventMsg(_) => None,
-    }) && let Some(builder) = builder_from_session_meta(session_meta, rollout_path)
+    let flattened = match flatten_rollout_items(items) {
+        Ok(flattened) => flattened,
+        Err(err) => {
+            warn!(%err, "failed to traverse rollout history for metadata builder");
+            return None;
+        }
+    };
+    if let Some(session_meta) = flattened
+        .items()
+        .iter()
+        .copied()
+        .find_map(|item| match item {
+            RolloutItem::SessionMeta(meta_line) => Some(meta_line),
+            RolloutItem::ResponseItem(_)
+            | RolloutItem::InterAgentCommunication(_)
+            | RolloutItem::InterAgentCommunicationMetadata { .. }
+            | RolloutItem::Compacted(_)
+            | RolloutItem::TurnContext(_)
+            | RolloutItem::WorldState(_)
+            | RolloutItem::Transaction(_)
+            | RolloutItem::EventMsg(_) => None,
+        })
+        && let Some(builder) = builder_from_session_meta(session_meta, rollout_path)
     {
         return Some(builder);
     }
@@ -106,6 +120,12 @@ pub async fn extract_metadata_from_rollout(
             rollout_path.display()
         ));
     }
+    let flattened = flatten_rollout_items(items.as_slice()).map_err(|err| {
+        anyhow::anyhow!(
+            "failed to traverse rollout history in {}: {err}",
+            rollout_path.display()
+        )
+    })?;
     let builder = builder_from_items(items.as_slice(), rollout_path).ok_or_else(|| {
         anyhow::anyhow!(
             "rollout missing metadata builder: {}",
@@ -113,7 +133,7 @@ pub async fn extract_metadata_from_rollout(
         )
     })?;
     let mut metadata = builder.build(default_provider);
-    for item in &items {
+    for item in flattened.items() {
         apply_rollout_item(&mut metadata, item, default_provider);
     }
     if let Some(updated_at) = file_modified_time_utc(rollout_path).await {
@@ -122,16 +142,22 @@ pub async fn extract_metadata_from_rollout(
     }
     Ok(ExtractionOutcome {
         metadata,
-        memory_mode: items.iter().rev().find_map(|item| match item {
-            RolloutItem::SessionMeta(meta_line) => meta_line.meta.memory_mode.clone(),
-            RolloutItem::ResponseItem(_)
-            | RolloutItem::InterAgentCommunication(_)
-            | RolloutItem::InterAgentCommunicationMetadata { .. }
-            | RolloutItem::Compacted(_)
-            | RolloutItem::TurnContext(_)
-            | RolloutItem::WorldState(_)
-            | RolloutItem::EventMsg(_) => None,
-        }),
+        memory_mode: flattened
+            .items()
+            .iter()
+            .rev()
+            .copied()
+            .find_map(|item| match item {
+                RolloutItem::SessionMeta(meta_line) => meta_line.meta.memory_mode.clone(),
+                RolloutItem::ResponseItem(_)
+                | RolloutItem::InterAgentCommunication(_)
+                | RolloutItem::InterAgentCommunicationMetadata { .. }
+                | RolloutItem::Compacted(_)
+                | RolloutItem::TurnContext(_)
+                | RolloutItem::WorldState(_)
+                | RolloutItem::Transaction(_)
+                | RolloutItem::EventMsg(_) => None,
+            }),
         parse_errors,
     })
 }

@@ -4417,8 +4417,17 @@ fn summary_from_thread_metadata(metadata: &ThreadMetadata) -> ConversationSummar
 }
 
 fn preview_from_rollout_items(items: &[RolloutItem]) -> String {
-    items
+    let flattened = match codex_protocol::protocol::flatten_rollout_items(items) {
+        Ok(flattened) => flattened,
+        Err(err) => {
+            warn!("failed to build thread preview from rollout history: {err}");
+            return String::new();
+        }
+    };
+    flattened
+        .items()
         .iter()
+        .copied()
         .find_map(|item| match item {
             RolloutItem::ResponseItem(item) => match codex_core::parse_turn_item(item) {
                 Some(codex_protocol::items::TurnItem::UserMessage(user)) => Some(user.message()),

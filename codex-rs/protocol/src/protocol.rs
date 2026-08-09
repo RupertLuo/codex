@@ -5,6 +5,7 @@
 
 use std::collections::BTreeMap;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::fmt;
 use std::ops::Mul;
 use std::path::Path;
@@ -2522,26 +2523,26 @@ pub enum InitialHistory {
 
 impl InitialHistory {
     pub fn scan_rollout_items(&self, mut predicate: impl FnMut(&RolloutItem) -> bool) -> bool {
-        match self {
-            InitialHistory::New | InitialHistory::Cleared => false,
-            InitialHistory::Resumed(resumed) => resumed.history.iter().any(&mut predicate),
-            InitialHistory::Forked(items) => items.iter().any(predicate),
-        }
+        self.logical_rollout_items()
+            .is_some_and(|items| items.items().iter().copied().any(&mut predicate))
     }
 
     pub fn forked_from_id(&self) -> Option<ThreadId> {
+        let items = self.logical_rollout_items()?;
         match self {
             InitialHistory::New | InitialHistory::Cleared => None,
-            InitialHistory::Resumed(resumed) => {
-                resumed.history.iter().find_map(|item| match item {
+            InitialHistory::Resumed(_) => {
+                items.items().iter().copied().find_map(|item| match item {
                     RolloutItem::SessionMeta(meta_line) => meta_line.meta.forked_from_id,
                     _ => None,
                 })
             }
-            InitialHistory::Forked(items) => items.iter().find_map(|item| match item {
-                RolloutItem::SessionMeta(meta_line) => Some(meta_line.meta.id),
-                _ => None,
-            }),
+            InitialHistory::Forked(_) => {
+                items.items().iter().copied().find_map(|item| match item {
+                    RolloutItem::SessionMeta(meta_line) => Some(meta_line.meta.id),
+                    _ => None,
+                })
+            }
         }
     }
 
@@ -2564,21 +2565,16 @@ impl InitialHistory {
     pub fn get_event_msgs(&self) -> Option<Vec<EventMsg>> {
         match self {
             InitialHistory::New | InitialHistory::Cleared => None,
-            InitialHistory::Resumed(resumed) => Some(
-                resumed
-                    .history
+            InitialHistory::Resumed(_) | InitialHistory::Forked(_) => Some(
+                self.logical_rollout_items()?
+                    .items()
                     .iter()
-                    .filter_map(|ri| match ri {
-                        RolloutItem::EventMsg(ev) => Some(ev.clone()),
-                        _ => None,
-                    })
-                    .collect(),
-            ),
-            InitialHistory::Forked(items) => Some(
-                items
-                    .iter()
-                    .filter_map(|ri| match ri {
-                        RolloutItem::EventMsg(ev) => Some(ev.clone()),
+                    .copied()
+                    .filter_map(|item| match item {
+                        // RawResponseItem is the durable companion for model history, not a
+                        // legacy client event to replay through SessionConfigured.initial_messages.
+                        RolloutItem::EventMsg(EventMsg::RawResponseItem(_)) => None,
+                        RolloutItem::EventMsg(event) => Some(event.clone()),
                         _ => None,
                     })
                     .collect(),
@@ -2588,35 +2584,25 @@ impl InitialHistory {
 
     pub fn get_base_instructions(&self) -> Option<BaseInstructions> {
         // TODO: SessionMeta should (in theory) always be first in the history, so we can probably only check the first item?
-        match self {
-            InitialHistory::New | InitialHistory::Cleared => None,
-            InitialHistory::Resumed(resumed) => {
-                resumed.history.iter().find_map(|item| match item {
-                    RolloutItem::SessionMeta(meta_line) => meta_line.meta.base_instructions.clone(),
-                    _ => None,
-                })
-            }
-            InitialHistory::Forked(items) => items.iter().find_map(|item| match item {
+        self.logical_rollout_items()?
+            .items()
+            .iter()
+            .copied()
+            .find_map(|item| match item {
                 RolloutItem::SessionMeta(meta_line) => meta_line.meta.base_instructions.clone(),
                 _ => None,
-            }),
-        }
+            })
     }
 
     pub fn get_dynamic_tools(&self) -> Option<Vec<DynamicToolSpec>> {
-        match self {
-            InitialHistory::New | InitialHistory::Cleared => None,
-            InitialHistory::Resumed(resumed) => {
-                resumed.history.iter().find_map(|item| match item {
-                    RolloutItem::SessionMeta(meta_line) => meta_line.meta.dynamic_tools.clone(),
-                    _ => None,
-                })
-            }
-            InitialHistory::Forked(items) => items.iter().find_map(|item| match item {
+        self.logical_rollout_items()?
+            .items()
+            .iter()
+            .copied()
+            .find_map(|item| match item {
                 RolloutItem::SessionMeta(meta_line) => meta_line.meta.dynamic_tools.clone(),
                 _ => None,
-            }),
-        }
+            })
     }
 
     pub fn get_selected_capability_roots(&self) -> Vec<SelectedCapabilityRoot> {
@@ -2650,14 +2636,12 @@ impl InitialHistory {
     }
 
     pub fn get_latest_effective_multi_agent_mode(&self) -> Option<MultiAgentMode> {
-        let items = match self {
-            InitialHistory::New | InitialHistory::Cleared => return None,
-            InitialHistory::Resumed(resumed) => &resumed.history,
-            InitialHistory::Forked(items) => items,
-        };
+        let items = self.logical_rollout_items()?;
         items
+            .items()
             .iter()
             .rev()
+            .copied()
             .find_map(|item| match item {
                 RolloutItem::TurnContext(turn_context) => Some(turn_context),
                 RolloutItem::SessionMeta(_)
@@ -2666,6 +2650,7 @@ impl InitialHistory {
                 | RolloutItem::InterAgentCommunicationMetadata { .. }
                 | RolloutItem::Compacted(_)
                 | RolloutItem::WorldState(_)
+                | RolloutItem::Transaction(_)
                 | RolloutItem::EventMsg(_) => None,
             })
             .and_then(|turn_context| turn_context.multi_agent_mode)
@@ -2693,39 +2678,59 @@ impl InitialHistory {
     }
 
     fn get_session_meta(&self) -> Option<&SessionMeta> {
-        match self {
-            InitialHistory::New | InitialHistory::Cleared => None,
-            InitialHistory::Resumed(resumed) => {
-                resumed.history.iter().find_map(|item| match item {
-                    RolloutItem::SessionMeta(meta_line) => Some(&meta_line.meta),
-                    _ => None,
-                })
-            }
-            InitialHistory::Forked(items) => items.iter().find_map(|item| match item {
+        self.logical_rollout_items()?
+            .items()
+            .iter()
+            .copied()
+            .find_map(|item| match item {
                 RolloutItem::SessionMeta(meta_line) => Some(&meta_line.meta),
                 _ => None,
-            }),
-        }
+            })
     }
 
     fn get_resumed_session_meta(&self) -> Option<&SessionMeta> {
         match self {
             InitialHistory::New | InitialHistory::Cleared | InitialHistory::Forked(_) => None,
-            InitialHistory::Resumed(resumed) => {
-                resumed.history.iter().find_map(|item| match item {
+            InitialHistory::Resumed(_) => self
+                .logical_rollout_items()?
+                .items()
+                .iter()
+                .copied()
+                .find_map(|item| match item {
                     RolloutItem::SessionMeta(meta_line) => Some(&meta_line.meta),
                     _ => None,
-                })
+                }),
+        }
+    }
+
+    fn logical_rollout_items(&self) -> Option<FlattenedRolloutItems<'_>> {
+        let items = self.get_rollout_items();
+        match flatten_rollout_items(items) {
+            Ok(items) => Some(items),
+            Err(err) => {
+                error!(%err, "failed to traverse initial rollout history");
+                None
             }
         }
     }
 }
 
 fn session_cwd_from_items(items: &[RolloutItem]) -> Option<PathBuf> {
-    items.iter().find_map(|item| match item {
-        RolloutItem::SessionMeta(meta_line) => Some(meta_line.meta.cwd.clone()),
-        _ => None,
-    })
+    let flattened = match flatten_rollout_items(items) {
+        Ok(flattened) => flattened,
+        Err(err) => {
+            error!(%err, "failed to traverse rollout history for session cwd");
+            return None;
+        }
+    };
+    flattened
+        .items()
+        .iter()
+        .copied()
+        .find_map(|item| match item {
+            RolloutItem::SessionMeta(meta_line) => Some(meta_line.meta.cwd.clone()),
+            _ => None,
+        })
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema, TS, Default)]
@@ -2984,26 +2989,45 @@ fn multi_agent_version_from_items(
     items: &[RolloutItem],
     thread_id: Option<ThreadId>,
 ) -> Option<MultiAgentVersion> {
-    let session_meta_version = items.iter().rev().find_map(|item| match item {
-        RolloutItem::SessionMeta(meta_line)
-            if thread_id.is_none_or(|thread_id| meta_line.meta.id == thread_id) =>
-        {
-            meta_line.meta.multi_agent_version
+    let flattened = match flatten_rollout_items(items) {
+        Ok(flattened) => flattened,
+        Err(err) => {
+            error!(%err, "failed to traverse rollout history for multi-agent version");
+            return None;
         }
-        _ => None,
-    });
+    };
+    let session_meta_version =
+        flattened
+            .items()
+            .iter()
+            .rev()
+            .copied()
+            .find_map(|item| match item {
+                RolloutItem::SessionMeta(meta_line)
+                    if thread_id.is_none_or(|thread_id| meta_line.meta.id == thread_id) =>
+                {
+                    meta_line.meta.multi_agent_version
+                }
+                _ => None,
+            });
 
     session_meta_version.or_else(|| {
-        items.iter().rev().find_map(|item| match item {
-            RolloutItem::TurnContext(turn_context) => turn_context.multi_agent_version,
-            RolloutItem::SessionMeta(_)
-            | RolloutItem::ResponseItem(_)
-            | RolloutItem::InterAgentCommunication(_)
-            | RolloutItem::InterAgentCommunicationMetadata { .. }
-            | RolloutItem::Compacted(_)
-            | RolloutItem::WorldState(_)
-            | RolloutItem::EventMsg(_) => None,
-        })
+        flattened
+            .items()
+            .iter()
+            .rev()
+            .copied()
+            .find_map(|item| match item {
+                RolloutItem::TurnContext(turn_context) => turn_context.multi_agent_version,
+                RolloutItem::SessionMeta(_)
+                | RolloutItem::ResponseItem(_)
+                | RolloutItem::InterAgentCommunication(_)
+                | RolloutItem::InterAgentCommunicationMetadata { .. }
+                | RolloutItem::Compacted(_)
+                | RolloutItem::WorldState(_)
+                | RolloutItem::Transaction(_)
+                | RolloutItem::EventMsg(_) => None,
+            })
     })
 }
 
@@ -3164,7 +3188,179 @@ pub enum RolloutItem {
     Compacted(CompactedItem),
     TurnContext(TurnContextItem),
     WorldState(WorldStateItem),
+    Transaction(RolloutTransaction),
     EventMsg(EventMsg),
+}
+
+/// One stable, single-record transaction in rollout storage.
+///
+/// Normal writers only construct transactions after applying rollout persistence policy and reject
+/// nested transactions. Readers accept nested transactions defensively through
+/// [`flatten_rollout_items`].
+#[derive(Serialize, Deserialize, Debug, Clone, JsonSchema, TS)]
+pub struct RolloutTransaction {
+    pub transaction_id: String,
+    pub items: Vec<RolloutItem>,
+}
+
+pub const DEFAULT_MAX_ROLLOUT_TRANSACTION_DEPTH: usize = 32;
+pub const DEFAULT_MAX_EXPANDED_ROLLOUT_ITEMS: usize = 100_000;
+
+/// Resource limits for defensive logical rollout traversal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RolloutItemTraversalLimits {
+    pub max_transaction_depth: usize,
+    pub max_expanded_items: usize,
+}
+
+impl Default for RolloutItemTraversalLimits {
+    fn default() -> Self {
+        Self {
+            max_transaction_depth: DEFAULT_MAX_ROLLOUT_TRANSACTION_DEPTH,
+            max_expanded_items: DEFAULT_MAX_EXPANDED_ROLLOUT_ITEMS,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum RolloutItemTraversalError {
+    #[error("rollout transaction nesting exceeds maximum depth {max_depth}")]
+    TransactionDepthExceeded { max_depth: usize },
+    #[error("rollout traversal exceeds maximum expanded item count {max_expanded_items}")]
+    ExpandedItemLimitExceeded { max_expanded_items: usize },
+}
+
+/// Bounded, deduplicated logical view of rollout records.
+#[derive(Debug)]
+pub struct FlattenedRolloutItems<'a> {
+    items: Vec<&'a RolloutItem>,
+    transaction_ids: HashSet<String>,
+}
+
+/// Stateful bounded flattener for readers that consume rollout records incrementally.
+#[derive(Debug)]
+pub struct RolloutItemFlattener {
+    limits: RolloutItemTraversalLimits,
+    transaction_ids: HashSet<String>,
+}
+
+impl Default for RolloutItemFlattener {
+    fn default() -> Self {
+        Self::new(RolloutItemTraversalLimits::default())
+    }
+}
+
+impl RolloutItemFlattener {
+    pub fn new(limits: RolloutItemTraversalLimits) -> Self {
+        Self {
+            limits,
+            transaction_ids: HashSet::new(),
+        }
+    }
+
+    /// Expands another structural batch while retaining transaction deduplication state.
+    pub fn flatten<'a>(
+        &mut self,
+        items: &'a [RolloutItem],
+    ) -> Result<Vec<&'a RolloutItem>, RolloutItemTraversalError> {
+        let mut flattened = Vec::new();
+
+        // Resource accounting is per physical rollout record. Callers may pass several records
+        // in one batch, while transaction identity must remain shared across the entire stream.
+        for physical_item in items {
+            let mut stack = vec![(physical_item, 0usize)];
+            let mut expanded_items = 0usize;
+
+            while let Some((item, parent_transaction_depth)) = stack.pop() {
+                expanded_items = expanded_items.saturating_add(1);
+                if expanded_items > self.limits.max_expanded_items {
+                    return Err(RolloutItemTraversalError::ExpandedItemLimitExceeded {
+                        max_expanded_items: self.limits.max_expanded_items,
+                    });
+                }
+                match item {
+                    RolloutItem::Transaction(transaction) => {
+                        if !self
+                            .transaction_ids
+                            .insert(transaction.transaction_id.clone())
+                        {
+                            continue;
+                        }
+                        let transaction_depth = parent_transaction_depth.saturating_add(1);
+                        if transaction_depth > self.limits.max_transaction_depth {
+                            return Err(RolloutItemTraversalError::TransactionDepthExceeded {
+                                max_depth: self.limits.max_transaction_depth,
+                            });
+                        }
+                        stack.extend(
+                            transaction
+                                .items
+                                .iter()
+                                .rev()
+                                .map(|item| (item, transaction_depth)),
+                        );
+                    }
+                    RolloutItem::SessionMeta(_)
+                    | RolloutItem::ResponseItem(_)
+                    | RolloutItem::InterAgentCommunication(_)
+                    | RolloutItem::InterAgentCommunicationMetadata { .. }
+                    | RolloutItem::Compacted(_)
+                    | RolloutItem::TurnContext(_)
+                    | RolloutItem::WorldState(_)
+                    | RolloutItem::EventMsg(_) => flattened.push(item),
+                }
+            }
+        }
+
+        Ok(flattened)
+    }
+
+    pub fn contains_transaction_id(&self, transaction_id: &str) -> bool {
+        self.transaction_ids.contains(transaction_id)
+    }
+}
+
+impl<'a> FlattenedRolloutItems<'a> {
+    pub fn items(&self) -> &[&'a RolloutItem] {
+        self.items.as_slice()
+    }
+
+    pub fn into_items(self) -> Vec<&'a RolloutItem> {
+        self.items
+    }
+
+    pub fn contains_transaction_id(&self, transaction_id: &str) -> bool {
+        self.transaction_ids.contains(transaction_id)
+    }
+}
+
+/// Returns the bounded logical view of rollout records using production traversal limits.
+pub fn flatten_rollout_items(
+    items: &[RolloutItem],
+) -> Result<FlattenedRolloutItems<'_>, RolloutItemTraversalError> {
+    flatten_rollout_items_with_limits(items, RolloutItemTraversalLimits::default())
+}
+
+/// Iteratively expands rollout transactions while deduplicating transaction IDs globally.
+///
+/// The first transaction carrying an ID wins. Later transactions with the same ID, including
+/// nested duplicates, contribute no logical items.
+pub fn flatten_rollout_items_with_limits(
+    items: &[RolloutItem],
+    limits: RolloutItemTraversalLimits,
+) -> Result<FlattenedRolloutItems<'_>, RolloutItemTraversalError> {
+    let mut flattener = RolloutItemFlattener::new(limits);
+    let mut flattened = Vec::new();
+    // The expansion limit protects one physical rollout record. Transaction identity remains
+    // global across records, but long flat legacy histories must not exhaust a cumulative budget.
+    for item in items {
+        flattened.extend(flattener.flatten(std::slice::from_ref(item))?);
+    }
+
+    Ok(FlattenedRolloutItems {
+        items: flattened,
+        transaction_ids: flattener.transaction_ids,
+    })
 }
 
 /// Persisted comparison state used to resume model-visible world-state diffing.
@@ -4419,6 +4615,178 @@ mod tests {
     use std::path::PathBuf;
     use tempfile::NamedTempFile;
     use tempfile::TempDir;
+
+    fn world_state_label(label: &str) -> RolloutItem {
+        RolloutItem::WorldState(WorldStateItem::full(json!({ "label": label })))
+    }
+
+    fn world_state_labels<'a>(items: &[&'a RolloutItem]) -> Vec<&'a str> {
+        items
+            .iter()
+            .filter_map(|item| match item {
+                RolloutItem::WorldState(world_state) => world_state.state["label"].as_str(),
+                RolloutItem::SessionMeta(_)
+                | RolloutItem::ResponseItem(_)
+                | RolloutItem::InterAgentCommunication(_)
+                | RolloutItem::InterAgentCommunicationMetadata { .. }
+                | RolloutItem::Compacted(_)
+                | RolloutItem::TurnContext(_)
+                | RolloutItem::Transaction(_)
+                | RolloutItem::EventMsg(_) => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn rollout_transaction_has_stable_wire_shape_and_legacy_items_still_decode() -> Result<()> {
+        let transaction = RolloutItem::Transaction(RolloutTransaction {
+            transaction_id: "txn-1".to_string(),
+            items: vec![world_state_label("inside")],
+        });
+
+        assert_eq!(
+            serde_json::to_value(&transaction)?,
+            json!({
+                "type": "transaction",
+                "payload": {
+                    "transaction_id": "txn-1",
+                    "items": [{
+                        "type": "world_state",
+                        "payload": {"full": true, "state": {"label": "inside"}}
+                    }]
+                }
+            })
+        );
+        let decoded: RolloutItem = serde_json::from_value(serde_json::to_value(transaction)?)?;
+        assert!(matches!(
+            decoded,
+            RolloutItem::Transaction(RolloutTransaction { transaction_id, items })
+                if transaction_id == "txn-1" && items.len() == 1
+        ));
+
+        let legacy: RolloutItem = serde_json::from_value(json!({
+            "type": "world_state",
+            "payload": {"full": true, "state": {"label": "legacy"}}
+        }))?;
+        assert_eq!(world_state_labels(&[&legacy]), vec!["legacy"]);
+        Ok(())
+    }
+
+    #[test]
+    fn rollout_transactions_flatten_iteratively_and_first_duplicate_id_wins() -> Result<()> {
+        let items = vec![
+            RolloutItem::Transaction(RolloutTransaction {
+                transaction_id: "outer".to_string(),
+                items: vec![
+                    world_state_label("outer-item"),
+                    RolloutItem::Transaction(RolloutTransaction {
+                        transaction_id: "duplicate".to_string(),
+                        items: vec![world_state_label("first-duplicate")],
+                    }),
+                ],
+            }),
+            RolloutItem::Transaction(RolloutTransaction {
+                transaction_id: "duplicate".to_string(),
+                items: vec![world_state_label("second-duplicate")],
+            }),
+            world_state_label("legacy-tail"),
+        ];
+
+        let flattened = flatten_rollout_items(&items)?;
+
+        assert_eq!(
+            world_state_labels(flattened.items()),
+            vec!["outer-item", "first-duplicate", "legacy-tail"]
+        );
+        assert!(flattened.contains_transaction_id("outer"));
+        assert!(flattened.contains_transaction_id("duplicate"));
+        Ok(())
+    }
+
+    #[test]
+    fn rollout_transaction_flattening_reports_depth_limit() {
+        let items = vec![RolloutItem::Transaction(RolloutTransaction {
+            transaction_id: "outer".to_string(),
+            items: vec![RolloutItem::Transaction(RolloutTransaction {
+                transaction_id: "inner".to_string(),
+                items: vec![world_state_label("too-deep")],
+            })],
+        })];
+
+        let result = flatten_rollout_items_with_limits(
+            &items,
+            RolloutItemTraversalLimits {
+                max_transaction_depth: 1,
+                max_expanded_items: 10,
+            },
+        );
+
+        assert_eq!(
+            result.unwrap_err(),
+            RolloutItemTraversalError::TransactionDepthExceeded { max_depth: 1 }
+        );
+    }
+
+    #[test]
+    fn rollout_transaction_flattening_reports_expanded_item_limit() {
+        let items = vec![RolloutItem::Transaction(RolloutTransaction {
+            transaction_id: "txn".to_string(),
+            items: vec![world_state_label("first"), world_state_label("second")],
+        })];
+
+        let result = flatten_rollout_items_with_limits(
+            &items,
+            RolloutItemTraversalLimits {
+                max_transaction_depth: 10,
+                max_expanded_items: 1,
+            },
+        );
+
+        assert_eq!(
+            result.unwrap_err(),
+            RolloutItemTraversalError::ExpandedItemLimitExceeded {
+                max_expanded_items: 1
+            }
+        );
+    }
+
+    #[test]
+    fn rollout_transaction_expansion_budget_resets_per_physical_record() -> Result<()> {
+        let mut flattener = RolloutItemFlattener::new(RolloutItemTraversalLimits {
+            max_transaction_depth: 10,
+            max_expanded_items: 2,
+        });
+        let items = ["first", "second"].map(|transaction_id| {
+            RolloutItem::Transaction(RolloutTransaction {
+                transaction_id: transaction_id.to_string(),
+                items: vec![world_state_label(transaction_id)],
+            })
+        });
+
+        assert_eq!(
+            world_state_labels(&flattener.flatten(&items)?),
+            vec!["first", "second"]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn flat_legacy_history_does_not_consume_transaction_expansion_budget() -> Result<()> {
+        let items = vec![world_state_label("first"), world_state_label("second")];
+        let flattened = flatten_rollout_items_with_limits(
+            &items,
+            RolloutItemTraversalLimits {
+                max_transaction_depth: 10,
+                max_expanded_items: 1,
+            },
+        )?;
+
+        assert_eq!(
+            world_state_labels(flattened.items()),
+            vec!["first", "second"]
+        );
+        Ok(())
+    }
 
     #[test]
     fn feature_thread_source_serializes_as_its_app_owned_label() -> Result<()> {

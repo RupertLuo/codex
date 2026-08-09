@@ -37,9 +37,18 @@ impl Session {
     )]
     async fn inject_if_running_with_guard(
         &self,
-        _lifecycle: &tokio::sync::MutexGuard<'_, crate::session::session::PersistenceLifecycle>,
+        lifecycle: &tokio::sync::MutexGuard<'_, crate::session::session::PersistenceLifecycle>,
         input: Vec<ResponseItem>,
     ) -> Result<(), InjectIfRunningError> {
+        if matches!(
+            &**lifecycle,
+            crate::session::session::PersistenceLifecycle::Quarantined(_)
+        ) {
+            return Err(InjectIfRunningError::new(
+                InjectIfRunningRejectionReason::PersistenceQuarantined,
+                input,
+            ));
+        }
         let mut active = self.active_turn.lock().await;
         match active.as_mut() {
             Some(active_turn) => {
@@ -193,12 +202,12 @@ impl Session {
         if let Some(hook) = self.services.compact_commit_test_hook.as_ref() {
             hook.pause_task_start_before_gate_if_requested().await;
         }
-        let lifecycle = match self.acquire_persistence_side_effect().await {
+        let mut lifecycle = match self.acquire_persistence_side_effect().await {
             Ok(lifecycle) => lifecycle,
             Err(_) => return,
         };
         if let Err(err) = self
-            .inject_no_new_turn_with_guard(&lifecycle, items, current_turn_context)
+            .inject_no_new_turn_with_guard(&mut lifecycle, items, current_turn_context)
             .await
         {
             tracing::error!("failed to inject conversation items: {err:#}");
@@ -207,10 +216,15 @@ impl Session {
 
     pub(crate) async fn inject_no_new_turn_with_guard(
         &self,
-        lifecycle: &tokio::sync::MutexGuard<'_, crate::session::session::PersistenceLifecycle>,
+        lifecycle: &mut tokio::sync::MutexGuard<'_, crate::session::session::PersistenceLifecycle>,
         items: Vec<ResponseItem>,
         current_turn_context: Option<&TurnContext>,
     ) -> codex_thread_store::ThreadStoreResult<()> {
+        if let crate::session::session::PersistenceLifecycle::Quarantined(reason) = &**lifecycle {
+            return Err(codex_thread_store::ThreadStoreError::InvalidRequest {
+                message: reason.clone(),
+            });
+        }
         let items = match self.inject_if_running_with_guard(lifecycle, items).await {
             Ok(()) => return Ok(()),
             Err(err) => err.into_input(),

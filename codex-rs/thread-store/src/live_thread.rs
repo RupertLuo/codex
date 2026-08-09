@@ -4,7 +4,9 @@ use std::sync::Arc;
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::CompactedItem;
 use codex_protocol::protocol::RolloutItem;
+use codex_protocol::protocol::RolloutTransaction;
 use codex_protocol::protocol::ThreadMemoryMode;
+use codex_protocol::protocol::flatten_rollout_items;
 use codex_rollout::RolloutPersistenceBatchMeasurement;
 use codex_rollout::RolloutPersistenceTelemetry;
 use codex_rollout::measure_and_filter_rollout_items;
@@ -29,14 +31,14 @@ use crate::ThreadTitleRequest;
 use crate::UpdateThreadMetadataParams;
 use crate::thread_metadata_sync::ThreadMetadataSync;
 
-const COMPACTION_CHECKPOINT_RECONCILIATION_ATTEMPTS: usize = 3;
+const ATOMIC_APPEND_RECONCILIATION_ATTEMPTS: usize = 3;
 
-/// Durable outcome of appending one atomic local-compaction checkpoint.
+/// Durable outcome of appending one stable-identity rollout record.
 #[derive(Debug)]
-pub enum CompactionCheckpointAppendOutcome {
-    /// The checkpoint record is durably visible, either from the append result or reconciliation.
+pub enum AtomicAppendOutcome {
+    /// The record is durably visible, either from the append result or reconciliation.
     Committed,
-    /// Durable history was readable and did not contain the checkpoint ID.
+    /// Durable history was readable and did not contain the stable identity.
     NotCommitted {
         append_error: crate::ThreadStoreError,
     },
@@ -48,6 +50,13 @@ pub enum CompactionCheckpointAppendOutcome {
         append_error: crate::ThreadStoreError,
         reconciliation_errors: Vec<crate::ThreadStoreError>,
     },
+}
+
+pub type CompactionCheckpointAppendOutcome = AtomicAppendOutcome;
+
+enum AtomicAppendIdentity {
+    Transaction(String),
+    CompactionCheckpoint(String),
 }
 
 /// Handle for an active thread's persistence lifecycle.
@@ -203,6 +212,26 @@ impl LiveThread {
         Ok(())
     }
 
+    /// Appends one canonical transaction envelope and reconciles a store error by stable ID.
+    pub async fn append_transaction(
+        &self,
+        transaction: &RolloutTransaction,
+    ) -> AtomicAppendOutcome {
+        let item = RolloutItem::Transaction(transaction.clone());
+        if !codex_rollout::is_persisted_rollout_item(&item) {
+            return AtomicAppendOutcome::NotCommitted {
+                append_error: crate::ThreadStoreError::InvalidRequest {
+                    message: "rollout transaction payload is not canonical".to_string(),
+                },
+            };
+        }
+        self.append_identity_reconciled(
+            item,
+            AtomicAppendIdentity::Transaction(transaction.transaction_id.clone()),
+        )
+        .await
+    }
+
     /// Appends one local-compaction checkpoint record and reconciles an ambiguous store error by
     /// scanning durable history for its stable ID.
     ///
@@ -217,30 +246,48 @@ impl LiveThread {
             .as_ref()
             .map(|checkpoint| checkpoint.checkpoint_id.clone())
         else {
-            return CompactionCheckpointAppendOutcome::NotCommitted {
+            return AtomicAppendOutcome::NotCommitted {
                 append_error: crate::ThreadStoreError::InvalidRequest {
                     message: "compaction checkpoint payload is missing".to_string(),
                 },
             };
         };
         let item = RolloutItem::Compacted(compacted_item.clone());
+        self.append_identity_reconciled(
+            item,
+            AtomicAppendIdentity::CompactionCheckpoint(checkpoint_id),
+        )
+        .await
+    }
+
+    async fn append_identity_reconciled(
+        &self,
+        item: RolloutItem,
+        identity: AtomicAppendIdentity,
+    ) -> AtomicAppendOutcome {
         let append_error = match self.append_items(std::slice::from_ref(&item)).await {
-            Ok(()) => return CompactionCheckpointAppendOutcome::Committed,
+            Ok(()) => return AtomicAppendOutcome::Committed,
             Err(err) => err,
         };
+        let failed_append_may_become_durable = self.thread_store.failed_append_may_become_durable();
         let mut reconciliation_errors = Vec::new();
-        for attempt in 0..COMPACTION_CHECKPOINT_RECONCILIATION_ATTEMPTS {
+        for attempt in 0..ATOMIC_APPEND_RECONCILIATION_ATTEMPTS {
             match self.load_history(/*include_archived*/ true).await {
                 Ok(history) => {
-                    let committed = history.items.iter().any(|item| {
-                        matches!(
-                            item,
-                            RolloutItem::Compacted(compacted)
-                                if compacted.checkpoint.as_ref().is_some_and(|checkpoint| {
-                                    checkpoint.checkpoint_id == checkpoint_id
-                                })
-                        )
-                    });
+                    let committed = match atomic_identity_is_visible(&identity, &history.items) {
+                        Ok(committed) => committed,
+                        Err(err) => {
+                            reconciliation_errors.push(crate::ThreadStoreError::Internal {
+                                message: format!(
+                                    "failed to traverse durable history during append reconciliation: {err}"
+                                ),
+                            });
+                            if attempt + 1 < ATOMIC_APPEND_RECONCILIATION_ATTEMPTS {
+                                tokio::task::yield_now().await;
+                            }
+                            continue;
+                        }
+                    };
                     if committed {
                         let items = std::slice::from_ref(&item);
                         let (canonical_items, measurement) =
@@ -253,17 +300,27 @@ impl LiveThread {
                             };
                         self.finish_durable_append(items, &canonical_items, measurement)
                             .await;
-                        return CompactionCheckpointAppendOutcome::Committed;
+                        return AtomicAppendOutcome::Committed;
                     }
-                    return CompactionCheckpointAppendOutcome::NotCommitted { append_error };
+                    if !failed_append_may_become_durable {
+                        return AtomicAppendOutcome::NotCommitted { append_error };
+                    }
+                    if attempt + 1 == ATOMIC_APPEND_RECONCILIATION_ATTEMPTS {
+                        reconciliation_errors.push(crate::ThreadStoreError::Internal {
+                            message: "durable history does not contain the stable append ID, but \
+                                      the store may retain failed appends for a later durability \
+                                      barrier"
+                                .to_string(),
+                        });
+                    }
                 }
                 Err(err) => reconciliation_errors.push(err),
             }
-            if attempt + 1 < COMPACTION_CHECKPOINT_RECONCILIATION_ATTEMPTS {
+            if attempt + 1 < ATOMIC_APPEND_RECONCILIATION_ATTEMPTS {
                 tokio::task::yield_now().await;
             }
         }
-        CompactionCheckpointAppendOutcome::Ambiguous {
+        AtomicAppendOutcome::Ambiguous {
             append_error,
             reconciliation_errors,
         }
@@ -472,6 +529,29 @@ impl LiveThread {
     }
 }
 
+fn atomic_identity_is_visible(
+    identity: &AtomicAppendIdentity,
+    items: &[RolloutItem],
+) -> Result<bool, codex_protocol::protocol::RolloutItemTraversalError> {
+    let flattened = flatten_rollout_items(items)?;
+    Ok(match identity {
+        AtomicAppendIdentity::Transaction(transaction_id) => {
+            flattened.contains_transaction_id(transaction_id)
+        }
+        AtomicAppendIdentity::CompactionCheckpoint(checkpoint_id) => {
+            flattened.items().iter().copied().any(|item| {
+                matches!(
+                    item,
+                    RolloutItem::Compacted(compacted)
+                        if compacted.checkpoint.as_ref().is_some_and(|checkpoint| {
+                            checkpoint.checkpoint_id == *checkpoint_id
+                        })
+                )
+            })
+        }
+    })
+}
+
 /// Spawns the best-effort LLM title task on the current Tokio runtime.
 ///
 /// The task calls the host generator, then writes the title through the same
@@ -580,6 +660,7 @@ mod tests {
     use codex_protocol::protocol::CompactedItem;
     use codex_protocol::protocol::CompactionCheckpoint;
     use codex_protocol::protocol::EventMsg;
+    use codex_protocol::protocol::RolloutTransaction;
     use codex_protocol::protocol::SessionSource;
     use codex_protocol::protocol::ThreadHistoryMode;
     use codex_protocol::protocol::TokenCountEvent;
@@ -857,6 +938,13 @@ mod tests {
         }
     }
 
+    fn transaction(transaction_id: &str) -> RolloutTransaction {
+        RolloutTransaction {
+            transaction_id: transaction_id.to_string(),
+            items: vec![user_message_item("transaction message")],
+        }
+    }
+
     async fn live_thread() -> (Arc<InMemoryThreadStore>, LiveThread, ThreadId) {
         let thread_id = ThreadId::default();
         let store = Arc::new(InMemoryThreadStore::default());
@@ -864,6 +952,122 @@ mod tests {
             .await
             .expect("create live thread");
         (store, live_thread, thread_id)
+    }
+
+    #[tokio::test]
+    async fn transaction_append_reconciles_present_id_as_committed() {
+        let (store, live_thread, thread_id) = live_thread().await;
+        store
+            .fail_next_append_after_items(1, "ambiguous append after durable transaction")
+            .await;
+
+        let outcome = live_thread
+            .append_transaction(&transaction("transaction-present"))
+            .await;
+
+        assert!(matches!(outcome, AtomicAppendOutcome::Committed));
+        let history = store
+            .load_history(LoadThreadHistoryParams {
+                thread_id,
+                include_archived: true,
+            })
+            .await
+            .expect("load reconciled history");
+        assert_eq!(
+            history
+                .items
+                .iter()
+                .filter(|item| matches!(
+                    item,
+                    RolloutItem::Transaction(transaction)
+                        if transaction.transaction_id == "transaction-present"
+                ))
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn transaction_append_reconciles_absent_id_as_not_committed() {
+        let (store, live_thread, thread_id) = live_thread().await;
+        store
+            .fail_next_append("failure before transaction write")
+            .await;
+
+        let outcome = live_thread
+            .append_transaction(&transaction("transaction-absent"))
+            .await;
+
+        assert!(matches!(outcome, AtomicAppendOutcome::NotCommitted { .. }));
+        let history = store
+            .load_history(LoadThreadHistoryParams {
+                thread_id,
+                include_archived: true,
+            })
+            .await
+            .expect("load history");
+        assert!(history.items.iter().all(|item| !matches!(
+            item,
+            RolloutItem::Transaction(transaction)
+                if transaction.transaction_id == "transaction-absent"
+        )));
+    }
+
+    #[tokio::test]
+    async fn transaction_absence_is_ambiguous_when_store_may_commit_buffered_items_later() {
+        let permit_held = Arc::new(AtomicBool::new(false));
+        let store = Arc::new(PermitObservingThreadStore::new(permit_held));
+        let thread_id = ThreadId::default();
+        let live_thread = LiveThread::create(store.clone(), create_params(thread_id))
+            .await
+            .expect("create live thread");
+        store
+            .inner
+            .fail_next_append("buffered append failed before becoming readable")
+            .await;
+
+        let outcome = live_thread
+            .append_transaction(&transaction("transaction-buffered"))
+            .await;
+
+        assert!(matches!(outcome, AtomicAppendOutcome::Ambiguous { .. }));
+        assert_eq!(store.inner.calls().await.load_history, 3);
+    }
+
+    #[tokio::test]
+    async fn transaction_append_reports_ambiguous_after_bounded_reconciliation() {
+        let (store, live_thread, _thread_id) = live_thread().await;
+        store.fail_next_append("ambiguous backing append").await;
+        store
+            .fail_next_history_loads(10, "history unavailable during reconciliation")
+            .await;
+
+        let outcome = live_thread
+            .append_transaction(&transaction("transaction-unknown"))
+            .await;
+
+        assert!(matches!(outcome, AtomicAppendOutcome::Ambiguous { .. }));
+        assert_eq!(store.calls().await.load_history, 3);
+    }
+
+    #[tokio::test]
+    async fn metadata_failure_after_reconciled_transaction_does_not_downgrade_commit() {
+        let (store, live_thread, _thread_id) = live_thread().await;
+        store
+            .fail_next_append_after_items(1, "ambiguous append after durable transaction")
+            .await;
+        store
+            .fail_next_metadata_update("metadata projection unavailable")
+            .await;
+
+        let outcome = live_thread
+            .append_transaction(&transaction("transaction-metadata"))
+            .await;
+
+        assert!(matches!(outcome, AtomicAppendOutcome::Committed));
+        assert_eq!(store.calls().await.update_thread_metadata, 1);
+        live_thread.persist().await.expect("retry pending metadata");
+        assert_eq!(store.calls().await.update_thread_metadata, 2);
     }
 
     #[tokio::test]

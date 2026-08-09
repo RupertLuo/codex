@@ -2,6 +2,7 @@ use super::*;
 use crate::context::world_state::WorldStateSnapshot;
 use crate::context_manager::is_user_turn_boundary;
 use codex_protocol::protocol::SessionContextWindow;
+use codex_protocol::protocol::flatten_rollout_items;
 use std::collections::HashSet;
 use uuid::Uuid;
 
@@ -119,7 +120,13 @@ impl Session {
         &self,
         turn_context: &TurnContext,
         rollout_items: &[RolloutItem],
-    ) -> RolloutReconstruction {
+    ) -> Result<RolloutReconstruction, codex_protocol::protocol::RolloutItemTraversalError> {
+        let logical_rollout_items = flatten_rollout_items(rollout_items)?
+            .items()
+            .iter()
+            .map(|item| (**item).clone())
+            .collect::<Vec<_>>();
+        let rollout_items = logical_rollout_items.as_slice();
         // Replay metadata should already match the shape of the future lazy reverse loader, even
         // while history materialization still uses an eager bridge. Scan newest-to-oldest,
         // stopping once a surviving replacement-history checkpoint and the required resume metadata
@@ -312,7 +319,8 @@ impl Session {
                 }
                 RolloutItem::EventMsg(_)
                 | RolloutItem::SessionMeta(_)
-                | RolloutItem::InterAgentCommunicationMetadata { .. } => {}
+                | RolloutItem::InterAgentCommunicationMetadata { .. }
+                | RolloutItem::Transaction(_) => {}
             }
 
             if base_replacement_history.is_some()
@@ -408,7 +416,8 @@ impl Session {
                 RolloutItem::EventMsg(_)
                 | RolloutItem::TurnContext(_)
                 | RolloutItem::WorldState(_)
-                | RolloutItem::SessionMeta(_) => {}
+                | RolloutItem::SessionMeta(_)
+                | RolloutItem::Transaction(_) => {}
             }
         }
 
@@ -478,6 +487,7 @@ impl Session {
                 | RolloutItem::InterAgentCommunication(_)
                 | RolloutItem::InterAgentCommunicationMetadata { .. }
                 | RolloutItem::TurnContext(_)
+                | RolloutItem::Transaction(_)
                 | RolloutItem::EventMsg(_) => {
                     unreachable!("only world-state replay items are collected")
                 }
@@ -490,7 +500,7 @@ impl Session {
             previous_id: None,
             id: None,
         });
-        RolloutReconstruction {
+        Ok(RolloutReconstruction {
             history: history.into_raw_items(),
             previous_turn_settings,
             reference_context_item,
@@ -499,7 +509,7 @@ impl Session {
             first_window_id: window.first_id,
             previous_window_id: window.previous_id,
             window_id: window.id,
-        }
+        })
     }
 }
 

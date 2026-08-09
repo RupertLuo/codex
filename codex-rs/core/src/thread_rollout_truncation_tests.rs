@@ -8,6 +8,7 @@ use codex_protocol::protocol::CompactedItem;
 use codex_protocol::protocol::CompactionCheckpoint;
 use codex_protocol::protocol::InterAgentCommunication;
 use codex_protocol::protocol::RateLimitSnapshot;
+use codex_protocol::protocol::RolloutTransaction;
 use codex_protocol::protocol::ThreadRolledBackEvent;
 use codex_protocol::protocol::TokenCountEvent;
 use codex_protocol::protocol::TokenUsage;
@@ -113,6 +114,46 @@ fn truncates_rollout_after_terminal_canonical_turn_id() {
     assert_eq!(
         serde_json::to_value(&truncated).unwrap(),
         serde_json::to_value(&rollout[..4]).unwrap()
+    );
+}
+
+#[test]
+fn truncates_nested_rollout_after_first_winning_canonical_turn_id() {
+    let transaction_id = "canonical-turn-transaction".to_string();
+    let winning_items = vec![
+        turn_started("turn-1"),
+        turn_completed("turn-1"),
+        turn_started("turn-2"),
+        turn_completed("turn-2"),
+        turn_started("turn-3"),
+        turn_completed("turn-3"),
+    ];
+    let rollout = vec![
+        RolloutItem::Transaction(RolloutTransaction {
+            transaction_id: transaction_id.clone(),
+            items: vec![RolloutItem::Transaction(RolloutTransaction {
+                transaction_id: "canonical-turn-inner".to_string(),
+                items: winning_items.clone(),
+            })],
+        }),
+        RolloutItem::Transaction(RolloutTransaction {
+            transaction_id,
+            items: vec![turn_started("losing-turn"), turn_completed("losing-turn")],
+        }),
+    ];
+
+    let truncated =
+        truncate_rollout_after_turn_id(&rollout, "turn-2").expect("truncate nested turn-2");
+
+    let [RolloutItem::Transaction(transaction)] = truncated.as_slice() else {
+        panic!("partial physical transaction must remain one atomic envelope");
+    };
+    assert_ne!(transaction.transaction_id, "canonical-turn-transaction");
+    uuid::Uuid::parse_str(&transaction.transaction_id)
+        .expect("partial envelope must receive a fresh transaction ID");
+    assert_eq!(
+        serde_json::to_value(&transaction.items).unwrap(),
+        serde_json::to_value(&winning_items[..4]).unwrap()
     );
 }
 

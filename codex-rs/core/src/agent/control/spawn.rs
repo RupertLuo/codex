@@ -1,5 +1,6 @@
 use super::residency::is_v2_resident_session_source;
 use super::*;
+use codex_protocol::protocol::flatten_rollout_items;
 
 const AGENT_NAMES: &str = include_str!("../agent_names.txt");
 
@@ -63,6 +64,7 @@ fn keep_forked_rollout_item(item: &RolloutItem, preserve_reference_context_item:
         // so they must rebuild context on their first child turn.
         RolloutItem::TurnContext(_) | RolloutItem::WorldState(_) => preserve_reference_context_item,
         RolloutItem::Compacted(_) | RolloutItem::EventMsg(_) | RolloutItem::SessionMeta(_) => true,
+        RolloutItem::Transaction(_) => false,
     }
 }
 
@@ -434,8 +436,17 @@ impl AgentControl {
                 ))
             })?;
 
-        let selected_capability_roots = parent_history
-            .items
+        let parent_rollout_items = flatten_rollout_items(&parent_history.items)
+            .map_err(|err| {
+                CodexErr::Fatal(format!(
+                    "cannot fork corrupt parent rollout transaction history: {err}"
+                ))
+            })?
+            .items()
+            .iter()
+            .map(|item| (**item).clone())
+            .collect::<Vec<_>>();
+        let selected_capability_roots = parent_rollout_items
             .iter()
             .find_map(|item| {
                 let RolloutItem::SessionMeta(meta_line) = item else {
@@ -444,7 +455,7 @@ impl AgentControl {
                 Some(meta_line.meta.selected_capability_roots.clone())
             })
             .unwrap_or_default();
-        let mut forked_rollout_items = parent_history.items;
+        let mut forked_rollout_items = parent_rollout_items;
         if let SpawnAgentForkMode::LastNTurns(last_n_turns) = fork_mode {
             forked_rollout_items =
                 truncate_rollout_to_last_n_fork_turns(&forked_rollout_items, *last_n_turns);

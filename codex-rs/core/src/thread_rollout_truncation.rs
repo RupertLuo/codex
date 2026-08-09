@@ -15,6 +15,8 @@ use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::InitialHistory;
 use codex_protocol::protocol::InterAgentCommunication;
 use codex_protocol::protocol::RolloutItem;
+use codex_protocol::protocol::RolloutItemFlattener;
+use codex_protocol::protocol::RolloutTransaction;
 use uuid::Uuid;
 
 pub(crate) fn initial_history_has_prior_user_turns(conversation_history: &InitialHistory) -> bool {
@@ -164,7 +166,27 @@ pub fn truncate_rollout_after_turn_id(
     items: &[RolloutItem],
     last_turn_id: &str,
 ) -> CodexResult<Vec<RolloutItem>> {
-    let turns = build_turns_from_rollout_items(items);
+    let mut flattener = RolloutItemFlattener::default();
+    let mut logical_items = Vec::new();
+    let mut physical_logical_spans = Vec::with_capacity(items.len());
+    for item in items {
+        let start = logical_items.len();
+        logical_items.extend(
+            flattener
+                .flatten(std::slice::from_ref(item))
+                .map_err(|err| {
+                    CodexErr::Fatal(format!(
+                        "cannot truncate corrupt rollout transaction history: {err}"
+                    ))
+                })?
+                .into_iter()
+                .cloned(),
+        );
+        physical_logical_spans.push(start..logical_items.len());
+    }
+    let logical_items = logical_items;
+    let logical_slice = logical_items.as_slice();
+    let turns = build_turns_from_rollout_items(logical_slice);
     let turn = turns
         .iter()
         .find(|turn| turn.id == last_turn_id)
@@ -174,7 +196,7 @@ pub fn truncate_rollout_after_turn_id(
             ))
         })?;
 
-    let target_start_index = items
+    let target_start_index = logical_slice
         .iter()
         .position(|item| {
             matches!(
@@ -195,15 +217,39 @@ pub fn truncate_rollout_after_turn_id(
         )));
     }
 
-    let cut_index = items
+    let cut_index = logical_slice
         .iter()
         .enumerate()
         .skip(target_start_index.saturating_add(1))
         .find_map(|(index, item)| {
             matches!(item, RolloutItem::EventMsg(EventMsg::TurnStarted(_))).then_some(index)
         })
-        .unwrap_or(items.len());
-    Ok(items[..cut_index].to_vec())
+        .unwrap_or(logical_slice.len());
+
+    if cut_index == logical_slice.len() {
+        return Ok(items.to_vec());
+    }
+    let physical_cut_index = physical_logical_spans
+        .iter()
+        .position(|span| span.end > cut_index)
+        .expect("a logical cut before the end must belong to a physical record");
+    let span = &physical_logical_spans[physical_cut_index];
+    if cut_index == span.start {
+        return Ok(items[..physical_cut_index].to_vec());
+    }
+
+    let RolloutItem::Transaction(_) = &items[physical_cut_index] else {
+        unreachable!("one physical legacy record contributes exactly one logical item");
+    };
+    let retained_transaction_items = logical_slice[span.start..cut_index].to_vec();
+    let mut truncated = items[..physical_cut_index].to_vec();
+    truncated.push(RolloutItem::Transaction(RolloutTransaction {
+        // A stable transaction ID denotes one immutable payload. Splitting a parent envelope for
+        // a fork creates a new atomic record, so it must receive a fresh identity.
+        transaction_id: Uuid::now_v7().to_string(),
+        items: retained_transaction_items,
+    }));
+    Ok(truncated)
 }
 
 /// Return a suffix of `items` that keeps the last `n_from_end` fork turns.

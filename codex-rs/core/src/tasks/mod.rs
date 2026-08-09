@@ -70,6 +70,12 @@ const TASK_COMPACT_METRIC: &str = "codex.task.compact";
 pub(crate) type SessionTaskResult = CodexResult<Option<String>>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionTaskFinishOutcome {
+    Ordinary,
+    PersistenceUncertain,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum InterruptedTurnHistoryMarker {
     Disabled,
     ContextualUser,
@@ -453,22 +459,33 @@ impl Session {
                     .instrument(trace_span!("session_task.run"))
                     .await;
                 let sess = session_ctx.clone_session();
-                if let Err(err) = sess.flush_rollout().await {
-                    warn!("failed to flush rollout before completing turn: {err}");
-                    sess.send_event(
-                        ctx_for_finish.as_ref(),
-                        EventMsg::Warning(WarningEvent {
-                            message: format!(
-                                "Failed to save the conversation transcript; Codex will continue retrying. Error: {err}"
-                            ),
-                        }),
-                    )
-                    .await;
-                }
-                if !task_cancellation_token.is_cancelled() {
-                    // Finish uniformly from the spawn site so all tasks share the same lifecycle.
-                    sess.on_task_finished(Arc::clone(&ctx_for_finish), task_result)
-                        .await;
+                match sess
+                    .classify_session_task_finish(&ctx_for_finish, &task_result)
+                    .await
+                {
+                    SessionTaskFinishOutcome::PersistenceUncertain => {
+                        sess.finish_persistence_uncertain_task(&ctx_for_finish)
+                            .await;
+                    }
+                    SessionTaskFinishOutcome::Ordinary => {
+                        if let Err(err) = sess.flush_rollout().await {
+                            warn!("failed to flush rollout before completing turn: {err}");
+                            sess.send_event(
+                                ctx_for_finish.as_ref(),
+                                EventMsg::Warning(WarningEvent {
+                                    message: format!(
+                                        "Failed to save the conversation transcript; Codex will continue retrying. Error: {err}"
+                                    ),
+                                }),
+                            )
+                            .await;
+                        }
+                        if !task_cancellation_token.is_cancelled() {
+                            // Finish uniformly from the spawn site so all tasks share the same lifecycle.
+                            sess.on_task_finished(Arc::clone(&ctx_for_finish), task_result)
+                                .await;
+                        }
+                    }
                 }
                 done_clone.notify_waiters();
             }
@@ -598,10 +615,16 @@ impl Session {
             .and_then(|active_turn| active_turn.task.as_ref())
             .is_some_and(|task| task.turn_context.sub_id == transition_owner_turn_id);
         if transition_owner_is_active {
-            // The task that discovered the ambiguous checkpoint must remain alive long enough to
-            // return the fatal persistence error to its normal task boundary. It cannot perform
-            // any further durable work because the lifecycle is already quarantined, but its
-            // queued input must still be discarded.
+            // Keep the owner handle alive so its normal task boundary performs the dedicated
+            // persistence-uncertain cleanup, but cancel its work immediately. This also covers
+            // ordinary recording paths whose void compatibility wrapper cannot propagate the
+            // persistence error through every historical caller.
+            if let Some(task) = active
+                .as_ref()
+                .and_then(|active_turn| active_turn.task.as_ref())
+            {
+                task.cancellation_token.cancel();
+            }
             self.input_queue
                 .clear_for_persistence_quarantine(active.as_ref())
                 .await;
@@ -699,6 +722,59 @@ impl Session {
         }
 
         true
+    }
+
+    async fn classify_session_task_finish(
+        &self,
+        turn_context: &TurnContext,
+        task_result: &SessionTaskResult,
+    ) -> SessionTaskFinishOutcome {
+        if let Err(error) = task_result
+            && self.is_persistence_uncertain_fatal(error).await
+        {
+            return SessionTaskFinishOutcome::PersistenceUncertain;
+        }
+        if self.persistence_quarantine_reason().await.is_none() {
+            return SessionTaskFinishOutcome::Ordinary;
+        }
+        let active = self.active_turn.lock().await;
+        if active
+            .as_ref()
+            .and_then(|active_turn| active_turn.task.as_ref())
+            .is_some_and(|task| task.turn_context.sub_id == turn_context.sub_id)
+        {
+            SessionTaskFinishOutcome::PersistenceUncertain
+        } else {
+            SessionTaskFinishOutcome::Ordinary
+        }
+    }
+
+    async fn finish_persistence_uncertain_task(&self, turn_context: &Arc<TurnContext>) {
+        turn_context
+            .turn_metadata_state
+            .cancel_git_enrichment_task();
+        let mut active_turn = {
+            let mut active = self.active_turn.lock().await;
+            let owner_is_active = active
+                .as_ref()
+                .and_then(|active_turn| active_turn.task.as_ref())
+                .is_some_and(|task| task.turn_context.sub_id == turn_context.sub_id);
+            owner_is_active.then(|| active.take()).flatten()
+        };
+        let Some(active_turn) = active_turn.as_mut() else {
+            return;
+        };
+        if let Some(task) = active_turn.task.take() {
+            task.handle.detach();
+        }
+        self.input_queue
+            .clear_for_persistence_quarantine(Some(active_turn))
+            .await;
+        self.services
+            .guardian_rejection_circuit_breaker
+            .lock()
+            .await
+            .clear_turn(&turn_context.sub_id);
     }
 
     pub async fn on_task_finished(

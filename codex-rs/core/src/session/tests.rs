@@ -201,6 +201,67 @@ impl StepContext {
     }
 }
 
+#[tokio::test]
+async fn record_step_world_state_failure_does_not_advance_baseline() {
+    let (session, turn_context) = make_session_and_context().await;
+    let previous_world_state = Arc::new(WorldState::default());
+    let previous_snapshot = previous_world_state.snapshot();
+    session
+        .state
+        .lock()
+        .await
+        .history
+        .set_world_state_baseline(previous_snapshot.clone());
+    *session.persistence_lifecycle.lock().await =
+        PersistenceLifecycle::Quarantined("injected persistence failure".to_string());
+    let step_context = StepContext::for_test(Arc::new(turn_context));
+
+    let _ = session
+        .record_step_world_state_if_changed(&previous_world_state, step_context.as_ref())
+        .await;
+
+    assert_eq!(
+        session
+            .state
+            .lock()
+            .await
+            .history
+            .world_state_baseline_for_test(),
+        Some(previous_snapshot),
+        "a rejected context transaction must not install its speculative world-state baseline"
+    );
+}
+
+#[tokio::test]
+async fn initial_context_persistence_failure_does_not_install_world_state_baseline() {
+    let (session, turn_context) = make_session_and_context().await;
+    let step_context = StepContext::for_test(Arc::new(turn_context));
+    let mut lifecycle = session.persistence_lifecycle.lock().await;
+    *lifecycle = PersistenceLifecycle::Quarantined("injected persistence failure".to_string());
+
+    let result = session
+        .record_context_updates_and_set_reference_context_item_with_guard(
+            &mut lifecycle,
+            step_context.as_ref(),
+        )
+        .await;
+
+    assert!(
+        result.is_err(),
+        "the injected persistence failure must surface"
+    );
+    assert_eq!(
+        session
+            .state
+            .lock()
+            .await
+            .history
+            .world_state_baseline_for_test(),
+        None,
+        "failed initial-context persistence must not install a speculative baseline"
+    );
+}
+
 mod guardian_tests;
 
 struct InstructionsTestCase {
@@ -1646,7 +1707,8 @@ async fn reconstruct_history_matches_live_compactions() {
     let reconstruction_turn = session.new_default_turn().await;
     let reconstructed = session
         .reconstruct_history_from_rollout(reconstruction_turn.as_ref(), &rollout_items)
-        .await;
+        .await
+        .expect("valid rollout reconstruction");
 
     assert_eq!(expected, reconstructed.history);
     assert_eq!(2, reconstructed.window_number);
@@ -1699,7 +1761,8 @@ async fn reconstruct_history_uses_replacement_history_verbatim() {
 
     let reconstructed = session
         .reconstruct_history_from_rollout(&turn_context, &rollout_items)
-        .await;
+        .await
+        .expect("valid rollout reconstruction");
 
     assert_eq!(reconstructed.history, replacement_history);
     assert_eq!(42, reconstructed.window_number);
@@ -1719,7 +1782,8 @@ async fn record_initial_history_reconstructs_resumed_transcript() {
             history: Arc::new(rollout_items),
             rollout_path: Some(PathBuf::from("/tmp/resume.jsonl")),
         }))
-        .await;
+        .await
+        .expect("valid initial history");
 
     let history = session.state.lock().await.clone_history();
     assert_eq!(expected, history.raw_items());
@@ -1775,15 +1839,27 @@ async fn record_inter_agent_communication_sets_turn_id_in_rollout_and_resume() {
     else {
         panic!("expected resumed rollout history");
     };
-    let persisted_items = resumed
-        .history
+    assert_eq!(
+        resumed
+            .history
+            .iter()
+            .filter(|item| matches!(item, RolloutItem::Transaction(_)))
+            .count(),
+        1,
+        "inter-agent metadata, response, and raw event must share one physical envelope"
+    );
+    let flattened = flatten_rollout_items(&resumed.history).expect("flatten persisted IAC");
+    let persisted_items = flattened
+        .items()
         .iter()
+        .copied()
         .filter(|item| {
             matches!(
                 item,
                 RolloutItem::ResponseItem(_)
                     | RolloutItem::InterAgentCommunication(_)
                     | RolloutItem::InterAgentCommunicationMetadata { .. }
+                    | RolloutItem::EventMsg(EventMsg::RawResponseItem(_))
             )
         })
         .cloned()
@@ -1793,6 +1869,9 @@ async fn record_inter_agent_communication_sets_turn_id_in_rollout_and_resume() {
             trigger_turn: false,
         },
         RolloutItem::ResponseItem(expected_item.clone()),
+        RolloutItem::EventMsg(EventMsg::RawResponseItem(RawResponseItemEvent {
+            item: expected_item.clone(),
+        })),
     ];
     assert_eq!(
         serde_json::to_value(persisted_items).unwrap(),
@@ -1802,7 +1881,8 @@ async fn record_inter_agent_communication_sets_turn_id_in_rollout_and_resume() {
     let (resumed_session, _resumed_turn_context) = make_session_and_context().await;
     resumed_session
         .record_initial_history(InitialHistory::Resumed(resumed))
-        .await;
+        .await
+        .expect("valid initial history");
     assert_eq!(
         resumed_session.clone_history().await.raw_items(),
         std::slice::from_ref(&expected_item)
@@ -1850,10 +1930,15 @@ async fn record_inter_agent_communication_preserves_item_id_in_rollout_and_resum
     else {
         panic!("expected resumed rollout history");
     };
-    let persisted_item_id = resumed.history.iter().find_map(|item| match item {
-        RolloutItem::ResponseItem(item @ ResponseItem::AgentMessage { .. }) => item.id(),
-        _ => None,
-    });
+    let flattened = flatten_rollout_items(&resumed.history).expect("flatten persisted IAC");
+    let persisted_item_id = flattened
+        .items()
+        .iter()
+        .copied()
+        .find_map(|item| match item {
+            RolloutItem::ResponseItem(item @ ResponseItem::AgentMessage { .. }) => item.id(),
+            _ => None,
+        });
     assert_eq!(persisted_item_id, Some(live_item_id.as_str()));
 
     let (resumed_session, _resumed_turn_context, _rx) =
@@ -1867,7 +1952,8 @@ async fn record_inter_agent_communication_preserves_item_id_in_rollout_and_resum
         .await;
     resumed_session
         .record_initial_history(InitialHistory::Resumed(resumed))
-        .await;
+        .await
+        .expect("valid initial history");
     let resumed_history = resumed_session.clone_history().await;
     let [resumed_item] = resumed_history.raw_items() else {
         panic!("expected exactly one resumed history item");
@@ -1973,7 +2059,8 @@ async fn prepares_resumed_history_before_installing_it() {
             history: Arc::new(vec![RolloutItem::ResponseItem(resumed_item)]),
             rollout_path: Some(PathBuf::from("/tmp/resume.jsonl")),
         }))
-        .await;
+        .await
+        .expect("valid initial history");
 
     assert_eq!(
         session.state.lock().await.clone_history().raw_items(),
@@ -2068,7 +2155,10 @@ fn resolve_multi_agent_version_handles_unset_and_legacy_history() {
 async fn record_initial_history_new_defers_initial_context_until_first_turn() {
     let (session, _turn_context) = make_session_and_context().await;
 
-    session.record_initial_history(InitialHistory::New).await;
+    session
+        .record_initial_history(InitialHistory::New)
+        .await
+        .expect("valid initial history");
 
     let history = session.clone_history().await;
     assert_eq!(history.raw_items().to_vec(), Vec::<ResponseItem>::new());
@@ -2103,7 +2193,8 @@ async fn resumed_history_injects_initial_context_on_first_context_update_only() 
             history: Arc::new(rollout_items),
             rollout_path: Some(PathBuf::from("/tmp/resume.jsonl")),
         }))
-        .await;
+        .await
+        .expect("valid initial history");
 
     let history_before_seed = session.state.lock().await.clone_history();
     assert_eq!(expected, history_before_seed.raw_items());
@@ -2198,7 +2289,8 @@ async fn record_initial_history_seeds_token_info_from_rollout() {
             history: Arc::new(rollout_items),
             rollout_path: Some(PathBuf::from("/tmp/resume.jsonl")),
         }))
-        .await;
+        .await
+        .expect("valid initial history");
 
     let actual = session.state.lock().await.token_info();
     assert_eq!(actual, Some(info2));
@@ -2711,7 +2803,8 @@ async fn record_initial_history_reconstructs_forked_transcript() {
 
     session
         .record_initial_history(InitialHistory::Forked(rollout_items))
-        .await;
+        .await
+        .expect("valid initial history");
 
     let history = session.state.lock().await.clone_history();
     assert_eq!(expected, history.raw_items());
@@ -2760,6 +2853,7 @@ async fn start_new_context_window_assigns_and_persists_item_ids() {
         | RolloutItem::InterAgentCommunicationMetadata { .. }
         | RolloutItem::TurnContext(_)
         | RolloutItem::WorldState(_)
+        | RolloutItem::Transaction(_)
         | RolloutItem::EventMsg(_) => None,
     });
     assert_eq!(
@@ -2790,7 +2884,8 @@ async fn record_initial_history_assigns_and_persists_id_for_forked_response_item
         .record_initial_history(InitialHistory::Forked(vec![RolloutItem::ResponseItem(
             response_item,
         )]))
-        .await;
+        .await
+        .expect("valid initial history");
 
     let live_history = session.clone_history().await;
     let [live_item] = live_history.raw_items() else {
@@ -2819,6 +2914,7 @@ async fn record_initial_history_assigns_and_persists_id_for_forked_response_item
         | RolloutItem::Compacted(_)
         | RolloutItem::TurnContext(_)
         | RolloutItem::WorldState(_)
+        | RolloutItem::Transaction(_)
         | RolloutItem::EventMsg(_) => None,
     });
     assert_eq!(persisted_item_id, Some(live_item_id.as_str()));
@@ -3076,7 +3172,8 @@ async fn record_initial_history_forked_hydrates_previous_turn_settings() {
 
     session
         .record_initial_history(InitialHistory::Forked(rollout_items))
-        .await;
+        .await
+        .expect("valid initial history");
 
     let history = session.clone_history().await;
     assert_eq!(

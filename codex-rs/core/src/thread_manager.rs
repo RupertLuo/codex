@@ -71,6 +71,7 @@ use codex_protocol::protocol::TurnAbortReason;
 use codex_protocol::protocol::TurnAbortedEvent;
 use codex_protocol::protocol::TurnEnvironmentSelection;
 use codex_protocol::protocol::W3cTraceContext;
+use codex_protocol::protocol::flatten_rollout_items;
 use codex_rollout::state_db::StateDbHandle;
 use codex_thread_store::InMemoryThreadStore;
 use codex_thread_store::ListTurnsParams;
@@ -1023,6 +1024,7 @@ impl ThreadManager {
                 ))
             })?;
         let history = stored_thread_to_initial_history(stored_thread, fork_source.rollout_path())?;
+        let history = logical_history_for_fork(history)?;
         let inherited_multi_agent_version = fork_source
             .multi_agent_version()
             .unwrap_or(MultiAgentVersion::V1);
@@ -1416,6 +1418,7 @@ impl ThreadManager {
             .await;
         let interrupted_marker =
             InterruptedTurnHistoryMarker::from_config_and_version(&config, multi_agent_version);
+        let history = logical_history_for_fork(history)?;
         let history = fork_history_from_snapshot(snapshot, history, interrupted_marker);
         let environments = default_thread_environment_selections(
             self.state.environment_manager.as_ref(),
@@ -2292,6 +2295,28 @@ fn fork_history_from_snapshot(
                 history
             }
         }
+    }
+}
+
+fn logical_history_for_fork(history: InitialHistory) -> CodexResult<InitialHistory> {
+    fn logical_items(items: &[RolloutItem]) -> CodexResult<Vec<RolloutItem>> {
+        flatten_rollout_items(items)
+            .map(|items| items.into_items().into_iter().cloned().collect())
+            .map_err(|err| {
+                CodexErr::Fatal(format!(
+                    "cannot fork corrupt rollout transaction history: {err}"
+                ))
+            })
+    }
+
+    match history {
+        InitialHistory::New => Ok(InitialHistory::New),
+        InitialHistory::Cleared => Ok(InitialHistory::Cleared),
+        InitialHistory::Resumed(mut resumed) => {
+            resumed.history = Arc::new(logical_items(resumed.history.as_slice())?);
+            Ok(InitialHistory::Resumed(resumed))
+        }
+        InitialHistory::Forked(items) => Ok(InitialHistory::Forked(logical_items(&items)?)),
     }
 }
 

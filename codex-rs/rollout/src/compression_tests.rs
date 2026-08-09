@@ -10,6 +10,7 @@ use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::InitialHistory;
 use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::RolloutLine;
+use codex_protocol::protocol::RolloutTransaction;
 use codex_protocol::protocol::SessionMeta;
 use codex_protocol::protocol::SessionMetaLine;
 use codex_protocol::protocol::SessionSource;
@@ -126,6 +127,72 @@ async fn search_rollout_matches_uses_logical_path_for_compressed_rollout() -> an
         matches.get(rollout_path.as_path()),
         Some(&Some("targeted search term".to_string()))
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn search_plain_rollouts_ignores_losing_duplicate_transaction_payloads() -> anyhow::Result<()>
+{
+    let home = TempDir::new()?;
+    let losing_uuid = Uuid::from_u128(16);
+    let losing_thread_id = ThreadId::from_string(&losing_uuid.to_string())?;
+    let losing_path = rollout_path(home.path(), "2025-01-03T12-00-00", losing_uuid);
+    write_rollout(&losing_path, losing_thread_id, "visible conversation")?;
+    append_rollout_item_to_path(
+        &losing_path,
+        &RolloutItem::Transaction(RolloutTransaction {
+            transaction_id: "duplicate-search-transaction".to_string(),
+            items: vec![RolloutItem::EventMsg(EventMsg::UserMessage(
+                UserMessageEvent {
+                    message: "winning payload".to_string(),
+                    ..Default::default()
+                },
+            ))],
+        }),
+    )
+    .await?;
+    append_rollout_item_to_path(
+        &losing_path,
+        &RolloutItem::Transaction(RolloutTransaction {
+            transaction_id: "duplicate-search-transaction".to_string(),
+            items: vec![RolloutItem::EventMsg(EventMsg::UserMessage(
+                UserMessageEvent {
+                    message: "hidden duplicate needle".to_string(),
+                    ..Default::default()
+                },
+            ))],
+        }),
+    )
+    .await?;
+
+    let winning_uuid = Uuid::from_u128(17);
+    let winning_thread_id = ThreadId::from_string(&winning_uuid.to_string())?;
+    let winning_path = rollout_path(home.path(), "2025-01-03T12-00-01", winning_uuid);
+    write_rollout(&winning_path, winning_thread_id, "visible conversation")?;
+    append_rollout_item_to_path(
+        &winning_path,
+        &RolloutItem::Transaction(RolloutTransaction {
+            transaction_id: "visible-search-transaction".to_string(),
+            items: vec![RolloutItem::EventMsg(EventMsg::UserMessage(
+                UserMessageEvent {
+                    message: "visible needle".to_string(),
+                    ..Default::default()
+                },
+            ))],
+        }),
+    )
+    .await?;
+
+    let matches = search_rollout_matches(
+        std::path::Path::new("missing-rg-for-test"),
+        home.path(),
+        /*archived*/ false,
+        "needle",
+    )
+    .await?;
+
+    assert!(!matches.contains_key(&losing_path));
+    assert_eq!(matches.get(&winning_path), Some(&None));
     Ok(())
 }
 

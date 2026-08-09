@@ -764,6 +764,11 @@ async fn run_compact_task_inner_impl(
     };
     if let Err(err) = commit_result {
         sess.track_turn_codex_error(turn_context.as_ref(), &err);
+        if sess.is_persistence_uncertain_fatal(&err).await {
+            sess.deliver_persistence_quarantine_error(&turn_context.sub_id, err.to_string())
+                .await;
+            return Err(err);
+        }
         let event = EventMsg::Error(err.to_error_event(/*message_prefix*/ None));
         sess.send_event(&turn_context, event)
             .or_cancel(&cancellation_token)

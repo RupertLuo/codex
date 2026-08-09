@@ -15,6 +15,7 @@ use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::TokenUsage;
+use codex_protocol::protocol::flatten_rollout_items;
 use codex_rollout::INTERACTIVE_SESSION_SOURCES;
 use codex_rollout::should_persist_response_item_for_memories;
 use codex_secrets::redact_secrets;
@@ -404,8 +405,14 @@ mod job {
     pub(super) fn serialize_filtered_rollout_response_items(
         items: &[RolloutItem],
     ) -> codex_protocol::error::Result<String> {
-        let filtered = items
-            .iter()
+        let logical_items = flatten_rollout_items(items).map_err(|err| {
+            CodexErr::InvalidRequest(format!(
+                "failed to traverse rollout memory transaction: {err}"
+            ))
+        })?;
+        let filtered = logical_items
+            .into_items()
+            .into_iter()
             .filter_map(|item| match item {
                 RolloutItem::ResponseItem(item) => sanitize_response_item_for_memories(item),
                 RolloutItem::InterAgentCommunication(communication) => {
@@ -416,6 +423,7 @@ mod job {
                 | RolloutItem::Compacted(_)
                 | RolloutItem::TurnContext(_)
                 | RolloutItem::WorldState(_)
+                | RolloutItem::Transaction(_)
                 | RolloutItem::EventMsg(_) => None,
             })
             .collect::<Vec<_>>();
@@ -666,7 +674,44 @@ mod tests {
     use super::*;
     use codex_protocol::AgentPath;
     use codex_protocol::protocol::InterAgentCommunication;
+    use codex_protocol::protocol::RolloutTransaction;
     use pretty_assertions::assert_eq;
+
+    #[test]
+    fn serializes_nested_rollout_transactions_once_by_stable_id() {
+        let assistant_message = |text: &str| ResponseItem::Message {
+            id: None,
+            role: "assistant".to_string(),
+            content: vec![ContentItem::OutputText {
+                text: text.to_string(),
+            }],
+            phase: None,
+            internal_chat_message_metadata_passthrough: None,
+        };
+        let first = assistant_message("first");
+        let nested = assistant_message("nested");
+
+        let serialized = job::serialize_filtered_rollout_response_items(&[
+            RolloutItem::Transaction(RolloutTransaction {
+                transaction_id: "outer".to_string(),
+                items: vec![
+                    RolloutItem::ResponseItem(first.clone()),
+                    RolloutItem::Transaction(RolloutTransaction {
+                        transaction_id: "inner".to_string(),
+                        items: vec![RolloutItem::ResponseItem(nested.clone())],
+                    }),
+                ],
+            }),
+            RolloutItem::Transaction(RolloutTransaction {
+                transaction_id: "outer".to_string(),
+                items: vec![RolloutItem::ResponseItem(assistant_message("duplicate"))],
+            }),
+        ])
+        .expect("serialize nested rollout transaction");
+        let parsed: Vec<ResponseItem> = serde_json::from_str(&serialized).expect("parse");
+
+        assert_eq!(parsed, vec![first, nested]);
+    }
 
     #[test]
     fn serializes_memory_rollout_with_agents_removed_but_environment_kept() {

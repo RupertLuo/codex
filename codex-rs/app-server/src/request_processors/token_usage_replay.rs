@@ -22,6 +22,7 @@ use codex_core::CodexThread;
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::RolloutItem;
+use codex_protocol::protocol::RolloutItemFlattener;
 
 use crate::outgoing_message::ConnectionId;
 use crate::outgoing_message::OutgoingMessageSender;
@@ -71,19 +72,29 @@ pub(super) fn latest_token_usage_turn_id_from_rollout_items(
     turns: &[Turn],
 ) -> Option<String> {
     let mut builder = ThreadHistoryBuilder::new();
+    let mut flattener = RolloutItemFlattener::default();
     let mut token_usage_turn_owner = None;
 
     for item in rollout_items {
-        if matches!(item, RolloutItem::EventMsg(EventMsg::TokenCount(_))) {
-            token_usage_turn_owner =
-                builder
-                    .active_turn_snapshot()
-                    .map(|turn| TokenUsageTurnOwner {
-                        id: turn.id,
-                        position: builder.active_turn_position(),
-                    });
+        let logical_items = match flattener.flatten(std::slice::from_ref(item)) {
+            Ok(items) => items,
+            Err(err) => {
+                tracing::warn!(%err, "failed to traverse rollout for token usage attribution");
+                return None;
+            }
+        };
+        for item in logical_items {
+            if matches!(item, RolloutItem::EventMsg(EventMsg::TokenCount(_))) {
+                token_usage_turn_owner =
+                    builder
+                        .active_turn_snapshot()
+                        .map(|turn| TokenUsageTurnOwner {
+                            id: turn.id,
+                            position: builder.active_turn_position(),
+                        });
+            }
+            builder.handle_rollout_item(item);
         }
-        builder.handle_rollout_item(item);
     }
 
     let owner = token_usage_turn_owner?;
@@ -118,6 +129,7 @@ mod tests {
     use super::*;
     use codex_app_server_protocol::build_turns_from_rollout_items;
     use codex_protocol::protocol::AgentMessageEvent;
+    use codex_protocol::protocol::RolloutTransaction;
     use codex_protocol::protocol::TokenCountEvent;
     use codex_protocol::protocol::UserMessageEvent;
     use pretty_assertions::assert_eq;
@@ -142,6 +154,35 @@ mod tests {
         assert_eq!(
             latest_token_usage_turn_id_from_rollout_items(&rollout_items, turns.as_slice()),
             Some("rebuilt-turn-id".to_string())
+        );
+    }
+
+    #[test]
+    fn replay_attribution_uses_nested_first_winning_transaction_view() {
+        let transaction_id = "token-owner-transaction".to_string();
+        let rollout_items = vec![
+            RolloutItem::Transaction(RolloutTransaction {
+                transaction_id: transaction_id.clone(),
+                items: vec![RolloutItem::Transaction(RolloutTransaction {
+                    transaction_id: "token-owner-inner".to_string(),
+                    items: token_usage_history(),
+                })],
+            }),
+            RolloutItem::Transaction(RolloutTransaction {
+                transaction_id,
+                items: vec![RolloutItem::EventMsg(EventMsg::TokenCount(
+                    TokenCountEvent {
+                        info: None,
+                        rate_limits: None,
+                    },
+                ))],
+            }),
+        ];
+        let turns = build_turns_from_rollout_items(&rollout_items);
+
+        assert_eq!(
+            latest_token_usage_turn_id_from_rollout_items(&rollout_items, turns.as_slice()),
+            Some(turns[0].id.clone())
         );
     }
 

@@ -6,6 +6,7 @@ use codex_protocol::protocol::SessionMetaLine;
 use codex_protocol::protocol::TurnContextItem;
 use codex_protocol::protocol::USER_MESSAGE_BEGIN;
 use codex_protocol::protocol::UserMessageEvent;
+use codex_protocol::protocol::flatten_rollout_items;
 use serde::Serialize;
 use serde_json::Value;
 
@@ -36,6 +37,14 @@ pub fn apply_rollout_item(
             }
         }
         RolloutItem::WorldState(_) => {}
+        RolloutItem::Transaction(_) => match flatten_rollout_items(std::slice::from_ref(item)) {
+            Ok(flattened) => {
+                for logical_item in flattened.items() {
+                    apply_rollout_item(metadata, logical_item, default_provider);
+                }
+            }
+            Err(err) => tracing::warn!(%err, "failed to traverse rollout transaction metadata"),
+        },
     }
     if metadata.model_provider.is_empty() {
         metadata.model_provider = default_provider.to_string();
@@ -55,6 +64,15 @@ pub fn rollout_item_affects_thread_metadata(item: &RolloutItem) -> bool {
         | RolloutItem::InterAgentCommunication(_)
         | RolloutItem::InterAgentCommunicationMetadata { .. }
         | RolloutItem::WorldState(_) => false,
+        RolloutItem::Transaction(_) => {
+            flatten_rollout_items(std::slice::from_ref(item)).is_ok_and(|flattened| {
+                flattened
+                    .items()
+                    .iter()
+                    .copied()
+                    .any(rollout_item_affects_thread_metadata)
+            })
+        }
     }
 }
 

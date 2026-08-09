@@ -23,6 +23,7 @@ use crate::state_db;
 use codex_file_search as file_search;
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::RolloutItem;
+use codex_protocol::protocol::RolloutItemFlattener;
 use codex_protocol::protocol::RolloutLine;
 use codex_protocol::protocol::SessionMetaLine;
 use codex_protocol::protocol::SessionSource;
@@ -1115,6 +1116,7 @@ async fn read_head_summary(path: &Path, head_limit: usize) -> io::Result<HeadTai
     let mut lines = compression::open_rollout_line_reader(path).await?;
     let mut summary = HeadTailSummary::default();
     let mut lines_scanned = 0usize;
+    let mut flattener = RolloutItemFlattener::default();
 
     while lines_scanned < head_limit
         || (summary.saw_session_meta
@@ -1145,59 +1147,71 @@ async fn read_head_summary(path: &Path, head_limit: usize) -> io::Result<HeadTai
             }
         };
 
-        match rollout_line.item {
-            RolloutItem::SessionMeta(session_meta_line) => {
-                if !summary.saw_session_meta {
-                    summary.source = Some(session_meta_line.meta.source.clone());
-                    summary.thread_source = session_meta_line.meta.thread_source.clone();
-                    summary.history_mode = session_meta_line.meta.history_mode;
-                    summary.parent_thread_id = session_meta_line.meta.parent_thread_id;
-                    summary.agent_nickname = session_meta_line.meta.agent_nickname.clone();
-                    summary.agent_role = session_meta_line.meta.agent_role.clone();
-                    summary.model_provider = session_meta_line.meta.model_provider.clone();
-                    summary.thread_id = Some(session_meta_line.meta.id);
-                    summary.cwd = Some(session_meta_line.meta.cwd.clone());
-                    summary.git_branch = session_meta_line
-                        .git
-                        .as_ref()
-                        .and_then(|git| git.branch.clone());
-                    summary.git_sha = session_meta_line
-                        .git
-                        .as_ref()
-                        .and_then(|git| git.commit_hash.as_ref().map(|sha| sha.0.clone()));
-                    summary.git_origin_url = session_meta_line
-                        .git
-                        .as_ref()
-                        .and_then(|git| git.repository_url.clone());
-                    summary.cli_version = Some(session_meta_line.meta.cli_version);
-                    summary.created_at = Some(session_meta_line.meta.timestamp.clone());
-                    summary.saw_session_meta = true;
-                }
+        let logical_items = match flattener.flatten(std::slice::from_ref(&rollout_line.item)) {
+            Ok(items) => items,
+            Err(err) => {
+                tracing::warn!(%err, path = %path.display(), "failed to traverse rollout summary");
+                continue;
             }
-            RolloutItem::ResponseItem(_) | RolloutItem::InterAgentCommunication(_) => {
-                summary
-                    .created_at
-                    .get_or_insert_with(|| rollout_line.timestamp.clone());
-            }
-            RolloutItem::InterAgentCommunicationMetadata { .. } => {}
-            RolloutItem::TurnContext(_) => {
-                // Not included in `head`; skip.
-            }
-            RolloutItem::WorldState(_) => {
-                // Not included in `head`; skip.
-            }
-            RolloutItem::Compacted(_) => {
-                // Not included in `head`; skip.
-            }
-            RolloutItem::EventMsg(ev) => {
-                if let Some(preview) = event_msg_preview(&ev) {
-                    if summary.preview.is_none() {
-                        summary.preview = Some(preview.clone());
+        };
+        for item in logical_items {
+            match item {
+                RolloutItem::SessionMeta(session_meta_line) => {
+                    if !summary.saw_session_meta {
+                        summary.source = Some(session_meta_line.meta.source.clone());
+                        summary.thread_source = session_meta_line.meta.thread_source.clone();
+                        summary.history_mode = session_meta_line.meta.history_mode;
+                        summary.parent_thread_id = session_meta_line.meta.parent_thread_id;
+                        summary.agent_nickname = session_meta_line.meta.agent_nickname.clone();
+                        summary.agent_role = session_meta_line.meta.agent_role.clone();
+                        summary.model_provider = session_meta_line.meta.model_provider.clone();
+                        summary.thread_id = Some(session_meta_line.meta.id);
+                        summary.cwd = Some(session_meta_line.meta.cwd.clone());
+                        summary.git_branch = session_meta_line
+                            .git
+                            .as_ref()
+                            .and_then(|git| git.branch.clone());
+                        summary.git_sha = session_meta_line
+                            .git
+                            .as_ref()
+                            .and_then(|git| git.commit_hash.as_ref().map(|sha| sha.0.clone()));
+                        summary.git_origin_url = session_meta_line
+                            .git
+                            .as_ref()
+                            .and_then(|git| git.repository_url.clone());
+                        summary.cli_version = Some(session_meta_line.meta.cli_version.clone());
+                        summary.created_at = Some(session_meta_line.meta.timestamp.clone());
+                        summary.saw_session_meta = true;
                     }
-                    if let EventMsg::UserMessage(_) = ev
-                        && summary.first_user_message.is_none()
-                    {
-                        summary.first_user_message = Some(preview);
+                }
+                RolloutItem::ResponseItem(_) | RolloutItem::InterAgentCommunication(_) => {
+                    summary
+                        .created_at
+                        .get_or_insert_with(|| rollout_line.timestamp.clone());
+                }
+                RolloutItem::InterAgentCommunicationMetadata { .. } => {}
+                RolloutItem::TurnContext(_) => {
+                    // Not included in `head`; skip.
+                }
+                RolloutItem::WorldState(_) => {
+                    // Not included in `head`; skip.
+                }
+                RolloutItem::Compacted(_) => {
+                    // Not included in `head`; skip.
+                }
+                RolloutItem::Transaction(_) => {
+                    // Transactions are removed by the bounded flattener above.
+                }
+                RolloutItem::EventMsg(ev) => {
+                    if let Some(preview) = event_msg_preview(ev) {
+                        if summary.preview.is_none() {
+                            summary.preview = Some(preview.clone());
+                        }
+                        if let EventMsg::UserMessage(_) = ev
+                            && summary.first_user_message.is_none()
+                        {
+                            summary.first_user_message = Some(preview);
+                        }
                     }
                 }
             }
@@ -1219,6 +1233,7 @@ async fn read_head_summary(path: &Path, head_limit: usize) -> io::Result<HeadTai
 pub async fn read_head_for_summary(path: &Path) -> io::Result<Vec<serde_json::Value>> {
     let mut lines = compression::open_rollout_line_reader(path).await?;
     let mut head = Vec::new();
+    let mut flattener = RolloutItemFlattener::default();
 
     while head.len() < HEAD_RECORD_LIMIT {
         let Some(line) = lines.next_line().await? else {
@@ -1229,27 +1244,41 @@ pub async fn read_head_for_summary(path: &Path) -> io::Result<Vec<serde_json::Va
             continue;
         }
         if let Ok(rollout_line) = serde_json::from_str::<RolloutLine>(trimmed) {
-            match rollout_line.item {
-                RolloutItem::SessionMeta(session_meta_line) => {
-                    if let Ok(value) = serde_json::to_value(session_meta_line) {
-                        head.push(value);
-                    }
+            let logical_items = match flattener.flatten(std::slice::from_ref(&rollout_line.item)) {
+                Ok(items) => items,
+                Err(err) => {
+                    tracing::warn!(%err, path = %path.display(), "failed to traverse rollout head");
+                    continue;
                 }
-                RolloutItem::ResponseItem(item) => {
-                    if let Ok(value) = serde_json::to_value(item) {
-                        head.push(value);
-                    }
+            };
+            for item in logical_items {
+                if head.len() >= HEAD_RECORD_LIMIT {
+                    break;
                 }
-                RolloutItem::InterAgentCommunication(communication) => {
-                    if let Ok(value) = serde_json::to_value(communication.to_model_input_item()) {
-                        head.push(value);
+                match item {
+                    RolloutItem::SessionMeta(session_meta_line) => {
+                        if let Ok(value) = serde_json::to_value(session_meta_line) {
+                            head.push(value);
+                        }
                     }
+                    RolloutItem::ResponseItem(item) => {
+                        if let Ok(value) = serde_json::to_value(item) {
+                            head.push(value);
+                        }
+                    }
+                    RolloutItem::InterAgentCommunication(communication) => {
+                        if let Ok(value) = serde_json::to_value(communication.to_model_input_item())
+                        {
+                            head.push(value);
+                        }
+                    }
+                    RolloutItem::InterAgentCommunicationMetadata { .. }
+                    | RolloutItem::Compacted(_)
+                    | RolloutItem::TurnContext(_)
+                    | RolloutItem::WorldState(_)
+                    | RolloutItem::Transaction(_)
+                    | RolloutItem::EventMsg(_) => {}
                 }
-                RolloutItem::InterAgentCommunicationMetadata { .. }
-                | RolloutItem::Compacted(_)
-                | RolloutItem::TurnContext(_)
-                | RolloutItem::WorldState(_)
-                | RolloutItem::EventMsg(_) => {}
             }
         }
     }

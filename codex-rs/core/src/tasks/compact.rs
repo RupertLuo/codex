@@ -75,7 +75,10 @@ impl SessionTask for CompactTask {
             }];
             crate::compact::run_compact_task(session.clone(), ctx, input, cancellation_token).await
         };
-        if let Err(err @ CodexErr::TurnAborted) = result {
+        if let Err(err) = result
+            && (matches!(err, CodexErr::TurnAborted)
+                || session.is_persistence_uncertain_fatal(&err).await)
+        {
             return Err(err);
         }
         Ok(None)

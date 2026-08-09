@@ -530,6 +530,15 @@ impl CodexThread {
     }
 
     #[cfg(any(test, feature = "test-support"))]
+    pub(crate) async fn realtime_close_pending_for_test(&self) -> bool {
+        self.codex
+            .session
+            .conversation
+            .close_pending_for_test()
+            .await
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) async fn inject_no_new_turn_for_test(&self, items: Vec<ResponseItem>) {
         self.codex
             .session
@@ -572,7 +581,7 @@ impl CodexThread {
             ));
         }
 
-        let lifecycle = self
+        let mut lifecycle = self
             .codex
             .session
             .acquire_persistence_side_effect()
@@ -590,14 +599,15 @@ impl CodexThread {
             self.codex
                 .session
                 .record_context_updates_and_set_reference_context_item_with_guard(
-                    &lifecycle,
+                    &mut lifecycle,
                     step_context.as_ref(),
                 )
-                .await;
+                .await
+                .map_err(|err| CodexErr::Fatal(err.to_string()))?;
         }
         self.codex
             .session
-            .inject_no_new_turn_with_guard(&lifecycle, items, Some(turn_context.as_ref()))
+            .inject_no_new_turn_with_guard(&mut lifecycle, items, Some(turn_context.as_ref()))
             .await
             .map_err(|err| CodexErr::Io(std::io::Error::other(err.to_string())))?;
         self.codex

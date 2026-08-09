@@ -46,13 +46,14 @@ use crate::session::step_context::StepContext;
 use crate::session::turn_context::TurnContext;
 use crate::stream_events_utils::HandleOutputCtx;
 use crate::stream_events_utils::TurnItemContributorPolicy;
+use crate::stream_events_utils::apply_completed_response_item_facts;
 use crate::stream_events_utils::finalize_non_tool_response_item;
 use crate::stream_events_utils::handle_non_tool_response_item;
 use crate::stream_events_utils::handle_output_item_done;
 use crate::stream_events_utils::last_assistant_message_from_item;
 use crate::stream_events_utils::mark_thread_memory_mode_polluted_if_external_context;
+use crate::stream_events_utils::persist_completed_response_item;
 use crate::stream_events_utils::raw_assistant_output_text_from_item;
-use crate::stream_events_utils::record_completed_response_item_with_finalized_facts;
 use crate::tasks::emit_compact_metric;
 use crate::tools::ToolRouter;
 use crate::tools::context::SharedTurnDiffTracker;
@@ -182,10 +183,11 @@ pub(crate) async fn run_turn(
     // run_turn owns the step used to seed context and make the first sampling request.
     let first_step_context = sess.capture_step_context(Arc::clone(&turn_context)).await;
     // Keep the exact model-visible state used by this turn and its inline compactions.
-    let (mut world_state, display_roots) = tokio::join!(
-        sess.record_context_updates_and_set_reference_context_item(first_step_context.as_ref()),
+    let (world_state_result, display_roots) = tokio::join!(
+        sess.try_record_context_updates_and_set_reference_context_item(first_step_context.as_ref()),
         turn_diff_display_roots(turn_context.as_ref()),
     );
+    let mut world_state = world_state_result.map_err(|err| CodexErr::Fatal(err.to_string()))?;
 
     let Some((injection_items, explicitly_enabled_connectors)) = build_skills_and_plugins(
         &sess,
@@ -279,7 +281,8 @@ pub(crate) async fn run_turn(
             {
                 world_state = sess
                     .record_step_world_state_if_changed(&world_state, step_context.as_ref())
-                    .await;
+                    .await
+                    .map_err(|err| CodexErr::Fatal(err.to_string()))?;
             }
 
             // Construct the input that we will send to the model.
@@ -468,6 +471,9 @@ pub(crate) async fn run_turn(
                 break;
             }
             Err(e) => {
+                if sess.is_persistence_uncertain_fatal(&e).await {
+                    return Err(e);
+                }
                 info!("Turn error: {e:#}");
                 let error = e.to_codex_protocol_error();
                 sess.emit_turn_error_lifecycle(turn_context.as_ref(), error.clone())
@@ -1889,23 +1895,35 @@ async fn handle_assistant_item_done_in_plan_mode(
     state: &mut PlanModeStreamState,
     previously_active_item: Option<&TurnItem>,
     last_agent_message: &mut Option<String>,
-) -> bool {
+) -> CodexResult<bool> {
     if let ResponseItem::Message { role, .. } = item
         && role == "assistant"
     {
-        maybe_complete_plan_item_from_message(sess, turn_context, state, item).await;
+        persist_completed_response_item(sess, turn_context, item).await?;
 
         let mut finalized_facts = None;
-        if let Some(finalized_turn_item) = finalize_non_tool_response_item(
+        let finalized_turn_item = finalize_non_tool_response_item(
             sess,
             turn_context,
             TurnItemContributorPolicy::Run(turn_store),
             item,
             /*plan_mode*/ true,
         )
-        .await
-        {
+        .await;
+        if let Some(finalized_turn_item) = finalized_turn_item.as_ref() {
             finalized_facts = Some(finalized_turn_item.facts.clone());
+        }
+        let final_last_agent_message = finalized_facts
+            .as_ref()
+            .and_then(|facts| facts.last_agent_message.clone());
+
+        apply_completed_response_item_facts(sess, turn_context, item, finalized_facts.as_ref())
+            .await;
+        if let Some(reason) = sess.persistence_quarantine_reason().await {
+            return Err(CodexErr::Fatal(reason));
+        }
+        maybe_complete_plan_item_from_message(sess, turn_context, state, item).await;
+        if let Some(finalized_turn_item) = finalized_turn_item {
             emit_turn_item_in_plan_mode(
                 sess,
                 turn_context,
@@ -1915,23 +1933,12 @@ async fn handle_assistant_item_done_in_plan_mode(
             )
             .await;
         }
-        let final_last_agent_message = finalized_facts
-            .as_ref()
-            .and_then(|facts| facts.last_agent_message.clone());
-
-        record_completed_response_item_with_finalized_facts(
-            sess,
-            turn_context,
-            item,
-            finalized_facts.as_ref(),
-        )
-        .await;
         if let Some(agent_message) = final_last_agent_message {
             *last_agent_message = Some(agent_message);
         }
-        return true;
+        return Ok(true);
     }
-    false
+    Ok(false)
 }
 
 #[instrument(level = "trace", skip_all)]
@@ -1944,8 +1951,19 @@ async fn drain_in_flight(
         match res {
             Ok(response_input) => {
                 let response_item = response_input.into();
-                sess.record_conversation_items(&turn_context, std::slice::from_ref(&response_item))
-                    .await;
+                if let Err(err) = sess
+                    .try_record_conversation_items(
+                        &turn_context,
+                        std::slice::from_ref(&response_item),
+                    )
+                    .await
+                {
+                    let reason = sess
+                        .persistence_quarantine_reason()
+                        .await
+                        .unwrap_or_else(|| err.to_string());
+                    return Err(CodexErr::Fatal(reason));
+                }
                 mark_thread_memory_mode_polluted_if_external_context(
                     sess.as_ref(),
                     turn_context.as_ref(),
@@ -2096,8 +2114,8 @@ async fn try_run_sampling_request(
                     )
                     .await;
                 }
-                if let Some(state) = plan_mode_state.as_mut()
-                    && handle_assistant_item_done_in_plan_mode(
+                if let Some(state) = plan_mode_state.as_mut() {
+                    match handle_assistant_item_done_in_plan_mode(
                         &sess,
                         &turn_context,
                         turn_store.as_ref(),
@@ -2107,8 +2125,11 @@ async fn try_run_sampling_request(
                         &mut last_agent_message,
                     )
                     .await
-                {
-                    continue;
+                    {
+                        Ok(true) => continue,
+                        Ok(false) => {}
+                        Err(err) => break Err(err),
+                    }
                 }
 
                 let mut ctx = HandleOutputCtx {

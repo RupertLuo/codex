@@ -85,8 +85,18 @@ impl ContextManager {
         self.reference_context_item.clone()
     }
 
+    #[cfg(test)]
     pub(crate) fn update_world_state(
         &mut self,
+        world_state: &WorldState,
+    ) -> (Vec<Box<dyn ContextualUserFragment>>, Option<WorldStateItem>) {
+        let update = self.preview_world_state_update(world_state);
+        self.world_state_baseline = Some(world_state.snapshot());
+        update
+    }
+
+    pub(crate) fn preview_world_state_update(
+        &self,
         world_state: &WorldState,
     ) -> (Vec<Box<dyn ContextualUserFragment>>, Option<WorldStateItem>) {
         let snapshot = world_state.snapshot();
@@ -100,12 +110,16 @@ impl ContextManager {
                     .map(WorldStateItem::patch)
             },
         );
-        self.world_state_baseline = Some(snapshot);
         (fragments, rollout_item)
     }
 
     pub(crate) fn set_world_state_baseline(&mut self, snapshot: WorldStateSnapshot) {
         self.world_state_baseline = Some(snapshot);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn world_state_baseline_for_test(&self) -> Option<WorldStateSnapshot> {
+        self.world_state_baseline.clone()
     }
 
     pub(crate) fn set_token_usage_full(&mut self, context_window: i64) {

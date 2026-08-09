@@ -223,6 +223,12 @@ pub async fn conversation_history_for_test(
 
 #[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
+pub async fn realtime_close_pending_for_test(thread: &CodexThread) -> bool {
+    thread.realtime_close_pending_for_test().await
+}
+
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
 pub async fn inject_no_new_turn_for_test(
     thread: &CodexThread,
     items: Vec<codex_protocol::models::ResponseItem>,

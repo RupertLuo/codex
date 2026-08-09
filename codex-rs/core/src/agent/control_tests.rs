@@ -168,9 +168,11 @@ async fn persisted_originator(thread: &CodexThread) -> String {
         .await
         .expect("thread should be readable");
     let history = stored_thread.history.expect("history should be loaded");
-    history
-        .items
+    codex_protocol::protocol::flatten_rollout_items(&history.items)
+        .expect("stored rollout history should flatten")
+        .items()
         .iter()
+        .copied()
         .find_map(|item| match item {
             RolloutItem::SessionMeta(meta_line) => Some(meta_line.meta.originator.clone()),
             RolloutItem::ResponseItem(_)
@@ -179,7 +181,8 @@ async fn persisted_originator(thread: &CodexThread) -> String {
             | RolloutItem::EventMsg(_)
             | RolloutItem::Compacted(_)
             | RolloutItem::WorldState(_)
-            | RolloutItem::TurnContext(_) => None,
+            | RolloutItem::TurnContext(_)
+            | RolloutItem::Transaction(_) => None,
         })
         .expect("session metadata should be persisted")
 }

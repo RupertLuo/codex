@@ -11,6 +11,7 @@ use codex_core::test_support::clear_reference_context_item_for_direct_mutation_t
 use codex_core::test_support::conversation_history_for_test;
 use codex_core::test_support::direct_mutation_test_snapshot;
 use codex_core::test_support::inject_no_new_turn_for_test;
+use codex_core::test_support::realtime_close_pending_for_test;
 use codex_core::test_support::with_compact_commit_test_hook;
 use codex_core::test_support::with_realtime_start_test_hook;
 use codex_login::CodexAuth;
@@ -31,6 +32,7 @@ use codex_protocol::protocol::RealtimeOutputModality;
 use codex_protocol::protocol::ResumedHistory;
 use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::RolloutLine;
+use codex_protocol::protocol::flatten_rollout_items;
 use codex_protocol::user_input::UserInput;
 use codex_thread_store::InMemoryThreadStore;
 use codex_thread_store::LoadThreadHistoryParams;
@@ -42,6 +44,7 @@ use core_test_support::responses::ResponseMock;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
 use core_test_support::responses::ev_completed_with_tokens;
+use core_test_support::responses::ev_function_call;
 use core_test_support::responses::ev_response_created;
 use core_test_support::responses::mount_response_sequence;
 use core_test_support::responses::mount_sse_sequence;
@@ -51,6 +54,8 @@ use core_test_support::responses::sse_response;
 use core_test_support::responses::start_mock_server;
 use core_test_support::responses::start_websocket_server;
 use core_test_support::skip_if_no_network;
+use core_test_support::streaming_sse::StreamingSseChunk;
+use core_test_support::streaming_sse::start_streaming_sse_server;
 use core_test_support::test_codex::TestCodex;
 use core_test_support::test_codex::TestCodexBuilder;
 use core_test_support::test_codex::test_codex;
@@ -63,6 +68,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tempfile::TempDir;
 use tokio::sync::Semaphore;
+use tokio::sync::oneshot;
 
 const ACTIVE_MODEL: &str = "gpt-5.4";
 const COMPACT_MODEL: &str = "deepseek/deepseek-v4-flash";
@@ -231,8 +237,11 @@ async fn start_realtime_natural_close_server() -> core_test_support::responses::
 }
 
 fn realtime_closed_count(items: &[RolloutItem]) -> usize {
-    items
+    flatten_rollout_items(items)
+        .expect("rollout history should flatten")
+        .items()
         .iter()
+        .copied()
         .filter(|item| {
             matches!(
                 item,
@@ -240,6 +249,60 @@ fn realtime_closed_count(items: &[RolloutItem]) -> usize {
             )
         })
         .count()
+}
+
+fn response_item_contains_text(item: &ResponseItem, expected: &str) -> bool {
+    match item {
+        ResponseItem::Message { content, .. } => content.iter().any(|content| match content {
+            ContentItem::InputText { text } | ContentItem::OutputText { text } => text == expected,
+            ContentItem::InputImage { .. } => false,
+        }),
+        ResponseItem::AdditionalTools { .. }
+        | ResponseItem::AgentMessage { .. }
+        | ResponseItem::Reasoning { .. }
+        | ResponseItem::LocalShellCall { .. }
+        | ResponseItem::FunctionCall { .. }
+        | ResponseItem::ToolSearchCall { .. }
+        | ResponseItem::FunctionCallOutput { .. }
+        | ResponseItem::CustomToolCall { .. }
+        | ResponseItem::CustomToolCallOutput { .. }
+        | ResponseItem::ToolSearchOutput { .. }
+        | ResponseItem::WebSearchCall { .. }
+        | ResponseItem::ImageGenerationCall { .. }
+        | ResponseItem::Compaction { .. }
+        | ResponseItem::CompactionTrigger { .. }
+        | ResponseItem::ContextCompaction { .. }
+        | ResponseItem::Other => false,
+    }
+}
+
+fn logical_history_item_counts(items: &[RolloutItem], expected: &str) -> (usize, usize) {
+    let flattened = flatten_rollout_items(items).expect("rollout history should flatten");
+    let response_items = flattened
+        .items()
+        .iter()
+        .copied()
+        .filter(|item| {
+            matches!(
+                item,
+                RolloutItem::ResponseItem(response_item)
+                    if response_item_contains_text(response_item, expected)
+            )
+        })
+        .count();
+    let raw_events = flattened
+        .items()
+        .iter()
+        .copied()
+        .filter(|item| {
+            matches!(
+                item,
+                RolloutItem::EventMsg(EventMsg::RawResponseItem(event))
+                    if response_item_contains_text(&event.item, expected)
+            )
+        })
+        .count();
+    (response_items, raw_events)
 }
 
 async fn only_atomic_compaction_checkpoint(
@@ -364,6 +427,22 @@ fn assert_normal_request_shape(normal_body: &Value) {
     assert!(!normal_body.contains(COMPACT_MODEL));
 }
 
+async fn wait_for_ambiguous_compact_owner_active_turn_to_clear(test: &TestCodex) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if !direct_mutation_test_snapshot(&test.codex)
+                .await
+                .has_active_turn
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("ambiguous compact owner should clear its active turn");
+}
+
 async fn wait_for_ambiguous_compact_owner_to_settle(test: &TestCodex) {
     let compact_error = tokio::time::timeout(
         Duration::from_secs(5),
@@ -382,22 +461,7 @@ async fn wait_for_ambiguous_compact_owner_to_settle(test: &TestCodex) {
         "event filter guarantees the compact fatal error"
     );
 
-    // TurnComplete is delivered just before the task boundary clears active_turn. Wait on the
-    // actual state transition so snapshots cannot attribute the compact owner's normal cleanup to
-    // the operation deliberately paused before the lifecycle gate.
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            if !direct_mutation_test_snapshot(&test.codex)
-                .await
-                .has_active_turn
-            {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("ambiguous compact owner should clear its active turn");
+    wait_for_ambiguous_compact_owner_active_turn_to_clear(test).await;
 
     let flush_error = test
         .codex
@@ -1627,6 +1691,7 @@ async fn ambiguous_compact_persistence_quarantines_until_reload() {
     thread_store
         .fail_next_history_loads(3, "injected reconciliation read failure")
         .await;
+    let calls_before_owner_fatal = thread_store.calls().await;
     commit_hook.release_commit();
 
     let terminal = wait_for_event(&test.codex, |event| matches!(event, EventMsg::Error(_))).await;
@@ -1644,10 +1709,32 @@ async fn ambiguous_compact_persistence_quarantines_until_reload() {
         3,
         "reconciliation attempts must be bounded"
     );
-    wait_for_event(&test.codex, |event| {
-        matches!(event, EventMsg::TurnComplete(_))
-    })
+    wait_for_ambiguous_compact_owner_active_turn_to_clear(&test).await;
+    let unexpected_ordinary_terminal = tokio::time::timeout(
+        Duration::from_millis(250),
+        wait_for_event(&test.codex, |event| {
+            matches!(
+                event,
+                EventMsg::TurnComplete(_) | EventMsg::TurnAborted(_) | EventMsg::Warning(_)
+            )
+        }),
+    )
     .await;
+    assert!(
+        unexpected_ordinary_terminal.is_err(),
+        "persistence-uncertain compact must emit only the out-of-band fatal event: \
+         {unexpected_ordinary_terminal:?}"
+    );
+    assert_eq!(
+        thread_store.calls().await.flush_thread,
+        calls_before_owner_fatal.flush_thread,
+        "persistence-uncertain owner cleanup must skip ordinary flush barriers"
+    );
+    assert_eq!(
+        response_mock.requests().len(),
+        2,
+        "owner cleanup must not issue another model HTTP request"
+    );
 
     only_atomic_compaction_checkpoint(&test, &thread_store).await;
     Box::pin(assert_ambiguous_session_quarantined_then_reload_succeeds(
@@ -2060,14 +2147,19 @@ async fn ordinary_history_append_failure_leaves_live_and_cold_history_unchanged(
     .await
     .expect("load durable history before append failure");
     thread_store
-        .fail_next_append("injected ordinary history append failure")
+        .fail_next_transaction_appends(3, "injected ordinary history append failure")
         .await;
-    let _ = test
+    let result = test
         .codex
         .inject_response_items(vec![injected_assistant_item(
             "MUST_NOT_EXIST_AFTER_APPEND_FAILURE",
         )])
         .await;
+
+    assert!(
+        result.is_err(),
+        "exhausting ordinary transaction retries must reject the injection"
+    );
 
     assert_eq!(
         conversation_history_for_test(&test.codex).await,
@@ -2088,6 +2180,816 @@ async fn ordinary_history_append_failure_leaves_live_and_cold_history_unchanged(
         serde_json::to_value(&durable_before.items).expect("serialize durable history before"),
         "failed history transaction must not leave raw-only durable companions"
     );
+    let quarantine_error = test
+        .codex
+        .flush_rollout()
+        .await
+        .expect_err("retry exhaustion must quarantine persistence");
+    assert!(quarantine_error.to_string().contains("quarantined"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ordinary_history_prewrite_failure_retries_same_transaction_and_commits_once() {
+    skip_if_no_network!();
+
+    const STORE_ID: &str = "ordinary-history-prewrite-retry-same-id";
+    const INJECTED: &str = "RETRIED_ORDINARY_HISTORY_ITEM";
+    InMemoryThreadStore::remove_id(STORE_ID);
+    let thread_store = InMemoryThreadStore::for_id(STORE_ID);
+    let server = start_mock_server().await;
+    mount_sse_sequence(
+        &server,
+        vec![sse(vec![
+            ev_response_created("resp-before-history-retry"),
+            ev_assistant_message("first-message", "FIRST_REPLY"),
+            ev_completed("resp-before-history-retry"),
+        ])],
+    )
+    .await;
+    let mut builder = test_codex().with_model(ACTIVE_MODEL).with_config(|config| {
+        config.experimental_thread_store = ThreadStoreConfig::InMemory {
+            id: STORE_ID.to_string(),
+        };
+    });
+    let test = builder
+        .build_with_auto_env(&server)
+        .await
+        .expect("build codex");
+    test.submit_turn("FIRST_USER_TURN")
+        .await
+        .expect("submit first user turn");
+    let observed_before = thread_store.observed_transaction_ids().await.len();
+    thread_store
+        .fail_next_transaction_append("injected retryable ordinary prewrite failure")
+        .await;
+
+    test.codex
+        .inject_response_items(vec![injected_assistant_item(INJECTED)])
+        .await
+        .expect("one prewrite failure should retry and commit");
+
+    let observed = thread_store.observed_transaction_ids().await;
+    let retry_ids = &observed[observed_before..];
+    assert_eq!(retry_ids.len(), 2, "one failed attempt plus one commit");
+    assert_eq!(
+        retry_ids[0], retry_ids[1],
+        "retry must reuse transaction ID"
+    );
+    let durable_history = ThreadStore::load_history(
+        thread_store.as_ref(),
+        LoadThreadHistoryParams {
+            thread_id: test.session_configured.thread_id,
+            include_archived: true,
+        },
+    )
+    .await
+    .expect("load durable history after retry");
+    assert_eq!(
+        logical_history_item_counts(&durable_history.items, INJECTED),
+        (1, 1)
+    );
+    assert_eq!(
+        conversation_history_for_test(&test.codex)
+            .await
+            .iter()
+            .filter(|item| response_item_contains_text(item, INJECTED))
+            .count(),
+        1,
+        "committed retry must install one live item"
+    );
+    test.codex
+        .flush_rollout()
+        .await
+        .expect("successful retry must leave persistence writable");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn initial_context_retry_exhaustion_rejects_requested_injection_after_quarantine() {
+    skip_if_no_network!();
+
+    const STORE_ID: &str = "initial-context-retry-exhaustion-freezes-injection";
+    const REQUESTED: &str = "MUST_NOT_QUEUE_OR_PERSIST_AFTER_INITIAL_CONTEXT_FAILURE";
+    InMemoryThreadStore::remove_id(STORE_ID);
+    let thread_store = InMemoryThreadStore::for_id(STORE_ID);
+    let server = start_mock_server().await;
+    let mut builder = test_codex().with_model(ACTIVE_MODEL).with_config(|config| {
+        config.experimental_thread_store = ThreadStoreConfig::InMemory {
+            id: STORE_ID.to_string(),
+        };
+    });
+    let test = builder
+        .build_with_auto_env(&server)
+        .await
+        .expect("build codex");
+    let state_before = direct_mutation_test_snapshot(&test.codex).await;
+    let observed_before = thread_store.observed_transaction_ids().await.len();
+    thread_store
+        .fail_next_transaction_appends(3, "injected initial context prewrite failure")
+        .await;
+
+    let result = test
+        .codex
+        .inject_response_items(vec![injected_assistant_item(REQUESTED)])
+        .await;
+
+    let error = result.expect_err("initial context retry exhaustion must reject injection");
+    assert!(error.to_string().contains("quarantined"));
+    assert_eq!(
+        direct_mutation_test_snapshot(&test.codex).await,
+        state_before,
+        "requested injection must neither reserve a turn nor install live history"
+    );
+    let durable_history = ThreadStore::load_history(
+        thread_store.as_ref(),
+        LoadThreadHistoryParams {
+            thread_id: test.session_configured.thread_id,
+            include_archived: true,
+        },
+    )
+    .await
+    .expect("load durable history after rejected initial context");
+    assert_eq!(
+        logical_history_item_counts(&durable_history.items, REQUESTED),
+        (0, 0)
+    );
+    let observed = thread_store.observed_transaction_ids().await;
+    let retry_ids = &observed[observed_before..];
+    assert_eq!(
+        retry_ids.len(),
+        3,
+        "initial context should exhaust its retry budget"
+    );
+    assert!(
+        retry_ids.iter().all(|id| id == &retry_ids[0]),
+        "all initial-context attempts must reuse one transaction ID"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn inter_agent_prewrite_retry_exhaustion_is_atomic_and_stops_owner() {
+    skip_if_no_network!();
+
+    const STORE_ID: &str = "inter-agent-prewrite-exhaustion-atomic-owner-stop";
+    const MESSAGE: &str = "MUST_NOT_PERSIST_OR_REACH_MODEL_AFTER_IAC_FAILURE";
+    InMemoryThreadStore::remove_id(STORE_ID);
+    let thread_store = InMemoryThreadStore::for_id(STORE_ID);
+    let server = start_mock_server().await;
+    mount_sse_sequence(
+        &server,
+        vec![sse(vec![
+            ev_response_created("resp-before-iac-failure"),
+            ev_assistant_message("first-message", "FIRST_REPLY"),
+            ev_completed("resp-before-iac-failure"),
+        ])],
+    )
+    .await;
+    let mut builder = test_codex().with_model(ACTIVE_MODEL).with_config(|config| {
+        config.experimental_thread_store = ThreadStoreConfig::InMemory {
+            id: STORE_ID.to_string(),
+        };
+    });
+    let test = builder
+        .build_with_auto_env(&server)
+        .await
+        .expect("build codex");
+    test.submit_turn("FIRST_USER_TURN")
+        .await
+        .expect("submit first user turn");
+    let live_before = conversation_history_for_test(&test.codex).await;
+    let observed_before = thread_store.observed_transaction_ids().await.len();
+    let requests_before = server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .filter(|request| request.url.path().ends_with("/responses"))
+        .count();
+    thread_store
+        .fail_next_transaction_appends(3, "injected inter-agent prewrite failure")
+        .await;
+
+    test.codex
+        .submit(Op::InterAgentCommunication {
+            communication: codex_protocol::protocol::InterAgentCommunication::new(
+                AgentPath::try_from("/root/worker").expect("valid worker path"),
+                AgentPath::root(),
+                Vec::new(),
+                MESSAGE.to_string(),
+                /*trigger_turn*/ true,
+            ),
+        })
+        .await
+        .expect("submit trigger-turn inter-agent communication");
+    let fatal = tokio::time::timeout(
+        Duration::from_secs(5),
+        wait_for_event(&test.codex, |event| {
+            matches!(
+                event,
+                EventMsg::Error(error)
+                    if error.message.contains("ordinary history transaction")
+                        && error.message.contains("could not be persisted")
+            )
+        }),
+    )
+    .await
+    .expect("IAC retry exhaustion must deliver a fatal persistence error");
+    assert!(matches!(fatal, EventMsg::Error(_)));
+    wait_for_ambiguous_compact_owner_active_turn_to_clear(&test).await;
+
+    assert_eq!(
+        conversation_history_for_test(&test.codex).await,
+        live_before
+    );
+    let requests_after = server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .filter(|request| request.url.path().ends_with("/responses"))
+        .count();
+    assert_eq!(requests_after, requests_before);
+    let durable_history = ThreadStore::load_history(
+        thread_store.as_ref(),
+        LoadThreadHistoryParams {
+            thread_id: test.session_configured.thread_id,
+            include_archived: true,
+        },
+    )
+    .await
+    .expect("load durable history after IAC failure");
+    let flattened = flatten_rollout_items(&durable_history.items).expect("flatten durable history");
+    assert!(flattened.items().iter().all(|item| {
+        !serde_json::to_string(item)
+            .expect("serialize logical rollout item")
+            .contains(MESSAGE)
+    }));
+    let observed = thread_store.observed_transaction_ids().await;
+    let retry_ids = &observed[observed_before..];
+    assert_eq!(retry_ids.len(), 3, "IAC should exhaust its retry budget");
+    assert!(retry_ids.iter().all(|id| id == &retry_ids[0]));
+
+    let terminal = tokio::time::timeout(Duration::from_millis(250), async {
+        loop {
+            let event = test
+                .codex
+                .next_event()
+                .await
+                .expect("event stream should remain open");
+            if matches!(
+                event.msg,
+                EventMsg::TurnComplete(_) | EventMsg::TurnAborted(_)
+            ) {
+                break event.msg;
+            }
+        }
+    })
+    .await;
+    assert!(
+        terminal.is_err(),
+        "IAC persistence failure must have no terminal"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn user_prompt_retry_exhaustion_emits_no_uncommitted_item_or_http() {
+    skip_if_no_network!();
+
+    const STORE_ID: &str = "user-prompt-prewrite-exhaustion-no-live-item";
+    const MESSAGE: &str = "MUST_NOT_EMIT_OR_REQUEST_AFTER_USER_PERSIST_FAILURE";
+    InMemoryThreadStore::remove_id(STORE_ID);
+    let thread_store = InMemoryThreadStore::for_id(STORE_ID);
+    let server = start_mock_server().await;
+    mount_sse_sequence(
+        &server,
+        vec![sse(vec![
+            ev_response_created("resp-before-user-prompt-failure"),
+            ev_assistant_message("first-message", "FIRST_REPLY"),
+            ev_completed("resp-before-user-prompt-failure"),
+        ])],
+    )
+    .await;
+    let mut builder = test_codex().with_model(ACTIVE_MODEL).with_config(|config| {
+        config.experimental_thread_store = ThreadStoreConfig::InMemory {
+            id: STORE_ID.to_string(),
+        };
+    });
+    let test = builder
+        .build_with_auto_env(&server)
+        .await
+        .expect("build codex");
+    test.submit_turn("FIRST_USER_TURN")
+        .await
+        .expect("submit first user turn");
+    let live_before = conversation_history_for_test(&test.codex).await;
+    let observed_before = thread_store.observed_transaction_ids().await.len();
+    let requests_before = server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .filter(|request| request.url.path().ends_with("/responses"))
+        .count();
+    thread_store
+        .fail_next_transaction_appends(3, "injected user prompt prewrite failure")
+        .await;
+
+    test.codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: MESSAGE.to_string(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: Default::default(),
+        })
+        .await
+        .expect("submit user turn whose prompt persistence will fail");
+    let saw_uncommitted_item = tokio::time::timeout(Duration::from_secs(5), async {
+        let mut saw_uncommitted_item = false;
+        loop {
+            let event = test
+                .codex
+                .next_event()
+                .await
+                .expect("event stream should remain open");
+            if matches!(
+                &event.msg,
+                EventMsg::ItemStarted(_) | EventMsg::ItemCompleted(_) | EventMsg::UserMessage(_)
+            ) && serde_json::to_string(&event.msg)
+                .expect("serialize candidate leaked user event")
+                .contains(MESSAGE)
+            {
+                saw_uncommitted_item = true;
+            }
+            if matches!(
+                &event.msg,
+                EventMsg::Error(error)
+                    if error.message.contains("ordinary history transaction")
+                        && error.message.contains("could not be persisted")
+            ) {
+                break saw_uncommitted_item;
+            }
+        }
+    })
+    .await
+    .expect("user prompt retry exhaustion must deliver persistence error");
+    assert!(!saw_uncommitted_item);
+    wait_for_ambiguous_compact_owner_active_turn_to_clear(&test).await;
+    assert_eq!(
+        conversation_history_for_test(&test.codex).await,
+        live_before
+    );
+    let requests_after = server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .filter(|request| request.url.path().ends_with("/responses"))
+        .count();
+    assert_eq!(requests_after, requests_before);
+    let durable_history = ThreadStore::load_history(
+        thread_store.as_ref(),
+        LoadThreadHistoryParams {
+            thread_id: test.session_configured.thread_id,
+            include_archived: true,
+        },
+    )
+    .await
+    .expect("load durable history after user prompt failure");
+    assert_eq!(
+        logical_history_item_counts(&durable_history.items, MESSAGE),
+        (0, 0)
+    );
+    let observed = thread_store.observed_transaction_ids().await;
+    let retry_ids = &observed[observed_before..];
+    assert_eq!(retry_ids.len(), 3);
+    assert!(retry_ids.iter().all(|id| id == &retry_ids[0]));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tool_call_transaction_ambiguity_does_not_start_tool_or_follow_up() {
+    skip_if_no_network!();
+
+    const STORE_ID: &str = "tool-call-transaction-ambiguity-no-handler";
+    const CALL_ID: &str = "must-not-run-ambiguous-tool";
+    InMemoryThreadStore::remove_id(STORE_ID);
+    let thread_store = InMemoryThreadStore::for_id(STORE_ID);
+    let (tool_gate_tx, tool_gate_rx) = oneshot::channel();
+    let first_response = vec![
+        StreamingSseChunk {
+            gate: None,
+            body: sse(vec![ev_response_created("ambiguous-tool-response")]),
+        },
+        StreamingSseChunk {
+            gate: Some(tool_gate_rx),
+            body: sse(vec![ev_function_call(CALL_ID, "list_mcp_resources", "{}")]),
+        },
+        StreamingSseChunk {
+            gate: None,
+            body: sse(vec![ev_completed("ambiguous-tool-response")]),
+        },
+    ];
+    let second_response = vec![StreamingSseChunk {
+        gate: None,
+        body: sse(vec![
+            ev_response_created("must-not-follow-up-ambiguous-tool"),
+            ev_completed("must-not-follow-up-ambiguous-tool"),
+        ]),
+    }];
+    let (streaming_server, _completions) =
+        start_streaming_sse_server(vec![first_response, second_response]).await;
+    let mut builder = test_codex().with_model(ACTIVE_MODEL).with_config(|config| {
+        config.experimental_thread_store = ThreadStoreConfig::InMemory {
+            id: STORE_ID.to_string(),
+        };
+    });
+    let test = builder
+        .build_with_streaming_server(&streaming_server)
+        .await
+        .expect("build streaming codex");
+
+    test.codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "TRIGGER_AMBIGUOUS_TOOL_CALL".to_string(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: Default::default(),
+        })
+        .await
+        .expect("submit tool turn without waiting for completion");
+    streaming_server.wait_for_request_count(1).await;
+    let observed_before = thread_store.observed_transaction_ids().await.len();
+    thread_store
+        .fail_next_transaction_append("injected ambiguous tool-call transaction")
+        .await;
+    thread_store
+        .fail_next_history_loads(3, "injected tool-call reconciliation failure")
+        .await;
+    tool_gate_tx
+        .send(())
+        .expect("tool gate receiver should remain alive");
+
+    let saw_tool_event = tokio::time::timeout(Duration::from_secs(5), async {
+        let mut saw_tool_event = false;
+        loop {
+            let event = test
+                .codex
+                .next_event()
+                .await
+                .expect("event stream should remain open");
+            if matches!(&event.msg, EventMsg::ItemStarted(_) | EventMsg::ItemCompleted(_))
+                && serde_json::to_string(&event.msg)
+                    .expect("serialize candidate tool event")
+                    .contains(CALL_ID)
+            {
+                saw_tool_event = true;
+            }
+            if matches!(
+                &event.msg,
+                EventMsg::Error(error)
+                    if error.message.contains("ordinary history transaction persistence outcome is uncertain")
+            ) {
+                break saw_tool_event;
+            }
+        }
+    })
+    .await
+    .expect("ambiguous tool transaction must deliver persistence error");
+    assert!(!saw_tool_event, "tool handler lifecycle must not start");
+    wait_for_ambiguous_compact_owner_active_turn_to_clear(&test).await;
+    assert_eq!(streaming_server.requests().await.len(), 1);
+    let durable_history = ThreadStore::load_history(
+        thread_store.as_ref(),
+        LoadThreadHistoryParams {
+            thread_id: test.session_configured.thread_id,
+            include_archived: true,
+        },
+    )
+    .await
+    .expect("load durable history after tool ambiguity");
+    let flattened = flatten_rollout_items(&durable_history.items).expect("flatten durable history");
+    assert!(flattened.items().iter().all(|item| {
+        !serde_json::to_string(item)
+            .expect("serialize logical rollout item")
+            .contains(CALL_ID)
+    }));
+    let observed = thread_store.observed_transaction_ids().await;
+    assert_eq!(observed.len(), observed_before + 1);
+    streaming_server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ordinary_history_durable_then_error_reconciles_one_complete_envelope() {
+    skip_if_no_network!();
+
+    const STORE_ID: &str = "ordinary-history-durable-then-error-envelope";
+    const INJECTED: &str = "DURABLE_THEN_ERROR_HISTORY_ITEM";
+    InMemoryThreadStore::remove_id(STORE_ID);
+    let thread_store = InMemoryThreadStore::for_id(STORE_ID);
+    let server = start_mock_server().await;
+    mount_sse_sequence(
+        &server,
+        vec![sse(vec![
+            ev_response_created("resp-before-durable-history-error"),
+            ev_assistant_message("first-message", "FIRST_REPLY"),
+            ev_completed("resp-before-durable-history-error"),
+        ])],
+    )
+    .await;
+    let mut builder = test_codex().with_model(ACTIVE_MODEL).with_config(|config| {
+        config.experimental_thread_store = ThreadStoreConfig::InMemory {
+            id: STORE_ID.to_string(),
+        };
+    });
+    let test = builder
+        .build_with_auto_env(&server)
+        .await
+        .expect("build codex");
+    test.submit_turn("FIRST_USER_TURN")
+        .await
+        .expect("submit first user turn");
+    let history_loads_before = thread_store.calls().await.load_history;
+    thread_store
+        .fail_next_append_after_items(1, "injected error after one durable backing item")
+        .await;
+
+    test.codex
+        .inject_response_items(vec![injected_assistant_item(INJECTED)])
+        .await
+        .expect("stable transaction ID should reconcile the durable append");
+
+    assert!(
+        conversation_history_for_test(&test.codex)
+            .await
+            .iter()
+            .any(|item| response_item_contains_text(item, INJECTED)),
+        "Committed must install the response into live history"
+    );
+    let durable_history = ThreadStore::load_history(
+        thread_store.as_ref(),
+        LoadThreadHistoryParams {
+            thread_id: test.session_configured.thread_id,
+            include_archived: true,
+        },
+    )
+    .await
+    .expect("load reconciled durable history");
+    assert_eq!(
+        logical_history_item_counts(&durable_history.items, INJECTED),
+        (1, 1)
+    );
+    assert_eq!(
+        durable_history
+            .items
+            .iter()
+            .filter(|item| matches!(
+                item,
+                RolloutItem::Transaction(transaction)
+                    if transaction.items.iter().any(|item| matches!(
+                        item,
+                        RolloutItem::ResponseItem(response_item)
+                            if response_item_contains_text(response_item, INJECTED)
+                    ))
+            ))
+            .count(),
+        1,
+        "the backing writer must receive one complete envelope, not a multi-record prefix"
+    );
+    assert_eq!(
+        thread_store.calls().await.load_history,
+        history_loads_before + 2,
+        "append reconciliation and the assertion load should each read history once"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ordinary_history_failed_reconciliation_quarantines_without_live_install() {
+    skip_if_no_network!();
+
+    const STORE_ID: &str = "ordinary-history-reconcile-failure-quarantine";
+    InMemoryThreadStore::remove_id(STORE_ID);
+    let thread_store = InMemoryThreadStore::for_id(STORE_ID);
+    let server = start_mock_server().await;
+    mount_sse_sequence(
+        &server,
+        vec![sse(vec![
+            ev_response_created("resp-before-history-reconcile-failure"),
+            ev_assistant_message("first-message", "FIRST_REPLY"),
+            ev_completed("resp-before-history-reconcile-failure"),
+        ])],
+    )
+    .await;
+    let mut builder = test_codex().with_model(ACTIVE_MODEL).with_config(|config| {
+        config.experimental_thread_store = ThreadStoreConfig::InMemory {
+            id: STORE_ID.to_string(),
+        };
+    });
+    let test = builder
+        .build_with_auto_env(&server)
+        .await
+        .expect("build codex");
+    test.submit_turn("FIRST_USER_TURN")
+        .await
+        .expect("submit first user turn");
+    let live_before = conversation_history_for_test(&test.codex).await;
+    let history_loads_before = thread_store.calls().await.load_history;
+    thread_store
+        .fail_next_append("injected ambiguous ordinary transaction append")
+        .await;
+    thread_store
+        .fail_next_history_loads(3, "injected ordinary reconciliation read failure")
+        .await;
+
+    let result = test
+        .codex
+        .inject_response_items(vec![injected_assistant_item(
+            "MUST_NOT_INSTALL_AFTER_AMBIGUOUS_HISTORY",
+        )])
+        .await;
+
+    assert!(
+        result.is_err(),
+        "ambiguous transaction must fail the injection"
+    );
+    assert_eq!(
+        conversation_history_for_test(&test.codex).await,
+        live_before
+    );
+    assert_eq!(
+        thread_store.calls().await.load_history,
+        history_loads_before + 3,
+        "ambiguous transaction should exhaust bounded reconciliation"
+    );
+    let quarantine_error = test
+        .codex
+        .flush_rollout()
+        .await
+        .expect_err("ambiguous ordinary history must quarantine persistence");
+    assert!(quarantine_error.to_string().contains("quarantined"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ordinary_response_ambiguity_stops_owner_before_tools_or_follow_up_http() {
+    skip_if_no_network!();
+
+    const STORE_ID: &str = "ordinary-response-ambiguity-stops-owner";
+    InMemoryThreadStore::remove_id(STORE_ID);
+    let thread_store = InMemoryThreadStore::for_id(STORE_ID);
+    let (assistant_gate_tx, assistant_gate_rx) = oneshot::channel();
+    let first_response = vec![
+        StreamingSseChunk {
+            gate: None,
+            body: sse(vec![ev_response_created("ordinary-ambiguous-response")]),
+        },
+        StreamingSseChunk {
+            gate: Some(assistant_gate_rx),
+            body: sse(vec![ev_assistant_message(
+                "ordinary-ambiguous-message",
+                "AMBIGUOUS_OWNER_REPLY",
+            )]),
+        },
+        StreamingSseChunk {
+            gate: None,
+            body: sse(vec![ev_function_call(
+                "must-not-run-tool",
+                "list_mcp_resources",
+                "{}",
+            )]),
+        },
+        StreamingSseChunk {
+            gate: None,
+            body: sse(vec![ev_completed("ordinary-ambiguous-response")]),
+        },
+    ];
+    let second_response = vec![StreamingSseChunk {
+        gate: None,
+        body: sse(vec![
+            ev_response_created("must-not-request-follow-up"),
+            ev_completed("must-not-request-follow-up"),
+        ]),
+    }];
+    let (streaming_server, _completions) =
+        start_streaming_sse_server(vec![first_response, second_response]).await;
+    let mut builder = test_codex().with_model(ACTIVE_MODEL).with_config(|config| {
+        config.experimental_thread_store = ThreadStoreConfig::InMemory {
+            id: STORE_ID.to_string(),
+        };
+    });
+    let test = builder
+        .build_with_streaming_server(&streaming_server)
+        .await
+        .expect("build streaming codex");
+
+    test.codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "TRIGGER_ORDINARY_AMBIGUITY".to_string(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: Default::default(),
+        })
+        .await
+        .expect("submit ordinary turn without waiting for completion");
+    streaming_server.wait_for_request_count(1).await;
+    thread_store
+        .fail_next_transaction_append("injected ambiguous ordinary response transaction")
+        .await;
+    thread_store
+        .fail_next_history_loads(3, "injected ordinary response reconciliation failure")
+        .await;
+    assistant_gate_tx
+        .send(())
+        .expect("assistant gate receiver should remain alive");
+
+    let fatal_result = tokio::time::timeout(Duration::from_secs(5), async {
+        let mut saw_uncommitted_item_event = false;
+        loop {
+            let event = test
+                .codex
+                .next_event()
+                .await
+                .expect("event stream should remain open");
+            if matches!(
+                &event.msg,
+                EventMsg::ItemCompleted(_) | EventMsg::AgentMessage(_)
+            ) && serde_json::to_string(&event.msg)
+                .expect("serialize candidate leaked event")
+                .contains("AMBIGUOUS_OWNER_REPLY")
+            {
+                saw_uncommitted_item_event = true;
+            }
+            if matches!(
+                event.msg,
+                EventMsg::Error(ref error)
+                    if error.message.contains("ordinary history transaction persistence outcome is uncertain")
+            ) {
+                break (event.msg, saw_uncommitted_item_event);
+            }
+        }
+    })
+    .await;
+    let (fatal, saw_uncommitted_item_event) = match fatal_result {
+        Ok(result) => result,
+        Err(err) => panic!(
+            "ordinary ambiguity must deliver one fatal persistence error: {err}; calls={:?}; transaction_ids={:?}; state={:?}; requests={}",
+            thread_store.calls().await,
+            thread_store.observed_transaction_ids().await,
+            direct_mutation_test_snapshot(&test.codex).await,
+            streaming_server.requests().await.len(),
+        ),
+    };
+    assert!(matches!(fatal, EventMsg::Error(_)));
+    assert!(
+        !saw_uncommitted_item_event,
+        "uncommitted assistant response must not emit completion or legacy message events"
+    );
+    wait_for_ambiguous_compact_owner_active_turn_to_clear(&test).await;
+    let state_after_cleanup = direct_mutation_test_snapshot(&test.codex).await;
+    assert!(!state_after_cleanup.has_active_turn);
+    assert!(!state_after_cleanup.has_pending_input);
+    let calls_after_cleanup = thread_store.calls().await;
+
+    let mut duplicate_persistence_errors = 0usize;
+    let terminal = tokio::time::timeout(Duration::from_millis(250), async {
+        loop {
+            let event = test
+                .codex
+                .next_event()
+                .await
+                .expect("event stream should remain open");
+            if matches!(
+                &event.msg,
+                EventMsg::Error(error)
+                    if error.message.contains("ordinary history transaction persistence outcome is uncertain")
+            ) {
+                duplicate_persistence_errors += 1;
+            }
+            if matches!(event.msg, EventMsg::TurnComplete(_) | EventMsg::TurnAborted(_)) {
+                break event.msg;
+            }
+        }
+    })
+    .await;
+    assert!(
+        terminal.is_err(),
+        "ambiguous owner must have no terminal: {terminal:?}"
+    );
+    assert_eq!(
+        duplicate_persistence_errors, 0,
+        "ordinary ambiguity must deliver exactly one persistence error"
+    );
+    assert_eq!(streaming_server.requests().await.len(), 1);
+    assert_eq!(thread_store.calls().await, calls_after_cleanup);
+    streaming_server.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2439,10 +3341,7 @@ async fn ambiguous_compaction_linearizes_after_in_flight_append_and_blocks_later
         unreachable!("event filter guarantees an error")
     };
     assert!(error.message.contains("persistence outcome is uncertain"));
-    wait_for_event(&test.codex, |event| {
-        matches!(event, EventMsg::TurnComplete(_))
-    })
-    .await;
+    wait_for_ambiguous_compact_owner_active_turn_to_clear(&test).await;
 
     let history = ThreadStore::load_history(
         thread_store.as_ref(),
@@ -3061,6 +3960,103 @@ async fn realtime_natural_and_explicit_close_share_one_durable_winner() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn realtime_natural_close_ambiguity_delivers_one_fatal_error() {
+    skip_if_no_network!();
+
+    const STORE_ID: &str = "realtime-natural-close-ambiguity-fatal";
+    InMemoryThreadStore::remove_id(STORE_ID);
+    let thread_store = InMemoryThreadStore::for_id(STORE_ID);
+    let response_server = start_mock_server().await;
+    let realtime_server = start_realtime_natural_close_server().await;
+    let commit_hook = CompactCommitTestHook::new();
+    let realtime_hook = RealtimeStartTestHook::new();
+    realtime_hook.pause_close_after_claim_once();
+    let mut builder = in_memory_atomic_compact_realtime_builder(
+        STORE_ID,
+        commit_hook,
+        realtime_hook.clone(),
+        realtime_server.uri().to_string(),
+    );
+    let test = builder
+        .build_with_auto_env(&response_server)
+        .await
+        .expect("build codex");
+
+    test.codex
+        .submit(Op::RealtimeConversationStart(realtime_start_params()))
+        .await
+        .expect("start realtime conversation");
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::RealtimeConversationStarted(_))
+    })
+    .await;
+    wait_for_event(&test.codex, |event| {
+        matches!(
+            event,
+            EventMsg::RealtimeConversationRealtime(RealtimeConversationRealtimeEvent {
+                payload: RealtimeEvent::SessionUpdated { .. },
+            })
+        )
+    })
+    .await;
+    test.codex
+        .submit(Op::RealtimeConversationText(ConversationTextParams {
+            text: "trigger ambiguous natural close".to_string(),
+            role: ConversationTextRole::User,
+        }))
+        .await
+        .expect("send final realtime request");
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        realtime_hook.wait_until_close_after_claim_paused(),
+    )
+    .await
+    .expect("natural close should pause after claiming");
+    thread_store
+        .fail_next_append("injected ambiguous natural Closed append")
+        .await;
+    thread_store
+        .fail_next_history_loads(3, "injected natural close reconciliation failure")
+        .await;
+    realtime_hook.release_close_after_claim();
+
+    let fatal = tokio::time::timeout(
+        Duration::from_secs(5),
+        wait_for_event(&test.codex, |event| {
+            matches!(
+                event,
+                EventMsg::Error(error)
+                    if error.message.contains("realtime close persistence outcome is uncertain")
+            )
+        }),
+    )
+    .await
+    .expect("ambiguous natural close must deliver a fatal persistence error");
+    assert!(matches!(fatal, EventMsg::Error(_)));
+    let duplicate_fatal = tokio::time::timeout(
+        Duration::from_millis(250),
+        wait_for_event(&test.codex, |event| {
+            matches!(
+                event,
+                EventMsg::Error(error)
+                    if error.message.contains("realtime close persistence outcome is uncertain")
+            )
+        }),
+    )
+    .await;
+    assert!(
+        duplicate_fatal.is_err(),
+        "fatal must be delivered exactly once"
+    );
+    let quarantine_error = test
+        .codex
+        .flush_rollout()
+        .await
+        .expect_err("ambiguous natural close must quarantine the session");
+    assert!(quarantine_error.to_string().contains("quarantined"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn realtime_closed_append_failure_is_not_delivered_and_is_retryable() {
     skip_if_no_network!();
 
@@ -3167,6 +4163,593 @@ async fn realtime_closed_append_failure_is_not_delivered_and_is_retryable() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn requested_close_failure_upgraded_to_quarantine_retries_same_transaction_inside_gate() {
+    skip_if_no_network!();
+
+    const STORE_ID: &str = "requested-close-failure-upgraded-to-quarantine";
+    InMemoryThreadStore::remove_id(STORE_ID);
+    let thread_store = InMemoryThreadStore::for_id(STORE_ID);
+    let response_server = start_mock_server().await;
+    let realtime_server = start_realtime_race_server().await;
+    mount_sse_sequence(
+        &response_server,
+        vec![
+            sse(vec![
+                ev_response_created("resp-before-requested-close-upgrade"),
+                ev_assistant_message("first-message", "FIRST_REPLY"),
+                ev_completed("resp-before-requested-close-upgrade"),
+            ]),
+            sse(vec![
+                ev_assistant_message("compact-message", "REQUESTED_CLOSE_UPGRADE_SUMMARY"),
+                ev_completed("compact-requested-close-upgrade"),
+            ]),
+        ],
+    )
+    .await;
+    let commit_hook = CompactCommitTestHook::new();
+    let realtime_hook = RealtimeStartTestHook::new();
+    let mut builder = in_memory_atomic_compact_realtime_builder(
+        STORE_ID,
+        commit_hook.clone(),
+        realtime_hook.clone(),
+        realtime_server.uri().to_string(),
+    );
+    let test = builder
+        .build_with_auto_env(&response_server)
+        .await
+        .expect("build codex");
+
+    test.submit_turn("FIRST_USER_TURN")
+        .await
+        .expect("submit first user turn");
+    test.codex
+        .submit(Op::RealtimeConversationStart(realtime_start_params()))
+        .await
+        .expect("start realtime conversation");
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::RealtimeConversationStarted(_))
+    })
+    .await;
+
+    let observed_before_close = thread_store.observed_transaction_ids().await.len();
+    thread_store
+        .fail_next_append("injected requested Closed prewrite failure")
+        .await;
+    test.codex
+        .submit(Op::RealtimeConversationClose)
+        .await
+        .expect("submit requested close");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if thread_store.observed_transaction_ids().await.len() == observed_before_close + 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("requested close failure should reach the store");
+    assert!(realtime_close_pending_for_test(&test.codex).await);
+
+    test.codex
+        .submit(Op::Compact)
+        .await
+        .expect("submit compact operation");
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        commit_hook.wait_until_commit_paused(),
+    )
+    .await
+    .expect("compact commit should pause before lifecycle ownership");
+    realtime_hook.pause_close_after_claim_once();
+    thread_store
+        .fail_next_append("injected checkpoint prewrite failure")
+        .await;
+    thread_store
+        .fail_next_history_loads(3, "injected checkpoint reconciliation failure")
+        .await;
+    commit_hook.release_commit();
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        realtime_hook.wait_until_close_after_claim_paused(),
+    )
+    .await
+    .expect("quarantine close should reclaim the failed requested close");
+    thread_store
+        .fail_next_append("injected first upgraded quarantine close failure")
+        .await;
+    realtime_hook.release_close_after_claim();
+
+    let mut saw_closed = false;
+    let mut saw_compact_error = false;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !saw_closed || !saw_compact_error {
+            match test
+                .codex
+                .next_event()
+                .await
+                .expect("event stream should remain open")
+                .msg
+            {
+                EventMsg::RealtimeConversationClosed(event) => {
+                    assert_eq!(event.reason.as_deref(), Some("requested"));
+                    saw_closed = true;
+                }
+                EventMsg::Error(error)
+                    if error.message.contains("persistence outcome is uncertain") =>
+                {
+                    saw_compact_error = true;
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("upgraded close should retry before compact reports quarantine");
+
+    let observed = thread_store.observed_transaction_ids().await;
+    let close_attempt_ids = &observed[observed_before_close..];
+    assert_eq!(close_attempt_ids.len(), 3);
+    assert!(
+        close_attempt_ids
+            .iter()
+            .all(|id| id == &close_attempt_ids[0]),
+        "requested failure and both quarantine attempts must reuse one transaction ID"
+    );
+    assert!(!realtime_close_pending_for_test(&test.codex).await);
+    let durable_history = ThreadStore::load_history(
+        thread_store.as_ref(),
+        LoadThreadHistoryParams {
+            thread_id: test.session_configured.thread_id,
+            include_archived: true,
+        },
+    )
+    .await
+    .expect("load history after upgraded close retry");
+    assert_eq!(realtime_closed_count(&durable_history.items), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn realtime_closed_durable_then_error_reconciles_one_stable_transaction() {
+    skip_if_no_network!();
+
+    const STORE_ID: &str = "realtime-close-durable-then-error-transaction";
+    InMemoryThreadStore::remove_id(STORE_ID);
+    let thread_store = InMemoryThreadStore::for_id(STORE_ID);
+    let response_server = start_mock_server().await;
+    let realtime_server = start_realtime_race_server().await;
+    let commit_hook = CompactCommitTestHook::new();
+    let realtime_hook = RealtimeStartTestHook::new();
+    let mut builder = in_memory_atomic_compact_realtime_builder(
+        STORE_ID,
+        commit_hook,
+        realtime_hook,
+        realtime_server.uri().to_string(),
+    );
+    let test = builder
+        .build_with_auto_env(&response_server)
+        .await
+        .expect("build codex");
+
+    test.codex
+        .submit(Op::RealtimeConversationStart(realtime_start_params()))
+        .await
+        .expect("start realtime conversation");
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::RealtimeConversationStarted(_))
+    })
+    .await;
+    let history_loads_before = thread_store.calls().await.load_history;
+    thread_store
+        .fail_next_append_after_items(1, "injected durable Closed append error")
+        .await;
+
+    test.codex
+        .submit(Op::RealtimeConversationClose)
+        .await
+        .expect("submit realtime close");
+    let closed = tokio::time::timeout(
+        Duration::from_secs(5),
+        wait_for_event(&test.codex, |event| {
+            matches!(event, EventMsg::RealtimeConversationClosed(_))
+        }),
+    )
+    .await
+    .expect("durable close should reconcile and deliver Closed");
+    assert!(matches!(
+        closed,
+        EventMsg::RealtimeConversationClosed(ref event)
+            if event.reason.as_deref() == Some("requested")
+    ));
+
+    let durable_history = ThreadStore::load_history(
+        thread_store.as_ref(),
+        LoadThreadHistoryParams {
+            thread_id: test.session_configured.thread_id,
+            include_archived: true,
+        },
+    )
+    .await
+    .expect("load reconciled close history");
+    assert_eq!(realtime_closed_count(&durable_history.items), 1);
+    assert_eq!(
+        durable_history
+            .items
+            .iter()
+            .filter(|item| matches!(
+                item,
+                RolloutItem::Transaction(transaction)
+                    if transaction.items.iter().any(|item| matches!(
+                        item,
+                        RolloutItem::EventMsg(EventMsg::RealtimeConversationClosed(_))
+                    ))
+            ))
+            .count(),
+        1,
+        "Closed must be durably represented by one structural transaction"
+    );
+    assert_eq!(
+        thread_store.calls().await.load_history,
+        history_loads_before + 2,
+        "close reconciliation and the assertion load should each read history once"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn realtime_closed_failed_reconciliation_quarantines_without_delivery() {
+    skip_if_no_network!();
+
+    const STORE_ID: &str = "realtime-close-reconcile-failure-quarantine";
+    InMemoryThreadStore::remove_id(STORE_ID);
+    let thread_store = InMemoryThreadStore::for_id(STORE_ID);
+    let response_server = start_mock_server().await;
+    let realtime_server = start_realtime_race_server().await;
+    let commit_hook = CompactCommitTestHook::new();
+    let realtime_hook = RealtimeStartTestHook::new();
+    let mut builder = in_memory_atomic_compact_realtime_builder(
+        STORE_ID,
+        commit_hook,
+        realtime_hook,
+        realtime_server.uri().to_string(),
+    );
+    let test = builder
+        .build_with_auto_env(&response_server)
+        .await
+        .expect("build codex");
+
+    test.codex
+        .submit(Op::RealtimeConversationStart(realtime_start_params()))
+        .await
+        .expect("start realtime conversation");
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::RealtimeConversationStarted(_))
+    })
+    .await;
+    let history_loads_before = thread_store.calls().await.load_history;
+    thread_store
+        .fail_next_append("injected ambiguous Closed append")
+        .await;
+    thread_store
+        .fail_next_history_loads(3, "injected Closed reconciliation read failure")
+        .await;
+
+    test.codex
+        .submit(Op::RealtimeConversationClose)
+        .await
+        .expect("submit realtime close");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if thread_store.calls().await.load_history == history_loads_before + 3 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("ambiguous close should exhaust bounded reconciliation");
+    let fatal = tokio::time::timeout(
+        Duration::from_secs(5),
+        wait_for_event(&test.codex, |event| {
+            matches!(
+                event,
+                EventMsg::Error(error)
+                    if error.message.contains("realtime close persistence outcome is uncertain")
+            )
+        }),
+    )
+    .await
+    .expect("ambiguous explicit close must deliver a fatal persistence error");
+    assert!(matches!(fatal, EventMsg::Error(_)));
+    let premature_closed = tokio::time::timeout(
+        Duration::from_millis(250),
+        wait_for_event(&test.codex, |event| {
+            matches!(event, EventMsg::RealtimeConversationClosed(_))
+        }),
+    )
+    .await;
+    assert!(
+        premature_closed.is_err(),
+        "ambiguous close must not deliver a live-only Closed event: {premature_closed:?}"
+    );
+    let quarantine_error = test
+        .codex
+        .flush_rollout()
+        .await
+        .expect_err("ambiguous close persistence must quarantine the session");
+    assert!(quarantine_error.to_string().contains("quarantined"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn quarantine_close_retries_not_committed_with_same_transaction_inside_gate() {
+    skip_if_no_network!();
+
+    const STORE_ID: &str = "quarantine-close-internal-stable-retry";
+    InMemoryThreadStore::remove_id(STORE_ID);
+    let thread_store = InMemoryThreadStore::for_id(STORE_ID);
+    let response_server = start_mock_server().await;
+    let realtime_server = start_realtime_race_server().await;
+    mount_sse_sequence(
+        &response_server,
+        vec![
+            sse(vec![
+                ev_response_created("resp-before-quarantine-close-retry"),
+                ev_assistant_message("first-message", "FIRST_REPLY"),
+                ev_completed("resp-before-quarantine-close-retry"),
+            ]),
+            sse(vec![
+                ev_assistant_message("compact-message", "QUARANTINE_CLOSE_RETRY_SUMMARY"),
+                ev_completed("compact-quarantine-close-retry"),
+            ]),
+        ],
+    )
+    .await;
+    let commit_hook = CompactCommitTestHook::new();
+    let realtime_hook = RealtimeStartTestHook::new();
+    let mut builder = in_memory_atomic_compact_realtime_builder(
+        STORE_ID,
+        commit_hook.clone(),
+        realtime_hook.clone(),
+        realtime_server.uri().to_string(),
+    );
+    let test = builder
+        .build_with_auto_env(&response_server)
+        .await
+        .expect("build codex");
+
+    test.submit_turn("FIRST_USER_TURN")
+        .await
+        .expect("submit first user turn");
+    test.codex
+        .submit(Op::RealtimeConversationStart(realtime_start_params()))
+        .await
+        .expect("start realtime conversation");
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::RealtimeConversationStarted(_))
+    })
+    .await;
+    test.codex
+        .submit(Op::Compact)
+        .await
+        .expect("submit compact operation");
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        commit_hook.wait_until_commit_paused(),
+    )
+    .await
+    .expect("compact commit should pause before lifecycle ownership");
+
+    realtime_hook.pause_close_after_claim_once();
+    thread_store
+        .fail_next_append("injected checkpoint prewrite failure")
+        .await;
+    thread_store
+        .fail_next_history_loads(3, "injected checkpoint reconciliation failure")
+        .await;
+    commit_hook.release_commit();
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        realtime_hook.wait_until_close_after_claim_paused(),
+    )
+    .await
+    .expect("quarantine close should claim while retaining the lifecycle gate");
+
+    let observed_before = thread_store.observed_transaction_ids().await.len();
+    thread_store
+        .fail_next_append("injected first quarantine Closed prewrite failure")
+        .await;
+    realtime_hook.release_close_after_claim();
+
+    let mut saw_closed = false;
+    let mut saw_compact_error = false;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !saw_closed || !saw_compact_error {
+            let event = test
+                .codex
+                .next_event()
+                .await
+                .expect("event stream should remain open");
+            match event.msg {
+                EventMsg::RealtimeConversationClosed(event) => {
+                    assert_eq!(event.reason.as_deref(), Some("persistence_quarantine"));
+                    saw_closed = true;
+                }
+                EventMsg::Error(error)
+                    if error.message.contains("persistence outcome is uncertain") =>
+                {
+                    saw_compact_error = true;
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("in-gate close retry should commit before compact reports quarantine");
+    let duplicate_closed = tokio::time::timeout(
+        Duration::from_millis(250),
+        wait_for_event(&test.codex, |event| {
+            matches!(event, EventMsg::RealtimeConversationClosed(_))
+        }),
+    )
+    .await;
+    assert!(duplicate_closed.is_err(), "Closed must be delivered once");
+
+    let observed = thread_store.observed_transaction_ids().await;
+    let close_attempt_ids = &observed[observed_before..];
+    assert_eq!(
+        close_attempt_ids.len(),
+        2,
+        "one failed write plus one retry"
+    );
+    assert_eq!(
+        close_attempt_ids[0], close_attempt_ids[1],
+        "the in-gate retry must reuse the claimed close transaction ID"
+    );
+    assert!(!realtime_close_pending_for_test(&test.codex).await);
+    let durable_history = ThreadStore::load_history(
+        thread_store.as_ref(),
+        LoadThreadHistoryParams {
+            thread_id: test.session_configured.thread_id,
+            include_archived: true,
+        },
+    )
+    .await
+    .expect("load history after quarantine close retry");
+    assert_eq!(realtime_closed_count(&durable_history.items), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn quarantine_close_not_committed_exhaustion_retains_closing_without_delivery() {
+    skip_if_no_network!();
+
+    const STORE_ID: &str = "quarantine-close-internal-retry-exhaustion";
+    InMemoryThreadStore::remove_id(STORE_ID);
+    let thread_store = InMemoryThreadStore::for_id(STORE_ID);
+    let response_server = start_mock_server().await;
+    let realtime_server = start_realtime_race_server().await;
+    mount_sse_sequence(
+        &response_server,
+        vec![
+            sse(vec![
+                ev_response_created("resp-before-quarantine-close-exhaustion"),
+                ev_assistant_message("first-message", "FIRST_REPLY"),
+                ev_completed("resp-before-quarantine-close-exhaustion"),
+            ]),
+            sse(vec![
+                ev_assistant_message("compact-message", "QUARANTINE_CLOSE_EXHAUSTION_SUMMARY"),
+                ev_completed("compact-quarantine-close-exhaustion"),
+            ]),
+        ],
+    )
+    .await;
+    let commit_hook = CompactCommitTestHook::new();
+    let realtime_hook = RealtimeStartTestHook::new();
+    let mut builder = in_memory_atomic_compact_realtime_builder(
+        STORE_ID,
+        commit_hook.clone(),
+        realtime_hook.clone(),
+        realtime_server.uri().to_string(),
+    );
+    let test = builder
+        .build_with_auto_env(&response_server)
+        .await
+        .expect("build codex");
+
+    test.submit_turn("FIRST_USER_TURN")
+        .await
+        .expect("submit first user turn");
+    test.codex
+        .submit(Op::RealtimeConversationStart(realtime_start_params()))
+        .await
+        .expect("start realtime conversation");
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::RealtimeConversationStarted(_))
+    })
+    .await;
+    test.codex
+        .submit(Op::Compact)
+        .await
+        .expect("submit compact operation");
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        commit_hook.wait_until_commit_paused(),
+    )
+    .await
+    .expect("compact commit should pause before lifecycle ownership");
+
+    realtime_hook.pause_close_after_claim_once();
+    thread_store
+        .fail_next_append("injected checkpoint prewrite failure")
+        .await;
+    thread_store
+        .fail_next_history_loads(3, "injected checkpoint reconciliation failure")
+        .await;
+    commit_hook.release_commit();
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        realtime_hook.wait_until_close_after_claim_paused(),
+    )
+    .await
+    .expect("quarantine close should claim while retaining the lifecycle gate");
+
+    let observed_before = thread_store.observed_transaction_ids().await.len();
+    thread_store
+        .fail_next_appends(3, "injected repeated quarantine Closed prewrite failure")
+        .await;
+    realtime_hook.release_close_after_claim();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if thread_store.observed_transaction_ids().await.len() == observed_before + 3 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("quarantine close should exhaust its bounded append attempts");
+
+    let premature_closed = tokio::time::timeout(
+        Duration::from_millis(250),
+        wait_for_event(&test.codex, |event| {
+            matches!(event, EventMsg::RealtimeConversationClosed(_))
+        }),
+    )
+    .await;
+    assert!(
+        premature_closed.is_err(),
+        "exhausted NotCommitted attempts must not deliver Closed"
+    );
+    let observed = thread_store.observed_transaction_ids().await;
+    let close_attempt_ids = &observed[observed_before..];
+    assert_eq!(close_attempt_ids.len(), 3);
+    assert!(
+        close_attempt_ids
+            .iter()
+            .all(|id| id == &close_attempt_ids[0]),
+        "all bounded attempts must reuse the claimed transaction ID"
+    );
+    assert!(
+        realtime_close_pending_for_test(&test.codex).await,
+        "exhaustion must retain Closing for reload/diagnosis"
+    );
+    let durable_history = ThreadStore::load_history(
+        thread_store.as_ref(),
+        LoadThreadHistoryParams {
+            thread_id: test.session_configured.thread_id,
+            include_archived: true,
+        },
+    )
+    .await
+    .expect("load history after exhausted quarantine close");
+    assert_eq!(realtime_closed_count(&durable_history.items), 0);
+    let quarantine_error = test
+        .codex
+        .flush_rollout()
+        .await
+        .expect_err("the lifecycle must remain quarantined after close exhaustion");
+    assert!(quarantine_error.to_string().contains("quarantined"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn direct_injection_apis_reject_quarantine_before_mutation_or_side_effect() {
     skip_if_no_network!();
 
@@ -3226,10 +4809,7 @@ async fn direct_injection_apis_reject_quarantine_before_mutation_or_side_effect(
             .message
             .contains("persistence outcome is uncertain")
     );
-    wait_for_event(&test.codex, |event| {
-        matches!(event, EventMsg::TurnComplete(_) | EventMsg::TurnAborted(_))
-    })
-    .await;
+    wait_for_ambiguous_compact_owner_active_turn_to_clear(&test).await;
 
     clear_reference_context_item_for_direct_mutation_test(&test.codex).await;
     let state_before = direct_mutation_test_snapshot(&test.codex).await;

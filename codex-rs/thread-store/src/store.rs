@@ -68,6 +68,16 @@ pub trait ThreadStore: Any + Send + Sync {
     /// replay history and before updating any implementation-owned projections.
     fn append_items(&self, params: AppendThreadItemsParams) -> ThreadStoreFuture<'_, ()>;
 
+    /// Whether items accepted by an append that returns an error may remain buffered and become
+    /// durable during a later store barrier.
+    ///
+    /// The conservative default is `true`: a readable history that does not yet contain a stable
+    /// append ID is not proof that the append was rejected. Stores may return `false` only when an
+    /// error definitively prevents that call's items from becoming durable later.
+    fn failed_append_may_become_durable(&self) -> bool {
+        true
+    }
+
     /// Materializes the thread if persistence is lazy, then persists all queued items.
     fn persist_thread(&self, thread_id: ThreadId) -> ThreadStoreFuture<'_, ()>;
 

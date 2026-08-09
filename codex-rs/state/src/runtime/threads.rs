@@ -1237,16 +1237,29 @@ SELECT
 }
 
 pub(super) fn extract_memory_mode(items: &[RolloutItem]) -> Option<String> {
-    items.iter().rev().find_map(|item| match item {
-        RolloutItem::SessionMeta(meta_line) => meta_line.meta.memory_mode.clone(),
-        RolloutItem::ResponseItem(_)
-        | RolloutItem::InterAgentCommunication(_)
-        | RolloutItem::InterAgentCommunicationMetadata { .. }
-        | RolloutItem::Compacted(_)
-        | RolloutItem::TurnContext(_)
-        | RolloutItem::WorldState(_)
-        | RolloutItem::EventMsg(_) => None,
-    })
+    let flattened = match codex_protocol::protocol::flatten_rollout_items(items) {
+        Ok(flattened) => flattened,
+        Err(err) => {
+            tracing::warn!(%err, "failed to traverse rollout history for memory mode");
+            return None;
+        }
+    };
+    flattened
+        .items()
+        .iter()
+        .rev()
+        .copied()
+        .find_map(|item| match item {
+            RolloutItem::SessionMeta(meta_line) => meta_line.meta.memory_mode.clone(),
+            RolloutItem::ResponseItem(_)
+            | RolloutItem::InterAgentCommunication(_)
+            | RolloutItem::InterAgentCommunicationMetadata { .. }
+            | RolloutItem::Compacted(_)
+            | RolloutItem::TurnContext(_)
+            | RolloutItem::WorldState(_)
+            | RolloutItem::Transaction(_)
+            | RolloutItem::EventMsg(_) => None,
+        })
 }
 
 fn thread_spawn_parent_thread_id_from_source_str(source: &str) -> Option<ThreadId> {

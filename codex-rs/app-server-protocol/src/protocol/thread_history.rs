@@ -47,6 +47,7 @@ use codex_protocol::protocol::PatchApplyBeginEvent;
 use codex_protocol::protocol::PatchApplyEndEvent;
 use codex_protocol::protocol::ReviewOutputEvent;
 use codex_protocol::protocol::RolloutItem;
+use codex_protocol::protocol::RolloutItemFlattener;
 use codex_protocol::protocol::ThreadRolledBackEvent;
 use codex_protocol::protocol::TurnAbortedEvent;
 use codex_protocol::protocol::TurnCompleteEvent;
@@ -232,6 +233,7 @@ pub struct ThreadHistoryBuilder {
     current_rollout_index: usize,
     next_rollout_index: usize,
     active_change_set: Option<ThreadHistoryChangeSet>,
+    rollout_item_flattener: RolloutItemFlattener,
 }
 
 impl Default for ThreadHistoryBuilder {
@@ -249,6 +251,7 @@ impl ThreadHistoryBuilder {
             current_rollout_index: 0,
             next_rollout_index: 0,
             active_change_set: None,
+            rollout_item_flattener: RolloutItemFlattener::default(),
         }
     }
 
@@ -379,6 +382,22 @@ impl ThreadHistoryBuilder {
     }
 
     pub fn handle_rollout_item(&mut self, item: &RolloutItem) {
+        let logical_items = match self
+            .rollout_item_flattener
+            .flatten(std::slice::from_ref(item))
+        {
+            Ok(items) => items,
+            Err(err) => {
+                tracing::warn!(%err, "failed to traverse app-server rollout history");
+                return;
+            }
+        };
+        for item in logical_items {
+            self.handle_logical_rollout_item(item);
+        }
+    }
+
+    fn handle_logical_rollout_item(&mut self, item: &RolloutItem) {
         self.current_rollout_index = self.next_rollout_index;
         self.next_rollout_index += 1;
         match item {
@@ -389,7 +408,8 @@ impl ThreadHistoryBuilder {
             | RolloutItem::InterAgentCommunicationMetadata { .. }
             | RolloutItem::TurnContext(_)
             | RolloutItem::WorldState(_)
-            | RolloutItem::SessionMeta(_) => {}
+            | RolloutItem::SessionMeta(_)
+            | RolloutItem::Transaction(_) => {}
         }
     }
 

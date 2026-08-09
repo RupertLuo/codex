@@ -15,6 +15,7 @@ use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::InitialHistory;
 use codex_protocol::protocol::RolloutItem;
+use codex_protocol::protocol::flatten_rollout_items;
 use core_test_support::responses;
 use serde_json::Value;
 use std::path::Path;
@@ -82,10 +83,13 @@ async fn thread_inject_items_adds_raw_response_items_to_thread_history() -> Resu
     let InitialHistory::Resumed(resumed_history) = history else {
         panic!("expected resumed rollout history");
     };
+    let logical_history =
+        flatten_rollout_items(&resumed_history.history).context("flatten rollout history")?;
     assert!(
-        resumed_history
-            .history
+        logical_history
+            .items()
             .iter()
+            .copied()
             .any(|item| matches!(item, RolloutItem::ResponseItem(response_item) if responses::strip_metadata(response_item.clone()) == injected_item)),
         "injected item should be persisted in rollout history"
     );

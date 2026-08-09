@@ -192,24 +192,36 @@ pub(crate) async fn record_completed_response_item(
     sess: &Session,
     turn_context: &TurnContext,
     item: &ResponseItem,
-) {
-    record_completed_response_item_with_finalized_facts(
-        sess,
-        turn_context,
-        item,
-        /*finalized_facts*/ None,
-    )
-    .await;
+) -> Result<()> {
+    persist_completed_response_item(sess, turn_context, item).await?;
+    apply_completed_response_item_facts(sess, turn_context, item, /*finalized_facts*/ None).await;
+    Ok(())
 }
 
-pub(crate) async fn record_completed_response_item_with_finalized_facts(
+pub(crate) async fn persist_completed_response_item(
+    sess: &Session,
+    turn_context: &TurnContext,
+    item: &ResponseItem,
+) -> Result<()> {
+    if let Err(err) = sess
+        .try_record_conversation_items(turn_context, std::slice::from_ref(item))
+        .await
+    {
+        let reason = sess
+            .persistence_quarantine_reason()
+            .await
+            .unwrap_or_else(|| err.to_string());
+        return Err(CodexErr::Fatal(reason));
+    }
+    Ok(())
+}
+
+pub(crate) async fn apply_completed_response_item_facts(
     sess: &Session,
     turn_context: &TurnContext,
     item: &ResponseItem,
     finalized_facts: Option<&FinalizedTurnItemFacts>,
 ) {
-    sess.record_conversation_items(turn_context, std::slice::from_ref(item))
-        .await;
     let defers_mailbox_delivery = finalized_facts.map_or_else(
         || {
             completed_item_defers_mailbox_delivery_to_next_turn(
@@ -413,14 +425,6 @@ pub(crate) async fn handle_output_item_done(
     match ToolRouter::build_tool_call(item.clone()) {
         // The model emitted a tool call; log it, persist the item immediately, and queue the tool execution.
         Ok(Some(call)) => {
-            ctx.sess
-                .input_queue
-                .accept_mailbox_delivery_for_current_turn(
-                    &ctx.sess.active_turn,
-                    &ctx.turn_context.sub_id,
-                )
-                .await;
-
             let payload_preview = call.payload.log_payload().into_owned();
             tracing::info!(
                 thread_id = %ctx.sess.thread_id,
@@ -430,6 +434,14 @@ pub(crate) async fn handle_output_item_done(
             );
 
             record_completed_response_item(ctx.sess.as_ref(), ctx.turn_context.as_ref(), &item)
+                .await?;
+
+            ctx.sess
+                .input_queue
+                .accept_mailbox_delivery_for_current_turn(
+                    &ctx.sess.active_turn,
+                    &ctx.turn_context.sub_id,
+                )
                 .await;
 
             let cancellation_token = ctx.cancellation_token.child_token();
@@ -444,6 +456,8 @@ pub(crate) async fn handle_output_item_done(
         }
         // No tool call: convert messages/reasoning into turn items and mark them as complete.
         Ok(None) => {
+            persist_completed_response_item(ctx.sess.as_ref(), ctx.turn_context.as_ref(), &item)
+                .await?;
             let finalized_turn_item = finalize_non_tool_response_item(
                 ctx.sess.as_ref(),
                 ctx.turn_context.as_ref(),
@@ -455,6 +469,16 @@ pub(crate) async fn handle_output_item_done(
             let finalized_facts = finalized_turn_item
                 .as_ref()
                 .map(|finalized| finalized.facts.clone());
+            apply_completed_response_item_facts(
+                ctx.sess.as_ref(),
+                ctx.turn_context.as_ref(),
+                &item,
+                finalized_facts.as_ref(),
+            )
+            .await;
+            if let Some(reason) = ctx.sess.persistence_quarantine_reason().await {
+                return Err(CodexErr::Fatal(reason));
+            }
             if let Some(finalized_turn_item) = finalized_turn_item {
                 if previously_active_item.is_none() {
                     let mut started_item = finalized_turn_item.turn_item.clone();
@@ -473,14 +497,6 @@ pub(crate) async fn handle_output_item_done(
                     .emit_turn_item_completed(&ctx.turn_context, finalized_turn_item.turn_item)
                     .await;
             }
-            record_completed_response_item_with_finalized_facts(
-                ctx.sess.as_ref(),
-                ctx.turn_context.as_ref(),
-                &item,
-                finalized_facts.as_ref(),
-            )
-            .await;
-
             output.last_agent_message = finalized_facts.and_then(|facts| facts.last_agent_message);
         }
         // The tool request should be answered directly (or was denied); push that response into the transcript.
@@ -493,14 +509,22 @@ pub(crate) async fn handle_output_item_done(
                 },
             };
             record_completed_response_item(ctx.sess.as_ref(), ctx.turn_context.as_ref(), &item)
-                .await;
-            if let Some(response_item) = response_input_to_response_item(&response) {
-                ctx.sess
-                    .record_conversation_items(
+                .await?;
+            if let Some(response_item) = response_input_to_response_item(&response)
+                && let Err(err) = ctx
+                    .sess
+                    .try_record_conversation_items(
                         &ctx.turn_context,
                         std::slice::from_ref(&response_item),
                     )
-                    .await;
+                    .await
+            {
+                let reason = ctx
+                    .sess
+                    .persistence_quarantine_reason()
+                    .await
+                    .unwrap_or_else(|| err.to_string());
+                return Err(CodexErr::Fatal(reason));
             }
 
             output.needs_follow_up = true;

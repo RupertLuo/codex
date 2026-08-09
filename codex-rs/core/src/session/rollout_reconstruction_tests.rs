@@ -13,6 +13,7 @@ use codex_protocol::protocol::InitialHistory;
 use codex_protocol::protocol::InterAgentCommunication;
 use codex_protocol::protocol::RateLimitSnapshot;
 use codex_protocol::protocol::ResumedHistory;
+use codex_protocol::protocol::RolloutTransaction;
 use codex_protocol::protocol::SessionContextWindow;
 use codex_protocol::protocol::SessionMeta;
 use codex_protocol::protocol::SessionMetaLine;
@@ -24,6 +25,120 @@ use pretty_assertions::assert_eq;
 use serde_json::json;
 use std::path::PathBuf;
 use uuid::Uuid;
+
+#[tokio::test]
+async fn record_initial_history_rejects_transaction_over_traversal_limit() {
+    let (session, _turn_context) = make_session_and_context().await;
+    let mut nested_item = RolloutItem::WorldState(WorldStateItem::full(json!({})));
+    for depth in 0..=codex_protocol::protocol::DEFAULT_MAX_ROLLOUT_TRANSACTION_DEPTH {
+        nested_item = RolloutItem::Transaction(RolloutTransaction {
+            transaction_id: format!("depth-{depth}"),
+            items: vec![nested_item],
+        });
+    }
+
+    let err = session
+        .record_initial_history(InitialHistory::Resumed(ResumedHistory {
+            conversation_id: ThreadId::default(),
+            history: Arc::new(vec![nested_item]),
+            rollout_path: Some(PathBuf::from("/tmp/corrupt-resume.jsonl")),
+        }))
+        .await
+        .expect_err("over-limit transaction history must reject resume");
+
+    assert!(matches!(
+        err,
+        CodexErr::Fatal(message)
+            if message.contains("cannot resume or fork corrupt rollout transaction history")
+                && message.contains("maximum depth")
+    ));
+    assert!(session.clone_history().await.raw_items().is_empty());
+}
+
+#[tokio::test]
+async fn resume_checkpoint_state_uses_nested_first_winning_transaction_view() {
+    let (session, _turn_context) = make_session_and_context().await;
+    let winning_info = TokenUsageInfo {
+        total_token_usage: TokenUsage {
+            total_tokens: 700,
+            ..TokenUsage::default()
+        },
+        last_token_usage: TokenUsage {
+            total_tokens: 70,
+            ..TokenUsage::default()
+        },
+        model_context_window: Some(8_192),
+    };
+    let losing_info = TokenUsageInfo {
+        total_token_usage: TokenUsage {
+            total_tokens: 900,
+            ..TokenUsage::default()
+        },
+        last_token_usage: TokenUsage {
+            total_tokens: 90,
+            ..TokenUsage::default()
+        },
+        model_context_window: Some(16_384),
+    };
+    let checkpoint_item = |checkpoint_id: &str, server_reasoning_included: bool| {
+        RolloutItem::Compacted(CompactedItem {
+            message: "checkpoint".to_string(),
+            replacement_history: None,
+            window_number: None,
+            first_window_id: None,
+            previous_window_id: None,
+            window_id: None,
+            checkpoint: Some(CompactionCheckpoint {
+                checkpoint_id: checkpoint_id.to_string(),
+                reference_context_item: None,
+                world_state: None,
+                api_token_count: TokenCountEvent {
+                    info: None,
+                    rate_limits: None,
+                },
+                final_token_count: TokenCountEvent {
+                    info: None,
+                    rate_limits: None,
+                },
+                server_reasoning_included,
+            }),
+        })
+    };
+    let token_item = |info| {
+        RolloutItem::EventMsg(EventMsg::TokenCount(TokenCountEvent {
+            info: Some(info),
+            rate_limits: None,
+        }))
+    };
+    let rollout_items = vec![
+        RolloutItem::Transaction(RolloutTransaction {
+            transaction_id: "resume-checkpoint-outer".to_string(),
+            items: vec![RolloutItem::Transaction(RolloutTransaction {
+                transaction_id: "resume-checkpoint-inner".to_string(),
+                items: vec![
+                    checkpoint_item("winning-checkpoint", true),
+                    token_item(winning_info.clone()),
+                ],
+            })],
+        }),
+        RolloutItem::Transaction(RolloutTransaction {
+            transaction_id: "resume-checkpoint-outer".to_string(),
+            items: vec![
+                checkpoint_item("losing-checkpoint", false),
+                token_item(losing_info),
+            ],
+        }),
+    ];
+
+    session
+        .restore_resume_checkpoint_state(&rollout_items)
+        .await
+        .expect("valid nested checkpoint history");
+
+    let state = session.state.lock().await;
+    assert_eq!(state.token_info(), Some(winning_info));
+    assert!(state.server_reasoning_included());
+}
 
 fn user_message(text: &str) -> ResponseItem {
     ResponseItem::Message {
@@ -130,7 +245,8 @@ async fn record_initial_history_reconstructs_typed_inter_agent_message() {
             )]),
             rollout_path: Some(PathBuf::from("/tmp/resume.jsonl")),
         }))
-        .await;
+        .await
+        .expect("valid initial history");
 
     assert_eq!(
         session.state.lock().await.clone_history().raw_items(),
@@ -156,7 +272,8 @@ async fn record_initial_history_restores_world_state_baseline() {
             history: Arc::new(rollout_items),
             rollout_path: Some(PathBuf::from("/tmp/resume.jsonl")),
         }))
-        .await;
+        .await
+        .expect("valid initial history");
     let step_context = StepContext::for_test(Arc::clone(&turn_context));
     session
         .record_context_updates_and_set_reference_context_item(&step_context)
@@ -237,7 +354,8 @@ async fn record_initial_history_restores_atomic_compaction_checkpoint() {
 
     let reconstructed = session
         .reconstruct_history_from_rollout(&turn_context, &rollout_items)
-        .await;
+        .await
+        .expect("valid rollout reconstruction");
     assert_eq!(reconstructed.history, replacement_history);
     assert_eq!(
         reconstructed.reference_context_item,
@@ -255,7 +373,8 @@ async fn record_initial_history_restores_atomic_compaction_checkpoint() {
             history: Arc::new(rollout_items),
             rollout_path: Some(PathBuf::from("/tmp/resume.jsonl")),
         }))
-        .await;
+        .await
+        .expect("valid initial history");
 
     let state = session.state.lock().await;
     assert_eq!(state.token_info(), Some(final_token_info));
@@ -332,7 +451,8 @@ async fn last_n_fork_checkpoint_starts_without_parent_baselines_and_fully_reinje
         truncate_rollout_to_last_n_fork_turns(&parent_rollout, /*n_from_end*/ 1);
     let reconstructed = session
         .reconstruct_history_from_rollout(&turn_context, &forked_rollout)
-        .await;
+        .await
+        .expect("valid forked rollout reconstruction");
     assert_eq!(reconstructed.reference_context_item, None);
     assert_eq!(reconstructed.world_state_baseline, None);
     let child_window_ids = AutoCompactWindowIds {
@@ -345,7 +465,8 @@ async fn last_n_fork_checkpoint_starts_without_parent_baselines_and_fully_reinje
 
     session
         .record_initial_history(InitialHistory::Forked(forked_rollout))
-        .await;
+        .await
+        .expect("valid initial history");
     let history_before_first_child_turn = session.clone_history().await.raw_items().to_vec();
     {
         let state = session.state.lock().await;
@@ -418,7 +539,8 @@ async fn record_initial_history_resumed_bare_turn_context_does_not_hydrate_previ
 
     let reconstructed = session
         .reconstruct_history_from_rollout(&turn_context, &rollout_items)
-        .await;
+        .await
+        .expect("valid rollout reconstruction");
     assert_eq!(reconstructed.world_state_baseline, None);
 
     session
@@ -427,7 +549,8 @@ async fn record_initial_history_resumed_bare_turn_context_does_not_hydrate_previ
             history: Arc::new(rollout_items),
             rollout_path: Some(PathBuf::from("/tmp/resume.jsonl")),
         }))
-        .await;
+        .await
+        .expect("valid initial history");
 
     assert_eq!(session.previous_turn_settings().await, None);
     assert!(session.reference_context_item().await.is_none());
@@ -504,7 +627,8 @@ async fn record_initial_history_resumed_hydrates_previous_turn_settings_from_lif
             history: Arc::new(rollout_items),
             rollout_path: Some(PathBuf::from("/tmp/resume.jsonl")),
         }))
-        .await;
+        .await
+        .expect("valid initial history");
 
     assert_eq!(
         session.previous_turn_settings().await,
@@ -612,7 +736,8 @@ async fn reconstruct_history_rollback_keeps_history_and_metadata_in_sync_for_com
 
     let reconstructed = session
         .reconstruct_history_from_rollout(&turn_context, &rollout_items)
-        .await;
+        .await
+        .expect("valid rollout reconstruction");
 
     assert_eq!(
         reconstructed.history,
@@ -711,7 +836,8 @@ async fn reconstruct_history_rollback_keeps_history_and_metadata_in_sync_for_inc
 
     let reconstructed = session
         .reconstruct_history_from_rollout(&turn_context, &rollout_items)
-        .await;
+        .await
+        .expect("valid rollout reconstruction");
 
     assert_eq!(
         reconstructed.history,
@@ -837,7 +963,8 @@ async fn reconstruct_history_rollback_skips_non_user_turns_for_history_and_metad
 
     let reconstructed = session
         .reconstruct_history_from_rollout(&turn_context, &rollout_items)
-        .await;
+        .await
+        .expect("valid rollout reconstruction");
 
     assert_eq!(
         reconstructed.history,
@@ -935,7 +1062,8 @@ async fn reconstruct_history_rollback_counts_inter_agent_assistant_turns() {
 
     let reconstructed = session
         .reconstruct_history_from_rollout(&turn_context, &rollout_items)
-        .await;
+        .await
+        .expect("valid rollout reconstruction");
 
     assert_eq!(
         reconstructed.history,
@@ -1007,7 +1135,8 @@ async fn reconstruct_history_rollback_clears_history_and_metadata_when_exceeding
 
     let reconstructed = session
         .reconstruct_history_from_rollout(&turn_context, &rollout_items)
-        .await;
+        .await
+        .expect("valid rollout reconstruction");
 
     assert_eq!(reconstructed.history, Vec::new());
     assert_eq!(reconstructed.previous_turn_settings, None);
@@ -1083,7 +1212,8 @@ async fn record_initial_history_resumed_rollback_skips_only_user_turns() {
             history: Arc::new(rollout_items),
             rollout_path: Some(PathBuf::from("/tmp/resume.jsonl")),
         }))
-        .await;
+        .await
+        .expect("valid initial history");
 
     assert_eq!(session.previous_turn_settings().await, None);
     assert!(session.reference_context_item().await.is_none());
@@ -1168,7 +1298,8 @@ async fn record_initial_history_resumed_rollback_drops_incomplete_user_turn_comp
             history: Arc::new(rollout_items),
             rollout_path: Some(PathBuf::from("/tmp/resume.jsonl")),
         }))
-        .await;
+        .await
+        .expect("valid initial history");
 
     assert_eq!(
         session.previous_turn_settings().await,
@@ -1198,7 +1329,8 @@ async fn record_initial_history_resumed_bare_turn_context_does_not_seed_referenc
             history: Arc::new(rollout_items),
             rollout_path: Some(PathBuf::from("/tmp/resume.jsonl")),
         }))
-        .await;
+        .await
+        .expect("valid initial history");
 
     assert!(session.reference_context_item().await.is_none());
 }
@@ -1226,7 +1358,8 @@ async fn record_initial_history_resumed_does_not_seed_reference_context_item_aft
             history: Arc::new(rollout_items),
             rollout_path: Some(PathBuf::from("/tmp/resume.jsonl")),
         }))
-        .await;
+        .await
+        .expect("valid initial history");
 
     assert_eq!(session.previous_turn_settings().await, None);
     assert!(session.reference_context_item().await.is_none());
@@ -1251,7 +1384,8 @@ async fn reconstruct_history_restores_initial_window_from_session_meta() {
 
     let reconstructed = session
         .reconstruct_history_from_rollout(&turn_context, &rollout_items)
-        .await;
+        .await
+        .expect("valid rollout reconstruction");
 
     assert_eq!(reconstructed.window_number, 0);
     assert_eq!(reconstructed.first_window_id, Some(initial_window_id));
@@ -1292,7 +1426,8 @@ async fn reconstruct_history_prefers_compacted_window_over_session_meta() {
 
     let reconstructed = session
         .reconstruct_history_from_rollout(&turn_context, &rollout_items)
-        .await;
+        .await
+        .expect("valid rollout reconstruction");
 
     assert_eq!(reconstructed.window_number, 2);
     assert_eq!(
@@ -1335,7 +1470,8 @@ async fn reconstruct_history_replays_world_state_from_latest_compaction_window()
 
     let reconstructed = session
         .reconstruct_history_from_rollout(&turn_context, &rollout_items)
-        .await;
+        .await
+        .expect("valid rollout reconstruction");
 
     assert_eq!(
         serde_json::to_value(reconstructed.world_state_baseline)
@@ -1376,7 +1512,8 @@ async fn reconstruct_history_preserves_legacy_compaction_count_with_session_meta
 
     let reconstructed = session
         .reconstruct_history_from_rollout(&turn_context, &rollout_items)
-        .await;
+        .await
+        .expect("valid rollout reconstruction");
 
     assert_eq!(reconstructed.window_number, 1);
     assert_eq!(reconstructed.first_window_id, None);
@@ -1404,7 +1541,8 @@ async fn reconstruct_history_legacy_compaction_without_replacement_history_does_
 
     let reconstructed = session
         .reconstruct_history_from_rollout(&turn_context, &rollout_items)
-        .await;
+        .await
+        .expect("valid rollout reconstruction");
 
     assert_eq!(
         reconstructed.history,
@@ -1469,7 +1607,8 @@ async fn reconstruct_history_legacy_compaction_without_replacement_history_clear
 
     let reconstructed = session
         .reconstruct_history_from_rollout(&turn_context, &rollout_items)
-        .await;
+        .await
+        .expect("valid rollout reconstruction");
 
     assert!(reconstructed.reference_context_item.is_none());
 }
@@ -1553,7 +1692,8 @@ async fn record_initial_history_resumed_turn_context_after_compaction_reestablis
             history: Arc::new(rollout_items),
             rollout_path: Some(PathBuf::from("/tmp/resume.jsonl")),
         }))
-        .await;
+        .await
+        .expect("valid initial history");
 
     assert_eq!(
         session.previous_turn_settings().await,
@@ -1699,7 +1839,8 @@ async fn record_initial_history_resumed_aborted_turn_without_id_clears_active_tu
             history: Arc::new(rollout_items),
             rollout_path: Some(PathBuf::from("/tmp/resume.jsonl")),
         }))
-        .await;
+        .await
+        .expect("valid initial history");
 
     assert_eq!(
         session.previous_turn_settings().await,
@@ -1822,7 +1963,8 @@ async fn record_initial_history_resumed_unmatched_abort_preserves_active_turn_fo
             history: Arc::new(rollout_items),
             rollout_path: Some(PathBuf::from("/tmp/resume.jsonl")),
         }))
-        .await;
+        .await
+        .expect("valid initial history");
 
     assert_eq!(
         session.previous_turn_settings().await,
@@ -1939,7 +2081,8 @@ async fn record_initial_history_resumed_trailing_incomplete_turn_compaction_clea
             history: Arc::new(rollout_items),
             rollout_path: Some(PathBuf::from("/tmp/resume.jsonl")),
         }))
-        .await;
+        .await
+        .expect("valid initial history");
 
     assert_eq!(
         session.previous_turn_settings().await,
@@ -1990,7 +2133,8 @@ async fn record_initial_history_resumed_trailing_incomplete_turn_preserves_turn_
             history: Arc::new(rollout_items),
             rollout_path: Some(PathBuf::from("/tmp/resume.jsonl")),
         }))
-        .await;
+        .await
+        .expect("valid initial history");
 
     assert_eq!(
         session.previous_turn_settings().await,
@@ -2119,7 +2263,8 @@ async fn record_initial_history_resumed_replaced_incomplete_compacted_turn_clear
             history: Arc::new(rollout_items),
             rollout_path: Some(PathBuf::from("/tmp/resume.jsonl")),
         }))
-        .await;
+        .await
+        .expect("valid initial history");
 
     assert_eq!(
         session.previous_turn_settings().await,

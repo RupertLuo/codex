@@ -13,6 +13,7 @@ use codex_protocol::ThreadId;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::GitInfo;
 use codex_protocol::protocol::RolloutItem;
+use codex_protocol::protocol::RolloutItemFlattener;
 use codex_protocol::protocol::ThreadMemoryMode;
 use codex_protocol::protocol::USER_MESSAGE_BEGIN;
 use codex_protocol::protocol::UserMessageEvent;
@@ -46,6 +47,8 @@ pub(crate) struct ThreadMetadataSync {
     /// Set once the best-effort LLM title task has been dispatched so it never
     /// fires more than once per live thread.
     llm_title_dispatched: bool,
+    metadata_item_flattener: RolloutItemFlattener,
+    title_item_flattener: RolloutItemFlattener,
     seen_compaction_checkpoint_ids: HashSet<String>,
     pending_update: Option<ThreadMetadataPatch>,
     pending_update_generation: u64,
@@ -95,6 +98,8 @@ impl ThreadMetadataSync {
             title_seen: false,
             first_user_message: None,
             llm_title_dispatched: false,
+            metadata_item_flattener: RolloutItemFlattener::default(),
+            title_item_flattener: RolloutItemFlattener::default(),
             seen_compaction_checkpoint_ids: HashSet::new(),
             pending_update: Some(update),
             pending_update_generation: 1,
@@ -117,6 +122,8 @@ impl ThreadMetadataSync {
             title_seen: false,
             first_user_message: None,
             llm_title_dispatched: false,
+            metadata_item_flattener: RolloutItemFlattener::default(),
+            title_item_flattener: RolloutItemFlattener::default(),
             seen_compaction_checkpoint_ids: HashSet::new(),
             pending_update: None,
             pending_update_generation: 0,
@@ -132,6 +139,9 @@ impl ThreadMetadataSync {
 
     pub(crate) fn record_resume_history(&mut self, history: &[RolloutItem]) {
         let update = self.observe_resume_history(history);
+        if let Err(err) = self.title_item_flattener.flatten(history) {
+            tracing::warn!(%err, "failed to traverse resumed rollout history for title state");
+        }
         self.merge_pending_update(update);
         self.defer_resume_update_until_append = self.pending_update.is_some();
     }
@@ -172,14 +182,23 @@ impl ThreadMetadataSync {
     ) -> Option<PendingThreadMetadataPatch> {
         self.defer_create_update_until_history_exists = false;
         self.defer_resume_update_until_append = false;
+        let items = match self.metadata_item_flattener.flatten(items) {
+            Ok(items) => items,
+            Err(err) => {
+                tracing::warn!(%err, "failed to traverse appended rollout metadata");
+                return None;
+            }
+        };
         let affects_metadata = items
             .iter()
+            .copied()
             .any(codex_state::rollout_item_affects_thread_metadata);
         let advances_recency = items
             .iter()
+            .copied()
             .any(|item| matches!(item, RolloutItem::EventMsg(EventMsg::TurnStarted(_))));
         let mut update = if affects_metadata {
-            self.observe_items(items)?
+            self.observe_items(&items)?
         } else {
             thread_updated_at_touch()
         };
@@ -214,6 +233,13 @@ impl ThreadMetadataSync {
             return None;
         }
         let first_user_message = self.first_user_message.clone()?;
+        let items = match self.title_item_flattener.flatten(items) {
+            Ok(items) => items,
+            Err(err) => {
+                tracing::warn!(%err, "failed to traverse appended rollout title state");
+                return None;
+            }
+        };
         let mut first_assistant_message: Option<String> = None;
         let mut turn_completed = false;
         for item in items {
@@ -245,7 +271,7 @@ impl ThreadMetadataSync {
         })
     }
 
-    fn observe_items(&mut self, items: &[RolloutItem]) -> Option<ThreadMetadataPatch> {
+    fn observe_items(&mut self, items: &[&RolloutItem]) -> Option<ThreadMetadataPatch> {
         self.observe_items_with_update(
             items,
             ThreadMetadataPatch {
@@ -256,18 +282,25 @@ impl ThreadMetadataSync {
     }
 
     fn observe_resume_history(&mut self, items: &[RolloutItem]) -> Option<ThreadMetadataPatch> {
-        self.observe_items_with_update(items, ThreadMetadataPatch::default())
+        let items = match self.metadata_item_flattener.flatten(items) {
+            Ok(items) => items,
+            Err(err) => {
+                tracing::warn!(%err, "failed to traverse resumed rollout metadata");
+                return None;
+            }
+        };
+        self.observe_items_with_update(&items, ThreadMetadataPatch::default())
     }
 
     fn observe_items_with_update(
         &mut self,
-        items: &[RolloutItem],
+        items: &[&RolloutItem],
         mut update: ThreadMetadataPatch,
     ) -> Option<ThreadMetadataPatch> {
         if items.is_empty() {
             return None;
         }
-        for item in items {
+        for &item in items {
             match item {
                 RolloutItem::SessionMeta(meta_line) if meta_line.meta.id == self.thread_id => {
                     update.created_at = parse_session_timestamp(meta_line.meta.timestamp.as_str());
@@ -370,7 +403,8 @@ impl ThreadMetadataSync {
                 | RolloutItem::ResponseItem(_)
                 | RolloutItem::InterAgentCommunication(_)
                 | RolloutItem::InterAgentCommunicationMetadata { .. }
-                | RolloutItem::WorldState(_) => {}
+                | RolloutItem::WorldState(_)
+                | RolloutItem::Transaction(_) => {}
             }
         }
         Some(update)

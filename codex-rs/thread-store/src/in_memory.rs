@@ -451,7 +451,9 @@ pub struct InMemoryThreadStore {
 struct InMemoryThreadStoreState {
     calls: InMemoryThreadStoreCalls,
     #[cfg(any(test, feature = "test-support"))]
-    next_append_error: Option<String>,
+    next_append_errors: Option<(usize, String)>,
+    #[cfg(any(test, feature = "test-support"))]
+    next_transaction_append_errors: Option<(usize, String)>,
     #[cfg(any(test, feature = "test-support"))]
     next_append_error_after_items: Option<(usize, String)>,
     #[cfg(any(test, feature = "test-support"))]
@@ -460,6 +462,8 @@ struct InMemoryThreadStoreState {
     next_metadata_update_error: Option<String>,
     #[cfg(any(test, feature = "test-support"))]
     next_append_blocker: Option<InMemoryAppendBlocker>,
+    #[cfg(any(test, feature = "test-support"))]
+    observed_transaction_ids: Vec<String>,
     created_threads: HashMap<ThreadId, CreateThreadParams>,
     histories: HashMap<ThreadId, Vec<RolloutItem>>,
     metadata_updates: HashMap<ThreadId, ThreadMetadataPatch>,
@@ -494,7 +498,28 @@ impl InMemoryThreadStore {
     /// callers' durable-write error handling without introducing a second store implementation.
     #[cfg(any(test, feature = "test-support"))]
     pub async fn fail_next_append(&self, message: impl Into<String>) {
-        self.state.lock().await.next_append_error = Some(message.into());
+        self.fail_next_appends(1, message).await;
+    }
+
+    /// Makes the next `count` non-empty appends fail before modifying stored history.
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn fail_next_appends(&self, count: usize, message: impl Into<String>) {
+        self.state.lock().await.next_append_errors = (count > 0).then(|| (count, message.into()));
+    }
+
+    /// Makes the next canonical transaction append fail without consuming failures on legacy
+    /// protocol events that may be emitted immediately before the transaction.
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn fail_next_transaction_append(&self, message: impl Into<String>) {
+        self.fail_next_transaction_appends(1, message).await;
+    }
+
+    /// Makes the next `count` canonical transaction appends fail without consuming failures on
+    /// legacy protocol events that may be emitted immediately before the transaction.
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn fail_next_transaction_appends(&self, count: usize, message: impl Into<String>) {
+        self.state.lock().await.next_transaction_append_errors =
+            (count > 0).then(|| (count, message.into()));
     }
 
     /// Makes the next non-empty append persist at most `item_count` canonical records, then fail.
@@ -521,6 +546,12 @@ impl InMemoryThreadStore {
     pub async fn fail_next_history_loads(&self, count: usize, message: impl Into<String>) {
         self.state.lock().await.next_history_load_errors =
             (count > 0).then(|| (count, message.into()));
+    }
+
+    /// Returns transaction IDs seen at the backing append boundary, including failed attempts.
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn observed_transaction_ids(&self) -> Vec<String> {
+        self.state.lock().await.observed_transaction_ids.clone()
     }
 
     /// Makes the next metadata projection update fail.
@@ -600,9 +631,57 @@ impl InMemoryThreadStore {
         let (append_blocker, append_error, append_error_after_items) = {
             let mut state = self.state.lock().await;
             state.calls.append_items += 1;
+            state
+                .observed_transaction_ids
+                .extend(canonical_items.iter().filter_map(|item| match item {
+                    RolloutItem::Transaction(transaction) => {
+                        Some(transaction.transaction_id.clone())
+                    }
+                    _ => None,
+                }));
+            let is_transaction = canonical_items
+                .iter()
+                .any(|item| matches!(item, RolloutItem::Transaction(_)));
+            let transaction_append_error = is_transaction
+                .then(|| {
+                    state
+                        .next_transaction_append_errors
+                        .as_ref()
+                        .map(|(_, message)| message.clone())
+                })
+                .flatten();
+            if transaction_append_error.is_some() {
+                if let Some((remaining, _)) = state.next_transaction_append_errors.as_mut() {
+                    *remaining = remaining.saturating_sub(1);
+                }
+                if state
+                    .next_transaction_append_errors
+                    .as_ref()
+                    .is_some_and(|(remaining, _)| *remaining == 0)
+                {
+                    state.next_transaction_append_errors = None;
+                }
+            }
+            let append_error = transaction_append_error.or_else(|| {
+                let append_error = state
+                    .next_append_errors
+                    .as_ref()
+                    .map(|(_, message)| message.clone());
+                if let Some((remaining, _)) = state.next_append_errors.as_mut() {
+                    *remaining = remaining.saturating_sub(1);
+                }
+                if state
+                    .next_append_errors
+                    .as_ref()
+                    .is_some_and(|(remaining, _)| *remaining == 0)
+                {
+                    state.next_append_errors = None;
+                }
+                append_error
+            });
             (
                 state.next_append_blocker.take(),
-                state.next_append_error.take(),
+                append_error,
                 state.next_append_error_after_items.take(),
             )
         };
@@ -781,6 +860,10 @@ impl ThreadStore for InMemoryThreadStore {
 
     fn append_items(&self, params: AppendThreadItemsParams) -> ThreadStoreFuture<'_, ()> {
         Box::pin(InMemoryThreadStore::append_items(self, params))
+    }
+
+    fn failed_append_may_become_durable(&self) -> bool {
+        false
     }
 
     fn persist_thread(&self, _thread_id: ThreadId) -> ThreadStoreFuture<'_, ()> {
