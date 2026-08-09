@@ -27,6 +27,7 @@ use codex_protocol::openai_models::ModelPreset;
 use codex_protocol::protocol::SessionSource;
 use once_cell::sync::Lazy;
 
+use crate::CodexThread;
 use crate::ThreadManager;
 use crate::ThreadManagerRuntimeOptions;
 use crate::config::Config;
@@ -93,6 +94,83 @@ pub fn with_compact_commit_test_hook(
     hook: CompactCommitTestHook,
 ) -> ThreadManagerRuntimeOptions {
     options.with_compact_commit_test_hook_for_tests(hook.0)
+}
+
+/// Instance-scoped synchronization for realtime lifecycle integration tests.
+#[doc(hidden)]
+#[derive(Clone, Debug)]
+pub struct RealtimeStartTestHook(crate::realtime_conversation::RealtimeStartTestHook);
+
+impl RealtimeStartTestHook {
+    pub fn new() -> Self {
+        Self(crate::realtime_conversation::RealtimeStartTestHook::new())
+    }
+
+    pub fn pause_before_gate_once(&self) {
+        self.0.pause_before_gate_once();
+    }
+
+    pub async fn wait_until_before_gate_paused(&self) {
+        self.0.wait_until_before_gate_paused().await;
+    }
+
+    pub fn release_before_gate(&self) {
+        self.0.release_before_gate();
+    }
+
+    pub fn pause_after_gate_once(&self) {
+        self.0.pause_after_gate_once();
+    }
+
+    pub async fn wait_until_after_gate_paused(&self) {
+        self.0.wait_until_after_gate_paused().await;
+    }
+
+    pub fn release_after_gate(&self) {
+        self.0.release_after_gate();
+    }
+}
+
+impl Default for RealtimeStartTestHook {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Install the realtime synchronization hook without adding a production runtime API.
+#[doc(hidden)]
+pub fn with_realtime_start_test_hook(
+    options: ThreadManagerRuntimeOptions,
+    hook: RealtimeStartTestHook,
+) -> ThreadManagerRuntimeOptions {
+    options.with_realtime_start_test_hook_for_tests(hook.0)
+}
+
+/// Snapshot of the state direct injection APIs must leave untouched on rejection.
+#[doc(hidden)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DirectMutationTestSnapshot {
+    pub history_len: usize,
+    pub has_active_turn: bool,
+    pub has_pending_input: bool,
+}
+
+#[doc(hidden)]
+pub async fn direct_mutation_test_snapshot(thread: &CodexThread) -> DirectMutationTestSnapshot {
+    let (history_len, has_active_turn, has_pending_input) =
+        thread.direct_mutation_test_snapshot().await;
+    DirectMutationTestSnapshot {
+        history_len,
+        has_active_turn,
+        has_pending_input,
+    }
+}
+
+#[doc(hidden)]
+pub async fn clear_reference_context_item_for_direct_mutation_test(thread: &CodexThread) {
+    thread
+        .clear_reference_context_item_for_direct_mutation_test()
+        .await;
 }
 
 static TEST_MODEL_PRESETS: Lazy<Vec<ModelPreset>> = Lazy::new(|| {

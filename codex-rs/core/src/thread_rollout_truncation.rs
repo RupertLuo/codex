@@ -15,6 +15,7 @@ use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::InitialHistory;
 use codex_protocol::protocol::InterAgentCommunication;
 use codex_protocol::protocol::RolloutItem;
+use uuid::Uuid;
 
 pub(crate) fn initial_history_has_prior_user_turns(conversation_history: &InitialHistory) -> bool {
     conversation_history.scan_rollout_items(rollout_item_is_user_turn_boundary)
@@ -229,15 +230,17 @@ pub(crate) fn truncate_rollout_to_last_n_fork_turns(
 
     let mut forked_items = items[keep_idx..].to_vec();
     forked_items.retain_mut(sanitize_last_n_fork_item);
+    rewrite_last_n_fork_window_identity(&mut forked_items);
     forked_items
 }
 
 /// Remove thread-local recovery state from rollout items retained for a bounded child fork.
 ///
 /// Replacement history and checkpoint IDs remain part of the child's inherited transcript.
-/// Context/world-state baselines, cumulative usage, reasoning accounting, and compaction-window
-/// identities belong to the parent thread and must be rebuilt by the child. Rate-limit snapshots
-/// are intentionally retained because they describe the account/provider rather than a thread.
+/// Context/world-state baselines, cumulative usage, and reasoning accounting belong to the parent
+/// thread and must be rebuilt by the child. Rate-limit snapshots are intentionally retained because
+/// they describe the account/provider rather than a thread. Compaction-window identities are
+/// rewritten into a fresh child-local chain after sanitization.
 fn sanitize_last_n_fork_item(item: &mut RolloutItem) -> bool {
     match item {
         RolloutItem::TurnContext(_) | RolloutItem::WorldState(_) => false,
@@ -246,10 +249,6 @@ fn sanitize_last_n_fork_item(item: &mut RolloutItem) -> bool {
             token_count.rate_limits.is_some()
         }
         RolloutItem::Compacted(compacted) => {
-            compacted.window_number = None;
-            compacted.first_window_id = None;
-            compacted.previous_window_id = None;
-            compacted.window_id = None;
             if let Some(checkpoint) = compacted.checkpoint.as_mut() {
                 checkpoint.reference_context_item = None;
                 checkpoint.world_state = None;
@@ -260,6 +259,25 @@ fn sanitize_last_n_fork_item(item: &mut RolloutItem) -> bool {
             true
         }
         _ => true,
+    }
+}
+
+fn rewrite_last_n_fork_window_identity(items: &mut [RolloutItem]) {
+    let first_window_id = Uuid::now_v7();
+    let mut previous_window_id = first_window_id;
+    let mut window_number = 0_u64;
+
+    for item in items {
+        let RolloutItem::Compacted(compacted) = item else {
+            continue;
+        };
+        window_number = window_number.saturating_add(1);
+        let window_id = Uuid::now_v7();
+        compacted.window_number = Some(window_number);
+        compacted.first_window_id = Some(first_window_id.to_string());
+        compacted.previous_window_id = Some(previous_window_id.to_string());
+        compacted.window_id = Some(window_id.to_string());
+        previous_window_id = window_id;
     }
 }
 

@@ -1592,6 +1592,22 @@ impl RolloutWriterState {
             .fail_next_write_after_bytes = Some(byte_count);
     }
 
+    #[cfg(test)]
+    fn fail_next_rollback_truncate_for_test(&mut self) {
+        self.writer
+            .as_mut()
+            .expect("test writer must already be materialized")
+            .fail_next_rollback_truncate = true;
+    }
+
+    #[cfg(test)]
+    fn fail_next_rollback_syncs_for_test(&mut self, count: usize) {
+        self.writer
+            .as_mut()
+            .expect("test writer must already be materialized")
+            .fail_next_rollback_syncs = count;
+    }
+
     async fn flush_if_materialized(&mut self) {
         if self.is_deferred() {
             return;
@@ -1655,7 +1671,10 @@ impl RolloutWriterState {
         let Some(writer) = self.writer.as_mut() else {
             return Ok(());
         };
-        writer.rollback_failed_write().await.map_err(|rollback_err| {
+        writer
+            .rollback_failed_write(&self.rollout_path)
+            .await
+            .map_err(|rollback_err| {
             IoError::new(
                 rollback_err.kind(),
                 format!(
@@ -1714,7 +1733,7 @@ impl RolloutWriterState {
         if let Some(writer) = self.writer.as_mut() {
             // A previous rollback can fail transiently. Never start another record until the
             // original valid end-of-file has been restored.
-            writer.rollback_failed_write().await?;
+            writer.rollback_failed_write(&self.rollout_path).await?;
         }
         self.write_session_meta_if_needed().await?;
 
@@ -1833,9 +1852,19 @@ pub async fn append_rollout_item_to_path(
 
 struct JsonlWriter {
     file: tokio::fs::File,
-    failed_write_offset: Option<u64>,
+    failed_write_rollback: Option<FailedWriteRollback>,
     #[cfg(test)]
     fail_next_write_after_bytes: Option<usize>,
+    #[cfg(test)]
+    fail_next_rollback_truncate: bool,
+    #[cfg(test)]
+    fail_next_rollback_syncs: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FailedWriteRollback {
+    NeedsTruncate { valid_offset: u64 },
+    NeedsSync { valid_offset: u64 },
 }
 
 #[derive(serde::Serialize)]
@@ -1849,24 +1878,65 @@ impl JsonlWriter {
     fn new(file: tokio::fs::File) -> Self {
         Self {
             file,
-            failed_write_offset: None,
+            failed_write_rollback: None,
             #[cfg(test)]
             fail_next_write_after_bytes: None,
+            #[cfg(test)]
+            fail_next_rollback_truncate: false,
+            #[cfg(test)]
+            fail_next_rollback_syncs: 0,
         }
     }
 
-    async fn rollback_failed_write(&mut self) -> std::io::Result<()> {
-        let Some(valid_offset) = self.failed_write_offset else {
+    async fn rollback_failed_write(&mut self, rollout_path: &Path) -> std::io::Result<()> {
+        let Some(rollback) = self.failed_write_rollback else {
             return Ok(());
         };
-        // Some failures (for example a read-only handle) occur before writing any bytes. Avoid
-        // requiring truncate permission when the file is already at the saved valid boundary.
-        if self.file.metadata().await?.len() != valid_offset {
-            self.file.set_len(valid_offset).await?;
-            self.file.sync_data().await?;
+        match rollback {
+            FailedWriteRollback::NeedsTruncate { valid_offset } => {
+                // Some failures (for example a read-only handle) occur before writing any bytes.
+                // Avoid requiring truncate permission when the file is already at the saved valid
+                // boundary and no durability-changing truncate occurred.
+                if self.file.metadata().await?.len() == valid_offset {
+                    self.failed_write_rollback = None;
+                    return Ok(());
+                }
+                #[cfg(test)]
+                if std::mem::take(&mut self.fail_next_rollback_truncate) {
+                    return Err(IoError::other("injected rollback truncate failure"));
+                }
+                // Append-only handles cannot truncate on Windows. Keep atomic append semantics on
+                // the writer handle and use a short-lived write handle solely for rollback
+                // barriers.
+                let rollback_file = tokio::fs::OpenOptions::new()
+                    .write(true)
+                    .open(rollout_path)
+                    .await?;
+                rollback_file.set_len(valid_offset).await?;
+                // The phase transition must happen before sync_data: a failed sync is a pending
+                // durability barrier even though the file length already matches valid_offset.
+                self.failed_write_rollback = Some(FailedWriteRollback::NeedsSync { valid_offset });
+                self.sync_rollback_file(&rollback_file).await?;
+            }
+            FailedWriteRollback::NeedsSync { .. } => {
+                let rollback_file = tokio::fs::OpenOptions::new()
+                    .write(true)
+                    .open(rollout_path)
+                    .await?;
+                self.sync_rollback_file(&rollback_file).await?;
+            }
         }
-        self.failed_write_offset = None;
+        self.failed_write_rollback = None;
         Ok(())
+    }
+
+    async fn sync_rollback_file(&mut self, rollback_file: &tokio::fs::File) -> std::io::Result<()> {
+        #[cfg(test)]
+        if self.fail_next_rollback_syncs > 0 {
+            self.fail_next_rollback_syncs -= 1;
+            return Err(IoError::other("injected rollback sync failure"));
+        }
+        rollback_file.sync_data().await
     }
 
     async fn write_rollout_item(&mut self, rollout_item: &RolloutItem) -> std::io::Result<()> {
@@ -1886,7 +1956,9 @@ impl JsonlWriter {
     async fn write_line(&mut self, item: &impl serde::Serialize) -> std::io::Result<()> {
         let mut json = serde_json::to_string(item)?;
         json.push('\n');
-        self.failed_write_offset = Some(self.file.metadata().await?.len());
+        self.failed_write_rollback = Some(FailedWriteRollback::NeedsTruncate {
+            valid_offset: self.file.metadata().await?.len(),
+        });
         #[cfg(test)]
         if let Some(byte_count) = self.fail_next_write_after_bytes.take() {
             let prefix_len = byte_count.clamp(1, json.len().saturating_sub(1));
@@ -1898,7 +1970,7 @@ impl JsonlWriter {
         }
         self.file.write_all(json.as_bytes()).await?;
         self.file.flush().await?;
-        self.failed_write_offset = None;
+        self.failed_write_rollback = None;
         Ok(())
     }
 }

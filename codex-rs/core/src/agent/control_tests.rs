@@ -16,6 +16,7 @@ use codex_extension_api::empty_extension_registry;
 use codex_features::Feature;
 use codex_login::AuthManager;
 use codex_login::CodexAuth;
+use codex_model_provider_info::WireApi;
 use codex_protocol::AgentPath;
 use codex_protocol::capabilities::CapabilityRootLocation;
 use codex_protocol::capabilities::SelectedCapabilityRoot;
@@ -41,6 +42,12 @@ use codex_thread_store::LocalThreadStore;
 use codex_thread_store::LocalThreadStoreConfig;
 use codex_thread_store::ThreadStore;
 use codex_utils_path_uri::PathUri;
+use core_test_support::responses::ev_completed;
+use core_test_support::responses::ev_response_created;
+use core_test_support::responses::mount_sse_once;
+use core_test_support::responses::sse;
+use core_test_support::responses::start_mock_server;
+use core_test_support::responses::strip_metadata_from_json;
 use pretty_assertions::assert_eq;
 use tempfile::TempDir;
 use tokio::time::Duration;
@@ -1445,6 +1452,292 @@ async fn spawn_agent_fork_last_n_turns_keeps_only_recent_turns() {
         .submit(Op::Shutdown {})
         .await
         .expect("parent shutdown should submit");
+}
+
+#[tokio::test]
+async fn spawn_agent_last_n_window_ids_survive_shutdown_and_cold_resume() {
+    let server = start_mock_server().await;
+    let first_cold_request = mount_sse_once(
+        &server,
+        sse(vec![
+            ev_response_created("cold-last-n-child-response"),
+            ev_completed("cold-last-n-child-response"),
+        ]),
+    )
+    .await;
+    let (home, mut config) = test_config().await;
+    config.model_provider.base_url = Some(format!("{}/v1", server.uri()));
+    config.model_provider.wire_api = WireApi::Responses;
+    config.model_provider.supports_websockets = false;
+    let harness = AgentControlHarness::new_with_config(home, config).await;
+    let (parent_thread_id, parent_thread) = harness.start_thread().await;
+    parent_thread
+        .inject_user_message_without_turn("retained parent turn".to_string())
+        .await;
+
+    let parent_first_window_id = uuid::Uuid::now_v7();
+    let parent_previous_window_id = uuid::Uuid::now_v7();
+    let parent_window_id = uuid::Uuid::now_v7();
+    let parent_spawn_call_id = "spawn-call-last-n-window-resume".to_string();
+    parent_thread
+        .codex
+        .session
+        .persist_rollout_items(&[
+            RolloutItem::Compacted(CompactedItem {
+                message: "retained compact summary".to_string(),
+                replacement_history: Some(vec![
+                    ResponseItem::Message {
+                        id: None,
+                        role: "user".to_string(),
+                        content: vec![ContentItem::InputText {
+                            text: "retained parent turn".to_string(),
+                        }],
+                        phase: None,
+                        internal_chat_message_metadata_passthrough: None,
+                    },
+                    assistant_message("retained compact summary", None),
+                ]),
+                window_number: Some(9),
+                first_window_id: Some(parent_first_window_id.to_string()),
+                previous_window_id: Some(parent_previous_window_id.to_string()),
+                window_id: Some(parent_window_id.to_string()),
+                checkpoint: None,
+            }),
+            RolloutItem::ResponseItem(spawn_agent_call(&parent_spawn_call_id)),
+        ])
+        .await;
+    parent_thread.ensure_rollout_materialized().await;
+    parent_thread
+        .flush_rollout()
+        .await
+        .expect("parent rollout should flush");
+
+    let child_config = harness.config.clone();
+    let child_thread_id = harness
+        .control
+        .spawn_agent_with_metadata(
+            child_config.clone(),
+            // This regression exercises fork/reload state, not turn execution. An initial user
+            // turn can race far enough under a loaded suite to establish reference context before
+            // the snapshot, making the child baseline timing-dependent.
+            Op::Interrupt,
+            Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                parent_thread_id,
+                depth: 1,
+                agent_path: None,
+                agent_nickname: None,
+                agent_role: None,
+            })),
+            SpawnAgentOptions {
+                fork_parent_spawn_call_id: Some(parent_spawn_call_id),
+                fork_mode: Some(SpawnAgentForkMode::LastNTurns(1)),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("bounded fork should spawn")
+        .thread_id;
+    let child_thread = harness
+        .manager
+        .get_thread(child_thread_id)
+        .await
+        .expect("child thread should be registered");
+    child_thread.ensure_rollout_materialized().await;
+    child_thread
+        .flush_rollout()
+        .await
+        .expect("child rollout should flush");
+
+    let child_stored = child_thread
+        .read_thread(
+            /*include_archived*/ true, /*include_history*/ true,
+        )
+        .await
+        .expect("child thread should be readable");
+    let child_items = child_stored.history.expect("child history").items;
+    let child_initial_window_id = child_items
+        .iter()
+        .find_map(|item| match item {
+            RolloutItem::SessionMeta(meta) => meta
+                .meta
+                .context_window
+                .as_ref()
+                .map(|window| window.window_id.clone()),
+            _ => None,
+        })
+        .expect("child session meta should contain an initial window id");
+    let child_compacted = child_items
+        .iter()
+        .find_map(|item| match item {
+            RolloutItem::Compacted(compacted) => Some(compacted),
+            _ => None,
+        })
+        .expect("child rollout should retain the compacted checkpoint");
+    let child_first_window_id = child_compacted
+        .first_window_id
+        .as_deref()
+        .expect("child first window id");
+    assert_eq!(child_compacted.window_number, Some(1));
+    assert_eq!(child_initial_window_id, child_first_window_id);
+    assert_eq!(
+        child_compacted.previous_window_id.as_deref(),
+        Some(child_first_window_id)
+    );
+    assert_ne!(child_first_window_id, parent_first_window_id.to_string());
+    assert_ne!(
+        child_compacted.previous_window_id.as_deref(),
+        Some(parent_previous_window_id.to_string().as_str())
+    );
+    assert_ne!(
+        child_compacted.window_id.as_deref(),
+        Some(parent_window_id.to_string().as_str())
+    );
+
+    let live_window_state = child_thread
+        .codex
+        .session
+        .auto_compact_window_state_for_test()
+        .await;
+    assert_eq!(live_window_state.0, 1);
+    assert_eq!(
+        live_window_state.1.first_window_id.to_string(),
+        child_initial_window_id
+    );
+    assert_eq!(
+        live_window_state
+            .1
+            .previous_window_id
+            .map(|id| id.to_string()),
+        child_compacted.previous_window_id
+    );
+    assert_eq!(
+        live_window_state.1.window_id.to_string(),
+        child_compacted
+            .window_id
+            .as_deref()
+            .expect("child window id")
+    );
+    assert!(
+        child_thread
+            .codex
+            .session
+            .reference_context_item()
+            .await
+            .is_none()
+    );
+
+    let child_rollout_path = child_thread
+        .rollout_path()
+        .expect("child rollout path should be materialized");
+    child_thread
+        .shutdown_and_wait()
+        .await
+        .expect("child should shut down before cold resume");
+    let _ = harness.manager.remove_thread(&child_thread_id).await;
+    let cold = harness
+        .manager
+        .resume_thread_from_rollout(
+            child_config,
+            child_rollout_path,
+            harness.manager.auth_manager(),
+            /*parent_trace*/ None,
+            /*supports_openai_form_elicitation*/ false,
+        )
+        .await
+        .expect("cold resume bounded child");
+    let cold_window_state = cold
+        .thread
+        .codex
+        .session
+        .auto_compact_window_state_for_test()
+        .await;
+    assert_eq!(cold_window_state, live_window_state);
+    assert!(
+        cold.thread
+            .codex
+            .session
+            .reference_context_item()
+            .await
+            .is_none()
+    );
+
+    let first_turn = cold.thread.codex.session.new_default_turn().await;
+    let first_step = cold
+        .thread
+        .codex
+        .session
+        .capture_step_context(Arc::clone(&first_turn))
+        .await;
+    let first_world_state = cold
+        .thread
+        .codex
+        .session
+        .build_world_state_for_step(first_step.as_ref())
+        .await;
+    let expected_full_context = cold
+        .thread
+        .codex
+        .session
+        .build_initial_context_with_world_state(&first_turn, &first_world_state)
+        .await;
+    cold.thread
+        .submit(text_input("first cold-resumed child turn"))
+        .await
+        .expect("first cold-resumed child turn should submit");
+    let mut seen_events = Vec::new();
+    let first_turn_result = timeout(Duration::from_secs(5), async {
+        loop {
+            let event = cold
+                .thread
+                .next_event()
+                .await
+                .expect("cold child event stream should remain open");
+            seen_events.push(format!("{:?}", event.msg));
+            match event.msg {
+                EventMsg::TurnComplete(_) => break Ok(()),
+                EventMsg::Error(error) => break Err(error.message),
+                _ => {}
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "first cold-resumed child turn should complete; events={seen_events:#?}; requests={:#?}",
+            first_cold_request.requests()
+        )
+    });
+    first_turn_result.unwrap_or_else(|message| panic!("cold child turn failed: {message}"));
+    let outbound_input = first_cold_request
+        .single_request()
+        .input()
+        .into_iter()
+        .map(strip_metadata_from_json)
+        .collect::<Vec<_>>();
+    let expected_full_context = expected_full_context
+        .iter()
+        .map(|item| {
+            strip_metadata_from_json(
+                serde_json::to_value(item).expect("context item should serialize"),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        outbound_input
+            .windows(expected_full_context.len())
+            .any(|window| window == expected_full_context),
+        "the first cold-resumed child request must contain the complete reinjected context; \
+         expected={expected_full_context:#?}; actual={outbound_input:#?}"
+    );
+
+    cold.thread
+        .shutdown_and_wait()
+        .await
+        .expect("cold-resumed child should shut down");
+    parent_thread
+        .shutdown_and_wait()
+        .await
+        .expect("parent should shut down");
 }
 
 #[tokio::test]

@@ -328,8 +328,6 @@ async fn last_n_fork_checkpoint_starts_without_parent_baselines_and_fully_reinje
         })),
         RolloutItem::ResponseItem(assistant_message("retained answer")),
     ];
-    let child_initial_window_ids = session.state.lock().await.auto_compact_window_ids();
-
     let forked_rollout =
         truncate_rollout_to_last_n_fork_turns(&parent_rollout, /*n_from_end*/ 1);
     let reconstructed = session
@@ -337,6 +335,13 @@ async fn last_n_fork_checkpoint_starts_without_parent_baselines_and_fully_reinje
         .await;
     assert_eq!(reconstructed.reference_context_item, None);
     assert_eq!(reconstructed.world_state_baseline, None);
+    let child_window_ids = AutoCompactWindowIds {
+        first_window_id: reconstructed
+            .first_window_id
+            .expect("rewritten child first window id"),
+        previous_window_id: reconstructed.previous_window_id,
+        window_id: reconstructed.window_id.expect("rewritten child window id"),
+    };
 
     session
         .record_initial_history(InitialHistory::Forked(forked_rollout))
@@ -353,7 +358,7 @@ async fn last_n_fork_checkpoint_starts_without_parent_baselines_and_fully_reinje
             1,
             "the retained compaction is counted in the child's local window sequence"
         );
-        assert_eq!(state.auto_compact_window_ids(), child_initial_window_ids);
+        assert_eq!(state.auto_compact_window_ids(), child_window_ids);
         assert_ne!(
             state.auto_compact_window_ids().first_window_id,
             parent_first_window_id

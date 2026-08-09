@@ -235,6 +235,7 @@ pub(crate) use self::input_queue::TurnInputQueue;
 pub use self::mcp_runtime::McpRuntimeSnapshot;
 use self::review::spawn_review_thread;
 use self::session::AppServerClientMetadata;
+use self::session::PersistenceLifecycle;
 use self::session::Session;
 use self::session::SessionConfiguration;
 pub(crate) use self::session::SessionSettingsUpdate;
@@ -464,6 +465,8 @@ pub(crate) struct CodexSpawnArgs {
     pub(crate) thread_store: Arc<dyn ThreadStore>,
     pub(crate) http_transport: Option<HttpTransportHandle>,
     pub(crate) compact_commit_test_hook: Option<crate::compact::CompactCommitTestHook>,
+    pub(crate) realtime_start_test_hook:
+        Option<crate::realtime_conversation::RealtimeStartTestHook>,
     pub(crate) attestation_provider: Option<Arc<dyn AttestationProvider>>,
     pub(crate) external_time_provider: Option<Arc<dyn TimeProvider>>,
     pub(crate) inherited_multi_agent_version: Option<MultiAgentVersion>,
@@ -554,6 +557,7 @@ impl Codex {
             thread_store,
             http_transport,
             compact_commit_test_hook,
+            realtime_start_test_hook,
             attestation_provider,
             external_time_provider,
             inherited_multi_agent_version,
@@ -724,6 +728,7 @@ impl Codex {
             parent_rollout_thread_trace,
             http_transport,
             compact_commit_test_hook,
+            realtime_start_test_hook,
             attestation_provider,
             external_time_provider,
             multi_agent_version,
@@ -1182,32 +1187,32 @@ impl Session {
         self.services.state_db.clone()
     }
 
-    pub(crate) fn persistence_quarantine_reason(&self) -> Option<String> {
-        self.persistence_quarantine
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
-    }
-
-    fn quarantine_persistence(&self, reason: String) {
-        let mut quarantine = self
-            .persistence_quarantine
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if quarantine.is_none() {
-            *quarantine = Some(reason);
+    pub(crate) async fn persistence_quarantine_reason(&self) -> Option<String> {
+        let lifecycle = self.persistence_lifecycle.lock().await;
+        match &*lifecycle {
+            PersistenceLifecycle::Writable => None,
+            PersistenceLifecycle::Quarantined(reason) => Some(reason.clone()),
         }
     }
 
-    pub(crate) fn ensure_persistence_not_quarantined(&self) -> anyhow::Result<()> {
-        if let Some(reason) = self.persistence_quarantine_reason() {
-            anyhow::bail!(reason);
+    fn quarantine_persistence(lifecycle: &mut PersistenceLifecycle, reason: String) {
+        if matches!(lifecycle, PersistenceLifecycle::Writable) {
+            *lifecycle = PersistenceLifecycle::Quarantined(reason);
         }
-        Ok(())
+    }
+
+    pub(crate) async fn acquire_persistence_side_effect(
+        &self,
+    ) -> anyhow::Result<tokio::sync::MutexGuard<'_, PersistenceLifecycle>> {
+        let lifecycle = self.persistence_lifecycle.lock().await;
+        if let PersistenceLifecycle::Quarantined(reason) = &*lifecycle {
+            anyhow::bail!(reason.clone());
+        }
+        Ok(lifecycle)
     }
 
     pub(crate) async fn reject_if_persistence_quarantined(&self, sub_id: &str) -> bool {
-        let Some(message) = self.persistence_quarantine_reason() else {
+        let Some(message) = self.persistence_quarantine_reason().await else {
             return false;
         };
         let event = Event {
@@ -1240,8 +1245,17 @@ impl Session {
     /// Flush rollout writes and return the final durability-barrier result.
     #[instrument(name = "session.flush_rollout", level = "trace", skip_all)]
     pub(crate) async fn flush_rollout(&self) -> std::io::Result<()> {
-        self.ensure_persistence_not_quarantined()
+        let lifecycle = self
+            .acquire_persistence_side_effect()
+            .await
             .map_err(std::io::Error::other)?;
+        self.flush_rollout_with_guard(&lifecycle).await
+    }
+
+    pub(crate) async fn flush_rollout_with_guard(
+        &self,
+        _lifecycle: &tokio::sync::MutexGuard<'_, PersistenceLifecycle>,
+    ) -> std::io::Result<()> {
         if let Some(live_thread) = self.live_thread() {
             live_thread.flush().await.map_err(std::io::Error::other)
         } else {
@@ -1250,7 +1264,9 @@ impl Session {
     }
 
     pub(crate) async fn try_ensure_rollout_materialized(&self) -> std::io::Result<()> {
-        self.ensure_persistence_not_quarantined()
+        let _lifecycle = self
+            .acquire_persistence_side_effect()
+            .await
             .map_err(std::io::Error::other)?;
         if let Some(live_thread) = self.live_thread() {
             live_thread.persist().await.map_err(std::io::Error::other)?;
@@ -1911,6 +1927,59 @@ impl Session {
         }
     }
 
+    pub(crate) async fn send_event_with_persistence_guard(
+        &self,
+        lifecycle: &tokio::sync::MutexGuard<'_, PersistenceLifecycle>,
+        turn_context: &TurnContext,
+        msg: EventMsg,
+    ) {
+        let legacy_source = msg.clone();
+        if let EventMsg::Error(error) = &legacy_source
+            && error
+                .codex_error_info
+                .as_ref()
+                .is_some_and(CodexErrorInfo::affects_turn_status)
+        {
+            turn_context
+                .terminal_error
+                .lock()
+                .await
+                .replace(error.message.clone());
+        }
+        self.services
+            .rollout_thread_trace
+            .record_codex_turn_event(&turn_context.sub_id, &legacy_source);
+        self.services
+            .rollout_thread_trace
+            .record_tool_call_event(turn_context.sub_id.clone(), &legacy_source);
+        self.send_event_raw_with_persistence_guard(
+            lifecycle,
+            Event {
+                id: turn_context.sub_id.clone(),
+                msg,
+            },
+        )
+        .await;
+        self.maybe_notify_parent_of_terminal_turn(turn_context, &legacy_source)
+            .await;
+        self.maybe_mirror_event_text_to_realtime(&legacy_source)
+            .await;
+        self.maybe_clear_realtime_handoff_for_event(&legacy_source)
+            .await;
+
+        let show_raw_agent_reasoning = self.show_raw_agent_reasoning();
+        for legacy in legacy_source.as_legacy_events(show_raw_agent_reasoning) {
+            self.send_event_raw_with_persistence_guard(
+                lifecycle,
+                Event {
+                    id: turn_context.sub_id.clone(),
+                    msg: legacy,
+                },
+            )
+            .await;
+        }
+    }
+
     /// Forwards terminal turn events from spawned MultiAgentV2 children to their direct parent.
     async fn maybe_notify_parent_of_terminal_turn(
         &self,
@@ -2047,6 +2116,24 @@ impl Session {
         // Persist the event into rollout storage (the store filters as needed).
         let rollout_items = vec![RolloutItem::EventMsg(event.msg.clone())];
         self.persist_rollout_items(&rollout_items).await;
+        self.services
+            .rollout_thread_trace
+            .record_protocol_event(&event.msg);
+        self.deliver_event_raw(event).await;
+    }
+
+    pub(crate) async fn send_event_raw_with_persistence_guard(
+        &self,
+        lifecycle: &tokio::sync::MutexGuard<'_, PersistenceLifecycle>,
+        event: Event,
+    ) {
+        let rollout_items = vec![RolloutItem::EventMsg(event.msg.clone())];
+        if let Err(err) = self
+            .persist_rollout_items_with_guard(lifecycle, &rollout_items)
+            .await
+        {
+            error!("failed to record rollout items: {err:#}");
+        }
         self.services
             .rollout_thread_trace
             .record_protocol_event(&event.msg);
@@ -2921,6 +3008,28 @@ impl Session {
         self.send_raw_response_items(turn_context, items).await;
     }
 
+    pub(crate) async fn record_conversation_items_with_persistence_guard(
+        &self,
+        lifecycle: &tokio::sync::MutexGuard<'_, PersistenceLifecycle>,
+        turn_context: &TurnContext,
+        items: &[ResponseItem],
+    ) {
+        let items = self.prepare_conversation_items_for_history(turn_context, items);
+        let items = items.as_ref();
+        {
+            let mut state = self.state.lock().await;
+            state.current_time_reminder.note_recorded_items(items);
+            state.record_items(
+                items.iter(),
+                turn_context.model_info.truncation_policy.into(),
+            );
+        }
+        self.persist_rollout_response_items_with_guard(lifecycle, items)
+            .await;
+        self.send_raw_response_items_with_guard(lifecycle, turn_context, items)
+            .await;
+    }
+
     pub(crate) async fn record_step_world_state_if_changed(
         &self,
         previous_world_state: &Arc<WorldState>,
@@ -3191,6 +3300,22 @@ impl Session {
         incremental_baseline: compact::CompactCommitBaseline,
         turn_context: Arc<TurnContext>,
     ) -> CodexResult<()> {
+        // The test pause represents arrival at the commit boundary, before either lifecycle or
+        // SessionState ownership. Keeping test waits outside both locks also lets race tests arrange
+        // which real side effect linearizes first without changing production lock order.
+        if let Some(hook) = self.services.compact_commit_test_hook.as_ref() {
+            hook.pause_commit().await;
+            assert!(
+                !hook.should_panic_commit(),
+                "injected compact commit task panic"
+            );
+        }
+        // This is the global mixed-lock order: lifecycle gate before SessionState. The checkpoint
+        // append below receives this guard as a capability and must not reacquire the gate.
+        let mut persistence_lifecycle = self
+            .acquire_persistence_side_effect()
+            .await
+            .map_err(|err| CodexErr::Fatal(err.to_string()))?;
         let mut state = self.state.lock().await;
         if !state.can_commit_prepared_auto_compact_window_advance(
             prepared.window_number,
@@ -3266,14 +3391,10 @@ impl Session {
             ..prepared.compacted_item
         };
 
-        if let Some(hook) = self.services.compact_commit_test_hook.as_ref() {
-            hook.pause_commit().await;
-            assert!(
-                !hook.should_panic_commit(),
-                "injected compact commit task panic"
-            );
-        }
-        match self.persist_compaction_checkpoint(&compacted_item).await {
+        match self
+            .persist_compaction_checkpoint(&persistence_lifecycle, &compacted_item)
+            .await
+        {
             CompactionCheckpointAppendOutcome::Committed => {}
             CompactionCheckpointAppendOutcome::NotCommitted { append_error } => {
                 if let Some(baseline) = incremental_baseline.take() {
@@ -3300,7 +3421,21 @@ impl Session {
                      before continuing (append error: {append_error}; reconciliation errors: \
                      {reconciliation_errors})"
                 );
-                self.quarantine_persistence(quarantine_reason.clone());
+                Self::quarantine_persistence(&mut persistence_lifecycle, quarantine_reason.clone());
+                // Realtime may have linearized before this checkpoint append. Close it while the
+                // lifecycle gate still exposes Quarantined, but never await shutdown while holding
+                // SessionState.
+                drop(state);
+                if let Err(err) = crate::realtime_conversation::close_for_persistence_quarantine(
+                    self,
+                    &persistence_lifecycle,
+                )
+                .await
+                {
+                    warn!(
+                        "failed to close realtime conversation during persistence quarantine: {err}"
+                    );
+                }
                 return Err(CodexErr::Fatal(quarantine_reason));
             }
         }
@@ -3324,6 +3459,7 @@ impl Session {
         state.http_incremental_baseline = Default::default();
         state.queue_pending_session_start_source(codex_hooks::SessionStartSource::Compact);
         drop(state);
+        drop(persistence_lifecycle);
 
         if prepared.token_usage.is_some()
             && let Some(api_token_info) = api_token_info.as_ref()
@@ -3376,6 +3512,24 @@ impl Session {
         self.persist_rollout_items(&rollout_items).await;
     }
 
+    async fn persist_rollout_response_items_with_guard(
+        &self,
+        lifecycle: &tokio::sync::MutexGuard<'_, PersistenceLifecycle>,
+        items: &[ResponseItem],
+    ) {
+        let rollout_items = items
+            .iter()
+            .cloned()
+            .map(RolloutItem::ResponseItem)
+            .collect::<Vec<_>>();
+        if let Err(err) = self
+            .persist_rollout_items_with_guard(lifecycle, &rollout_items)
+            .await
+        {
+            error!("failed to record rollout items: {err:#}");
+        }
+    }
+
     pub fn enabled(&self, feature: Feature) -> bool {
         self.features.enabled(feature)
     }
@@ -3420,6 +3574,22 @@ impl Session {
     async fn send_raw_response_items(&self, turn_context: &TurnContext, items: &[ResponseItem]) {
         for item in items {
             self.send_event(
+                turn_context,
+                EventMsg::RawResponseItem(RawResponseItemEvent { item: item.clone() }),
+            )
+            .await;
+        }
+    }
+
+    async fn send_raw_response_items_with_guard(
+        &self,
+        lifecycle: &tokio::sync::MutexGuard<'_, PersistenceLifecycle>,
+        turn_context: &TurnContext,
+        items: &[ResponseItem],
+    ) {
+        for item in items {
+            self.send_event_with_persistence_guard(
+                lifecycle,
                 turn_context,
                 EventMsg::RawResponseItem(RawResponseItemEvent { item: item.clone() }),
             )
@@ -3838,9 +4008,21 @@ impl Session {
         &self,
         items: &[RolloutItem],
     ) -> codex_thread_store::ThreadStoreResult<()> {
-        if let Some(message) = self.persistence_quarantine_reason() {
-            return Err(codex_thread_store::ThreadStoreError::InvalidRequest { message });
-        }
+        let lifecycle = self
+            .acquire_persistence_side_effect()
+            .await
+            .map_err(|err| codex_thread_store::ThreadStoreError::InvalidRequest {
+                message: err.to_string(),
+            })?;
+        self.persist_rollout_items_with_guard(&lifecycle, items)
+            .await
+    }
+
+    async fn persist_rollout_items_with_guard(
+        &self,
+        _lifecycle: &tokio::sync::MutexGuard<'_, PersistenceLifecycle>,
+        items: &[RolloutItem],
+    ) -> codex_thread_store::ThreadStoreResult<()> {
         let Some(live_thread) = self.live_thread() else {
             return Ok(());
         };
@@ -3849,13 +4031,9 @@ impl Session {
 
     async fn persist_compaction_checkpoint(
         &self,
+        _lifecycle: &tokio::sync::MutexGuard<'_, PersistenceLifecycle>,
         compacted_item: &CompactedItem,
     ) -> CompactionCheckpointAppendOutcome {
-        if let Some(message) = self.persistence_quarantine_reason() {
-            return CompactionCheckpointAppendOutcome::NotCommitted {
-                append_error: codex_thread_store::ThreadStoreError::InvalidRequest { message },
-            };
-        }
         let Some(live_thread) = self.live_thread() else {
             return CompactionCheckpointAppendOutcome::Committed;
         };
@@ -3874,6 +4052,15 @@ impl Session {
         let thread_id = self.thread_id;
         let window_number = state.auto_compact_window_number();
         format!("{thread_id}:{window_number}")
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn auto_compact_window_state_for_test(&self) -> (u64, AutoCompactWindowIds) {
+        let state = self.state.lock().await;
+        (
+            state.auto_compact_window_number(),
+            state.auto_compact_window_ids(),
+        )
     }
 
     pub(crate) async fn advance_auto_compact_window(&self) -> (u64, AutoCompactWindowIds) {
@@ -3935,6 +4122,10 @@ impl Session {
         state.reference_context_item()
     }
 
+    pub(crate) async fn clear_reference_context_item_for_direct_mutation_test(&self) {
+        self.state.lock().await.set_reference_context_item(None);
+    }
+
     /// Persist the latest turn context snapshot for the first real user turn and for
     /// steady-state turns that emit model-visible context updates.
     ///
@@ -3952,6 +4143,30 @@ impl Session {
     pub(crate) async fn record_context_updates_and_set_reference_context_item(
         &self,
         step_context: &StepContext,
+    ) -> Arc<WorldState> {
+        self.record_context_updates_and_set_reference_context_item_impl(
+            step_context,
+            /*lifecycle*/ None,
+        )
+        .await
+    }
+
+    pub(crate) async fn record_context_updates_and_set_reference_context_item_with_guard(
+        &self,
+        lifecycle: &tokio::sync::MutexGuard<'_, PersistenceLifecycle>,
+        step_context: &StepContext,
+    ) -> Arc<WorldState> {
+        self.record_context_updates_and_set_reference_context_item_impl(
+            step_context,
+            Some(lifecycle),
+        )
+        .await
+    }
+
+    async fn record_context_updates_and_set_reference_context_item_impl(
+        &self,
+        step_context: &StepContext,
+        lifecycle: Option<&tokio::sync::MutexGuard<'_, PersistenceLifecycle>>,
     ) -> Arc<WorldState> {
         let turn_context = step_context.turn.as_ref();
         let reference_context_item = {
@@ -4012,13 +4227,31 @@ impl Session {
             return world_state;
         }
         if !context_items.is_empty() {
-            self.record_conversation_items(turn_context, &context_items)
+            if let Some(lifecycle) = lifecycle {
+                self.record_conversation_items_with_persistence_guard(
+                    lifecycle,
+                    turn_context,
+                    &context_items,
+                )
                 .await;
+            } else {
+                self.record_conversation_items(turn_context, &context_items)
+                    .await;
+            }
         }
         // Persist state only after any model-visible context generated from it.
         if let Some(world_state_item) = world_state_item {
-            self.persist_rollout_items(&[RolloutItem::WorldState(world_state_item)])
-                .await;
+            let items = [RolloutItem::WorldState(world_state_item)];
+            if let Some(lifecycle) = lifecycle {
+                if let Err(err) = self
+                    .persist_rollout_items_with_guard(lifecycle, &items)
+                    .await
+                {
+                    error!("failed to record rollout items: {err:#}");
+                }
+            } else {
+                self.persist_rollout_items(&items).await;
+            }
         }
         // A snapshot-only change does not require a duplicate TurnContext record.
         if only_world_state_changed {
@@ -4026,8 +4259,17 @@ impl Session {
         }
         // Persist one `TurnContextItem` per real user turn so resume/lazy replay can recover the
         // latest durable baseline even when this turn emitted no model-visible context diffs.
-        self.persist_rollout_items(&[RolloutItem::TurnContext(turn_context_item.clone())])
-            .await;
+        let items = [RolloutItem::TurnContext(turn_context_item.clone())];
+        if let Some(lifecycle) = lifecycle {
+            if let Err(err) = self
+                .persist_rollout_items_with_guard(lifecycle, &items)
+                .await
+            {
+                error!("failed to record rollout items: {err:#}");
+            }
+        } else {
+            self.persist_rollout_items(&items).await;
+        }
 
         // Advance the persisted-settings baseline even when this turn emitted no model-visible
         // context items.

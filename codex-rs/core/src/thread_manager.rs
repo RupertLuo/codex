@@ -253,6 +253,7 @@ pub struct ThreadManager {
 pub struct ThreadManagerRuntimeOptions {
     http_transport: Option<HttpTransportHandle>,
     compact_commit_test_hook: Option<crate::compact::CompactCommitTestHook>,
+    realtime_start_test_hook: Option<crate::realtime_conversation::RealtimeStartTestHook>,
     model_catalog: Option<ModelsResponse>,
     required_base_instructions: Option<String>,
     runtime_extensions: Vec<Arc<dyn RuntimeExtension<Config>>>,
@@ -272,6 +273,14 @@ impl ThreadManagerRuntimeOptions {
         hook: crate::compact::CompactCommitTestHook,
     ) -> Self {
         self.compact_commit_test_hook = Some(hook);
+        self
+    }
+
+    pub(crate) fn with_realtime_start_test_hook_for_tests(
+        mut self,
+        hook: crate::realtime_conversation::RealtimeStartTestHook,
+    ) -> Self {
+        self.realtime_start_test_hook = Some(hook);
         self
     }
 
@@ -338,6 +347,7 @@ impl ThreadManagerRuntimeOptions {
     pub fn has_process_local_overrides(&self) -> bool {
         self.has_http_transport_override()
             || self.compact_commit_test_hook.is_some()
+            || self.realtime_start_test_hook.is_some()
             || self.has_model_catalog_override()
             || self.required_base_instructions.is_some()
             || self.has_runtime_extension_override()
@@ -369,6 +379,12 @@ impl ThreadManagerRuntimeOptions {
 
     pub(crate) fn compact_commit_test_hook(&self) -> Option<crate::compact::CompactCommitTestHook> {
         self.compact_commit_test_hook.clone()
+    }
+
+    pub(crate) fn realtime_start_test_hook(
+        &self,
+    ) -> Option<crate::realtime_conversation::RealtimeStartTestHook> {
+        self.realtime_start_test_hook.clone()
     }
 
     pub(crate) fn model_catalog(&self) -> Option<ModelsResponse> {
@@ -1996,6 +2012,7 @@ impl ThreadManagerState {
             thread_store: Arc::clone(&self.thread_store),
             http_transport: self.runtime_options.http_transport(),
             compact_commit_test_hook: self.runtime_options.compact_commit_test_hook(),
+            realtime_start_test_hook: self.runtime_options.realtime_start_test_hook(),
             attestation_provider: self.attestation_provider.clone(),
             external_time_provider: self.external_time_provider.clone(),
             inherited_multi_agent_version: multi_agent_version,

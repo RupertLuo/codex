@@ -15,6 +15,8 @@ mod types;
 
 pub use error::ThreadStoreError;
 pub use error::ThreadStoreResult;
+#[cfg(any(test, feature = "test-support"))]
+pub use in_memory::InMemoryAppendBlocker;
 pub use in_memory::InMemoryThreadStore;
 pub use in_memory::InMemoryThreadStoreCalls;
 pub use live_thread::CompactionCheckpointAppendOutcome;

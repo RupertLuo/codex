@@ -93,6 +93,8 @@ pub(crate) struct SessionServices {
     pub(crate) live_thread: Option<LiveThread>,
     pub(crate) thread_store: Arc<dyn ThreadStore>,
     pub(crate) compact_commit_test_hook: Option<crate::compact::CompactCommitTestHook>,
+    pub(crate) realtime_start_test_hook:
+        Option<crate::realtime_conversation::RealtimeStartTestHook>,
     pub(crate) attestation_provider: Option<Arc<dyn AttestationProvider>>,
     pub(crate) time_provider: Arc<dyn TimeProvider>,
     /// Session-scoped model client shared across turns.

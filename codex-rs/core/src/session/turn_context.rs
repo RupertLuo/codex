@@ -812,6 +812,37 @@ impl Session {
         }
     }
 
+    pub(crate) async fn maybe_emit_model_warnings_for_turn_with_guard(
+        &self,
+        lifecycle: &tokio::sync::MutexGuard<'_, crate::session::session::PersistenceLifecycle>,
+        tc: &TurnContext,
+    ) {
+        if tc.model_info.used_fallback_model_metadata {
+            self.send_event_with_persistence_guard(
+                lifecycle,
+                tc,
+                EventMsg::Warning(WarningEvent {
+                    message: format!(
+                        "Model metadata for `{}` not found. Defaulting to fallback metadata; this can degrade performance and cause issues.",
+                        tc.model_info.slug
+                    ),
+                }),
+            )
+            .await;
+        }
+
+        if let Some(message) =
+            unsupported_code_mode_warning(&tc.model_info, tc.config.features.get())
+        {
+            self.send_event_with_persistence_guard(
+                lifecycle,
+                tc,
+                EventMsg::Warning(WarningEvent { message }),
+            )
+            .await;
+        }
+    }
+
     pub(crate) async fn new_default_turn(&self) -> Arc<TurnContext> {
         self.new_default_turn_with_sub_id(self.next_internal_sub_id())
             .await

@@ -489,7 +489,7 @@ pub async fn thread_rollback(sess: &Arc<Session>, sub_id: String, num_turns: u32
             return;
         }
     };
-    if let Err(err) = live_thread.flush().await {
+    if let Err(err) = sess.flush_rollout().await {
         sess.send_event_raw(Event {
             id: turn_context.sub_id.clone(),
             msg: EventMsg::Error(ErrorEvent {
@@ -556,7 +556,7 @@ pub(super) async fn persist_thread_memory_mode_update(
     sess: &Arc<Session>,
     mode: ThreadMemoryMode,
 ) -> anyhow::Result<()> {
-    sess.ensure_persistence_not_quarantined()?;
+    let _lifecycle = sess.acquire_persistence_side_effect().await?;
     let live_thread = sess.live_thread_for_persistence("update thread memory mode")?;
     live_thread.persist().await?;
     live_thread.flush().await?;

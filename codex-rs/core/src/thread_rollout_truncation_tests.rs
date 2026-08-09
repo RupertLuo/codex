@@ -563,9 +563,9 @@ async fn last_n_fork_sanitizes_parent_checkpoint_recovery_state() {
             assistant_msg("retained compact summary"),
         ]),
         window_number: Some(7),
-        first_window_id: Some(parent_first_window_id),
-        previous_window_id: Some(parent_previous_window_id),
-        window_id: Some(parent_window_id),
+        first_window_id: Some(parent_first_window_id.clone()),
+        previous_window_id: Some(parent_previous_window_id.clone()),
+        window_id: Some(parent_window_id.clone()),
         checkpoint: Some(CompactionCheckpoint {
             checkpoint_id: "parent-checkpoint".to_string(),
             reference_context_item: Some(parent_reference_context),
@@ -601,10 +601,34 @@ async fn last_n_fork_sanitizes_parent_checkpoint_recovery_state() {
             _ => None,
         })
         .expect("retained compact checkpoint");
-    assert_eq!(compacted.window_number, None);
-    assert_eq!(compacted.first_window_id, None);
-    assert_eq!(compacted.previous_window_id, None);
-    assert_eq!(compacted.window_id, None);
+    assert_eq!(compacted.window_number, Some(1));
+    let child_first_window_id = uuid::Uuid::parse_str(
+        compacted
+            .first_window_id
+            .as_deref()
+            .expect("child first window id"),
+    )
+    .expect("child first window id should be a UUID");
+    let child_previous_window_id = uuid::Uuid::parse_str(
+        compacted
+            .previous_window_id
+            .as_deref()
+            .expect("child previous window id"),
+    )
+    .expect("child previous window id should be a UUID");
+    let child_window_id =
+        uuid::Uuid::parse_str(compacted.window_id.as_deref().expect("child window id"))
+            .expect("child window id should be a UUID");
+    assert_eq!(child_first_window_id.get_version_num(), 7);
+    assert_eq!(child_previous_window_id, child_first_window_id);
+    assert_eq!(child_window_id.get_version_num(), 7);
+    assert_ne!(child_window_id, child_first_window_id);
+    assert_ne!(child_first_window_id.to_string(), parent_first_window_id);
+    assert_ne!(
+        child_previous_window_id.to_string(),
+        parent_previous_window_id
+    );
+    assert_ne!(child_window_id.to_string(), parent_window_id);
     let checkpoint = compacted.checkpoint.as_ref().expect("nested checkpoint");
     assert_eq!(checkpoint.reference_context_item, None);
     assert_eq!(checkpoint.world_state, None);
@@ -627,4 +651,55 @@ async fn last_n_fork_sanitizes_parent_checkpoint_recovery_state() {
                 }))
         )
     }));
+}
+
+#[test]
+fn last_n_fork_rewrites_multiple_compactions_as_one_child_local_chain() {
+    let parent_first = uuid::Uuid::now_v7().to_string();
+    let parent_window_one = uuid::Uuid::now_v7().to_string();
+    let parent_window_two = uuid::Uuid::now_v7().to_string();
+    let compacted = |number, previous: &str, window: &str| {
+        RolloutItem::Compacted(CompactedItem {
+            message: format!("summary {number}"),
+            replacement_history: None,
+            window_number: Some(number),
+            first_window_id: Some(parent_first.clone()),
+            previous_window_id: Some(previous.to_string()),
+            window_id: Some(window.to_string()),
+            checkpoint: None,
+        })
+    };
+    let rollout = vec![
+        RolloutItem::ResponseItem(user_msg("turn one")),
+        compacted(8, &parent_first, &parent_window_one),
+        RolloutItem::ResponseItem(user_msg("turn two")),
+        compacted(9, &parent_window_one, &parent_window_two),
+    ];
+
+    let truncated = truncate_rollout_to_last_n_fork_turns(&rollout, /*n_from_end*/ 2);
+    let windows = truncated
+        .iter()
+        .filter_map(|item| match item {
+            RolloutItem::Compacted(compacted) => Some(compacted),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(windows.len(), 2);
+    assert_eq!(windows[0].window_number, Some(1));
+    assert_eq!(windows[1].window_number, Some(2));
+    assert_eq!(windows[0].first_window_id, windows[1].first_window_id);
+    assert_eq!(windows[0].previous_window_id, windows[0].first_window_id);
+    assert_eq!(windows[1].previous_window_id, windows[0].window_id);
+    assert_ne!(
+        windows[0].first_window_id.as_deref(),
+        Some(parent_first.as_str())
+    );
+    assert_ne!(
+        windows[0].window_id.as_deref(),
+        Some(parent_window_one.as_str())
+    );
+    assert_ne!(
+        windows[1].window_id.as_deref(),
+        Some(parent_window_two.as_str())
+    );
 }

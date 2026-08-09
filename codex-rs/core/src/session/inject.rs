@@ -1,6 +1,8 @@
 use super::input_queue::TurnInput;
 use super::session::Session;
 use super::turn_context::TurnContext;
+use crate::codex_thread::InjectIfRunningError;
+use crate::codex_thread::InjectIfRunningRejectionReason;
 use crate::codex_thread::TryStartTurnIfIdleError;
 use crate::codex_thread::TryStartTurnIfIdleRejectionReason;
 use crate::state::ActiveTurn;
@@ -19,7 +21,21 @@ impl Session {
     pub async fn inject_if_running(
         &self,
         input: Vec<ResponseItem>,
-    ) -> Result<(), Vec<ResponseItem>> {
+    ) -> Result<(), InjectIfRunningError> {
+        let lifecycle = self.acquire_persistence_side_effect().await.map_err(|_| {
+            InjectIfRunningError::new(
+                InjectIfRunningRejectionReason::PersistenceQuarantined,
+                input.clone(),
+            )
+        })?;
+        self.inject_if_running_with_guard(&lifecycle, input).await
+    }
+
+    async fn inject_if_running_with_guard(
+        &self,
+        _lifecycle: &tokio::sync::MutexGuard<'_, crate::session::session::PersistenceLifecycle>,
+        input: Vec<ResponseItem>,
+    ) -> Result<(), InjectIfRunningError> {
         let mut active = self.active_turn.lock().await;
         match active.as_mut() {
             Some(active_turn) => {
@@ -31,7 +47,10 @@ impl Session {
                     .await;
                 Ok(())
             }
-            None => Err(input),
+            None => Err(InjectIfRunningError::new(
+                InjectIfRunningRejectionReason::NoActiveTurn,
+                input,
+            )),
         }
     }
 
@@ -49,6 +68,12 @@ impl Session {
         if input.is_empty() {
             return Ok(());
         }
+        let lifecycle = self.acquire_persistence_side_effect().await.map_err(|_| {
+            TryStartTurnIfIdleError::new(
+                TryStartTurnIfIdleRejectionReason::PersistenceQuarantined,
+                input.clone(),
+            )
+        })?;
         if self.input_queue.has_trigger_turn_mailbox_items().await {
             return Err(TryStartTurnIfIdleError::new(
                 TryStartTurnIfIdleRejectionReason::PendingTriggerTurn,
@@ -76,6 +101,7 @@ impl Session {
 
         if self.input_queue.has_trigger_turn_mailbox_items().await {
             self.clear_reserved_idle_turn(&turn_state).await;
+            drop(lifecycle);
             self.maybe_start_turn_for_pending_work().await;
             return Err(TryStartTurnIfIdleError::new(
                 TryStartTurnIfIdleRejectionReason::PendingTriggerTurn,
@@ -88,16 +114,18 @@ impl Session {
             .await;
         if turn_context.collaboration_mode.mode == ModeKind::Plan {
             self.clear_reserved_idle_turn(&turn_state).await;
+            drop(lifecycle);
             self.maybe_start_turn_for_pending_work().await;
             return Err(TryStartTurnIfIdleError::new(
                 TryStartTurnIfIdleRejectionReason::PlanMode,
                 input,
             ));
         }
-        self.maybe_emit_model_warnings_for_turn(turn_context.as_ref())
+        self.maybe_emit_model_warnings_for_turn_with_guard(&lifecycle, turn_context.as_ref())
             .await;
         if self.input_queue.has_trigger_turn_mailbox_items().await {
             self.clear_reserved_idle_turn(&turn_state).await;
+            drop(lifecycle);
             self.maybe_start_turn_for_pending_work().await;
             return Err(TryStartTurnIfIdleError::new(
                 TryStartTurnIfIdleRejectionReason::PendingTriggerTurn,
@@ -124,8 +152,13 @@ impl Session {
                 input.into_iter().map(TurnInput::ResponseItem).collect(),
             )
             .await;
-        self.start_task(turn_context, Vec::new(), RegularTask::new())
-            .await;
+        self.start_task_with_persistence_guard(
+            &lifecycle,
+            turn_context,
+            Vec::new(),
+            RegularTask::new(),
+        )
+        .await;
         Ok(())
     }
 
@@ -145,8 +178,12 @@ impl Session {
         items: Vec<ResponseItem>,
         current_turn_context: Option<&TurnContext>,
     ) {
-        let Err(items) = self.inject_if_running(items).await else {
-            return;
+        let items = match self.inject_if_running(items).await {
+            Ok(()) => return,
+            Err(err) if err.reason() == InjectIfRunningRejectionReason::NoActiveTurn => {
+                err.into_input()
+            }
+            Err(_) => return,
         };
         let default_turn_context;
         let turn_context = match current_turn_context {
@@ -157,5 +194,27 @@ impl Session {
             }
         };
         self.record_conversation_items(turn_context, &items).await;
+    }
+
+    pub(crate) async fn inject_no_new_turn_with_guard(
+        &self,
+        lifecycle: &tokio::sync::MutexGuard<'_, crate::session::session::PersistenceLifecycle>,
+        items: Vec<ResponseItem>,
+        current_turn_context: Option<&TurnContext>,
+    ) {
+        let items = match self.inject_if_running_with_guard(lifecycle, items).await {
+            Ok(()) => return,
+            Err(err) => err.into_input(),
+        };
+        let default_turn_context;
+        let turn_context = match current_turn_context {
+            Some(turn_context) => turn_context,
+            None => {
+                default_turn_context = self.new_default_turn().await;
+                default_turn_context.as_ref()
+            }
+        };
+        self.record_conversation_items_with_persistence_guard(lifecycle, turn_context, &items)
+            .await;
     }
 }

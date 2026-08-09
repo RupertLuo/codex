@@ -5248,6 +5248,7 @@ async fn session_new_fails_when_zsh_fork_enabled_without_packaged_zsh() {
         codex_rollout_trace::ThreadTraceContext::disabled(),
         /*http_transport*/ None,
         /*compact_commit_test_hook*/ None,
+        /*realtime_start_test_hook*/ None,
         /*attestation_provider*/ None,
         /*external_time_provider*/ None,
         Some(config.multi_agent_version_from_features()),
@@ -5435,6 +5436,7 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
             /*state_db*/ None,
         )),
         compact_commit_test_hook: None,
+        realtime_start_test_hook: None,
         attestation_provider: None,
         time_provider: Arc::new(crate::current_time::SystemTimeProvider),
         model_client: ModelClient::new(
@@ -5512,7 +5514,7 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
         guardian_review_session: crate::guardian::GuardianReviewSessionManager::default(),
         services,
         next_internal_sub_id: AtomicU64::new(0),
-        persistence_quarantine: std::sync::RwLock::new(None),
+        persistence_lifecycle: Mutex::new(PersistenceLifecycle::Writable),
     };
 
     (session, turn_context)
@@ -5634,6 +5636,7 @@ async fn make_session_with_config_and_rx(
         codex_rollout_trace::ThreadTraceContext::disabled(),
         /*http_transport*/ None,
         /*compact_commit_test_hook*/ None,
+        /*realtime_start_test_hook*/ None,
         /*attestation_provider*/ None,
         /*external_time_provider*/ None,
         Some(config.multi_agent_version_from_features()),
@@ -5751,6 +5754,7 @@ async fn make_session_with_history_source_and_agent_control_and_rx(
         codex_rollout_trace::ThreadTraceContext::disabled(),
         /*http_transport*/ None,
         /*compact_commit_test_hook*/ None,
+        /*realtime_start_test_hook*/ None,
         /*attestation_provider*/ None,
         /*external_time_provider*/ None,
         Some(config.multi_agent_version_from_features()),
@@ -7567,6 +7571,7 @@ where
             state_db,
         )),
         compact_commit_test_hook: None,
+        realtime_start_test_hook: None,
         attestation_provider: None,
         time_provider: Arc::new(crate::current_time::SystemTimeProvider),
         model_client: ModelClient::new(
@@ -7644,7 +7649,7 @@ where
         guardian_review_session: crate::guardian::GuardianReviewSessionManager::default(),
         services,
         next_internal_sub_id: AtomicU64::new(0),
-        persistence_quarantine: std::sync::RwLock::new(None),
+        persistence_lifecycle: Mutex::new(PersistenceLifecycle::Writable),
     });
 
     (session, turn_context, rx_event)
@@ -9860,6 +9865,21 @@ async fn try_start_turn_if_idle_rejects_active_turn_without_injecting() {
         sess.input_queue.get_pending_input(&sess.active_turn).await
     );
 
+    sess.abort_all_tasks(TurnAbortReason::Interrupted).await;
+}
+
+#[tokio::test]
+async fn try_start_turn_if_idle_success_does_not_reacquire_lifecycle_gate() {
+    let (sess, _tc, _rx) = make_session_and_context_with_rx().await;
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        sess.try_start_turn_if_idle(vec![user_message("synthetic idle input")]),
+    )
+    .await
+    .expect("idle start must not deadlock by reacquiring its lifecycle gate")
+    .expect("idle session should accept automatic input");
+
+    assert!(sess.active_turn.lock().await.is_some());
     sess.abort_all_tasks(TurnAbortReason::Interrupted).await;
 }
 

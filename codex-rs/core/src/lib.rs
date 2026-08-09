@@ -28,6 +28,8 @@ mod config_lock;
 pub use codex_thread::BackgroundTerminalInfo;
 pub use codex_thread::CodexThread;
 pub use codex_thread::CodexThreadSettingsOverrides;
+pub use codex_thread::InjectIfRunningError;
+pub use codex_thread::InjectIfRunningRejectionReason;
 pub use codex_thread::ManagedSelectedCapabilityRoots;
 pub use codex_thread::MemberSelectedCapabilityRoots;
 pub use codex_thread::ThreadConfigSnapshot;

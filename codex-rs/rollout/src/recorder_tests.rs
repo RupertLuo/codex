@@ -629,7 +629,8 @@ async fn writer_state_retries_write_error_before_reporting_flush_success() -> st
 async fn writer_state_truncates_partial_checkpoint_before_internal_retry() -> std::io::Result<()> {
     let home = TempDir::new().expect("temp dir");
     let rollout_path = home.path().join("rollout.jsonl");
-    let file = File::create(&rollout_path)?;
+    File::create(&rollout_path)?;
+    let file = open_log_file(&rollout_path)?;
     let mut state = RolloutWriterState::new(
         Some(tokio::fs::File::from_std(file)),
         /*deferred_log_file_info*/ None,
@@ -679,6 +680,125 @@ async fn writer_state_truncates_partial_checkpoint_before_internal_retry() -> st
         .collect::<Vec<_>>();
     assert_eq!(checkpoint_ids, vec![checkpoint_id]);
     Ok(())
+}
+
+fn checkpoint_rollout_item(checkpoint_id: &str) -> RolloutItem {
+    RolloutItem::Compacted(CompactedItem {
+        message: "summary".to_string(),
+        replacement_history: Some(Vec::new()),
+        window_number: Some(1),
+        first_window_id: None,
+        previous_window_id: None,
+        window_id: None,
+        checkpoint: Some(CompactionCheckpoint {
+            checkpoint_id: checkpoint_id.to_string(),
+            reference_context_item: None,
+            world_state: None,
+            api_token_count: TokenCountEvent {
+                info: None,
+                rate_limits: None,
+            },
+            final_token_count: TokenCountEvent {
+                info: None,
+                rate_limits: None,
+            },
+            server_reasoning_included: false,
+        }),
+    })
+}
+
+async fn assert_cold_rollout_has_one_checkpoint(
+    rollout_path: &Path,
+    checkpoint_id: &str,
+) -> std::io::Result<()> {
+    let (items, _thread_id, parse_errors) =
+        RolloutRecorder::load_rollout_items(rollout_path).await?;
+    assert_eq!(
+        parse_errors, 0,
+        "rollback must not leave a malformed prefix"
+    );
+    let checkpoint_ids = items
+        .iter()
+        .filter_map(|item| match item {
+            RolloutItem::Compacted(compacted) => compacted
+                .checkpoint
+                .as_ref()
+                .map(|checkpoint| checkpoint.checkpoint_id.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(checkpoint_ids, vec![checkpoint_id]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn writer_state_retries_pending_truncate_before_checkpoint_append() -> std::io::Result<()> {
+    let home = TempDir::new().expect("temp dir");
+    let rollout_path = home.path().join("rollout.jsonl");
+    File::create(&rollout_path)?;
+    let file = open_log_file(&rollout_path)?;
+    let mut state = RolloutWriterState::new(
+        Some(tokio::fs::File::from_std(file)),
+        /*deferred_log_file_info*/ None,
+        /*meta*/ None,
+        home.path().to_path_buf(),
+        rollout_path.clone(),
+    );
+    let checkpoint_id = "checkpoint-after-truncate-retry";
+    state.add_items(vec![checkpoint_rollout_item(checkpoint_id)]);
+    state.fail_next_write_after_bytes_for_test(128);
+    state.fail_next_rollback_truncate_for_test();
+
+    let first_error = state
+        .flush()
+        .await
+        .expect_err("injected truncate failure must fail the first barrier");
+    assert!(
+        first_error
+            .to_string()
+            .contains("injected rollback truncate")
+    );
+
+    state.flush().await?;
+    assert_cold_rollout_has_one_checkpoint(&rollout_path, checkpoint_id).await
+}
+
+#[tokio::test]
+async fn writer_state_retries_pending_sync_before_checkpoint_append() -> std::io::Result<()> {
+    let home = TempDir::new().expect("temp dir");
+    let rollout_path = home.path().join("rollout.jsonl");
+    File::create(&rollout_path)?;
+    let file = open_log_file(&rollout_path)?;
+    let mut state = RolloutWriterState::new(
+        Some(tokio::fs::File::from_std(file)),
+        /*deferred_log_file_info*/ None,
+        /*meta*/ None,
+        home.path().to_path_buf(),
+        rollout_path.clone(),
+    );
+    let checkpoint_id = "checkpoint-after-sync-retry";
+    state.add_items(vec![checkpoint_rollout_item(checkpoint_id)]);
+    state.fail_next_write_after_bytes_for_test(128);
+    state.fail_next_rollback_syncs_for_test(1);
+
+    let first_error = state
+        .flush()
+        .await
+        .expect_err("injected sync failure must fail the first barrier");
+    assert!(first_error.to_string().contains("injected rollback sync"));
+
+    // The truncate already succeeded, so only an explicit NeedsSync phase can make the next
+    // barrier call sync_data again. Fail both attempts within that barrier to prove no append can
+    // overtake the pending durability step.
+    state.fail_next_rollback_syncs_for_test(2);
+    let second_error = state
+        .flush()
+        .await
+        .expect_err("pending sync must be retried before a checkpoint append can succeed");
+    assert!(second_error.to_string().contains("injected rollback sync"));
+
+    state.flush().await?;
+    assert_cold_rollout_has_one_checkpoint(&rollout_path, checkpoint_id).await
 }
 
 #[tokio::test]

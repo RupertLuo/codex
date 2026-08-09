@@ -47,10 +47,39 @@ pub(crate) struct Session {
     pub(crate) guardian_review_session: GuardianReviewSessionManager,
     pub(crate) services: SessionServices,
     pub(super) next_internal_sub_id: AtomicU64,
-    /// Set after a compaction append whose durable outcome cannot be reconciled. Once set, this
-    /// session must not issue more inference requests or mutate thread persistence; only creating
-    /// a new session from durable history can resolve which checkpoint actually committed.
-    pub(super) persistence_quarantine: std::sync::RwLock<Option<String>>,
+    /// Serializes persistence and realtime-start side effects with the transition to quarantine.
+    /// Once quarantined, only creating a new session from durable history can resolve which
+    /// checkpoint actually committed.
+    pub(super) persistence_lifecycle: Mutex<PersistenceLifecycle>,
+}
+
+#[derive(Debug)]
+pub(crate) enum PersistenceLifecycle {
+    Writable,
+    Quarantined(String),
+}
+
+fn initial_auto_compact_window_ids(initial_history: &InitialHistory) -> AutoCompactWindowIds {
+    let rewritten_first_window_id = match initial_history {
+        InitialHistory::Forked(items) => items.iter().find_map(|item| {
+            let RolloutItem::Compacted(compacted) = item else {
+                return None;
+            };
+            compacted
+                .first_window_id
+                .as_deref()
+                .and_then(|id| uuid::Uuid::parse_str(id).ok())
+        }),
+        InitialHistory::New | InitialHistory::Cleared | InitialHistory::Resumed(_) => None,
+    };
+    let Some(window_id) = rewritten_first_window_id else {
+        return AutoCompactWindowIds::new_initial();
+    };
+    AutoCompactWindowIds {
+        first_window_id: window_id,
+        previous_window_id: None,
+        window_id,
+    }
 }
 
 #[derive(Clone)]
@@ -510,6 +539,7 @@ impl Session {
         parent_rollout_thread_trace: ThreadTraceContext,
         http_transport: Option<HttpTransportHandle>,
         compact_commit_test_hook: Option<crate::compact::CompactCommitTestHook>,
+        realtime_start_test_hook: Option<crate::realtime_conversation::RealtimeStartTestHook>,
         attestation_provider: Option<Arc<dyn AttestationProvider>>,
         external_time_provider: Option<Arc<dyn TimeProvider>>,
         multi_agent_version: Option<MultiAgentVersion>,
@@ -557,7 +587,7 @@ impl Session {
                 SessionId::from(thread_id)
             }
         });
-        let initial_auto_compact_window_ids = AutoCompactWindowIds::new_initial();
+        let initial_auto_compact_window_ids = initial_auto_compact_window_ids(&initial_history);
         let agent_control = agent_control.with_session_id(
             session_id,
             config
@@ -1128,6 +1158,7 @@ impl Session {
                 live_thread: live_thread_init.as_ref().cloned(),
                 thread_store: Arc::clone(&thread_store),
                 compact_commit_test_hook,
+                realtime_start_test_hook,
                 attestation_provider: attestation_provider.clone(),
                 time_provider,
                 model_client,
@@ -1157,7 +1188,7 @@ impl Session {
                 guardian_review_session: GuardianReviewSessionManager::default(),
                 services,
                 next_internal_sub_id: AtomicU64::new(0),
-                persistence_quarantine: std::sync::RwLock::new(None),
+                persistence_lifecycle: Mutex::new(PersistenceLifecycle::Writable),
             });
             if let Some(network_policy_decider_session) = network_policy_decider_session {
                 let mut guard = network_policy_decider_session.write().await;

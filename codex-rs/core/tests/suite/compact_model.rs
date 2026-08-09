@@ -1,14 +1,27 @@
+use codex_core::InjectIfRunningRejectionReason;
 use codex_core::ThreadManagerRuntimeOptions;
+use codex_core::TryStartTurnIfIdleRejectionReason;
 use codex_core::compact::SUMMARY_PREFIX;
 use codex_core::config::ThreadStoreConfig;
 use codex_core::test_support::CompactCommitTestHook;
+use codex_core::test_support::RealtimeStartTestHook;
 use codex_core::test_support::auth_manager_from_auth;
+use codex_core::test_support::clear_reference_context_item_for_direct_mutation_test;
+use codex_core::test_support::direct_mutation_test_snapshot;
 use codex_core::test_support::with_compact_commit_test_hook;
+use codex_core::test_support::with_realtime_start_test_hook;
 use codex_login::CodexAuth;
+use codex_protocol::models::ContentItem;
+use codex_protocol::models::ResponseItem;
+use codex_protocol::protocol::AgentMessageEvent;
 use codex_protocol::protocol::CompactedItem;
+use codex_protocol::protocol::ConversationStartParams;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::InitialHistory;
 use codex_protocol::protocol::Op;
+use codex_protocol::protocol::RealtimeConversationRealtimeEvent;
+use codex_protocol::protocol::RealtimeEvent;
+use codex_protocol::protocol::RealtimeOutputModality;
 use codex_protocol::protocol::ResumedHistory;
 use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::RolloutLine;
@@ -28,6 +41,7 @@ use core_test_support::responses::sse;
 use core_test_support::responses::sse_failed;
 use core_test_support::responses::sse_response;
 use core_test_support::responses::start_mock_server;
+use core_test_support::responses::start_websocket_server;
 use core_test_support::skip_if_no_network;
 use core_test_support::test_codex::TestCodex;
 use core_test_support::test_codex::TestCodexBuilder;
@@ -35,6 +49,7 @@ use core_test_support::test_codex::test_codex;
 use core_test_support::wait_for_event;
 use pretty_assertions::assert_eq;
 use serde_json::Value;
+use serde_json::json;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -45,6 +60,18 @@ const COMPACT_MODEL: &str = "deepseek/deepseek-v4-flash";
 const COMPACT_PROMPT: &str = "Summarize the conversation as durable text state.";
 const FAILED_TURN_MODEL: &str = "gpt-5.3-codex";
 const IMAGE_URL: &str = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==";
+
+fn injected_assistant_item(text: &str) -> ResponseItem {
+    ResponseItem::Message {
+        id: None,
+        role: "assistant".to_string(),
+        content: vec![ContentItem::OutputText {
+            text: text.to_string(),
+        }],
+        phase: None,
+        internal_chat_message_metadata_passthrough: None,
+    }
+}
 
 fn in_memory_atomic_compact_builder(
     store_id: &'static str,
@@ -67,6 +94,64 @@ fn in_memory_atomic_compact_builder(
             config.compact_prompt = Some(COMPACT_PROMPT.to_string());
             config.model_provider.name = "Catalyst-compatible test provider".to_string();
         })
+}
+
+fn in_memory_atomic_compact_realtime_builder(
+    store_id: &'static str,
+    commit_hook: CompactCommitTestHook,
+    realtime_hook: RealtimeStartTestHook,
+    realtime_base_url: String,
+) -> TestCodexBuilder {
+    let runtime_options = with_realtime_start_test_hook(
+        with_compact_commit_test_hook(ThreadManagerRuntimeOptions::default(), commit_hook),
+        realtime_hook,
+    );
+    test_codex()
+        .with_runtime_options(runtime_options)
+        .with_auth(CodexAuth::from_api_key("dummy"))
+        .with_model(ACTIVE_MODEL)
+        .with_model_info_override(ACTIVE_MODEL, |model_info| {
+            model_info.supports_incremental_requests = true;
+        })
+        .with_config(move |config| {
+            config.experimental_thread_store = ThreadStoreConfig::InMemory {
+                id: store_id.to_string(),
+            };
+            config.compact_model = Some(COMPACT_MODEL.to_string());
+            config.compact_prompt = Some(COMPACT_PROMPT.to_string());
+            config.model_provider.name = "Catalyst-compatible test provider".to_string();
+            config.experimental_realtime_ws_base_url = Some(realtime_base_url);
+        })
+}
+
+fn realtime_start_params() -> ConversationStartParams {
+    ConversationStartParams {
+        client_managed_handoffs: false,
+        codex_responses_as_items: false,
+        codex_response_item_prefix: None,
+        codex_response_handoff_prefix: None,
+        model: None,
+        output_modality: RealtimeOutputModality::Audio,
+        include_startup_context: false,
+        prompt: Some(Some("backend prompt".to_string())),
+        realtime_session_id: None,
+        transport: None,
+        version: None,
+        voice: None,
+    }
+}
+
+async fn start_realtime_race_server() -> core_test_support::responses::WebSocketTestServer {
+    start_websocket_server(vec![vec![
+        vec![json!({
+            "type": "session.updated",
+            "session": { "id": "sess_atomicity_race", "instructions": "backend prompt" }
+        })],
+        vec![],
+        vec![],
+        vec![],
+    ]])
+    .await
 }
 
 async fn only_atomic_compaction_checkpoint(
@@ -1440,6 +1525,508 @@ async fn ambiguous_compact_persistence_quarantines_until_reload() {
         &response_mock,
     ))
     .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ambiguous_compaction_linearizes_after_in_flight_append_and_blocks_later_appends() {
+    skip_if_no_network!();
+
+    const STORE_ID: &str = "ambiguous-compact-blocked-append-race";
+    const ORDINARY_APPEND: &str = "ORDINARY_APPEND_ALREADY_IN_FLIGHT";
+    InMemoryThreadStore::remove_id(STORE_ID);
+    let thread_store = InMemoryThreadStore::for_id(STORE_ID);
+    let server = start_mock_server().await;
+    mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![
+                ev_response_created("resp-before-blocked-append-race"),
+                ev_assistant_message("first-message", "FIRST_REPLY"),
+                ev_completed("resp-before-blocked-append-race"),
+            ]),
+            sse(vec![
+                ev_assistant_message("compact-message", "RACE_COMPACT_SUMMARY"),
+                ev_completed("compact-blocked-append-race"),
+            ]),
+        ],
+    )
+    .await;
+    let commit_hook = CompactCommitTestHook::new();
+    let mut builder = in_memory_atomic_compact_builder(STORE_ID, commit_hook.clone());
+    let test = builder
+        .build_with_auto_env(&server)
+        .await
+        .expect("build codex");
+
+    test.submit_turn("FIRST_USER_TURN")
+        .await
+        .expect("submit first user turn");
+    test.codex
+        .submit(Op::Compact)
+        .await
+        .expect("submit compact operation");
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        commit_hook.wait_until_commit_paused(),
+    )
+    .await
+    .expect("compact commit should reach the deterministic pause");
+
+    let append_blocker = thread_store.block_next_append().await;
+    let codex = Arc::clone(&test.codex);
+    let append_task = tokio::spawn(async move {
+        codex
+            .append_rollout_items(&[RolloutItem::EventMsg(EventMsg::AgentMessage(
+                AgentMessageEvent {
+                    message: ORDINARY_APPEND.to_string(),
+                    phase: None,
+                    memory_citation: None,
+                },
+            ))])
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(5), append_blocker.wait_until_blocked())
+        .await
+        .expect("ordinary append should pause inside the backing store");
+
+    // These controls remain unclaimed by the already-entered ordinary append and therefore force
+    // the following checkpoint append into the Ambiguous outcome.
+    thread_store
+        .fail_next_append_after_items(1, "injected uncertain durable checkpoint")
+        .await;
+    thread_store
+        .fail_next_history_loads(3, "injected reconciliation read failure")
+        .await;
+    commit_hook.release_commit();
+
+    // The old TOCTOU implementation can finish Ambiguous quarantine while the ordinary append is
+    // still blocked. The lifecycle gate makes this timeout: compaction must wait for the side
+    // effect that linearized first. Preserve either observed event so cleanup and the final durable
+    // ordering assertion run on both RED and GREEN implementations.
+    let premature_error = tokio::time::timeout(
+        Duration::from_millis(250),
+        wait_for_event(&test.codex, |event| matches!(event, EventMsg::Error(_))),
+    )
+    .await
+    .ok();
+
+    append_blocker.release();
+    append_task
+        .await
+        .expect("ordinary append task should not panic")
+        .expect("ordinary append that linearized first should complete");
+    let error_event = match premature_error {
+        Some(event) => event,
+        None => wait_for_event(&test.codex, |event| matches!(event, EventMsg::Error(_))).await,
+    };
+    let EventMsg::Error(error) = error_event else {
+        unreachable!("event filter guarantees an error")
+    };
+    assert!(error.message.contains("persistence outcome is uncertain"));
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+
+    let history = ThreadStore::load_history(
+        thread_store.as_ref(),
+        LoadThreadHistoryParams {
+            thread_id: test.session_configured.thread_id,
+            include_archived: true,
+        },
+    )
+    .await
+    .expect("load durable history after the race");
+    let ordinary_index = history
+        .items
+        .iter()
+        .position(|item| {
+            matches!(
+                item,
+                RolloutItem::EventMsg(EventMsg::AgentMessage(event))
+                    if event.message == ORDINARY_APPEND
+            )
+        })
+        .expect("ordinary append should be durable");
+    let checkpoint_index = history
+        .items
+        .iter()
+        .position(|item| {
+            matches!(
+                item,
+                RolloutItem::Compacted(compacted) if compacted.checkpoint.is_some()
+            )
+        })
+        .expect("uncertain checkpoint should be durable");
+    assert!(
+        ordinary_index < checkpoint_index,
+        "no ordinary append may land after the checkpoint whose outcome quarantined the session"
+    );
+
+    let calls_before_rejected_append = thread_store.calls().await.append_items;
+    let rejected = test
+        .codex
+        .append_rollout_items(&[RolloutItem::EventMsg(EventMsg::AgentMessage(
+            AgentMessageEvent {
+                message: "APPEND_AFTER_QUARANTINE".to_string(),
+                phase: None,
+                memory_citation: None,
+            },
+        ))])
+        .await
+        .expect_err("quarantined session must reject later append entrypoints");
+    assert!(rejected.to_string().contains("quarantined"));
+    assert_eq!(
+        thread_store.calls().await.append_items,
+        calls_before_rejected_append,
+        "rejected append must not reach the backing store"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn realtime_prepared_before_quarantine_cannot_connect_after_ambiguous_checkpoint() {
+    skip_if_no_network!();
+
+    const STORE_ID: &str = "ambiguous-compact-realtime-before-gate";
+    InMemoryThreadStore::remove_id(STORE_ID);
+    let thread_store = InMemoryThreadStore::for_id(STORE_ID);
+    let response_server = start_mock_server().await;
+    let realtime_server = start_realtime_race_server().await;
+    mount_sse_sequence(
+        &response_server,
+        vec![
+            sse(vec![
+                ev_response_created("resp-before-realtime-race"),
+                ev_assistant_message("first-message", "FIRST_REPLY"),
+                ev_completed("resp-before-realtime-race"),
+            ]),
+            sse(vec![
+                ev_assistant_message("compact-message", "REALTIME_RACE_SUMMARY"),
+                ev_completed("compact-realtime-race"),
+            ]),
+        ],
+    )
+    .await;
+    let commit_hook = CompactCommitTestHook::new();
+    let realtime_hook = RealtimeStartTestHook::new();
+    realtime_hook.pause_before_gate_once();
+    let mut builder = in_memory_atomic_compact_realtime_builder(
+        STORE_ID,
+        commit_hook.clone(),
+        realtime_hook.clone(),
+        realtime_server.uri().to_string(),
+    );
+    let test = builder
+        .build_with_auto_env(&response_server)
+        .await
+        .expect("build codex");
+
+    test.submit_turn("FIRST_USER_TURN")
+        .await
+        .expect("submit first user turn");
+    test.codex
+        .submit(Op::Compact)
+        .await
+        .expect("submit compact operation");
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        commit_hook.wait_until_commit_paused(),
+    )
+    .await
+    .expect("compact commit should pause before lifecycle ownership");
+    test.codex
+        .submit(Op::RealtimeConversationStart(realtime_start_params()))
+        .await
+        .expect("submit realtime start");
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        realtime_hook.wait_until_before_gate_paused(),
+    )
+    .await
+    .expect("realtime start should pause after prepare and before lifecycle gate");
+
+    thread_store
+        .fail_next_append_after_items(1, "injected uncertain durable checkpoint")
+        .await;
+    thread_store
+        .fail_next_history_loads(3, "injected reconciliation read failure")
+        .await;
+    commit_hook.release_commit();
+    let compact_error =
+        wait_for_event(&test.codex, |event| matches!(event, EventMsg::Error(_))).await;
+    let EventMsg::Error(compact_error) = compact_error else {
+        unreachable!("event filter guarantees an error")
+    };
+    assert!(
+        compact_error
+            .message
+            .contains("persistence outcome is uncertain")
+    );
+
+    realtime_hook.release_before_gate();
+    let realtime_terminal = tokio::time::timeout(
+        Duration::from_secs(5),
+        wait_for_event(&test.codex, |event| {
+            matches!(
+                event,
+                EventMsg::RealtimeConversationStarted(_)
+                    | EventMsg::RealtimeConversationRealtime(RealtimeConversationRealtimeEvent {
+                        payload: RealtimeEvent::Error(_),
+                    })
+            )
+        }),
+    )
+    .await
+    .expect("realtime start should terminate explicitly after quarantine");
+    assert!(
+        matches!(
+            realtime_terminal,
+            EventMsg::RealtimeConversationRealtime(RealtimeConversationRealtimeEvent {
+                payload: RealtimeEvent::Error(ref message),
+            }) if message.contains("quarantined")
+        ),
+        "quarantine must reject realtime before connect: {realtime_terminal:?}"
+    );
+    assert_eq!(
+        realtime_server.handshakes().len(),
+        0,
+        "a prepared realtime start must not connect after quarantine linearizes"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn realtime_that_linearizes_first_is_closed_by_later_ambiguous_checkpoint() {
+    skip_if_no_network!();
+
+    const STORE_ID: &str = "ambiguous-compact-realtime-after-gate";
+    InMemoryThreadStore::remove_id(STORE_ID);
+    let thread_store = InMemoryThreadStore::for_id(STORE_ID);
+    let response_server = start_mock_server().await;
+    let realtime_server = start_realtime_race_server().await;
+    mount_sse_sequence(
+        &response_server,
+        vec![
+            sse(vec![
+                ev_response_created("resp-before-realtime-first"),
+                ev_assistant_message("first-message", "FIRST_REPLY"),
+                ev_completed("resp-before-realtime-first"),
+            ]),
+            sse(vec![
+                ev_assistant_message("compact-message", "REALTIME_FIRST_SUMMARY"),
+                ev_completed("compact-realtime-first"),
+            ]),
+        ],
+    )
+    .await;
+    let commit_hook = CompactCommitTestHook::new();
+    let realtime_hook = RealtimeStartTestHook::new();
+    realtime_hook.pause_after_gate_once();
+    let mut builder = in_memory_atomic_compact_realtime_builder(
+        STORE_ID,
+        commit_hook.clone(),
+        realtime_hook.clone(),
+        realtime_server.uri().to_string(),
+    );
+    let test = builder
+        .build_with_auto_env(&response_server)
+        .await
+        .expect("build codex");
+
+    test.submit_turn("FIRST_USER_TURN")
+        .await
+        .expect("submit first user turn");
+    test.codex
+        .submit(Op::Compact)
+        .await
+        .expect("submit compact operation");
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        commit_hook.wait_until_commit_paused(),
+    )
+    .await
+    .expect("compact commit should pause before lifecycle ownership");
+    test.codex
+        .submit(Op::RealtimeConversationStart(realtime_start_params()))
+        .await
+        .expect("submit realtime start");
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        realtime_hook.wait_until_after_gate_paused(),
+    )
+    .await
+    .expect("realtime should pause after lifecycle linearization and before connect");
+
+    thread_store
+        .fail_next_append_after_items(1, "injected uncertain durable checkpoint")
+        .await;
+    thread_store
+        .fail_next_history_loads(3, "injected reconciliation read failure")
+        .await;
+    commit_hook.release_commit();
+    let premature_compact_error = tokio::time::timeout(
+        Duration::from_millis(250),
+        wait_for_event(&test.codex, |event| matches!(event, EventMsg::Error(_))),
+    )
+    .await
+    .ok();
+
+    realtime_hook.release_after_gate();
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        wait_for_event(&test.codex, |event| {
+            matches!(event, EventMsg::RealtimeConversationStarted(_))
+        }),
+    )
+    .await
+    .expect("the realtime start that linearized first should connect");
+    let mut compact_error = premature_compact_error.and_then(|event| match event {
+        EventMsg::Error(error) => Some(error),
+        _ => None,
+    });
+    let mut saw_realtime_closed = false;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while compact_error.is_none() || !saw_realtime_closed {
+            let event = test
+                .codex
+                .next_event()
+                .await
+                .expect("event stream should remain open");
+            match event.msg {
+                EventMsg::Error(error) => compact_error = Some(error),
+                EventMsg::RealtimeConversationClosed(_) => saw_realtime_closed = true,
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("quarantine must report the compact failure and close realtime");
+    let compact_error = compact_error.expect("compact failure should be observed");
+    assert!(
+        compact_error
+            .message
+            .contains("persistence outcome is uncertain")
+    );
+    assert_eq!(
+        realtime_server.handshakes().len(),
+        1,
+        "the first-linearized realtime start should connect exactly once before quarantine closes it"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn direct_injection_apis_reject_quarantine_before_mutation_or_side_effect() {
+    skip_if_no_network!();
+
+    const STORE_ID: &str = "ambiguous-compact-direct-injection-gate";
+    InMemoryThreadStore::remove_id(STORE_ID);
+    let thread_store = InMemoryThreadStore::for_id(STORE_ID);
+    let server = start_mock_server().await;
+    let response_mock = mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![
+                ev_response_created("resp-before-direct-injection"),
+                ev_assistant_message("first-message", "FIRST_REPLY"),
+                ev_completed("resp-before-direct-injection"),
+            ]),
+            sse(vec![
+                ev_assistant_message("compact-message", "DIRECT_INJECTION_SUMMARY"),
+                ev_completed("compact-direct-injection"),
+            ]),
+        ],
+    )
+    .await;
+    let commit_hook = CompactCommitTestHook::new();
+    let mut builder = in_memory_atomic_compact_builder(STORE_ID, commit_hook.clone());
+    let test = builder
+        .build_with_auto_env(&server)
+        .await
+        .expect("build codex");
+
+    test.submit_turn("FIRST_USER_TURN")
+        .await
+        .expect("submit first user turn");
+    test.codex
+        .submit(Op::Compact)
+        .await
+        .expect("submit compact operation");
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        commit_hook.wait_until_commit_paused(),
+    )
+    .await
+    .expect("compact commit should pause before lifecycle ownership");
+    thread_store
+        .fail_next_append_after_items(1, "injected uncertain durable checkpoint")
+        .await;
+    thread_store
+        .fail_next_history_loads(3, "injected reconciliation read failure")
+        .await;
+    commit_hook.release_commit();
+    let compact_error =
+        wait_for_event(&test.codex, |event| matches!(event, EventMsg::Error(_))).await;
+    let EventMsg::Error(compact_error) = compact_error else {
+        unreachable!("event filter guarantees an error")
+    };
+    assert!(
+        compact_error
+            .message
+            .contains("persistence outcome is uncertain")
+    );
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_) | EventMsg::TurnAborted(_))
+    })
+    .await;
+
+    clear_reference_context_item_for_direct_mutation_test(&test.codex).await;
+    let state_before = direct_mutation_test_snapshot(&test.codex).await;
+    let calls_before = thread_store.calls().await;
+    let requests_before = response_mock.requests().len();
+
+    let inject_response_error = test
+        .codex
+        .inject_response_items(vec![injected_assistant_item(
+            "HISTORY_ONLY_AFTER_QUARANTINE",
+        )])
+        .await
+        .expect_err("history-only injection must reject quarantine");
+    assert!(inject_response_error.to_string().contains("quarantined"));
+
+    let inject_running_error = test
+        .codex
+        .inject_if_running(vec![injected_assistant_item("RUNNING_AFTER_QUARANTINE")])
+        .await
+        .expect_err("active-turn injection must reject quarantine explicitly");
+    assert_eq!(
+        inject_running_error.reason(),
+        InjectIfRunningRejectionReason::PersistenceQuarantined
+    );
+
+    let idle_start_error = test
+        .codex
+        .try_start_turn_if_idle(vec![injected_assistant_item("IDLE_AFTER_QUARANTINE")])
+        .await
+        .expect_err("idle start must reject quarantine explicitly");
+    assert_eq!(
+        idle_start_error.reason(),
+        TryStartTurnIfIdleRejectionReason::PersistenceQuarantined
+    );
+
+    assert_eq!(
+        direct_mutation_test_snapshot(&test.codex).await,
+        state_before,
+        "history, queue, and active-turn reservation must remain unchanged"
+    );
+    assert_eq!(
+        thread_store.calls().await,
+        calls_before,
+        "rejected direct APIs must not reach the thread store"
+    );
+    assert_eq!(
+        response_mock.requests().len(),
+        requests_before,
+        "rejected direct APIs must not start an HTTP model request"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

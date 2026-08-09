@@ -340,6 +340,27 @@ impl Session {
         {
             return;
         }
+        self.start_task_with_persistence_capability(turn_context, input, task)
+            .await;
+    }
+
+    pub(crate) async fn start_task_with_persistence_guard<T: SessionTask>(
+        self: &Arc<Self>,
+        _lifecycle: &tokio::sync::MutexGuard<'_, crate::session::session::PersistenceLifecycle>,
+        turn_context: Arc<TurnContext>,
+        input: Vec<TurnInput>,
+        task: T,
+    ) {
+        self.start_task_with_persistence_capability(turn_context, input, task)
+            .await;
+    }
+
+    async fn start_task_with_persistence_capability<T: SessionTask>(
+        self: &Arc<Self>,
+        turn_context: Arc<TurnContext>,
+        input: Vec<TurnInput>,
+        task: T,
+    ) {
         let task: Arc<dyn AnySessionTask> = Arc::new(task);
         let task_kind = task.kind();
         let span_name = task.span_name();

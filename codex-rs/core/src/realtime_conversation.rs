@@ -58,6 +58,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use tokio::sync::Mutex;
+use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 use tracing::debug;
 use tracing::error;
@@ -80,6 +81,95 @@ const REALTIME_V2_STEER_ACKNOWLEDGEMENT: &str =
     "This was sent to steer the previous background agent task.";
 const REALTIME_ACTIVE_RESPONSE_ERROR_PREFIX: &str =
     "Conversation already has an active response in progress:";
+
+/// Instance-scoped synchronization used by realtime lifecycle integration tests.
+#[derive(Clone, Debug)]
+pub(crate) struct RealtimeStartTestHook {
+    inner: Arc<RealtimeStartTestHookInner>,
+}
+
+#[derive(Debug)]
+struct RealtimeStartTestHookInner {
+    pause_before_gate: AtomicBool,
+    before_gate_paused: Semaphore,
+    release_before_gate: Semaphore,
+    pause_after_gate: AtomicBool,
+    after_gate_paused: Semaphore,
+    release_after_gate: Semaphore,
+}
+
+impl RealtimeStartTestHook {
+    pub(crate) fn new() -> Self {
+        Self {
+            inner: Arc::new(RealtimeStartTestHookInner {
+                pause_before_gate: AtomicBool::new(false),
+                before_gate_paused: Semaphore::new(0),
+                release_before_gate: Semaphore::new(0),
+                pause_after_gate: AtomicBool::new(false),
+                after_gate_paused: Semaphore::new(0),
+                release_after_gate: Semaphore::new(0),
+            }),
+        }
+    }
+
+    pub(crate) fn pause_before_gate_once(&self) {
+        self.inner.pause_before_gate.store(true, Ordering::SeqCst);
+    }
+
+    pub(crate) async fn wait_until_before_gate_paused(&self) {
+        let Ok(permit) = self.inner.before_gate_paused.acquire().await else {
+            return;
+        };
+        permit.forget();
+    }
+
+    pub(crate) fn release_before_gate(&self) {
+        self.inner.release_before_gate.add_permits(1);
+    }
+
+    pub(crate) fn pause_after_gate_once(&self) {
+        self.inner.pause_after_gate.store(true, Ordering::SeqCst);
+    }
+
+    pub(crate) async fn wait_until_after_gate_paused(&self) {
+        let Ok(permit) = self.inner.after_gate_paused.acquire().await else {
+            return;
+        };
+        permit.forget();
+    }
+
+    pub(crate) fn release_after_gate(&self) {
+        self.inner.release_after_gate.add_permits(1);
+    }
+
+    pub(crate) async fn pause_before_gate_if_requested(&self) {
+        if !self.inner.pause_before_gate.swap(false, Ordering::SeqCst) {
+            return;
+        }
+        self.inner.before_gate_paused.add_permits(1);
+        let Ok(permit) = self.inner.release_before_gate.acquire().await else {
+            return;
+        };
+        permit.forget();
+    }
+
+    pub(crate) async fn pause_after_gate_if_requested(&self) {
+        if !self.inner.pause_after_gate.swap(false, Ordering::SeqCst) {
+            return;
+        }
+        self.inner.after_gate_paused.add_permits(1);
+        let Ok(permit) = self.inner.release_after_gate.acquire().await else {
+            return;
+        };
+        permit.forget();
+    }
+}
+
+impl Default for RealtimeStartTestHook {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RealtimeConversationEnd {
@@ -235,6 +325,7 @@ impl RealtimeHandoffState {
 
 #[allow(dead_code)]
 struct ConversationState {
+    sub_id: String,
     audio_tx: Sender<RealtimeAudioFrame>,
     text_tx: Sender<ConversationTextParams>,
     session_kind: RealtimeSessionKind,
@@ -245,6 +336,7 @@ struct ConversationState {
 }
 
 struct RealtimeStart {
+    sub_id: String,
     api_provider: ApiProvider,
     extra_headers: Option<HeaderMap>,
     client_managed_handoffs: bool,
@@ -302,6 +394,7 @@ impl RealtimeConversationManager {
 
     async fn start_inner(&self, start: RealtimeStart) -> CodexResult<RealtimeStartOutput> {
         let RealtimeStart {
+            sub_id,
             api_provider,
             extra_headers,
             client_managed_handoffs,
@@ -391,6 +484,7 @@ impl RealtimeConversationManager {
 
         let mut guard = self.state.lock().await;
         *guard = Some(ConversationState {
+            sub_id,
             audio_tx,
             text_tx,
             session_kind,
@@ -656,6 +750,20 @@ impl RealtimeConversationManager {
         }
         Ok(())
     }
+
+    async fn shutdown_for_persistence_quarantine(&self) -> CodexResult<Option<String>> {
+        let state = {
+            let mut guard = self.state.lock().await;
+            guard.take()
+        };
+
+        let Some(state) = state else {
+            return Ok(None);
+        };
+        let sub_id = state.sub_id.clone();
+        stop_conversation_state(state, RealtimeFanoutTaskStop::Abort).await;
+        Ok(Some(sub_id))
+    }
 }
 
 async fn stop_conversation_state(
@@ -698,15 +806,41 @@ pub(crate) async fn handle_start(
         }
     };
 
-    if let Err(err) = handle_start_inner(sess, &sub_id, prepared_start).await {
+    if let Some(hook) = sess.services.realtime_start_test_hook.as_ref() {
+        hook.pause_before_gate_if_requested().await;
+    }
+
+    let _lifecycle = match sess.acquire_persistence_side_effect().await {
+        Ok(lifecycle) => lifecycle,
+        Err(err) => {
+            error!("failed to start realtime conversation: {err}");
+            sess.send_event_raw(Event {
+                id: sub_id,
+                msg: EventMsg::RealtimeConversationRealtime(RealtimeConversationRealtimeEvent {
+                    payload: RealtimeEvent::Error(err.to_string()),
+                }),
+            })
+            .await;
+            return Ok(());
+        }
+    };
+
+    if let Some(hook) = sess.services.realtime_start_test_hook.as_ref() {
+        hook.pause_after_gate_if_requested().await;
+    }
+
+    if let Err(err) = handle_start_inner(sess, &_lifecycle, &sub_id, prepared_start).await {
         error!("failed to start realtime conversation: {err}");
         let message = err.to_string();
-        sess.send_event_raw(Event {
-            id: sub_id.clone(),
-            msg: EventMsg::RealtimeConversationRealtime(RealtimeConversationRealtimeEvent {
-                payload: RealtimeEvent::Error(message),
-            }),
-        })
+        sess.send_event_raw_with_persistence_guard(
+            &_lifecycle,
+            Event {
+                id: sub_id.clone(),
+                msg: EventMsg::RealtimeConversationRealtime(RealtimeConversationRealtimeEvent {
+                    payload: RealtimeEvent::Error(message),
+                }),
+            },
+        )
         .await;
     }
     Ok(())
@@ -959,6 +1093,7 @@ fn validate_realtime_voice(version: RealtimeWsVersion, voice: RealtimeVoice) -> 
 
 async fn handle_start_inner(
     sess: &Arc<Session>,
+    lifecycle: &tokio::sync::MutexGuard<'_, crate::session::session::PersistenceLifecycle>,
     sub_id: &str,
     prepared_start: PreparedRealtimeConversationStart,
 ) -> CodexResult<()> {
@@ -981,6 +1116,7 @@ async fn handle_start_inner(
         ConversationStartTransport::Webrtc { sdp } => Some(sdp),
     };
     let start = RealtimeStart {
+        sub_id: sub_id.to_string(),
         api_provider,
         extra_headers,
         client_managed_handoffs,
@@ -996,13 +1132,16 @@ async fn handle_start_inner(
 
     info!("realtime conversation started");
 
-    sess.send_event_raw(Event {
-        id: sub_id.to_string(),
-        msg: EventMsg::RealtimeConversationStarted(RealtimeConversationStartedEvent {
-            realtime_session_id: requested_realtime_session_id,
-            version,
-        }),
-    })
+    sess.send_event_raw_with_persistence_guard(
+        lifecycle,
+        Event {
+            id: sub_id.to_string(),
+            msg: EventMsg::RealtimeConversationStarted(RealtimeConversationStartedEvent {
+                realtime_session_id: requested_realtime_session_id,
+                version,
+            }),
+        },
+    )
     .await;
 
     let RealtimeStartOutput {
@@ -1011,10 +1150,13 @@ async fn handle_start_inner(
         sdp,
     } = start_output;
     if let Some(sdp) = sdp {
-        sess.send_event_raw(Event {
-            id: sub_id.to_string(),
-            msg: EventMsg::RealtimeConversationSdp(RealtimeConversationSdpEvent { sdp }),
-        })
+        sess.send_event_raw_with_persistence_guard(
+            lifecycle,
+            Event {
+                id: sub_id.to_string(),
+                msg: EventMsg::RealtimeConversationSdp(RealtimeConversationSdpEvent { sdp }),
+            },
+        )
         .await;
     }
 
@@ -1773,8 +1915,32 @@ async fn end_realtime_conversation(
     send_realtime_conversation_closed(sess, sub_id, end).await;
 }
 
+pub(crate) async fn close_for_persistence_quarantine(
+    sess: &Session,
+    lifecycle: &tokio::sync::MutexGuard<'_, crate::session::session::PersistenceLifecycle>,
+) -> CodexResult<()> {
+    let Some(sub_id) = sess
+        .conversation
+        .shutdown_for_persistence_quarantine()
+        .await?
+    else {
+        return Ok(());
+    };
+    sess.send_event_raw_with_persistence_guard(
+        lifecycle,
+        Event {
+            id: sub_id,
+            msg: EventMsg::RealtimeConversationClosed(RealtimeConversationClosedEvent {
+                reason: Some("persistence_quarantine".to_string()),
+            }),
+        },
+    )
+    .await;
+    Ok(())
+}
+
 async fn send_realtime_conversation_closed(
-    sess: &Arc<Session>,
+    sess: &Session,
     sub_id: String,
     end: RealtimeConversationEnd,
 ) {

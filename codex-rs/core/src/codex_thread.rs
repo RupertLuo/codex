@@ -85,6 +85,8 @@ pub struct ThreadConfigSnapshot {
 /// idle turn.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TryStartTurnIfIdleRejectionReason {
+    /// The thread entered persistence quarantine after an ambiguous durable checkpoint outcome.
+    PersistenceQuarantined,
     /// User/client-triggered mailbox work is already queued and must take
     /// priority over extension-initiated idle work.
     PendingTriggerTurn,
@@ -94,6 +96,36 @@ pub enum TryStartTurnIfIdleRejectionReason {
     /// Another turn or task is active, or the idle reservation was lost before
     /// the automatic turn could start.
     Busy,
+}
+
+/// Explains why `CodexThread::inject_if_running` rejected injected items.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InjectIfRunningRejectionReason {
+    /// The thread entered persistence quarantine after an ambiguous durable checkpoint outcome.
+    PersistenceQuarantined,
+    /// There is no active turn to receive the items.
+    NoActiveTurn,
+}
+
+/// Rejection returned when model-visible items cannot be injected into active work.
+#[derive(Debug)]
+pub struct InjectIfRunningError {
+    reason: InjectIfRunningRejectionReason,
+    input: Vec<ResponseItem>,
+}
+
+impl InjectIfRunningError {
+    pub(crate) fn new(reason: InjectIfRunningRejectionReason, input: Vec<ResponseItem>) -> Self {
+        Self { reason, input }
+    }
+
+    pub fn reason(&self) -> InjectIfRunningRejectionReason {
+        self.reason
+    }
+
+    pub fn into_input(self) -> Vec<ResponseItem> {
+        self.input
+    }
 }
 
 /// Rejection returned when an extension asks to start automatic idle work but
@@ -331,7 +363,7 @@ impl CodexThread {
     pub async fn inject_if_running(
         &self,
         items: Vec<ResponseItem>,
-    ) -> Result<(), Vec<ResponseItem>> {
+    ) -> Result<(), InjectIfRunningError> {
         self.codex.session.inject_if_running(items).await
     }
 
@@ -474,6 +506,25 @@ impl CodexThread {
         self.codex.session.token_usage_info().await
     }
 
+    pub(crate) async fn direct_mutation_test_snapshot(&self) -> (usize, bool, bool) {
+        let history_len = self.codex.session.clone_history().await.raw_items().len();
+        let has_active_turn = self.codex.session.active_turn.lock().await.is_some();
+        let has_pending_input = self
+            .codex
+            .session
+            .input_queue
+            .has_pending_input(&self.codex.session.active_turn)
+            .await;
+        (history_len, has_active_turn, has_pending_input)
+    }
+
+    pub(crate) async fn clear_reference_context_item_for_direct_mutation_test(&self) {
+        self.codex
+            .session
+            .clear_reference_context_item_for_direct_mutation_test()
+            .await;
+    }
+
     /// Records a user-role session-prefix message without creating a new user turn boundary.
     pub(crate) async fn inject_user_message_without_turn(&self, message: String) {
         let item = ResponseItem::Message {
@@ -497,6 +548,13 @@ impl CodexThread {
             ));
         }
 
+        let lifecycle = self
+            .codex
+            .session
+            .acquire_persistence_side_effect()
+            .await
+            .map_err(|err| CodexErr::Fatal(err.to_string()))?;
+
         let turn_context = self.codex.session.new_default_turn().await;
         if self.codex.session.reference_context_item().await.is_none() {
             // This history-only API runs without run_turn, so it owns its initial step.
@@ -507,14 +565,20 @@ impl CodexThread {
                 .await;
             self.codex
                 .session
-                .record_context_updates_and_set_reference_context_item(step_context.as_ref())
+                .record_context_updates_and_set_reference_context_item_with_guard(
+                    &lifecycle,
+                    step_context.as_ref(),
+                )
                 .await;
         }
         self.codex
             .session
-            .inject_no_new_turn(items, Some(turn_context.as_ref()))
+            .inject_no_new_turn_with_guard(&lifecycle, items, Some(turn_context.as_ref()))
             .await;
-        self.codex.session.flush_rollout().await?;
+        self.codex
+            .session
+            .flush_rollout_with_guard(&lifecycle)
+            .await?;
         Ok(())
     }
 
@@ -574,9 +638,11 @@ impl CodexThread {
         patch: ThreadMetadataPatch,
         include_archived: bool,
     ) -> ThreadStoreResult<StoredThread> {
-        self.codex
+        let _lifecycle = self
+            .codex
             .session
-            .ensure_persistence_not_quarantined()
+            .acquire_persistence_side_effect()
+            .await
             .map_err(|err| ThreadStoreError::InvalidRequest {
                 message: err.to_string(),
             })?;
@@ -592,9 +658,11 @@ impl CodexThread {
 
     /// Appends rollout items through the live thread so derived metadata stays in sync.
     pub async fn append_rollout_items(&self, items: &[RolloutItem]) -> ThreadStoreResult<()> {
-        self.codex
+        let _lifecycle = self
+            .codex
             .session
-            .ensure_persistence_not_quarantined()
+            .acquire_persistence_side_effect()
+            .await
             .map_err(|err| ThreadStoreError::InvalidRequest {
                 message: err.to_string(),
             })?;

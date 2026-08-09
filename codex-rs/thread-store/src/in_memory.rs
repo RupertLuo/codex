@@ -5,6 +5,10 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::MutexGuard;
 use std::sync::OnceLock;
+#[cfg(any(test, feature = "test-support"))]
+use std::sync::atomic::AtomicBool;
+#[cfg(any(test, feature = "test-support"))]
+use std::sync::atomic::Ordering;
 
 use chrono::Utc;
 use codex_protocol::ThreadId;
@@ -378,6 +382,59 @@ pub struct InMemoryThreadStoreCalls {
     pub delete_thread: usize,
 }
 
+/// Deterministically pauses one in-memory append after the store call has begun but before its
+/// durable history mutation. Available only to tests and test-support builds.
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Clone, Default)]
+pub struct InMemoryAppendBlocker {
+    inner: Arc<InMemoryAppendBlockerInner>,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Default)]
+struct InMemoryAppendBlockerInner {
+    blocked: AtomicBool,
+    released: AtomicBool,
+    blocked_notify: tokio::sync::Notify,
+    released_notify: tokio::sync::Notify,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl InMemoryAppendBlocker {
+    pub async fn wait_until_blocked(&self) {
+        loop {
+            if self.inner.blocked.load(Ordering::Acquire) {
+                return;
+            }
+            let notified = self.inner.blocked_notify.notified();
+            if self.inner.blocked.load(Ordering::Acquire) {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    pub fn release(&self) {
+        self.inner.released.store(true, Ordering::Release);
+        self.inner.released_notify.notify_waiters();
+    }
+
+    async fn block_append(&self) {
+        self.inner.blocked.store(true, Ordering::Release);
+        self.inner.blocked_notify.notify_waiters();
+        loop {
+            if self.inner.released.load(Ordering::Acquire) {
+                return;
+            }
+            let notified = self.inner.released_notify.notified();
+            if self.inner.released.load(Ordering::Acquire) {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
 /// In-memory [`ThreadStore`] implementation for tests and debug configs.
 ///
 /// Test and debug configs can select this store by id, letting tests exercise
@@ -399,6 +456,8 @@ struct InMemoryThreadStoreState {
     next_history_load_errors: Option<(usize, String)>,
     #[cfg(any(test, feature = "test-support"))]
     next_metadata_update_error: Option<String>,
+    #[cfg(any(test, feature = "test-support"))]
+    next_append_blocker: Option<InMemoryAppendBlocker>,
     created_threads: HashMap<ThreadId, CreateThreadParams>,
     histories: HashMap<ThreadId, Vec<RolloutItem>>,
     metadata_updates: HashMap<ThreadId, ThreadMetadataPatch>,
@@ -444,6 +503,15 @@ impl InMemoryThreadStore {
         message: impl Into<String>,
     ) {
         self.state.lock().await.next_append_error_after_items = Some((item_count, message.into()));
+    }
+
+    /// Pauses the next non-empty append after its call and failure controls are reserved, but
+    /// before it mutates durable history. The store mutex is not held while the append is paused.
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn block_next_append(&self) -> InMemoryAppendBlocker {
+        let blocker = InMemoryAppendBlocker::default();
+        self.state.lock().await.next_append_blocker = Some(blocker.clone());
+        blocker
     }
 
     /// Makes the next `count` history loads fail.
@@ -526,14 +594,33 @@ impl InMemoryThreadStore {
         if canonical_items.is_empty() {
             return Ok(());
         }
-        let mut state = self.state.lock().await;
-        state.calls.append_items += 1;
         #[cfg(any(test, feature = "test-support"))]
-        if let Some(message) = state.next_append_error.take() {
+        let (append_blocker, append_error, append_error_after_items) = {
+            let mut state = self.state.lock().await;
+            state.calls.append_items += 1;
+            (
+                state.next_append_blocker.take(),
+                state.next_append_error.take(),
+                state.next_append_error_after_items.take(),
+            )
+        };
+        #[cfg(not(any(test, feature = "test-support")))]
+        {
+            self.state.lock().await.calls.append_items += 1;
+        }
+
+        #[cfg(any(test, feature = "test-support"))]
+        if let Some(blocker) = append_blocker {
+            blocker.block_append().await;
+        }
+
+        let mut state = self.state.lock().await;
+        #[cfg(any(test, feature = "test-support"))]
+        if let Some(message) = append_error {
             return Err(ThreadStoreError::Internal { message });
         }
         #[cfg(any(test, feature = "test-support"))]
-        if let Some((item_count, message)) = state.next_append_error_after_items.take() {
+        if let Some((item_count, message)) = append_error_after_items {
             state
                 .histories
                 .entry(params.thread_id)
