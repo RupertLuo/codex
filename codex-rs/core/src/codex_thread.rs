@@ -574,6 +574,12 @@ impl CodexThread {
         patch: ThreadMetadataPatch,
         include_archived: bool,
     ) -> ThreadStoreResult<StoredThread> {
+        self.codex
+            .session
+            .ensure_persistence_not_quarantined()
+            .map_err(|err| ThreadStoreError::InvalidRequest {
+                message: err.to_string(),
+            })?;
         let live_thread = self
             .codex
             .session
@@ -586,6 +592,12 @@ impl CodexThread {
 
     /// Appends rollout items through the live thread so derived metadata stays in sync.
     pub async fn append_rollout_items(&self, items: &[RolloutItem]) -> ThreadStoreResult<()> {
+        self.codex
+            .session
+            .ensure_persistence_not_quarantined()
+            .map_err(|err| ThreadStoreError::InvalidRequest {
+                message: err.to_string(),
+            })?;
         let live_thread = self
             .codex
             .session

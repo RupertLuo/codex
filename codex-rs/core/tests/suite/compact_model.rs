@@ -2,10 +2,14 @@ use codex_core::ThreadManagerRuntimeOptions;
 use codex_core::compact::SUMMARY_PREFIX;
 use codex_core::config::ThreadStoreConfig;
 use codex_core::test_support::CompactCommitTestHook;
+use codex_core::test_support::auth_manager_from_auth;
 use codex_core::test_support::with_compact_commit_test_hook;
+use codex_login::CodexAuth;
 use codex_protocol::protocol::CompactedItem;
 use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::InitialHistory;
 use codex_protocol::protocol::Op;
+use codex_protocol::protocol::ResumedHistory;
 use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::RolloutLine;
 use codex_protocol::user_input::UserInput;
@@ -185,6 +189,129 @@ fn assert_normal_request_shape(normal_body: &Value) {
     let normal_body = normal_body.to_string();
     assert!(!normal_body.contains("<model_switch>"));
     assert!(!normal_body.contains(COMPACT_MODEL));
+}
+
+async fn assert_ambiguous_session_quarantined_then_reload_succeeds(
+    test: &TestCodex,
+    thread_store: &InMemoryThreadStore,
+    response_mock: &ResponseMock,
+) {
+    let thread_id = test.session_configured.thread_id;
+    let durable_history = ThreadStore::load_history(
+        thread_store,
+        LoadThreadHistoryParams {
+            thread_id,
+            include_archived: true,
+        },
+    )
+    .await
+    .expect("load durable history before quarantined follow-up");
+    let calls_before_quarantined_follow_up = thread_store.calls().await;
+    let flush_error = test
+        .codex
+        .flush_rollout()
+        .await
+        .expect_err("quarantined session must reject persistence barriers");
+    assert!(flush_error.to_string().contains("quarantined"));
+    test.codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "FOLLOW_UP_AFTER_AMBIGUOUS_COMPACT".to_string(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: Default::default(),
+        })
+        .await
+        .expect("queue follow-up after ambiguous compact");
+    let quarantine_event = wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::Error(_) | EventMsg::TurnStarted(_))
+    })
+    .await;
+    let EventMsg::Error(quarantine_error) = quarantine_event else {
+        panic!("quarantined session started another inference turn: {quarantine_event:?}")
+    };
+    assert!(
+        quarantine_error.message.contains("quarantined"),
+        "same-session use should explain the quarantine: {}",
+        quarantine_error.message
+    );
+    assert!(quarantine_error.message.contains("restart or reload"));
+
+    assert_eq!(
+        response_mock.requests().len(),
+        2,
+        "quarantined session must not issue another inference request"
+    );
+    assert_eq!(
+        thread_store.calls().await.append_items,
+        calls_before_quarantined_follow_up.append_items,
+        "quarantined session must not attempt another rollout append"
+    );
+    let history_after_quarantined_follow_up = ThreadStore::load_history(
+        thread_store,
+        LoadThreadHistoryParams {
+            thread_id,
+            include_archived: true,
+        },
+    )
+    .await
+    .expect("load durable history after quarantined follow-up");
+    assert_eq!(
+        serde_json::to_value(&history_after_quarantined_follow_up.items)
+            .expect("serialize history after quarantine"),
+        serde_json::to_value(&durable_history.items).expect("serialize durable history"),
+        "quarantined session must not mutate durable rollout history"
+    );
+
+    test.codex
+        .shutdown_and_wait()
+        .await
+        .expect("shutdown quarantined session");
+    test.thread_manager.remove_thread(&thread_id).await;
+    let resumed = test
+        .thread_manager
+        .resume_thread_with_history(
+            test.config.clone(),
+            InitialHistory::Resumed(ResumedHistory {
+                conversation_id: thread_id,
+                history: Arc::new(durable_history.items),
+                rollout_path: None,
+            }),
+            auth_manager_from_auth(CodexAuth::from_api_key("dummy")),
+            /*parent_trace*/ None,
+            /*supports_openai_form_elicitation*/ false,
+        )
+        .await
+        .expect("reload thread from durable checkpoint");
+    resumed
+        .thread
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "FOLLOW_UP_AFTER_RELOAD".to_string(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: Default::default(),
+        })
+        .await
+        .expect("submit follow-up after reload");
+    wait_for_event(&resumed.thread, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+
+    assert_eq!(response_mock.requests().len(), 3);
+    let follow_up = request_body_containing_user_text(response_mock, "FOLLOW_UP_AFTER_RELOAD");
+    assert!(
+        follow_up.get("previous_response_id").is_none(),
+        "reload must not reuse the stale pre-compact response id"
+    );
+    assert!(follow_up.to_string().contains("AMBIGUOUS_COMPACT_SUMMARY"));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1230,7 +1357,7 @@ async fn compact_metadata_projection_failure_is_best_effort() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn ambiguous_compact_persistence_drops_stale_incremental_baseline() {
+async fn ambiguous_compact_persistence_quarantines_until_reload() {
     skip_if_no_network!();
 
     const STORE_ID: &str = "ambiguous-compact-persistence";
@@ -1307,17 +1434,12 @@ async fn ambiguous_compact_persistence_drops_stale_incremental_baseline() {
     .await;
 
     only_atomic_compaction_checkpoint(&test, &thread_store).await;
-    test.submit_turn("FOLLOW_UP_AFTER_AMBIGUOUS_COMPACT")
-        .await
-        .expect("submit follow-up after ambiguous compact");
-
-    assert_eq!(response_mock.requests().len(), 3);
-    let follow_up =
-        request_body_containing_user_text(&response_mock, "FOLLOW_UP_AFTER_AMBIGUOUS_COMPACT");
-    assert!(
-        follow_up.get("previous_response_id").is_none(),
-        "the stale pre-compact response id must never be reused after ambiguous persistence"
-    );
+    Box::pin(assert_ambiguous_session_quarantined_then_reload_succeeds(
+        &test,
+        thread_store.as_ref(),
+        &response_mock,
+    ))
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

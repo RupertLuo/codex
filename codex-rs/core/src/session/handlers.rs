@@ -556,6 +556,7 @@ pub(super) async fn persist_thread_memory_mode_update(
     sess: &Arc<Session>,
     mode: ThreadMemoryMode,
 ) -> anyhow::Result<()> {
+    sess.ensure_persistence_not_quarantined()?;
     let live_thread = sess.live_thread_for_persistence("update thread memory mode")?;
     live_thread.persist().await?;
     live_thread.flush().await?;
@@ -699,6 +700,19 @@ pub async fn review(
     }
 }
 
+fn operation_allowed_during_persistence_quarantine(op: &Op) -> bool {
+    matches!(
+        op,
+        Op::Interrupt
+            | Op::CleanBackgroundTerminals
+            | Op::RealtimeConversationClose
+            | Op::RealtimeConversationListVoices
+            | Op::RefreshMcpServers { .. }
+            | Op::ReloadUserConfig
+            | Op::Shutdown
+    )
+}
+
 pub(super) async fn submission_loop(
     sess: Arc<Session>,
     config: Arc<Config>,
@@ -710,6 +724,13 @@ pub(super) async fn submission_loop(
         debug!(?sub, "Submission");
         let dispatch_span = submission_dispatch_span(&sub);
         let should_exit = async {
+            if !operation_allowed_during_persistence_quarantine(&sub.op)
+                && sess
+                    .reject_if_persistence_quarantined(sub.id.as_str())
+                    .await
+            {
+                return false;
+            }
             match sub.op.clone() {
                 Op::Interrupt => {
                     interrupt(&sess).await;

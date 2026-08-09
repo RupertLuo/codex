@@ -47,6 +47,10 @@ pub(crate) struct Session {
     pub(crate) guardian_review_session: GuardianReviewSessionManager,
     pub(crate) services: SessionServices,
     pub(super) next_internal_sub_id: AtomicU64,
+    /// Set after a compaction append whose durable outcome cannot be reconciled. Once set, this
+    /// session must not issue more inference requests or mutate thread persistence; only creating
+    /// a new session from durable history can resolve which checkpoint actually committed.
+    pub(super) persistence_quarantine: std::sync::RwLock<Option<String>>,
 }
 
 #[derive(Clone)]
@@ -1153,6 +1157,7 @@ impl Session {
                 guardian_review_session: GuardianReviewSessionManager::default(),
                 services,
                 next_internal_sub_id: AtomicU64::new(0),
+                persistence_quarantine: std::sync::RwLock::new(None),
             });
             if let Some(network_policy_decider_session) = network_policy_decider_session {
                 let mut guard = network_policy_decider_session.write().await;

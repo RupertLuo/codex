@@ -317,6 +317,12 @@ impl Session {
         input: Vec<TurnInput>,
         task: T,
     ) {
+        if self
+            .reject_if_persistence_quarantined(turn_context.sub_id.as_str())
+            .await
+        {
+            return;
+        }
         self.abort_all_tasks(TurnAbortReason::Replaced).await;
         self.clear_connector_selection().await;
         self.start_task(turn_context, input, task).await;
@@ -328,6 +334,12 @@ impl Session {
         input: Vec<TurnInput>,
         task: T,
     ) {
+        if self
+            .reject_if_persistence_quarantined(turn_context.sub_id.as_str())
+            .await
+        {
+            return;
+        }
         let task: Arc<dyn AnySessionTask> = Arc::new(task);
         let task_kind = task.kind();
         let span_name = task.span_name();
@@ -470,6 +482,12 @@ impl Session {
         self: &Arc<Self>,
         sub_id: String,
     ) {
+        if self
+            .reject_if_persistence_quarantined(sub_id.as_str())
+            .await
+        {
+            return;
+        }
         if !self.input_queue.has_trigger_turn_mailbox_items().await {
             return;
         }

@@ -4,11 +4,18 @@ use crate::session::tests::make_session_and_context;
 use codex_protocol::AgentPath;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ReasoningItemReasoningSummary;
+use codex_protocol::protocol::CompactedItem;
+use codex_protocol::protocol::CompactionCheckpoint;
 use codex_protocol::protocol::InterAgentCommunication;
+use codex_protocol::protocol::RateLimitSnapshot;
 use codex_protocol::protocol::ThreadRolledBackEvent;
+use codex_protocol::protocol::TokenCountEvent;
+use codex_protocol::protocol::TokenUsage;
+use codex_protocol::protocol::TokenUsageInfo;
 use codex_protocol::protocol::TurnCompleteEvent;
 use codex_protocol::protocol::TurnStartedEvent;
 use codex_protocol::protocol::UserMessageEvent;
+use codex_protocol::protocol::WorldStateItem;
 use pretty_assertions::assert_eq;
 use std::sync::Arc;
 
@@ -517,4 +524,107 @@ fn truncates_rollout_to_last_n_fork_turns_keeps_full_rollout_when_n_is_large() {
         serde_json::to_value(&truncated).unwrap(),
         serde_json::to_value(&rollout).unwrap()
     );
+}
+
+#[tokio::test]
+async fn last_n_fork_sanitizes_parent_checkpoint_recovery_state() {
+    let (session, turn_context) = make_session_and_context().await;
+    let turn_context = Arc::new(turn_context);
+    let parent_reference_context = turn_context.to_turn_context_item();
+    let parent_world_state = build_world_state_from_turn_context(&session, &turn_context).await;
+    let parent_token_info = TokenUsageInfo {
+        total_token_usage: TokenUsage {
+            total_tokens: 42_000,
+            ..TokenUsage::default()
+        },
+        last_token_usage: TokenUsage {
+            total_tokens: 2_000,
+            ..TokenUsage::default()
+        },
+        model_context_window: Some(64_000),
+    };
+    let rate_limits = RateLimitSnapshot {
+        limit_id: Some("account-limit".to_string()),
+        limit_name: None,
+        primary: None,
+        secondary: None,
+        credits: None,
+        individual_limit: None,
+        plan_type: None,
+        rate_limit_reached_type: None,
+    };
+    let parent_first_window_id = uuid::Uuid::now_v7().to_string();
+    let parent_previous_window_id = uuid::Uuid::now_v7().to_string();
+    let parent_window_id = uuid::Uuid::now_v7().to_string();
+    let checkpoint = CompactedItem {
+        message: "retained compact summary".to_string(),
+        replacement_history: Some(vec![
+            user_msg("retained parent turn"),
+            assistant_msg("retained compact summary"),
+        ]),
+        window_number: Some(7),
+        first_window_id: Some(parent_first_window_id),
+        previous_window_id: Some(parent_previous_window_id),
+        window_id: Some(parent_window_id),
+        checkpoint: Some(CompactionCheckpoint {
+            checkpoint_id: "parent-checkpoint".to_string(),
+            reference_context_item: Some(parent_reference_context),
+            world_state: Some(WorldStateItem::full(
+                parent_world_state.snapshot().into_value(),
+            )),
+            api_token_count: TokenCountEvent {
+                info: Some(parent_token_info.clone()),
+                rate_limits: Some(rate_limits.clone()),
+            },
+            final_token_count: TokenCountEvent {
+                info: Some(parent_token_info.clone()),
+                rate_limits: Some(rate_limits.clone()),
+            },
+            server_reasoning_included: true,
+        }),
+    };
+    let rollout = vec![
+        RolloutItem::ResponseItem(user_msg("retained parent turn")),
+        RolloutItem::Compacted(checkpoint),
+        RolloutItem::EventMsg(EventMsg::TokenCount(TokenCountEvent {
+            info: Some(parent_token_info),
+            rate_limits: Some(rate_limits.clone()),
+        })),
+        RolloutItem::ResponseItem(assistant_msg("retained answer")),
+    ];
+
+    let truncated = truncate_rollout_to_last_n_fork_turns(&rollout, /*n_from_end*/ 1);
+    let compacted = truncated
+        .iter()
+        .find_map(|item| match item {
+            RolloutItem::Compacted(compacted) => Some(compacted),
+            _ => None,
+        })
+        .expect("retained compact checkpoint");
+    assert_eq!(compacted.window_number, None);
+    assert_eq!(compacted.first_window_id, None);
+    assert_eq!(compacted.previous_window_id, None);
+    assert_eq!(compacted.window_id, None);
+    let checkpoint = compacted.checkpoint.as_ref().expect("nested checkpoint");
+    assert_eq!(checkpoint.reference_context_item, None);
+    assert_eq!(checkpoint.world_state, None);
+    assert_eq!(checkpoint.api_token_count.info, None);
+    assert_eq!(checkpoint.final_token_count.info, None);
+    assert_eq!(
+        checkpoint.final_token_count.rate_limits,
+        Some(rate_limits),
+        "account-scoped rate limits remain useful across a child fork"
+    );
+    assert!(!checkpoint.server_reasoning_included);
+    assert!(truncated.iter().all(|item| {
+        !matches!(
+            item,
+            RolloutItem::TurnContext(_)
+                | RolloutItem::WorldState(_)
+                | RolloutItem::EventMsg(EventMsg::TokenCount(TokenCountEvent {
+                    info: Some(_),
+                    ..
+                }))
+        )
+    }));
 }

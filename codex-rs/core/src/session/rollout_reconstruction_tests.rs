@@ -2,6 +2,7 @@ use super::*;
 
 use super::tests::build_world_state_from_turn_context;
 use super::tests::make_session_and_context;
+use crate::thread_rollout_truncation::truncate_rollout_to_last_n_fork_turns;
 use codex_protocol::AgentPath;
 use codex_protocol::ThreadId;
 use codex_protocol::models::ContentItem;
@@ -260,6 +261,125 @@ async fn record_initial_history_restores_atomic_compaction_checkpoint() {
     assert_eq!(state.token_info(), Some(final_token_info));
     assert_eq!(state.latest_rate_limits, Some(rate_limits));
     assert!(state.server_reasoning_included());
+}
+
+#[tokio::test]
+async fn last_n_fork_checkpoint_starts_without_parent_baselines_and_fully_reinjects() {
+    let (session, turn_context) = make_session_and_context().await;
+    let turn_context = Arc::new(turn_context);
+    let parent_reference_context = turn_context.to_turn_context_item();
+    let parent_world_state = build_world_state_from_turn_context(&session, &turn_context).await;
+    let parent_token_info = TokenUsageInfo {
+        total_token_usage: TokenUsage {
+            total_tokens: 42_000,
+            ..TokenUsage::default()
+        },
+        last_token_usage: TokenUsage {
+            total_tokens: 2_000,
+            ..TokenUsage::default()
+        },
+        model_context_window: Some(64_000),
+    };
+    let rate_limits = RateLimitSnapshot {
+        limit_id: Some("account-limit".to_string()),
+        limit_name: None,
+        primary: None,
+        secondary: None,
+        credits: None,
+        individual_limit: None,
+        plan_type: None,
+        rate_limit_reached_type: None,
+    };
+    let parent_first_window_id = Uuid::now_v7();
+    let parent_previous_window_id = Uuid::now_v7();
+    let parent_window_id = Uuid::now_v7();
+    let parent_rollout = vec![
+        RolloutItem::ResponseItem(user_message("retained parent turn")),
+        RolloutItem::Compacted(CompactedItem {
+            message: "retained compact summary".to_string(),
+            replacement_history: Some(vec![
+                user_message("retained parent turn"),
+                assistant_message("retained compact summary"),
+            ]),
+            window_number: Some(7),
+            first_window_id: Some(parent_first_window_id.to_string()),
+            previous_window_id: Some(parent_previous_window_id.to_string()),
+            window_id: Some(parent_window_id.to_string()),
+            checkpoint: Some(CompactionCheckpoint {
+                checkpoint_id: "parent-checkpoint".to_string(),
+                reference_context_item: Some(parent_reference_context),
+                world_state: Some(WorldStateItem::full(
+                    parent_world_state.snapshot().into_value(),
+                )),
+                api_token_count: TokenCountEvent {
+                    info: Some(parent_token_info.clone()),
+                    rate_limits: Some(rate_limits.clone()),
+                },
+                final_token_count: TokenCountEvent {
+                    info: Some(parent_token_info.clone()),
+                    rate_limits: Some(rate_limits.clone()),
+                },
+                server_reasoning_included: true,
+            }),
+        }),
+        RolloutItem::EventMsg(EventMsg::TokenCount(TokenCountEvent {
+            info: Some(parent_token_info),
+            rate_limits: Some(rate_limits.clone()),
+        })),
+        RolloutItem::ResponseItem(assistant_message("retained answer")),
+    ];
+    let child_initial_window_ids = session.state.lock().await.auto_compact_window_ids();
+
+    let forked_rollout =
+        truncate_rollout_to_last_n_fork_turns(&parent_rollout, /*n_from_end*/ 1);
+    let reconstructed = session
+        .reconstruct_history_from_rollout(&turn_context, &forked_rollout)
+        .await;
+    assert_eq!(reconstructed.reference_context_item, None);
+    assert_eq!(reconstructed.world_state_baseline, None);
+
+    session
+        .record_initial_history(InitialHistory::Forked(forked_rollout))
+        .await;
+    let history_before_first_child_turn = session.clone_history().await.raw_items().to_vec();
+    {
+        let state = session.state.lock().await;
+        assert_eq!(state.reference_context_item(), None);
+        assert_eq!(state.token_info(), None);
+        assert_eq!(state.latest_rate_limits, Some(rate_limits));
+        assert!(!state.server_reasoning_included());
+        assert_eq!(
+            state.auto_compact_window_number(),
+            1,
+            "the retained compaction is counted in the child's local window sequence"
+        );
+        assert_eq!(state.auto_compact_window_ids(), child_initial_window_ids);
+        assert_ne!(
+            state.auto_compact_window_ids().first_window_id,
+            parent_first_window_id
+        );
+        assert_ne!(state.auto_compact_window_ids().window_id, parent_window_id);
+    }
+
+    let child_world_state = build_world_state_from_turn_context(&session, &turn_context).await;
+    let expected_full_context = session
+        .build_initial_context_with_world_state(&turn_context, &child_world_state)
+        .await;
+    let step_context = StepContext::for_test(Arc::clone(&turn_context));
+    session
+        .record_context_updates_and_set_reference_context_item(&step_context)
+        .await;
+
+    let history_after_first_child_turn = session.clone_history().await.raw_items().to_vec();
+    assert_eq!(
+        &history_after_first_child_turn[..history_before_first_child_turn.len()],
+        history_before_first_child_turn.as_slice()
+    );
+    assert_eq!(
+        &history_after_first_child_turn[history_before_first_child_turn.len()..],
+        expected_full_context.as_slice(),
+        "the first child turn must receive a full context reinjection"
+    );
 }
 
 #[tokio::test]

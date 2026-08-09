@@ -1570,7 +1570,7 @@ impl RolloutWriterState {
         rollout_path: PathBuf,
     ) -> Self {
         Self {
-            writer: file.map(|file| JsonlWriter { file }),
+            writer: file.map(JsonlWriter::new),
             deferred_log_file_info,
             pending_items: Vec::new(),
             meta,
@@ -1584,12 +1584,23 @@ impl RolloutWriterState {
         self.pending_items.extend(items);
     }
 
+    #[cfg(test)]
+    fn fail_next_write_after_bytes_for_test(&mut self, byte_count: usize) {
+        self.writer
+            .as_mut()
+            .expect("test writer must already be materialized")
+            .fail_next_write_after_bytes = Some(byte_count);
+    }
+
     async fn flush_if_materialized(&mut self) {
         if self.is_deferred() {
             return;
         }
         if let Err(err) = self.flush().await {
-            self.enter_recovery_mode(&err);
+            // `write_pending_with_recovery` drops the handle only after a failed record has been
+            // rolled back. If truncation itself failed, keep the writer and its saved offset so a
+            // later barrier can retry that rollback before writing anything else.
+            warn!("background rollout flush remains buffered for retry: {err}");
         }
     }
 
@@ -1618,6 +1629,7 @@ impl RolloutWriterState {
                 Ok(())
             }
             Err(first_err) => {
+                self.rollback_failed_write(&first_err).await?;
                 self.enter_recovery_mode(&first_err);
                 warn!("failed to {operation} rollout writer; reopening and retrying: {first_err}");
                 match self.write_pending_once().await {
@@ -1626,6 +1638,7 @@ impl RolloutWriterState {
                         Ok(())
                     }
                     Err(second_err) => {
+                        self.rollback_failed_write(&second_err).await?;
                         self.enter_recovery_mode(&second_err);
                         warn!(
                             "retrying rollout writer {operation} failed; first error: \
@@ -1636,6 +1649,20 @@ impl RolloutWriterState {
                 }
             }
         }
+    }
+
+    async fn rollback_failed_write(&mut self, write_err: &IoError) -> std::io::Result<()> {
+        let Some(writer) = self.writer.as_mut() else {
+            return Ok(());
+        };
+        writer.rollback_failed_write().await.map_err(|rollback_err| {
+            IoError::new(
+                rollback_err.kind(),
+                format!(
+                    "rollout write failed ({write_err}) and the partial record could not be rolled back: {rollback_err}"
+                ),
+            )
+        })
     }
 
     fn is_deferred(&self) -> bool {
@@ -1668,9 +1695,7 @@ impl RolloutWriterState {
             .map(|info| info.path.as_path())
             .unwrap_or(self.rollout_path.as_path());
         let file = open_log_file(path)?;
-        self.writer = Some(JsonlWriter {
-            file: tokio::fs::File::from_std(file),
-        });
+        self.writer = Some(JsonlWriter::new(tokio::fs::File::from_std(file)));
         self.deferred_log_file_info = None;
         Ok(())
     }
@@ -1686,6 +1711,11 @@ impl RolloutWriterState {
 
     async fn write_pending_once(&mut self) -> std::io::Result<()> {
         self.ensure_writer_open().await?;
+        if let Some(writer) = self.writer.as_mut() {
+            // A previous rollback can fail transiently. Never start another record until the
+            // original valid end-of-file has been restored.
+            writer.rollback_failed_write().await?;
+        }
         self.write_session_meta_if_needed().await?;
 
         self.write_pending_items_once().await?;
@@ -1797,12 +1827,15 @@ pub async fn append_rollout_item_to_path(
         .append(true)
         .open(rollout_path)
         .await?;
-    let mut writer = JsonlWriter { file };
+    let mut writer = JsonlWriter::new(file);
     writer.write_rollout_item(item).await
 }
 
 struct JsonlWriter {
     file: tokio::fs::File,
+    failed_write_offset: Option<u64>,
+    #[cfg(test)]
+    fail_next_write_after_bytes: Option<usize>,
 }
 
 #[derive(serde::Serialize)]
@@ -1813,6 +1846,29 @@ struct RolloutLineRef<'a> {
 }
 
 impl JsonlWriter {
+    fn new(file: tokio::fs::File) -> Self {
+        Self {
+            file,
+            failed_write_offset: None,
+            #[cfg(test)]
+            fail_next_write_after_bytes: None,
+        }
+    }
+
+    async fn rollback_failed_write(&mut self) -> std::io::Result<()> {
+        let Some(valid_offset) = self.failed_write_offset else {
+            return Ok(());
+        };
+        // Some failures (for example a read-only handle) occur before writing any bytes. Avoid
+        // requiring truncate permission when the file is already at the saved valid boundary.
+        if self.file.metadata().await?.len() != valid_offset {
+            self.file.set_len(valid_offset).await?;
+            self.file.sync_data().await?;
+        }
+        self.failed_write_offset = None;
+        Ok(())
+    }
+
     async fn write_rollout_item(&mut self, rollout_item: &RolloutItem) -> std::io::Result<()> {
         let timestamp_format: &[FormatItem] = format_description!(
             "[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:3]Z"
@@ -1830,8 +1886,19 @@ impl JsonlWriter {
     async fn write_line(&mut self, item: &impl serde::Serialize) -> std::io::Result<()> {
         let mut json = serde_json::to_string(item)?;
         json.push('\n');
+        self.failed_write_offset = Some(self.file.metadata().await?.len());
+        #[cfg(test)]
+        if let Some(byte_count) = self.fail_next_write_after_bytes.take() {
+            let prefix_len = byte_count.clamp(1, json.len().saturating_sub(1));
+            self.file.write_all(&json.as_bytes()[..prefix_len]).await?;
+            self.file.flush().await?;
+            return Err(IoError::other(
+                "injected rollout failure after partial record write",
+            ));
+        }
         self.file.write_all(json.as_bytes()).await?;
         self.file.flush().await?;
+        self.failed_write_offset = None;
         Ok(())
     }
 }

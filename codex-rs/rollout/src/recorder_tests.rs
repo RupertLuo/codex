@@ -8,6 +8,8 @@ use codex_protocol::ThreadId;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::AgentMessageEvent;
 use codex_protocol::protocol::AskForApproval;
+use codex_protocol::protocol::CompactedItem;
+use codex_protocol::protocol::CompactionCheckpoint;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::RolloutLine;
@@ -17,6 +19,7 @@ use codex_protocol::protocol::SessionMetaLine;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::ThreadHistoryMode;
 use codex_protocol::protocol::ThreadSource;
+use codex_protocol::protocol::TokenCountEvent;
 use codex_protocol::protocol::TurnContextItem;
 use codex_protocol::protocol::UserMessageEvent;
 use pretty_assertions::assert_eq;
@@ -619,6 +622,62 @@ async fn writer_state_retries_write_error_before_reporting_flush_success() -> st
         text_after_retry.contains("queued-after-writer-error"),
         "flush should retry after reopening and write buffered items"
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn writer_state_truncates_partial_checkpoint_before_internal_retry() -> std::io::Result<()> {
+    let home = TempDir::new().expect("temp dir");
+    let rollout_path = home.path().join("rollout.jsonl");
+    let file = File::create(&rollout_path)?;
+    let mut state = RolloutWriterState::new(
+        Some(tokio::fs::File::from_std(file)),
+        /*deferred_log_file_info*/ None,
+        /*meta*/ None,
+        home.path().to_path_buf(),
+        rollout_path.clone(),
+    );
+    let checkpoint_id = "checkpoint-after-partial-write";
+    state.add_items(vec![RolloutItem::Compacted(CompactedItem {
+        message: "summary".to_string(),
+        replacement_history: Some(Vec::new()),
+        window_number: Some(1),
+        first_window_id: None,
+        previous_window_id: None,
+        window_id: None,
+        checkpoint: Some(CompactionCheckpoint {
+            checkpoint_id: checkpoint_id.to_string(),
+            reference_context_item: None,
+            world_state: None,
+            api_token_count: TokenCountEvent {
+                info: None,
+                rate_limits: None,
+            },
+            final_token_count: TokenCountEvent {
+                info: None,
+                rate_limits: None,
+            },
+            server_reasoning_included: false,
+        }),
+    })]);
+    state.fail_next_write_after_bytes_for_test(128);
+
+    state.flush().await?;
+
+    let (items, _thread_id, parse_errors) =
+        RolloutRecorder::load_rollout_items(&rollout_path).await?;
+    assert_eq!(parse_errors, 0, "retry must not leave a malformed prefix");
+    let checkpoint_ids = items
+        .iter()
+        .filter_map(|item| match item {
+            RolloutItem::Compacted(compacted) => compacted
+                .checkpoint
+                .as_ref()
+                .map(|checkpoint| checkpoint.checkpoint_id.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(checkpoint_ids, vec![checkpoint_id]);
     Ok(())
 }
 

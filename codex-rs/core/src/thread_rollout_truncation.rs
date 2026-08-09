@@ -226,7 +226,41 @@ pub(crate) fn truncate_rollout_to_last_n_fork_turns(
     else {
         return Vec::new();
     };
-    items[keep_idx..].to_vec()
+
+    let mut forked_items = items[keep_idx..].to_vec();
+    forked_items.retain_mut(sanitize_last_n_fork_item);
+    forked_items
+}
+
+/// Remove thread-local recovery state from rollout items retained for a bounded child fork.
+///
+/// Replacement history and checkpoint IDs remain part of the child's inherited transcript.
+/// Context/world-state baselines, cumulative usage, reasoning accounting, and compaction-window
+/// identities belong to the parent thread and must be rebuilt by the child. Rate-limit snapshots
+/// are intentionally retained because they describe the account/provider rather than a thread.
+fn sanitize_last_n_fork_item(item: &mut RolloutItem) -> bool {
+    match item {
+        RolloutItem::TurnContext(_) | RolloutItem::WorldState(_) => false,
+        RolloutItem::EventMsg(EventMsg::TokenCount(token_count)) => {
+            token_count.info = None;
+            token_count.rate_limits.is_some()
+        }
+        RolloutItem::Compacted(compacted) => {
+            compacted.window_number = None;
+            compacted.first_window_id = None;
+            compacted.previous_window_id = None;
+            compacted.window_id = None;
+            if let Some(checkpoint) = compacted.checkpoint.as_mut() {
+                checkpoint.reference_context_item = None;
+                checkpoint.world_state = None;
+                checkpoint.api_token_count.info = None;
+                checkpoint.final_token_count.info = None;
+                checkpoint.server_reasoning_included = false;
+            }
+            true
+        }
+        _ => true,
+    }
 }
 
 fn is_real_user_message_boundary(item: &ResponseItem) -> bool {

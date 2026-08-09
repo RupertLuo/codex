@@ -1182,6 +1182,49 @@ impl Session {
         self.services.state_db.clone()
     }
 
+    pub(crate) fn persistence_quarantine_reason(&self) -> Option<String> {
+        self.persistence_quarantine
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    fn quarantine_persistence(&self, reason: String) {
+        let mut quarantine = self
+            .persistence_quarantine
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if quarantine.is_none() {
+            *quarantine = Some(reason);
+        }
+    }
+
+    pub(crate) fn ensure_persistence_not_quarantined(&self) -> anyhow::Result<()> {
+        if let Some(reason) = self.persistence_quarantine_reason() {
+            anyhow::bail!(reason);
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn reject_if_persistence_quarantined(&self, sub_id: &str) -> bool {
+        let Some(message) = self.persistence_quarantine_reason() else {
+            return false;
+        };
+        let event = Event {
+            id: sub_id.to_string(),
+            msg: EventMsg::Error(ErrorEvent {
+                message,
+                codex_error_info: Some(CodexErrorInfo::Other),
+            }),
+        };
+        self.services
+            .rollout_thread_trace
+            .record_protocol_event(&event.msg);
+        // Quarantine forbids additional rollout writes, including persistence of this error.
+        self.deliver_event_raw(event).await;
+        true
+    }
+
     pub(crate) fn live_thread_for_persistence(
         &self,
         operation: &str,
@@ -1197,6 +1240,8 @@ impl Session {
     /// Flush rollout writes and return the final durability-barrier result.
     #[instrument(name = "session.flush_rollout", level = "trace", skip_all)]
     pub(crate) async fn flush_rollout(&self) -> std::io::Result<()> {
+        self.ensure_persistence_not_quarantined()
+            .map_err(std::io::Error::other)?;
         if let Some(live_thread) = self.live_thread() {
             live_thread.flush().await.map_err(std::io::Error::other)
         } else {
@@ -1205,6 +1250,8 @@ impl Session {
     }
 
     pub(crate) async fn try_ensure_rollout_materialized(&self) -> std::io::Result<()> {
+        self.ensure_persistence_not_quarantined()
+            .map_err(std::io::Error::other)?;
         if let Some(live_thread) = self.live_thread() {
             live_thread.persist().await.map_err(std::io::Error::other)?;
         }
@@ -1225,9 +1272,16 @@ impl Session {
     }
 
     pub(crate) async fn route_realtime_text_input(self: &Arc<Self>, text: String) {
+        let sub_id = Uuid::now_v7().to_string();
+        if self
+            .reject_if_persistence_quarantined(sub_id.as_str())
+            .await
+        {
+            return;
+        }
         handlers::user_input_or_turn_inner(
             self,
-            Uuid::now_v7().to_string(),
+            sub_id,
             Op::UserInput {
                 items: vec![UserInput::Text {
                     text,
@@ -3240,12 +3294,14 @@ impl Session {
                     .map(ToString::to_string)
                     .collect::<Vec<_>>()
                     .join("; ");
-                return Err(CodexErr::Fatal(format!(
-                    "compaction checkpoint persistence outcome is uncertain for checkpoint \
-                     {checkpoint_id}; restart or reload the thread before relying on live state \
-                     (append error: {append_error}; reconciliation errors: \
+                let quarantine_reason = format!(
+                    "thread is quarantined because compaction checkpoint persistence outcome is \
+                     uncertain for checkpoint {checkpoint_id}; restart or reload the thread \
+                     before continuing (append error: {append_error}; reconciliation errors: \
                      {reconciliation_errors})"
-                )));
+                );
+                self.quarantine_persistence(quarantine_reason.clone());
+                return Err(CodexErr::Fatal(quarantine_reason));
             }
         }
 
@@ -3782,6 +3838,9 @@ impl Session {
         &self,
         items: &[RolloutItem],
     ) -> codex_thread_store::ThreadStoreResult<()> {
+        if let Some(message) = self.persistence_quarantine_reason() {
+            return Err(codex_thread_store::ThreadStoreError::InvalidRequest { message });
+        }
         let Some(live_thread) = self.live_thread() else {
             return Ok(());
         };
@@ -3792,6 +3851,11 @@ impl Session {
         &self,
         compacted_item: &CompactedItem,
     ) -> CompactionCheckpointAppendOutcome {
+        if let Some(message) = self.persistence_quarantine_reason() {
+            return CompactionCheckpointAppendOutcome::NotCommitted {
+                append_error: codex_thread_store::ThreadStoreError::InvalidRequest { message },
+            };
+        }
         let Some(live_thread) = self.live_thread() else {
             return CompactionCheckpointAppendOutcome::Committed;
         };
