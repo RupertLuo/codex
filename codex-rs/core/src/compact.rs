@@ -1,5 +1,6 @@
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 
@@ -114,6 +115,10 @@ struct CompactCommitTestHookInner {
     pause_task_start_before_gate: AtomicBool,
     task_start_before_gate_paused: Semaphore,
     release_task_start_before_gate: Semaphore,
+    pause_after_persistence_fatal: AtomicBool,
+    persistence_fatal_paused: Semaphore,
+    release_persistence_fatal: Semaphore,
+    turn_abort_lifecycle_calls: AtomicUsize,
 }
 
 impl CompactCommitTestHook {
@@ -133,6 +138,10 @@ impl CompactCommitTestHook {
                 pause_task_start_before_gate: AtomicBool::new(false),
                 task_start_before_gate_paused: Semaphore::new(0),
                 release_task_start_before_gate: Semaphore::new(0),
+                pause_after_persistence_fatal: AtomicBool::new(false),
+                persistence_fatal_paused: Semaphore::new(0),
+                release_persistence_fatal: Semaphore::new(0),
+                turn_abort_lifecycle_calls: AtomicUsize::new(0),
             }),
         }
     }
@@ -264,6 +273,52 @@ impl CompactCommitTestHook {
             return;
         };
         permit.forget();
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn pause_after_persistence_fatal_once(&self) {
+        self.inner
+            .pause_after_persistence_fatal
+            .store(true, Ordering::SeqCst);
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) async fn wait_until_persistence_fatal_paused(&self) {
+        let Ok(permit) = self.inner.persistence_fatal_paused.acquire().await else {
+            return;
+        };
+        permit.forget();
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn release_persistence_fatal(&self) {
+        self.inner.release_persistence_fatal.add_permits(1);
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn turn_abort_lifecycle_calls(&self) -> usize {
+        self.inner.turn_abort_lifecycle_calls.load(Ordering::SeqCst)
+    }
+
+    pub(crate) async fn pause_after_persistence_fatal_if_requested(&self) {
+        if !self
+            .inner
+            .pause_after_persistence_fatal
+            .swap(false, Ordering::SeqCst)
+        {
+            return;
+        }
+        self.inner.persistence_fatal_paused.add_permits(1);
+        let Ok(permit) = self.inner.release_persistence_fatal.acquire().await else {
+            return;
+        };
+        permit.forget();
+    }
+
+    pub(crate) fn notify_turn_abort_lifecycle(&self) {
+        self.inner
+            .turn_abort_lifecycle_calls
+            .fetch_add(1, Ordering::SeqCst);
     }
 }
 
@@ -767,6 +822,9 @@ async fn run_compact_task_inner_impl(
         if sess.is_persistence_uncertain_fatal(&err).await {
             sess.deliver_persistence_quarantine_error(&turn_context.sub_id, err.to_string())
                 .await;
+            if let Some(hook) = sess.services.compact_commit_test_hook.as_ref() {
+                hook.pause_after_persistence_fatal_if_requested().await;
+            }
             return Err(err);
         }
         let event = EventMsg::Error(err.to_error_event(/*message_prefix*/ None));

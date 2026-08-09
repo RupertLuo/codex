@@ -48,6 +48,7 @@ use codex_protocol::protocol::PatchApplyEndEvent;
 use codex_protocol::protocol::ReviewOutputEvent;
 use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::RolloutItemFlattener;
+use codex_protocol::protocol::RolloutItemTraversalError;
 use codex_protocol::protocol::ThreadRolledBackEvent;
 use codex_protocol::protocol::TurnAbortedEvent;
 use codex_protocol::protocol::TurnCompleteEvent;
@@ -77,12 +78,14 @@ use codex_protocol::protocol::PatchApplyStatus as CorePatchApplyStatus;
 ///
 /// When available, this uses `TurnContext.turn_id` as the canonical turn id so
 /// resumed/rebuilt thread history preserves the original turn identifiers.
-pub fn build_turns_from_rollout_items(items: &[RolloutItem]) -> Vec<Turn> {
+pub fn build_turns_from_rollout_items(
+    items: &[RolloutItem],
+) -> Result<Vec<Turn>, RolloutItemTraversalError> {
     let mut builder = ThreadHistoryBuilder::new();
     for item in items {
-        builder.handle_rollout_item(item);
+        builder.handle_rollout_item(item)?;
     }
-    builder.finish()
+    Ok(builder.finish())
 }
 
 /// A materialized `ThreadItem` snapshot that changed while handling one input.
@@ -381,20 +384,17 @@ impl ThreadHistoryBuilder {
         }
     }
 
-    pub fn handle_rollout_item(&mut self, item: &RolloutItem) {
-        let logical_items = match self
-            .rollout_item_flattener
-            .flatten(std::slice::from_ref(item))
-        {
-            Ok(items) => items,
-            Err(err) => {
-                tracing::warn!(%err, "failed to traverse app-server rollout history");
-                return;
-            }
-        };
+    pub fn handle_rollout_item(
+        &mut self,
+        item: &RolloutItem,
+    ) -> Result<(), RolloutItemTraversalError> {
+        let mut candidate_flattener = self.rollout_item_flattener.clone();
+        let logical_items = candidate_flattener.flatten(std::slice::from_ref(item))?;
         for item in logical_items {
             self.handle_logical_rollout_item(item);
         }
+        self.rollout_item_flattener = candidate_flattener;
+        Ok(())
     }
 
     fn handle_logical_rollout_item(&mut self, item: &RolloutItem) {
@@ -424,8 +424,13 @@ impl ThreadHistoryBuilder {
     pub fn handle_rollout_item_with_changes(
         &mut self,
         item: &RolloutItem,
-    ) -> ThreadHistoryChangeSet {
-        self.collect_changes(|builder| builder.handle_rollout_item(item))
+    ) -> Result<ThreadHistoryChangeSet, RolloutItemTraversalError> {
+        let before = self.active_change_set.take();
+        debug_assert!(before.is_none());
+        self.active_change_set = Some(ThreadHistoryChangeSet::default());
+        let result = self.handle_rollout_item(item);
+        let changes = self.active_change_set.take().unwrap_or_default();
+        result.map(|()| changes)
     }
 
     /// Handles rollout items in order and returns a coalesced end-of-batch
@@ -434,12 +439,12 @@ impl ThreadHistoryBuilder {
     pub fn handle_rollout_items_with_changes(
         &mut self,
         items: &[RolloutItem],
-    ) -> ThreadHistoryChangeSet {
+    ) -> Result<ThreadHistoryChangeSet, RolloutItemTraversalError> {
         let mut accumulator = ThreadHistoryChangeAccumulator::default();
         for item in items {
-            accumulator.push(self.handle_rollout_item_with_changes(item));
+            accumulator.push(self.handle_rollout_item_with_changes(item)?);
         }
-        accumulator.finish()
+        Ok(accumulator.finish())
     }
 
     fn collect_changes(&mut self, handle: impl FnOnce(&mut Self)) -> ThreadHistoryChangeSet {
@@ -1595,6 +1600,7 @@ mod tests {
     use codex_protocol::protocol::McpInvocation;
     use codex_protocol::protocol::McpToolCallEndEvent;
     use codex_protocol::protocol::PatchApplyBeginEvent;
+    use codex_protocol::protocol::RolloutTransaction;
     use codex_protocol::protocol::ThreadRolledBackEvent;
     use codex_protocol::protocol::TurnAbortReason;
     use codex_protocol::protocol::TurnAbortedEvent;
@@ -1734,7 +1740,8 @@ mod tests {
             },
         ))];
 
-        let turns = build_turns_from_rollout_items(&events);
+        let turns =
+            build_turns_from_rollout_items(&events).expect("test rollout history should traverse");
 
         assert_eq!(turns.len(), 1);
         assert_eq!(
@@ -1803,7 +1810,8 @@ mod tests {
             .into_iter()
             .map(RolloutItem::EventMsg)
             .collect::<Vec<_>>();
-        let turns = build_turns_from_rollout_items(&items);
+        let turns =
+            build_turns_from_rollout_items(&items).expect("test rollout history should traverse");
         assert_eq!(turns.len(), 1);
         assert_eq!(turns[0].items.len(), 1);
         assert_eq!(
@@ -1854,7 +1862,8 @@ mod tests {
             .into_iter()
             .map(RolloutItem::EventMsg)
             .collect::<Vec<_>>();
-        let turns = build_turns_from_rollout_items(&items);
+        let turns =
+            build_turns_from_rollout_items(&items).expect("test rollout history should traverse");
 
         assert_eq!(turns.len(), 1);
         assert_eq!(
@@ -1915,7 +1924,8 @@ mod tests {
             .into_iter()
             .map(RolloutItem::EventMsg)
             .collect::<Vec<_>>();
-        let turns = build_turns_from_rollout_items(&items);
+        let turns =
+            build_turns_from_rollout_items(&items).expect("test rollout history should traverse");
 
         assert_eq!(turns.len(), 1);
         assert_eq!(
@@ -1983,7 +1993,8 @@ mod tests {
             .into_iter()
             .map(RolloutItem::EventMsg)
             .collect::<Vec<_>>();
-        let turns = build_turns_from_rollout_items(&items);
+        let turns =
+            build_turns_from_rollout_items(&items).expect("test rollout history should traverse");
         assert_eq!(turns.len(), 1);
         assert_eq!(
             turns[0].items,
@@ -2010,7 +2021,8 @@ mod tests {
             .into_iter()
             .map(RolloutItem::EventMsg)
             .collect::<Vec<_>>();
-        let turns = build_turns_from_rollout_items(&items);
+        let turns =
+            build_turns_from_rollout_items(&items).expect("test rollout history should traverse");
         assert_eq!(turns.len(), 1);
         assert_eq!(
             turns[0].items[0],
@@ -2057,7 +2069,8 @@ mod tests {
             })),
         ];
 
-        let turns = build_turns_from_rollout_items(&items);
+        let turns =
+            build_turns_from_rollout_items(&items).expect("test rollout history should traverse");
         assert_eq!(turns.len(), 1);
         assert_eq!(
             turns[0],
@@ -2121,7 +2134,8 @@ mod tests {
             .into_iter()
             .map(RolloutItem::EventMsg)
             .collect::<Vec<_>>();
-        let turns = build_turns_from_rollout_items(&items);
+        let turns =
+            build_turns_from_rollout_items(&items).expect("test rollout history should traverse");
         assert_eq!(turns.len(), 1);
         let turn = &turns[0];
         assert_eq!(turn.items.len(), 4);
@@ -2185,7 +2199,8 @@ mod tests {
             .into_iter()
             .map(RolloutItem::EventMsg)
             .collect::<Vec<_>>();
-        let turns = build_turns_from_rollout_items(&items);
+        let turns =
+            build_turns_from_rollout_items(&items).expect("test rollout history should traverse");
         assert_eq!(turns.len(), 2);
 
         let first_turn = &turns[0];
@@ -2286,7 +2301,8 @@ mod tests {
             .into_iter()
             .map(RolloutItem::EventMsg)
             .collect::<Vec<_>>();
-        let turns = build_turns_from_rollout_items(&items);
+        let turns =
+            build_turns_from_rollout_items(&items).expect("test rollout history should traverse");
         assert_eq!(turns.len(), 2);
         assert_eq!(turns[0].id, "rollout-0");
         assert_eq!(turns[1].id, "rollout-5");
@@ -2369,7 +2385,8 @@ mod tests {
             .into_iter()
             .map(RolloutItem::EventMsg)
             .collect::<Vec<_>>();
-        let turns = build_turns_from_rollout_items(&items);
+        let turns =
+            build_turns_from_rollout_items(&items).expect("test rollout history should traverse");
         assert_eq!(turns, Vec::<Turn>::new());
     }
 
@@ -2412,7 +2429,8 @@ mod tests {
             .into_iter()
             .map(RolloutItem::EventMsg)
             .collect::<Vec<_>>();
-        let turns = build_turns_from_rollout_items(&items);
+        let turns =
+            build_turns_from_rollout_items(&items).expect("test rollout history should traverse");
         assert_eq!(turns.len(), 1);
         assert_eq!(turns[0].id, "turn-a");
         assert_eq!(
@@ -2507,7 +2525,8 @@ mod tests {
             .into_iter()
             .map(RolloutItem::EventMsg)
             .collect::<Vec<_>>();
-        let turns = build_turns_from_rollout_items(&items);
+        let turns =
+            build_turns_from_rollout_items(&items).expect("test rollout history should traverse");
         assert_eq!(turns.len(), 1);
         assert_eq!(turns[0].items.len(), 4);
         assert_eq!(
@@ -2601,7 +2620,8 @@ mod tests {
             .into_iter()
             .map(RolloutItem::EventMsg)
             .collect::<Vec<_>>();
-        let turns = build_turns_from_rollout_items(&items);
+        let turns =
+            build_turns_from_rollout_items(&items).expect("test rollout history should traverse");
         assert_eq!(turns.len(), 1);
         assert_eq!(
             turns[0].items[0],
@@ -2685,7 +2705,8 @@ mod tests {
             .into_iter()
             .map(RolloutItem::EventMsg)
             .collect::<Vec<_>>();
-        let turns = build_turns_from_rollout_items(&items);
+        let turns =
+            build_turns_from_rollout_items(&items).expect("test rollout history should traverse");
         assert_eq!(turns.len(), 1);
         assert_eq!(turns[0].items.len(), 2);
         assert_eq!(
@@ -2763,7 +2784,8 @@ mod tests {
             .into_iter()
             .map(RolloutItem::EventMsg)
             .collect::<Vec<_>>();
-        let turns = build_turns_from_rollout_items(&items);
+        let turns =
+            build_turns_from_rollout_items(&items).expect("test rollout history should traverse");
         assert_eq!(turns.len(), 1);
         assert_eq!(turns[0].items.len(), 3);
         assert_eq!(
@@ -2861,7 +2883,8 @@ mod tests {
             .into_iter()
             .map(RolloutItem::EventMsg)
             .collect::<Vec<_>>();
-        let turns = build_turns_from_rollout_items(&items);
+        let turns =
+            build_turns_from_rollout_items(&items).expect("test rollout history should traverse");
         assert_eq!(turns.len(), 1);
         assert_eq!(turns[0].items.len(), 2);
         assert_eq!(
@@ -2927,7 +2950,8 @@ mod tests {
             .into_iter()
             .map(RolloutItem::EventMsg)
             .collect::<Vec<_>>();
-        let turns = build_turns_from_rollout_items(&items);
+        let turns =
+            build_turns_from_rollout_items(&items).expect("test rollout history should traverse");
         assert_eq!(turns.len(), 1);
         assert_eq!(turns[0].items.len(), 2);
         assert_eq!(
@@ -3022,7 +3046,8 @@ mod tests {
             .into_iter()
             .map(RolloutItem::EventMsg)
             .collect::<Vec<_>>();
-        let turns = build_turns_from_rollout_items(&items);
+        let turns =
+            build_turns_from_rollout_items(&items).expect("test rollout history should traverse");
         assert_eq!(turns.len(), 2);
         assert_eq!(turns[0].id, "turn-a");
         assert_eq!(turns[1].id, "turn-b");
@@ -3342,7 +3367,8 @@ mod tests {
             .into_iter()
             .map(RolloutItem::EventMsg)
             .collect::<Vec<_>>();
-        let turns = build_turns_from_rollout_items(&items);
+        let turns =
+            build_turns_from_rollout_items(&items).expect("test rollout history should traverse");
         assert_eq!(turns.len(), 2);
         assert_eq!(turns[0].id, "turn-a");
         assert_eq!(turns[1].id, "turn-b");
@@ -3406,7 +3432,8 @@ mod tests {
             .into_iter()
             .map(RolloutItem::EventMsg)
             .collect::<Vec<_>>();
-        let turns = build_turns_from_rollout_items(&items);
+        let turns =
+            build_turns_from_rollout_items(&items).expect("test rollout history should traverse");
         assert_eq!(turns.len(), 2);
         assert_eq!(turns[0].id, "turn-a");
         assert_eq!(turns[1].id, "turn-b");
@@ -3442,7 +3469,8 @@ mod tests {
             })),
         ];
 
-        let turns = build_turns_from_rollout_items(&items);
+        let turns =
+            build_turns_from_rollout_items(&items).expect("test rollout history should traverse");
         assert_eq!(
             turns,
             vec![Turn {
@@ -3486,7 +3514,8 @@ mod tests {
             .into_iter()
             .map(RolloutItem::EventMsg)
             .collect::<Vec<_>>();
-        let turns = build_turns_from_rollout_items(&items);
+        let turns =
+            build_turns_from_rollout_items(&items).expect("test rollout history should traverse");
         assert_eq!(turns.len(), 1);
         assert_eq!(turns[0].items.len(), 2);
         assert_eq!(
@@ -3546,7 +3575,8 @@ mod tests {
             .into_iter()
             .map(RolloutItem::EventMsg)
             .collect::<Vec<_>>();
-        let turns = build_turns_from_rollout_items(&items);
+        let turns =
+            build_turns_from_rollout_items(&items).expect("test rollout history should traverse");
         assert_eq!(turns.len(), 1);
         assert_eq!(turns[0].items.len(), 2);
         assert_eq!(
@@ -3618,7 +3648,8 @@ mod tests {
             .into_iter()
             .map(RolloutItem::EventMsg)
             .collect::<Vec<_>>();
-        let turns = build_turns_from_rollout_items(&items);
+        let turns =
+            build_turns_from_rollout_items(&items).expect("test rollout history should traverse");
         assert_eq!(turns.len(), 1);
         assert_eq!(turns[0].items.len(), 2);
         assert_eq!(
@@ -3671,7 +3702,8 @@ mod tests {
             .into_iter()
             .map(RolloutItem::EventMsg)
             .collect::<Vec<_>>();
-        let turns = build_turns_from_rollout_items(&items);
+        let turns =
+            build_turns_from_rollout_items(&items).expect("test rollout history should traverse");
         assert_eq!(turns.len(), 1);
         assert_eq!(turns[0].status, TurnStatus::Completed);
         assert_eq!(turns[0].error, None);
@@ -3712,7 +3744,8 @@ mod tests {
             .into_iter()
             .map(RolloutItem::EventMsg)
             .collect::<Vec<_>>();
-        let turns = build_turns_from_rollout_items(&items);
+        let turns =
+            build_turns_from_rollout_items(&items).expect("test rollout history should traverse");
         assert_eq!(turns.len(), 1);
         assert_eq!(
             turns[0],
@@ -3773,7 +3806,8 @@ mod tests {
             .into_iter()
             .map(RolloutItem::EventMsg)
             .collect::<Vec<_>>();
-        let turns = build_turns_from_rollout_items(&items);
+        let turns =
+            build_turns_from_rollout_items(&items).expect("test rollout history should traverse");
         assert_eq!(turns.len(), 1);
         assert_eq!(turns[0].id, "turn-a");
         assert_eq!(turns[0].status, TurnStatus::Failed);
@@ -3824,7 +3858,8 @@ mod tests {
             })),
         ];
 
-        let turns = build_turns_from_rollout_items(&items);
+        let turns =
+            build_turns_from_rollout_items(&items).expect("test rollout history should traverse");
 
         assert_eq!(turns.len(), 1);
         assert_eq!(turns[0].items.len(), 2);
@@ -3874,7 +3909,8 @@ mod tests {
             })),
         ];
 
-        let turns = build_turns_from_rollout_items(&items);
+        let turns =
+            build_turns_from_rollout_items(&items).expect("test rollout history should traverse");
         assert_eq!(turns.len(), 1);
         assert!(turns[0].items.is_empty());
     }
@@ -3895,7 +3931,7 @@ mod tests {
         ));
 
         assert_eq!(
-            changes,
+            changes.expect("test rollout item should traverse"),
             ThreadHistoryChangeSet {
                 changed_items: vec![ThreadHistoryItemChange {
                     turn_id: "rollout-0".into(),
@@ -3924,11 +3960,11 @@ mod tests {
     #[test]
     fn changed_rollout_item_reports_updated_existing_item_snapshot() {
         let mut builder = ThreadHistoryBuilder::new();
-        builder.handle_rollout_item_with_changes(&RolloutItem::EventMsg(EventMsg::WebSearchBegin(
-            WebSearchBeginEvent {
+        let _ = builder.handle_rollout_item_with_changes(&RolloutItem::EventMsg(
+            EventMsg::WebSearchBegin(WebSearchBeginEvent {
                 call_id: "search-1".into(),
-            },
-        )));
+            }),
+        ));
 
         let changes = builder.handle_rollout_item_with_changes(&RolloutItem::EventMsg(
             EventMsg::WebSearchEnd(WebSearchEndEvent {
@@ -3942,7 +3978,7 @@ mod tests {
         ));
 
         assert_eq!(
-            changes,
+            changes.expect("test rollout item should traverse"),
             ThreadHistoryChangeSet {
                 changed_items: vec![ThreadHistoryItemChange {
                     turn_id: "rollout-0".into(),
@@ -3964,11 +4000,11 @@ mod tests {
     #[test]
     fn changed_rollout_item_reports_streaming_item_mutation() {
         let mut builder = ThreadHistoryBuilder::new();
-        builder.handle_rollout_item_with_changes(&RolloutItem::EventMsg(EventMsg::AgentReasoning(
-            AgentReasoningEvent {
+        let _ = builder.handle_rollout_item_with_changes(&RolloutItem::EventMsg(
+            EventMsg::AgentReasoning(AgentReasoningEvent {
                 text: "summary".into(),
-            },
-        )));
+            }),
+        ));
 
         let changes = builder.handle_rollout_item_with_changes(&RolloutItem::EventMsg(
             EventMsg::AgentReasoningRawContent(AgentReasoningRawContentEvent {
@@ -3977,7 +4013,7 @@ mod tests {
         ));
 
         assert_eq!(
-            changes,
+            changes.expect("test rollout item should traverse"),
             ThreadHistoryChangeSet {
                 changed_items: vec![ThreadHistoryItemChange {
                     turn_id: "rollout-0".into(),
@@ -4007,7 +4043,7 @@ mod tests {
             }),
         ));
         assert_eq!(
-            start_changes,
+            start_changes.expect("test rollout item should traverse"),
             ThreadHistoryChangeSet {
                 changed_items: Vec::new(),
                 changed_turns: vec![ThreadHistoryTurnChange {
@@ -4022,16 +4058,16 @@ mod tests {
             }
         );
 
-        builder.handle_rollout_item_with_changes(&RolloutItem::EventMsg(EventMsg::UserMessage(
-            UserMessageEvent {
+        let _ = builder.handle_rollout_item_with_changes(&RolloutItem::EventMsg(
+            EventMsg::UserMessage(UserMessageEvent {
                 client_id: None,
                 message: "hello".into(),
                 images: None,
                 text_elements: Vec::new(),
                 local_images: Vec::new(),
                 ..Default::default()
-            },
-        )));
+            }),
+        ));
         let complete_changes = builder.handle_rollout_item_with_changes(&RolloutItem::EventMsg(
             EventMsg::TurnComplete(TurnCompleteEvent {
                 turn_id: "turn-a".into(),
@@ -4043,7 +4079,7 @@ mod tests {
         ));
 
         assert_eq!(
-            complete_changes,
+            complete_changes.expect("test rollout item should traverse"),
             ThreadHistoryChangeSet {
                 changed_items: Vec::new(),
                 changed_turns: vec![ThreadHistoryTurnChange {
@@ -4077,7 +4113,7 @@ mod tests {
         ]);
 
         assert_eq!(
-            changes,
+            changes.expect("test rollout item should traverse"),
             ThreadHistoryChangeSet {
                 changed_items: vec![ThreadHistoryItemChange {
                     turn_id: "rollout-0".into(),
@@ -4124,7 +4160,7 @@ mod tests {
         ]);
 
         assert_eq!(
-            changes,
+            changes.expect("test rollout item should traverse"),
             ThreadHistoryChangeSet {
                 changed_items: Vec::new(),
                 changed_turns: vec![ThreadHistoryTurnChange {
@@ -4165,12 +4201,50 @@ mod tests {
         ]);
 
         assert_eq!(
-            changes,
+            changes.expect("test rollout item should traverse"),
             ThreadHistoryChangeSet {
                 changed_items: Vec::new(),
                 changed_turns: Vec::new(),
                 removed_turn_ids: vec!["turn-a".into()],
             }
         );
+    }
+
+    #[test]
+    fn rollout_traversal_error_is_explicit_and_does_not_poison_builder() {
+        let mut nested = RolloutItem::EventMsg(EventMsg::UserMessage(UserMessageEvent {
+            message: "too deep".into(),
+            ..Default::default()
+        }));
+        for depth in 0..34 {
+            nested = RolloutItem::Transaction(RolloutTransaction {
+                transaction_id: if depth == 33 {
+                    "retry-id".to_string()
+                } else {
+                    format!("nested-{depth}")
+                },
+                items: vec![nested],
+            });
+        }
+
+        let mut builder = ThreadHistoryBuilder::new();
+        assert!(matches!(
+            builder.handle_rollout_item(&nested),
+            Err(RolloutItemTraversalError::TransactionDepthExceeded { .. })
+        ));
+        assert!(builder.active_turn_snapshot().is_none());
+
+        builder
+            .handle_rollout_item(&RolloutItem::Transaction(RolloutTransaction {
+                transaction_id: "retry-id".to_string(),
+                items: vec![RolloutItem::EventMsg(EventMsg::UserMessage(
+                    UserMessageEvent {
+                        message: "accepted".into(),
+                        ..Default::default()
+                    },
+                ))],
+            }))
+            .expect("valid retry should traverse");
+        assert_eq!(builder.active_turn_snapshot().unwrap().items.len(), 1);
     }
 }

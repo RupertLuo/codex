@@ -94,6 +94,22 @@ impl CompactCommitTestHook {
     pub fn release_task_start_before_gate(&self) {
         self.0.release_task_start_before_gate();
     }
+
+    pub fn pause_after_persistence_fatal_once(&self) {
+        self.0.pause_after_persistence_fatal_once();
+    }
+
+    pub async fn wait_until_persistence_fatal_paused(&self) {
+        self.0.wait_until_persistence_fatal_paused().await;
+    }
+
+    pub fn release_persistence_fatal(&self) {
+        self.0.release_persistence_fatal();
+    }
+
+    pub fn turn_abort_lifecycle_calls(&self) -> usize {
+        self.0.turn_abort_lifecycle_calls()
+    }
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -211,6 +227,43 @@ pub async fn direct_mutation_test_snapshot(thread: &CodexThread) -> DirectMutati
         has_active_turn,
         has_pending_input,
     }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub async fn context_persistence_test_snapshot(
+    thread: &CodexThread,
+) -> (
+    Option<codex_protocol::protocol::TurnContextItem>,
+    Option<serde_json::Value>,
+) {
+    thread.context_persistence_test_snapshot().await
+}
+
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub async fn record_step_world_state_from_empty_for_test(
+    thread: &CodexThread,
+) -> codex_thread_store::ThreadStoreResult<()> {
+    thread.record_step_world_state_from_empty_for_test().await
+}
+
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub async fn record_deferred_context_update_for_test(
+    thread: &CodexThread,
+) -> codex_thread_store::ThreadStoreResult<()> {
+    thread.record_deferred_context_update_for_test().await
+}
+
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub async fn establish_stale_deferred_context_baseline_for_test(
+    thread: &CodexThread,
+) -> codex_thread_store::ThreadStoreResult<()> {
+    thread
+        .establish_stale_deferred_context_baseline_for_test()
+        .await
 }
 
 #[cfg(any(test, feature = "test-support"))]

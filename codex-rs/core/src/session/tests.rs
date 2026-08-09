@@ -212,8 +212,10 @@ async fn record_step_world_state_failure_does_not_advance_baseline() {
         .await
         .history
         .set_world_state_baseline(previous_snapshot.clone());
-    *session.persistence_lifecycle.lock().await =
-        PersistenceLifecycle::Quarantined("injected persistence failure".to_string());
+    *session.persistence_lifecycle.lock().await = PersistenceLifecycle::Quarantined {
+        reason: "injected persistence failure".to_string(),
+        transition_owner: "injected-owner".to_string(),
+    };
     let step_context = StepContext::for_test(Arc::new(turn_context));
 
     let _ = session
@@ -237,7 +239,10 @@ async fn initial_context_persistence_failure_does_not_install_world_state_baseli
     let (session, turn_context) = make_session_and_context().await;
     let step_context = StepContext::for_test(Arc::new(turn_context));
     let mut lifecycle = session.persistence_lifecycle.lock().await;
-    *lifecycle = PersistenceLifecycle::Quarantined("injected persistence failure".to_string());
+    *lifecycle = PersistenceLifecycle::Quarantined {
+        reason: "injected persistence failure".to_string(),
+        transition_owner: "injected-owner".to_string(),
+    };
 
     let result = session
         .record_context_updates_and_set_reference_context_item_with_guard(
@@ -2827,7 +2832,8 @@ async fn start_new_context_window_assigns_and_persists_item_ids() {
 
     session
         .start_new_context_window(turn_context.as_ref(), world_state)
-        .await;
+        .await
+        .expect("new context window should commit");
 
     let live_history = session.clone_history().await;
     assert!(!live_history.raw_items().is_empty());
@@ -2845,17 +2851,19 @@ async fn start_new_context_window_assigns_and_persists_item_ids() {
     else {
         panic!("expected resumed rollout history");
     };
-    let persisted_replacement_history = resumed.history.iter().rev().find_map(|item| match item {
-        RolloutItem::Compacted(compacted) => compacted.replacement_history.as_ref(),
-        RolloutItem::SessionMeta(_)
-        | RolloutItem::ResponseItem(_)
-        | RolloutItem::InterAgentCommunication(_)
-        | RolloutItem::InterAgentCommunicationMetadata { .. }
-        | RolloutItem::TurnContext(_)
-        | RolloutItem::WorldState(_)
-        | RolloutItem::Transaction(_)
-        | RolloutItem::EventMsg(_) => None,
-    });
+    let flattened = flatten_rollout_items(&resumed.history).expect("flatten compact transaction");
+    let persisted_replacement_history =
+        flattened.items().iter().rev().find_map(|item| match item {
+            RolloutItem::Compacted(compacted) => compacted.replacement_history.as_ref(),
+            RolloutItem::SessionMeta(_)
+            | RolloutItem::ResponseItem(_)
+            | RolloutItem::InterAgentCommunication(_)
+            | RolloutItem::InterAgentCommunicationMetadata { .. }
+            | RolloutItem::TurnContext(_)
+            | RolloutItem::WorldState(_)
+            | RolloutItem::Transaction(_)
+            | RolloutItem::EventMsg(_) => None,
+        });
     assert_eq!(
         persisted_replacement_history.map(Vec::as_slice),
         Some(live_history.raw_items())

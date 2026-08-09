@@ -1147,13 +1147,9 @@ async fn read_head_summary(path: &Path, head_limit: usize) -> io::Result<HeadTai
             }
         };
 
-        let logical_items = match flattener.flatten(std::slice::from_ref(&rollout_line.item)) {
-            Ok(items) => items,
-            Err(err) => {
-                tracing::warn!(%err, path = %path.display(), "failed to traverse rollout summary");
-                continue;
-            }
-        };
+        let logical_items = flattener
+            .flatten(std::slice::from_ref(&rollout_line.item))
+            .map_err(io::Error::other)?;
         for item in logical_items {
             match item {
                 RolloutItem::SessionMeta(session_meta_line) => {
@@ -1244,13 +1240,9 @@ pub async fn read_head_for_summary(path: &Path) -> io::Result<Vec<serde_json::Va
             continue;
         }
         if let Ok(rollout_line) = serde_json::from_str::<RolloutLine>(trimmed) {
-            let logical_items = match flattener.flatten(std::slice::from_ref(&rollout_line.item)) {
-                Ok(items) => items,
-                Err(err) => {
-                    tracing::warn!(%err, path = %path.display(), "failed to traverse rollout head");
-                    continue;
-                }
-            };
+            let logical_items = flattener
+                .flatten(std::slice::from_ref(&rollout_line.item))
+                .map_err(io::Error::other)?;
             for item in logical_items {
                 if head.len() >= HEAD_RECORD_LIMIT {
                     break;

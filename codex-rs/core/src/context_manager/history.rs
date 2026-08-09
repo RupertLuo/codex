@@ -117,7 +117,7 @@ impl ContextManager {
         self.world_state_baseline = Some(snapshot);
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn world_state_baseline_for_test(&self) -> Option<WorldStateSnapshot> {
         self.world_state_baseline.clone()
     }

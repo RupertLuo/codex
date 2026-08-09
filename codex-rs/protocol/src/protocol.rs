@@ -3238,7 +3238,7 @@ pub struct FlattenedRolloutItems<'a> {
 }
 
 /// Stateful bounded flattener for readers that consume rollout records incrementally.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct RolloutItemFlattener {
     limits: RolloutItemTraversalLimits,
     transaction_ids: HashSet<String>,

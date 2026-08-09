@@ -326,6 +326,20 @@ pub(crate) struct PreparedCompactionCommit {
     update_auto_compact_prefill: bool,
 }
 
+#[derive(Default)]
+struct ConversationPersistenceInstall {
+    world_state_baseline: Option<WorldStateSnapshot>,
+    reference_context_item: Option<TurnContextItem>,
+}
+
+struct ConversationPersistenceEnvelope {
+    transaction_id: String,
+    transaction: Option<codex_protocol::protocol::RolloutTransaction>,
+    response_items: Vec<ResponseItem>,
+    raw_events: Vec<EventMsg>,
+    install: ConversationPersistenceInstall,
+}
+
 #[cfg(test)]
 use crate::SkillMetadata;
 use crate::SkillsService;
@@ -1201,7 +1215,7 @@ impl Session {
         let lifecycle = self.persistence_lifecycle.lock().await;
         match &*lifecycle {
             PersistenceLifecycle::Writable => None,
-            PersistenceLifecycle::Quarantined(reason) => Some(reason.clone()),
+            PersistenceLifecycle::Quarantined { reason, .. } => Some(reason.clone()),
         }
     }
 
@@ -1212,9 +1226,16 @@ impl Session {
         self.persistence_quarantine_reason().await.as_deref() == Some(reason.as_str())
     }
 
-    pub(crate) fn quarantine_persistence(lifecycle: &mut PersistenceLifecycle, reason: String) {
+    pub(crate) fn quarantine_persistence(
+        lifecycle: &mut PersistenceLifecycle,
+        reason: String,
+        transition_owner: &str,
+    ) {
         if matches!(lifecycle, PersistenceLifecycle::Writable) {
-            *lifecycle = PersistenceLifecycle::Quarantined(reason);
+            *lifecycle = PersistenceLifecycle::Quarantined {
+                reason,
+                transition_owner: transition_owner.to_string(),
+            };
         }
     }
 
@@ -1222,10 +1243,16 @@ impl Session {
         &self,
     ) -> anyhow::Result<tokio::sync::MutexGuard<'_, PersistenceLifecycle>> {
         let lifecycle = self.persistence_lifecycle.lock().await;
-        if let PersistenceLifecycle::Quarantined(reason) = &*lifecycle {
+        if let PersistenceLifecycle::Quarantined { reason, .. } = &*lifecycle {
             anyhow::bail!(reason.clone());
         }
         Ok(lifecycle)
+    }
+
+    pub(crate) async fn acquire_persistence_task_cleanup_capability(
+        &self,
+    ) -> tokio::sync::MutexGuard<'_, PersistenceLifecycle> {
+        self.persistence_lifecycle.lock().await
     }
 
     pub(crate) async fn reject_if_persistence_quarantined(&self, sub_id: &str) -> bool {
@@ -3060,6 +3087,10 @@ impl Session {
         }
     }
 
+    #[allow(
+        clippy::await_holding_invalid_type,
+        reason = "the lifecycle guard serializes durable append with live history installation"
+    )]
     pub(crate) async fn try_record_conversation_items(
         &self,
         turn_context: &TurnContext,
@@ -3077,7 +3108,7 @@ impl Session {
             .await
     }
 
-    async fn try_record_conversation_items_with_guard(
+    pub(crate) async fn try_record_conversation_items_with_guard(
         &self,
         lifecycle: &mut tokio::sync::MutexGuard<'_, PersistenceLifecycle>,
         turn_context: &TurnContext,
@@ -3099,23 +3130,54 @@ impl Session {
         items: &[ResponseItem],
         transaction_prefix: &[RolloutItem],
     ) -> codex_thread_store::ThreadStoreResult<()> {
-        if let PersistenceLifecycle::Quarantined(reason) = &**lifecycle {
+        self.try_record_conversation_items_with_guard_and_envelope(
+            lifecycle,
+            turn_context,
+            items,
+            transaction_prefix,
+            &[],
+            ConversationPersistenceInstall::default(),
+        )
+        .await
+    }
+
+    async fn try_record_conversation_items_with_guard_and_envelope(
+        &self,
+        lifecycle: &mut tokio::sync::MutexGuard<'_, PersistenceLifecycle>,
+        turn_context: &TurnContext,
+        items: &[ResponseItem],
+        transaction_prefix: &[RolloutItem],
+        transaction_suffix: &[RolloutItem],
+        install: ConversationPersistenceInstall,
+    ) -> codex_thread_store::ThreadStoreResult<()> {
+        if let PersistenceLifecycle::Quarantined { reason, .. } = &**lifecycle {
             return Err(codex_thread_store::ThreadStoreError::InvalidRequest {
                 message: reason.clone(),
             });
         }
-        let items = self.prepare_conversation_items_for_history(turn_context, items);
-        let items = items.as_ref();
-        let raw_events = items
+        let response_items = self
+            .prepare_conversation_items_for_history(turn_context, items)
+            .into_owned();
+        let raw_events = response_items
             .iter()
             .cloned()
             .map(|item| EventMsg::RawResponseItem(RawResponseItemEvent { item }))
             .collect::<Vec<_>>();
-        let mut rollout_items =
-            Vec::with_capacity(transaction_prefix.len() + items.len() + raw_events.len());
+        let mut rollout_items = Vec::with_capacity(
+            transaction_prefix.len()
+                + response_items.len()
+                + raw_events.len()
+                + transaction_suffix.len(),
+        );
         rollout_items.extend_from_slice(transaction_prefix);
-        rollout_items.extend(items.iter().cloned().map(RolloutItem::ResponseItem));
+        rollout_items.extend(
+            response_items
+                .iter()
+                .cloned()
+                .map(RolloutItem::ResponseItem),
+        );
         rollout_items.extend(raw_events.iter().cloned().map(RolloutItem::EventMsg));
+        rollout_items.extend_from_slice(transaction_suffix);
         let transaction_id = Uuid::now_v7().to_string();
         let transaction = match build_rollout_transaction(transaction_id.clone(), &rollout_items) {
             Ok(RolloutItem::Transaction(transaction)) => Some(transaction),
@@ -3127,10 +3189,27 @@ impl Session {
             }
             Ok(_) => unreachable!("rollout transaction builder must return a transaction"),
         };
-        if let Some(transaction) = transaction {
+        let envelope = ConversationPersistenceEnvelope {
+            transaction_id,
+            transaction,
+            response_items,
+            raw_events,
+            install,
+        };
+        self.try_commit_conversation_persistence_envelope(lifecycle, turn_context, envelope)
+            .await
+    }
+
+    async fn try_commit_conversation_persistence_envelope(
+        &self,
+        lifecycle: &mut tokio::sync::MutexGuard<'_, PersistenceLifecycle>,
+        turn_context: &TurnContext,
+        envelope: ConversationPersistenceEnvelope,
+    ) -> codex_thread_store::ThreadStoreResult<()> {
+        if let Some(transaction) = envelope.transaction.as_ref() {
             for attempt in 0..ORDINARY_HISTORY_TRANSACTION_APPEND_ATTEMPTS {
                 match self
-                    .persist_rollout_transaction_with_guard(lifecycle, &transaction)
+                    .persist_rollout_transaction_with_guard(lifecycle, transaction)
                     .await
                 {
                     AtomicAppendOutcome::Committed => break,
@@ -3143,10 +3222,11 @@ impl Session {
                     AtomicAppendOutcome::NotCommitted { append_error } => {
                         let quarantine_reason = format!(
                             "thread is quarantined because ordinary history transaction \
-                             {transaction_id} could not be persisted after \
-                             {ORDINARY_HISTORY_TRANSACTION_APPEND_ATTEMPTS} attempts; restart or \
-                             reload the thread before continuing (last append error: \
-                             {append_error})"
+                            {} could not be persisted after \
+                            {ORDINARY_HISTORY_TRANSACTION_APPEND_ATTEMPTS} attempts; restart or \
+                            reload the thread before continuing (last append error: \
+                            {append_error})",
+                            envelope.transaction_id,
                         );
                         self.quarantine_after_ordinary_history_failure(
                             lifecycle,
@@ -3169,9 +3249,10 @@ impl Session {
                             .join("; ");
                         let quarantine_reason = format!(
                             "thread is quarantined because ordinary history transaction persistence \
-                         outcome is uncertain for transaction {transaction_id}; restart or reload \
+                         outcome is uncertain for transaction {}; restart or reload \
                          the thread before continuing (append error: {append_error}; \
-                         reconciliation errors: {reconciliation_errors})"
+                         reconciliation errors: {reconciliation_errors})",
+                            envelope.transaction_id,
                         );
                         self.quarantine_after_ordinary_history_failure(
                             lifecycle,
@@ -3188,13 +3269,23 @@ impl Session {
         }
         {
             let mut state = self.state.lock().await;
-            state.current_time_reminder.note_recorded_items(items);
-            state.record_items(
-                items.iter(),
-                turn_context.model_info.truncation_policy.into(),
-            );
+            if !envelope.response_items.is_empty() {
+                state
+                    .current_time_reminder
+                    .note_recorded_items(&envelope.response_items);
+                state.record_items(
+                    envelope.response_items.iter(),
+                    turn_context.model_info.truncation_policy.into(),
+                );
+            }
+            if let Some(world_state_baseline) = envelope.install.world_state_baseline {
+                state.history.set_world_state_baseline(world_state_baseline);
+            }
+            if let Some(reference_context_item) = envelope.install.reference_context_item {
+                state.set_reference_context_item(Some(reference_context_item));
+            }
         }
-        for event in raw_events {
+        for event in envelope.raw_events {
             self.deliver_persisted_event(turn_context, event).await;
         }
         Ok(())
@@ -3206,8 +3297,8 @@ impl Session {
         turn_context: &TurnContext,
         quarantine_reason: String,
     ) {
-        Self::quarantine_persistence(lifecycle, quarantine_reason.clone());
-        self.cancel_active_task_for_persistence_quarantine(&turn_context.sub_id)
+        Self::quarantine_persistence(lifecycle, quarantine_reason.clone(), &turn_context.sub_id);
+        self.cancel_active_task_for_persistence_quarantine(lifecycle, &turn_context.sub_id)
             .await;
         if let Err(err) =
             crate::realtime_conversation::close_for_persistence_quarantine(self, lifecycle).await
@@ -3220,6 +3311,10 @@ impl Session {
             .await;
     }
 
+    #[allow(
+        clippy::await_holding_invalid_type,
+        reason = "the lifecycle guard keeps the world-state envelope atomic with live baseline installation"
+    )]
     pub(crate) async fn record_step_world_state_if_changed(
         &self,
         previous_world_state: &Arc<WorldState>,
@@ -3243,26 +3338,22 @@ impl Session {
         let items = crate::context_manager::updates::merge_contextual_fragments(
             world_state.render_diff(&previous_snapshot),
         );
-        if !items.is_empty() {
-            self.try_record_conversation_items_with_guard(&mut lifecycle, turn_context, &items)
-                .await?;
-        }
-        // Record the patch after the context it describes is durable, while retaining the same
-        // lifecycle capability across both writes and the final live baseline commit.
-        if let Some(world_state_item) = world_state_item {
-            self.persist_rollout_items_with_guard(
-                &lifecycle,
-                &[RolloutItem::WorldState(world_state_item)],
-            )
-            .await?;
-        }
-
-        // ContextManager remembers this for later turns; run_turn owns the live value.
-        self.state
-            .lock()
-            .await
-            .history
-            .set_world_state_baseline(world_state_snapshot);
+        let transaction_suffix = world_state_item
+            .into_iter()
+            .map(RolloutItem::WorldState)
+            .collect::<Vec<_>>();
+        self.try_record_conversation_items_with_guard_and_envelope(
+            &mut lifecycle,
+            turn_context,
+            &items,
+            &[],
+            &transaction_suffix,
+            ConversationPersistenceInstall {
+                world_state_baseline: Some(world_state_snapshot),
+                reference_context_item: None,
+            },
+        )
+        .await?;
         Ok(world_state)
     }
 
@@ -3311,6 +3402,10 @@ impl Session {
         ))
     }
 
+    #[allow(
+        clippy::await_holding_invalid_type,
+        reason = "the lifecycle guard keeps communication metadata and model history in one atomic append"
+    )]
     pub(crate) async fn record_inter_agent_communication(
         &self,
         turn_context: &TurnContext,
@@ -3411,6 +3506,11 @@ impl Session {
         state.replace_history(items, reference_context_item);
     }
 
+    #[allow(
+        clippy::await_holding_invalid_type,
+        clippy::too_many_arguments,
+        reason = "remote compaction atomically persists and installs one prepared history window"
+    )]
     pub(crate) async fn replace_compacted_history(
         &self,
         turn_context: &TurnContext,
@@ -3418,7 +3518,9 @@ impl Session {
         reference_context_item: Option<TurnContextItem>,
         world_state_baseline: Option<Arc<WorldState>>,
         compacted_item: CompactedItem,
-    ) {
+        window_number: u64,
+        window_ids: AutoCompactWindowIds,
+    ) -> CodexResult<()> {
         let items = if turn_context.config.features.enabled(Feature::ItemIds) {
             Self::assign_missing_response_item_ids(Cow::Owned(items)).into_owned()
         } else {
@@ -3429,32 +3531,109 @@ impl Session {
             ..compacted_item
         };
         // Compaction starts a new history window, so its WorldState baseline must be full.
-        let mut world_state_item = None;
-        {
-            let mut state = self.state.lock().await;
-            state.replace_history(items, reference_context_item.clone());
-            if let Some(world_state) = world_state_baseline {
-                let snapshot = world_state.snapshot();
-                world_state_item = Some(WorldStateItem::full(snapshot.clone().into_value()));
-                state.history.set_world_state_baseline(snapshot);
+        let world_state_baseline = world_state_baseline.map(|world_state| world_state.snapshot());
+        let mut transaction_items = Vec::with_capacity(3);
+        transaction_items.push(RolloutItem::Compacted(compacted_item));
+        if let Some(snapshot) = world_state_baseline.as_ref() {
+            transaction_items.push(RolloutItem::WorldState(WorldStateItem::full(
+                snapshot.clone().into_value(),
+            )));
+        }
+        if let Some(turn_context_item) = reference_context_item.as_ref() {
+            transaction_items.push(RolloutItem::TurnContext(turn_context_item.clone()));
+        }
+        let transaction_id = Uuid::now_v7().to_string();
+        let transaction =
+            match build_rollout_transaction(transaction_id.clone(), &transaction_items) {
+                Ok(RolloutItem::Transaction(transaction)) => transaction,
+                Ok(_) => unreachable!("rollout transaction builder must return a transaction"),
+                Err(err) => {
+                    return Err(CodexErr::Fatal(format!(
+                        "failed to build remote compaction transaction: {err}"
+                    )));
+                }
+            };
+
+        let mut lifecycle = self
+            .acquire_persistence_side_effect()
+            .await
+            .map_err(|err| CodexErr::Fatal(err.to_string()))?;
+        let mut state = self.state.lock().await;
+        if !state.can_commit_prepared_auto_compact_window_advance(window_number, window_ids) {
+            return Err(CodexErr::Stream(
+                "compact window changed before remote compaction commit".to_string(),
+                None,
+            ));
+        }
+
+        for attempt in 0..ORDINARY_HISTORY_TRANSACTION_APPEND_ATTEMPTS {
+            match self
+                .persist_rollout_transaction_with_guard(&lifecycle, &transaction)
+                .await
+            {
+                AtomicAppendOutcome::Committed => break,
+                AtomicAppendOutcome::NotCommitted { .. }
+                    if attempt + 1 < ORDINARY_HISTORY_TRANSACTION_APPEND_ATTEMPTS =>
+                {
+                    tokio::task::yield_now().await;
+                }
+                AtomicAppendOutcome::NotCommitted { append_error } => {
+                    return Err(CodexErr::Io(std::io::Error::other(format!(
+                        "failed to persist remote compaction transaction {transaction_id}: \
+                         {append_error}"
+                    ))));
+                }
+                AtomicAppendOutcome::Ambiguous {
+                    append_error,
+                    reconciliation_errors,
+                } => {
+                    let reconciliation_errors = reconciliation_errors
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join("; ");
+                    let quarantine_reason = format!(
+                        "thread is quarantined because remote compaction transaction persistence \
+                         outcome is uncertain for transaction {transaction_id}; restart or reload \
+                         the thread before continuing (append error: {append_error}; \
+                         reconciliation errors: {reconciliation_errors})"
+                    );
+                    Self::quarantine_persistence(
+                        &mut lifecycle,
+                        quarantine_reason.clone(),
+                        &turn_context.sub_id,
+                    );
+                    drop(state);
+                    self.cancel_active_task_for_persistence_quarantine(
+                        &lifecycle,
+                        &turn_context.sub_id,
+                    )
+                    .await;
+                    if let Err(err) =
+                        crate::realtime_conversation::close_for_persistence_quarantine(
+                            self,
+                            &mut lifecycle,
+                        )
+                        .await
+                    {
+                        warn!(
+                            "failed to close realtime conversation during persistence quarantine: {err}"
+                        );
+                    }
+                    return Err(CodexErr::Fatal(quarantine_reason));
+                }
             }
         }
 
-        self.persist_rollout_items(&[RolloutItem::Compacted(compacted_item)])
-            .await;
-        // Persist the baseline after the replacement history that established it.
-        if let Some(world_state_item) = world_state_item {
-            self.persist_rollout_items(&[RolloutItem::WorldState(world_state_item)])
-                .await;
+        let committed =
+            state.commit_prepared_auto_compact_window_advance(window_number, window_ids);
+        debug_assert!(committed, "validated compact window should commit");
+        state.replace_history(items, reference_context_item);
+        if let Some(snapshot) = world_state_baseline {
+            state.history.set_world_state_baseline(snapshot);
         }
-        if let Some(turn_context_item) = reference_context_item {
-            self.persist_rollout_items(&[RolloutItem::TurnContext(turn_context_item)])
-                .await;
-        }
-        {
-            let mut state = self.state.lock().await;
-            state.queue_pending_session_start_source(codex_hooks::SessionStartSource::Compact);
-        }
+        state.queue_pending_session_start_source(codex_hooks::SessionStartSource::Compact);
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3621,13 +3800,20 @@ impl Session {
                      before continuing (append error: {append_error}; reconciliation errors: \
                      {reconciliation_errors})"
                 );
-                Self::quarantine_persistence(&mut persistence_lifecycle, quarantine_reason.clone());
+                Self::quarantine_persistence(
+                    &mut persistence_lifecycle,
+                    quarantine_reason.clone(),
+                    &turn_context.sub_id,
+                );
                 // Realtime may have linearized before this checkpoint append. Close it while the
                 // lifecycle gate still exposes Quarantined, but never await shutdown while holding
                 // SessionState.
                 drop(state);
-                self.cancel_active_task_for_persistence_quarantine(&turn_context.sub_id)
-                    .await;
+                self.cancel_active_task_for_persistence_quarantine(
+                    &persistence_lifecycle,
+                    &turn_context.sub_id,
+                )
+                .await;
                 if let Err(err) = crate::realtime_conversation::close_for_persistence_quarantine(
                     self,
                     &mut persistence_lifecycle,
@@ -4188,7 +4374,7 @@ impl Session {
         lifecycle: &tokio::sync::MutexGuard<'_, PersistenceLifecycle>,
         items: &[RolloutItem],
     ) -> codex_thread_store::ThreadStoreResult<()> {
-        if let PersistenceLifecycle::Quarantined(reason) = &**lifecycle {
+        if let PersistenceLifecycle::Quarantined { reason, .. } = &**lifecycle {
             return Err(codex_thread_store::ThreadStoreError::InvalidRequest {
                 message: reason.clone(),
             });
@@ -4244,14 +4430,15 @@ impl Session {
         )
     }
 
-    pub(crate) async fn advance_auto_compact_window(&self) -> (u64, AutoCompactWindowIds) {
-        let mut state = self.state.lock().await;
-        state.advance_auto_compact_window()
-    }
-
     pub(crate) async fn prepare_auto_compact_window_advance(&self) -> (u64, AutoCompactWindowIds) {
         let state = self.state.lock().await;
         state.prepare_auto_compact_window_advance()
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn advance_auto_compact_window(&self) -> (u64, AutoCompactWindowIds) {
+        let mut state = self.state.lock().await;
+        state.advance_auto_compact_window()
     }
 
     pub(crate) async fn request_new_context_window(&self) {
@@ -4268,14 +4455,15 @@ impl Session {
         &self,
         turn_context: &TurnContext,
         world_state: Arc<WorldState>,
-    ) -> u64 {
-        let window = {
-            let mut state = self.state.lock().await;
-            state.start_new_context_window()
-        };
+    ) -> CodexResult<u64> {
+        let window = self.prepare_auto_compact_window_advance().await;
         let (window_number, window_ids) = window;
         let context_items = self
-            .build_initial_context_with_world_state(turn_context, world_state.as_ref())
+            .build_initial_context_with_world_state_for_window(
+                turn_context,
+                world_state.as_ref(),
+                window_ids,
+            )
             .await;
         let turn_context_item = turn_context.to_turn_context_item();
         self.replace_compacted_history(
@@ -4292,10 +4480,12 @@ impl Session {
                 window_id: Some(window_ids.window_id.to_string()),
                 checkpoint: None,
             },
+            window_number,
+            window_ids,
         )
-        .await;
+        .await?;
         self.recompute_token_usage(turn_context).await;
-        window_number
+        Ok(window_number)
     }
 
     pub(crate) async fn reference_context_item(&self) -> Option<TurnContextItem> {
@@ -4306,6 +4496,76 @@ impl Session {
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) async fn clear_reference_context_item_for_direct_mutation_test(&self) {
         self.state.lock().await.set_reference_context_item(None);
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) async fn context_persistence_test_snapshot(
+        &self,
+    ) -> (Option<TurnContextItem>, Option<serde_json::Value>) {
+        let state = self.state.lock().await;
+        (
+            state.reference_context_item(),
+            state
+                .history
+                .world_state_baseline_for_test()
+                .map(WorldStateSnapshot::into_value),
+        )
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) async fn record_step_world_state_from_empty_for_test(
+        self: &Arc<Self>,
+    ) -> codex_thread_store::ThreadStoreResult<()> {
+        let turn_context = self.new_default_turn().await;
+        let step_context = self.capture_step_context(turn_context).await;
+        self.record_step_world_state_if_changed(
+            &Arc::new(WorldState::default()),
+            step_context.as_ref(),
+        )
+        .await
+        .map(|_| ())
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) async fn record_deferred_context_update_for_test(
+        self: &Arc<Self>,
+    ) -> codex_thread_store::ThreadStoreResult<()> {
+        let turn_context = self.new_default_turn().await;
+        let step_context = self.capture_step_context(turn_context).await;
+        self.try_record_context_updates_and_set_reference_context_item(step_context.as_ref())
+            .await
+            .map(|_| ())
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    #[allow(
+        clippy::await_holding_invalid_type,
+        reason = "test-only setup must persist and install the stale reference under one lifecycle guard"
+    )]
+    pub(crate) async fn establish_stale_deferred_context_baseline_for_test(
+        self: &Arc<Self>,
+    ) -> codex_thread_store::ThreadStoreResult<()> {
+        let turn_context = self.new_default_turn().await;
+        let mut stale_reference = turn_context.to_turn_context_item();
+        stale_reference.model = format!("stale-{}", stale_reference.model);
+        let mut lifecycle = self
+            .acquire_persistence_side_effect()
+            .await
+            .map_err(|err| codex_thread_store::ThreadStoreError::InvalidRequest {
+                message: err.to_string(),
+            })?;
+        self.try_record_conversation_items_with_guard_and_envelope(
+            &mut lifecycle,
+            turn_context.as_ref(),
+            &[],
+            &[],
+            &[RolloutItem::TurnContext(stale_reference.clone())],
+            ConversationPersistenceInstall {
+                world_state_baseline: None,
+                reference_context_item: Some(stale_reference),
+            },
+        )
+        .await
     }
 
     /// Persist the latest turn context snapshot for the first real user turn and for
@@ -4322,6 +4582,10 @@ impl Session {
     /// reinjects full initial context into replacement history. Live world-state changes may
     /// independently advance their in-memory baseline within a turn.
     #[instrument(level = "trace", skip_all)]
+    #[allow(
+        clippy::await_holding_invalid_type,
+        reason = "the lifecycle guard makes context history and its installed reference one transaction"
+    )]
     pub(crate) async fn record_context_updates_and_set_reference_context_item(
         &self,
         step_context: &StepContext,
@@ -4345,6 +4609,10 @@ impl Session {
         world_state
     }
 
+    #[allow(
+        clippy::await_holding_invalid_type,
+        reason = "the lifecycle guard makes context history and its installed reference one transaction"
+    )]
     pub(crate) async fn try_record_context_updates_and_set_reference_context_item(
         &self,
         step_context: &StepContext,
@@ -4437,47 +4705,32 @@ impl Session {
         if only_world_state_changed && world_state_item.is_none() {
             return (world_state, Ok(()));
         }
-        if !context_items.is_empty()
-            && let Err(err) = self
-                .try_record_conversation_items_with_guard(lifecycle, turn_context, &context_items)
-                .await
-        {
-            return (world_state, Err(err));
-        }
-        // Persist state only after any model-visible context generated from it.
+        let mut transaction_suffix = Vec::with_capacity(2);
         if let Some(world_state_item) = world_state_item {
-            let items = [RolloutItem::WorldState(world_state_item)];
-            if let Err(err) = self
-                .persist_rollout_items_with_guard(lifecycle, &items)
-                .await
-            {
-                return (world_state, Err(err));
-            }
+            transaction_suffix.push(RolloutItem::WorldState(world_state_item));
         }
-        // A snapshot-only change does not require a duplicate TurnContext record.
-        if only_world_state_changed {
-            self.state
-                .lock()
-                .await
-                .history
-                .set_world_state_baseline(world_state_snapshot);
-            return (world_state, Ok(()));
-        }
-        // Persist one `TurnContextItem` per real user turn so resume/lazy replay can recover the
-        // latest durable baseline even when this turn emitted no model-visible context diffs.
-        let items = [RolloutItem::TurnContext(turn_context_item.clone())];
-        if let Err(err) = self
-            .persist_rollout_items_with_guard(lifecycle, &items)
-            .await
-        {
+        let reference_context_item = if only_world_state_changed {
+            None
+        } else {
+            transaction_suffix.push(RolloutItem::TurnContext(turn_context_item.clone()));
+            Some(turn_context_item)
+        };
+        let result = self
+            .try_record_conversation_items_with_guard_and_envelope(
+                lifecycle,
+                turn_context,
+                &context_items,
+                &[],
+                &transaction_suffix,
+                ConversationPersistenceInstall {
+                    world_state_baseline: Some(world_state_snapshot),
+                    reference_context_item,
+                },
+            )
+            .await;
+        if let Err(err) = result {
             return (world_state, Err(err));
         }
-
-        // Advance the persisted-settings baseline even when this turn emitted no model-visible
-        // context items.
-        let mut state = self.state.lock().await;
-        state.set_reference_context_item(Some(turn_context_item));
-        state.history.set_world_state_baseline(world_state_snapshot);
         (world_state, Ok(()))
     }
 

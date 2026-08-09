@@ -186,7 +186,11 @@ pub fn truncate_rollout_after_turn_id(
     }
     let logical_items = logical_items;
     let logical_slice = logical_items.as_slice();
-    let turns = build_turns_from_rollout_items(logical_slice);
+    let turns = build_turns_from_rollout_items(logical_slice).map_err(|err| {
+        CodexErr::Fatal(format!(
+            "cannot project corrupt rollout transaction history: {err}"
+        ))
+    })?;
     let turn = turns
         .iter()
         .find(|turn| turn.id == last_turn_id)
@@ -229,10 +233,14 @@ pub fn truncate_rollout_after_turn_id(
     if cut_index == logical_slice.len() {
         return Ok(items.to_vec());
     }
-    let physical_cut_index = physical_logical_spans
+    let Some(physical_cut_index) = physical_logical_spans
         .iter()
         .position(|span| span.end > cut_index)
-        .expect("a logical cut before the end must belong to a physical record");
+    else {
+        return Err(CodexErr::Fatal(
+            "logical fork cut does not map to a physical rollout record".to_string(),
+        ));
+    };
     let span = &physical_logical_spans[physical_cut_index];
     if cut_index == span.start {
         return Ok(items[..physical_cut_index].to_vec());

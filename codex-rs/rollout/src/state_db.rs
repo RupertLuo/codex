@@ -643,13 +643,21 @@ pub async fn apply_rollout_items(
     let mut builder = match builder {
         Some(builder) => builder.clone(),
         None => match metadata::builder_from_items(items, rollout_path) {
-            Some(builder) => builder,
-            None => {
+            Ok(Some(builder)) => builder,
+            Ok(None) => {
                 warn!(
                     "state db apply_rollout_items missing builder during {stage}: {}",
                     rollout_path.display()
                 );
                 warn!("state db discrepancy during apply_rollout_items: {stage}, missing_builder");
+                return;
+            }
+            Err(err) => {
+                warn!(
+                    "state db apply_rollout_items rejected corrupt rollout history during {stage} \
+                     for {}: {err}",
+                    rollout_path.display()
+                );
                 return;
             }
         },

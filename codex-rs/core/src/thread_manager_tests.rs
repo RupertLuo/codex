@@ -624,7 +624,8 @@ fn out_of_range_truncation_drops_pre_user_active_turn_prefix() {
         RolloutItem::ResponseItem(assistant_msg("partial")),
     ];
 
-    let snapshot_state = snapshot_turn_state(&InitialHistory::Forked(items.clone()));
+    let snapshot_state = snapshot_turn_state(&InitialHistory::Forked(items.clone()))
+        .expect("test snapshot history should traverse");
     assert_eq!(
         snapshot_state,
         SnapshotTurnState {
@@ -1734,7 +1735,8 @@ fn last_n_turns_fork_snapshot_keeps_only_the_requested_recent_turns() {
         ForkSnapshot::LastNTurns(1),
         history,
         InterruptedTurnHistoryMarker::Disabled,
-    );
+    )
+    .expect("test fork history should traverse");
 
     let serialized = serde_json::to_string(forked.get_rollout_items()).expect("serialize fork");
     assert!(serialized.contains("second user"));
@@ -1806,7 +1808,7 @@ fn interrupted_snapshot_is_not_mid_turn() {
     ]);
 
     assert_eq!(
-        snapshot_turn_state(&interrupted_history),
+        snapshot_turn_state(&interrupted_history).expect("test history should traverse"),
         SnapshotTurnState {
             ends_mid_turn: false,
             active_turn_id: None,
@@ -1852,7 +1854,7 @@ fn completed_legacy_event_history_is_not_mid_turn() {
     ]);
 
     assert_eq!(
-        snapshot_turn_state(&completed_history),
+        snapshot_turn_state(&completed_history).expect("test history should traverse"),
         SnapshotTurnState {
             ends_mid_turn: false,
             active_turn_id: None,
@@ -1876,7 +1878,7 @@ fn mixed_response_and_legacy_user_event_history_is_mid_turn() {
     ]);
 
     assert_eq!(
-        snapshot_turn_state(&mixed_history),
+        snapshot_turn_state(&mixed_history).expect("test history should traverse"),
         SnapshotTurnState {
             ends_mid_turn: true,
             active_turn_id: None,
@@ -1931,7 +1933,8 @@ async fn interrupted_fork_snapshot_does_not_synthesize_turn_id_for_legacy_histor
     let source_history = RolloutRecorder::get_rollout_history(&source_path)
         .await
         .expect("read source rollout history");
-    let source_snapshot_state = snapshot_turn_state(&source_history);
+    let source_snapshot_state =
+        snapshot_turn_state(&source_history).expect("test history should traverse");
     assert!(source_snapshot_state.ends_mid_turn);
     let expected_turn_id = source_snapshot_state.active_turn_id.clone();
     assert_eq!(expected_turn_id, None);
@@ -1953,7 +1956,11 @@ async fn interrupted_fork_snapshot_does_not_synthesize_turn_id_for_legacy_histor
     let history = RolloutRecorder::get_rollout_history(&forked_path)
         .await
         .expect("read forked rollout history");
-    assert!(!snapshot_turn_state(&history).ends_mid_turn);
+    assert!(
+        !snapshot_turn_state(&history)
+            .expect("test history should traverse")
+            .ends_mid_turn
+    );
     let rollout_items: Vec<_> = history
         .get_rollout_items()
         .iter()
@@ -2047,7 +2054,8 @@ async fn interrupted_fork_snapshot_preserves_explicit_turn_id() {
     let source_history = RolloutRecorder::get_rollout_history(&source_path)
         .await
         .expect("read source rollout history");
-    let source_snapshot_state = snapshot_turn_state(&source_history);
+    let source_snapshot_state =
+        snapshot_turn_state(&source_history).expect("test history should traverse");
     assert_eq!(
         source_snapshot_state,
         SnapshotTurnState {
@@ -2139,7 +2147,11 @@ async fn interrupted_fork_snapshot_uses_persisted_mid_turn_history_without_live_
     let source_history = RolloutRecorder::get_rollout_history(&source_path)
         .await
         .expect("read source rollout history");
-    assert!(snapshot_turn_state(&source_history).ends_mid_turn);
+    assert!(
+        snapshot_turn_state(&source_history)
+            .expect("test history should traverse")
+            .ends_mid_turn
+    );
     manager.remove_thread(&source.thread_id).await;
 
     let forked = manager
@@ -2159,7 +2171,11 @@ async fn interrupted_fork_snapshot_uses_persisted_mid_turn_history_without_live_
     let history = RolloutRecorder::get_rollout_history(&forked_path)
         .await
         .expect("read forked rollout history");
-    assert!(!snapshot_turn_state(&history).ends_mid_turn);
+    assert!(
+        !snapshot_turn_state(&history)
+            .expect("test history should traverse")
+            .ends_mid_turn
+    );
 
     let forked_rollout_items: Vec<_> = history
         .get_rollout_items()

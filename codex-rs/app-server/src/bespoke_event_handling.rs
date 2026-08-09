@@ -1607,7 +1607,8 @@ fn thread_rollback_response_from_stored_thread(
             "thread {thread_id} did not include persisted history after rollback"
         ));
     };
-    populate_thread_turns_from_history(&mut thread, &history.items, /*active_turn*/ None);
+    populate_thread_turns_from_history(&mut thread, &history.items, /*active_turn*/ None)
+        .map_err(|err| format!("failed to traverse rollback history: {err}"))?;
     thread.status = loaded_status;
     Ok(ThreadRollbackResponse { thread })
 }

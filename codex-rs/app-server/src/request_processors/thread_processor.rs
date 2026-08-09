@@ -2290,7 +2290,12 @@ impl ThreadRequestProcessor {
                 let (mut thread, history) =
                     thread_from_stored_thread(stored_thread, fallback_provider, &self.config.cwd);
                 if include_turns && let Some(history) = history {
-                    thread.turns = build_api_turns_from_rollout_items(&history.items);
+                    thread.turns =
+                        build_api_turns_from_rollout_items(&history.items).map_err(|err| {
+                            ThreadReadViewError::Internal(format!(
+                                "failed to traverse thread rollout history: {err}"
+                            ))
+                        })?;
                 }
                 Ok(Some(thread))
             }
@@ -2359,7 +2364,11 @@ impl ThreadRequestProcessor {
                 .load_history(/*include_archived*/ true)
                 .await
                 .map_err(|err| thread_read_history_load_error(thread_id, err))?;
-            thread.turns = build_api_turns_from_rollout_items(&history.items);
+            thread.turns = build_api_turns_from_rollout_items(&history.items).map_err(|err| {
+                ThreadReadViewError::Internal(format!(
+                    "failed to traverse thread rollout history: {err}"
+                ))
+            })?;
         }
 
         Ok(())
@@ -2904,7 +2913,8 @@ impl ThreadRequestProcessor {
                     let token_usage_turn_id = latest_token_usage_turn_id_from_rollout_items(
                         response_history.get_rollout_items(),
                         token_usage_thread.turns.as_slice(),
-                    );
+                    )
+                    .expect("turn projection already validated rollout traversal");
                     // The client needs restored usage before it starts another turn.
                     // Sending after the response preserves JSON-RPC request ordering while
                     // still filling the status line before the next turn lifecycle begins.
@@ -3091,7 +3101,7 @@ impl ThreadRequestProcessor {
                 source_thread,
                 config_snapshot.model_provider_id.as_str(),
                 /*include_turns*/ false,
-            );
+            )?;
             thread_summary.session_id = existing_thread.session_configured().session_id.to_string();
             let instruction_sources = existing_thread.legacy_instruction_sources().await;
 
@@ -3233,7 +3243,7 @@ impl ThreadRequestProcessor {
         stored_thread: StoredThread,
         fallback_provider: &str,
         include_turns: bool,
-    ) -> Thread {
+    ) -> Result<Thread, JSONRPCErrorError> {
         let (mut thread, history) =
             thread_from_stored_thread(stored_thread, fallback_provider, &self.config.cwd);
         if include_turns && let Some(history) = history {
@@ -3241,9 +3251,12 @@ impl ThreadRequestProcessor {
                 &mut thread,
                 &history.items,
                 /*active_turn*/ None,
-            );
+            )
+            .map_err(|err| {
+                internal_error(format!("failed to traverse thread rollout history: {err}"))
+            })?;
         }
-        thread
+        Ok(thread)
     }
 
     async fn read_stored_thread_for_new_fork(
@@ -3337,7 +3350,8 @@ impl ThreadRequestProcessor {
                     &config_snapshot,
                     Some(rollout_path.into()),
                 );
-                thread.preview = preview_from_rollout_items(items);
+                thread.preview = preview_from_rollout_items(items)
+                    .map_err(|err| format!("failed to traverse thread rollout history: {err}"))?;
                 Ok(thread)
             }
             InitialHistory::New | InitialHistory::Cleared => Err(format!(
@@ -3354,7 +3368,8 @@ impl ThreadRequestProcessor {
                 &mut thread,
                 history_items,
                 /*active_turn*/ None,
-            );
+            )
+            .map_err(|err| format!("failed to traverse thread rollout history: {err}"))?;
         }
         self.attach_thread_name(thread_id, &mut thread).await;
         Ok(thread)
@@ -3560,7 +3575,7 @@ impl ThreadRequestProcessor {
                 stored_thread,
                 fallback_model_provider.as_str(),
                 include_turns,
-            )
+            )?
         } else {
             let config_snapshot = forked_thread.config_snapshot().await;
             let mut thread = build_thread_from_snapshot(
@@ -3569,14 +3584,19 @@ impl ThreadRequestProcessor {
                 &config_snapshot,
                 /*path*/ None,
             );
-            thread.preview = preview_from_rollout_items(&history_items);
+            thread.preview = preview_from_rollout_items(&history_items).map_err(|err| {
+                internal_error(format!("failed to traverse thread rollout history: {err}"))
+            })?;
             thread.forked_from_id = Some(source_thread_id.to_string());
             if include_turns {
                 populate_thread_turns_from_history(
                     &mut thread,
                     &history_items,
                     /*active_turn*/ None,
-                );
+                )
+                .map_err(|err| {
+                    internal_error(format!("failed to traverse thread rollout history: {err}"))
+                })?;
             }
             thread
         };
@@ -3637,7 +3657,8 @@ impl ThreadRequestProcessor {
             let token_usage_turn_id = latest_token_usage_turn_id_from_rollout_items(
                 &history_items,
                 token_usage_thread.turns.as_slice(),
-            );
+            )
+            .expect("turn projection already validated rollout traversal");
             // Mirror the resume contract for forks: the new thread is usable as soon
             // as the response arrives, so restored usage must follow immediately.
             send_thread_token_usage_update_to_connection(
@@ -3973,7 +3994,8 @@ fn build_thread_turns_page_response(
         loaded_status,
         has_live_running_thread,
         active_turn,
-    );
+    )
+    .map_err(|err| internal_error(format!("failed to traverse thread rollout history: {err}")))?;
     apply_thread_turns_items_view(&mut turns, options.items_view);
     let page = paginate_thread_turns(turns, options.cursor, options.limit, options.sort_direction)?;
     Ok(ThreadTurnsListResponse {
@@ -4048,17 +4070,17 @@ fn reconstruct_thread_turns_for_turns_list(
     loaded_status: ThreadStatus,
     has_live_running_thread: bool,
     active_turn: Option<Turn>,
-) -> Vec<Turn> {
+) -> Result<Vec<Turn>, codex_protocol::protocol::RolloutItemTraversalError> {
     let has_live_in_progress_turn = has_live_running_thread
         || active_turn
             .as_ref()
             .is_some_and(|turn| matches!(turn.status, TurnStatus::InProgress));
-    let mut turns = build_api_turns_from_rollout_items(items);
+    let mut turns = build_api_turns_from_rollout_items(items)?;
     normalize_thread_turns_status(&mut turns, loaded_status, has_live_in_progress_turn);
     if let Some(active_turn) = active_turn {
         merge_turn_history_with_active_turn(&mut turns, active_turn);
     }
-    turns
+    Ok(turns)
 }
 
 fn normalize_thread_turns_status(
@@ -4416,15 +4438,11 @@ fn summary_from_thread_metadata(metadata: &ThreadMetadata) -> ConversationSummar
     )
 }
 
-fn preview_from_rollout_items(items: &[RolloutItem]) -> String {
-    let flattened = match codex_protocol::protocol::flatten_rollout_items(items) {
-        Ok(flattened) => flattened,
-        Err(err) => {
-            warn!("failed to build thread preview from rollout history: {err}");
-            return String::new();
-        }
-    };
-    flattened
+fn preview_from_rollout_items(
+    items: &[RolloutItem],
+) -> Result<String, codex_protocol::protocol::RolloutItemTraversalError> {
+    let flattened = codex_protocol::protocol::flatten_rollout_items(items)?;
+    Ok(flattened
         .items()
         .iter()
         .copied()
@@ -4439,7 +4457,7 @@ fn preview_from_rollout_items(items: &[RolloutItem]) -> String {
             Some(idx) => preview[idx + USER_MESSAGE_BEGIN.len()..].trim().to_string(),
             None => preview,
         })
-        .unwrap_or_default()
+        .unwrap_or_default())
 }
 
 fn requested_permissions_trust_project(overrides: &ConfigOverrides, cwd: &Path) -> bool {

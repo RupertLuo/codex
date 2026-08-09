@@ -903,6 +903,10 @@ ON CONFLICT(id) DO UPDATE SET
     }
 
     /// Apply rollout items incrementally using the underlying database.
+    #[allow(
+        clippy::await_holding_invalid_type,
+        reason = "the per-thread flattener lock serializes projection and is committed only after all database writes succeed"
+    )]
     pub async fn apply_rollout_items(
         &self,
         builder: &ThreadMetadataBuilder,
@@ -913,13 +917,27 @@ ON CONFLICT(id) DO UPDATE SET
         if items.is_empty() {
             return Ok(());
         }
+        let thread_flattener = {
+            let mut flatteners = self.rollout_item_flatteners.lock().await;
+            Arc::clone(flatteners.entry(builder.id).or_insert_with(|| {
+                Arc::new(tokio::sync::Mutex::new(RolloutItemFlattener::default()))
+            }))
+        };
+        // Serialize projection for one thread. Clone-and-commit keeps both metadata and transaction
+        // identity unchanged when traversal or any later database write fails.
+        let mut stored_flattener = thread_flattener.lock().await;
+        let mut candidate_flattener = stored_flattener.clone();
+        let logical_items = candidate_flattener
+            .flatten(items)
+            .map_err(anyhow::Error::new)?;
         let existing_metadata = self.get_thread(builder.id).await?;
         let mut metadata = existing_metadata
             .clone()
             .unwrap_or_else(|| builder.build(&self.default_provider));
         metadata.rollout_path = builder.rollout_path.clone();
-        for item in items {
-            apply_rollout_item(&mut metadata, item, &self.default_provider);
+        for item in &logical_items {
+            apply_rollout_item(&mut metadata, item, &self.default_provider)
+                .map_err(anyhow::Error::new)?;
         }
         if let Some(existing_metadata) = existing_metadata.as_ref() {
             metadata.prefer_existing_git_info(existing_metadata);
@@ -938,13 +956,14 @@ ON CONFLICT(id) DO UPDATE SET
             self.upsert_thread(&metadata).await
         };
         upsert_result?;
-        if let Some(memory_mode) = extract_memory_mode(items)
+        if let Some(memory_mode) = extract_memory_mode_from_logical_items(&logical_items)
             && let Err(err) = self
                 .set_thread_memory_mode(builder.id, memory_mode.as_str())
                 .await
         {
             return Err(err);
         }
+        *stored_flattener = candidate_flattener;
         Ok(())
     }
 
@@ -1106,6 +1125,11 @@ WHERE assigned_thread_id = ?
         }
         tx.commit().await?;
 
+        let mut flatteners = self.rollout_item_flatteners.lock().await;
+        for thread_id in thread_ids {
+            flatteners.remove(thread_id);
+        }
+
         Ok(rows_affected)
     }
 }
@@ -1236,30 +1260,18 @@ SELECT
     );
 }
 
-pub(super) fn extract_memory_mode(items: &[RolloutItem]) -> Option<String> {
-    let flattened = match codex_protocol::protocol::flatten_rollout_items(items) {
-        Ok(flattened) => flattened,
-        Err(err) => {
-            tracing::warn!(%err, "failed to traverse rollout history for memory mode");
-            return None;
-        }
-    };
-    flattened
-        .items()
-        .iter()
-        .rev()
-        .copied()
-        .find_map(|item| match item {
-            RolloutItem::SessionMeta(meta_line) => meta_line.meta.memory_mode.clone(),
-            RolloutItem::ResponseItem(_)
-            | RolloutItem::InterAgentCommunication(_)
-            | RolloutItem::InterAgentCommunicationMetadata { .. }
-            | RolloutItem::Compacted(_)
-            | RolloutItem::TurnContext(_)
-            | RolloutItem::WorldState(_)
-            | RolloutItem::Transaction(_)
-            | RolloutItem::EventMsg(_) => None,
-        })
+pub(super) fn extract_memory_mode_from_logical_items(items: &[&RolloutItem]) -> Option<String> {
+    items.iter().rev().copied().find_map(|item| match item {
+        RolloutItem::SessionMeta(meta_line) => meta_line.meta.memory_mode.clone(),
+        RolloutItem::ResponseItem(_)
+        | RolloutItem::InterAgentCommunication(_)
+        | RolloutItem::InterAgentCommunicationMetadata { .. }
+        | RolloutItem::Compacted(_)
+        | RolloutItem::TurnContext(_)
+        | RolloutItem::WorldState(_)
+        | RolloutItem::Transaction(_)
+        | RolloutItem::EventMsg(_) => None,
+    })
 }
 
 fn thread_spawn_parent_thread_id_from_source_str(source: &str) -> Option<ThreadId> {
@@ -1436,13 +1448,60 @@ mod tests {
     use anyhow::Result;
     use codex_protocol::protocol::EventMsg;
     use codex_protocol::protocol::GitInfo;
+    use codex_protocol::protocol::RolloutTransaction;
     use codex_protocol::protocol::SessionMeta;
     use codex_protocol::protocol::SessionMetaLine;
     use codex_protocol::protocol::SessionSource;
     use codex_protocol::protocol::ThreadHistoryMode;
+    use codex_protocol::protocol::TokenCountEvent;
+    use codex_protocol::protocol::TokenUsage;
+    use codex_protocol::protocol::TokenUsageInfo;
     use pretty_assertions::assert_eq;
     use serde_json::json;
     use std::path::PathBuf;
+
+    fn token_transaction(transaction_id: &str, total_tokens: i64) -> RolloutItem {
+        RolloutItem::Transaction(RolloutTransaction {
+            transaction_id: transaction_id.to_string(),
+            items: vec![RolloutItem::EventMsg(EventMsg::TokenCount(
+                TokenCountEvent {
+                    info: Some(TokenUsageInfo {
+                        total_token_usage: TokenUsage {
+                            total_tokens,
+                            ..Default::default()
+                        },
+                        last_token_usage: TokenUsage::default(),
+                        model_context_window: None,
+                    }),
+                    rate_limits: None,
+                },
+            ))],
+        })
+    }
+
+    fn nested_transaction(transaction_id: &str, depth: usize, total_tokens: i64) -> RolloutItem {
+        let mut item = token_transaction("nested-leaf", total_tokens);
+        for level in 0..depth {
+            item = RolloutItem::Transaction(RolloutTransaction {
+                transaction_id: if level + 1 == depth {
+                    transaction_id.to_string()
+                } else {
+                    format!("nested-{level}")
+                },
+                items: vec![item],
+            });
+        }
+        item
+    }
+
+    fn test_builder(codex_home: &Path, thread_id: ThreadId) -> ThreadMetadataBuilder {
+        ThreadMetadataBuilder::new(
+            thread_id,
+            codex_home.join(format!("{thread_id}.jsonl")),
+            Utc::now(),
+            SessionSource::Cli,
+        )
+    }
 
     #[tokio::test]
     async fn upsert_thread_keeps_creation_memory_mode_for_existing_rows() {
@@ -2935,6 +2994,235 @@ mod tests {
             .expect("thread should exist");
         assert_eq!(persisted.tokens_used, 321);
         assert_eq!(persisted.updated_at, override_updated_at);
+    }
+
+    #[tokio::test]
+    async fn apply_rollout_items_deduplicates_transaction_ids_within_and_across_batches() {
+        let codex_home = unique_temp_dir();
+        let runtime = StateRuntime::init(codex_home.clone(), "test-provider".to_string())
+            .await
+            .expect("state db should initialize");
+        let thread_id =
+            ThreadId::from_string("00000000-0000-0000-0000-000000000793").expect("valid thread id");
+        let builder = test_builder(&codex_home, thread_id);
+        let updated_at = Utc::now();
+
+        runtime
+            .apply_rollout_items(
+                &builder,
+                &[
+                    token_transaction("same-id", 11),
+                    token_transaction("same-id", 22),
+                ],
+                None,
+                Some(updated_at),
+            )
+            .await
+            .expect("same-batch projection should succeed");
+        runtime
+            .apply_rollout_items(
+                &builder,
+                &[token_transaction("same-id", 33)],
+                None,
+                Some(updated_at),
+            )
+            .await
+            .expect("cross-batch projection should succeed");
+
+        let persisted = runtime
+            .get_thread(thread_id)
+            .await
+            .expect("thread should load")
+            .expect("thread should exist");
+        assert_eq!(persisted.tokens_used, 11);
+    }
+
+    #[tokio::test]
+    async fn apply_rollout_items_keeps_transaction_identity_independent_per_thread() {
+        let codex_home = unique_temp_dir();
+        let runtime = StateRuntime::init(codex_home.clone(), "test-provider".to_string())
+            .await
+            .expect("state db should initialize");
+        let first_id =
+            ThreadId::from_string("00000000-0000-0000-0000-000000000794").expect("valid thread id");
+        let second_id =
+            ThreadId::from_string("00000000-0000-0000-0000-000000000795").expect("valid thread id");
+        let updated_at = Utc::now();
+
+        runtime
+            .apply_rollout_items(
+                &test_builder(&codex_home, first_id),
+                &[token_transaction("shared-id", 41)],
+                None,
+                Some(updated_at),
+            )
+            .await
+            .expect("first thread projection should succeed");
+        runtime
+            .apply_rollout_items(
+                &test_builder(&codex_home, second_id),
+                &[token_transaction("shared-id", 42)],
+                None,
+                Some(updated_at),
+            )
+            .await
+            .expect("second thread projection should succeed");
+
+        assert_eq!(
+            runtime
+                .get_thread(first_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .tokens_used,
+            41
+        );
+        assert_eq!(
+            runtime
+                .get_thread(second_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .tokens_used,
+            42
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_rollout_traversal_does_not_apply_or_poison_transaction_identity() {
+        let codex_home = unique_temp_dir();
+        let runtime = StateRuntime::init(codex_home.clone(), "test-provider".to_string())
+            .await
+            .expect("state db should initialize");
+        let thread_id =
+            ThreadId::from_string("00000000-0000-0000-0000-000000000796").expect("valid thread id");
+        let builder = test_builder(&codex_home, thread_id);
+        let updated_at = Utc::now();
+
+        runtime
+            .apply_rollout_items(
+                &builder,
+                &[nested_transaction("retry-id", 34, 51)],
+                None,
+                Some(updated_at),
+            )
+            .await
+            .expect_err("over-depth transaction must fail explicitly");
+        assert!(runtime.get_thread(thread_id).await.unwrap().is_none());
+
+        runtime
+            .apply_rollout_items(
+                &builder,
+                &[token_transaction("retry-id", 52)],
+                None,
+                Some(updated_at),
+            )
+            .await
+            .expect("valid retry should succeed");
+        assert_eq!(
+            runtime
+                .get_thread(thread_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .tokens_used,
+            52
+        );
+    }
+
+    #[tokio::test]
+    async fn deleting_thread_clears_transaction_identity_state() {
+        let codex_home = unique_temp_dir();
+        let runtime = StateRuntime::init(codex_home.clone(), "test-provider".to_string())
+            .await
+            .expect("state db should initialize");
+        let thread_id =
+            ThreadId::from_string("00000000-0000-0000-0000-000000000797").expect("valid thread id");
+        let builder = test_builder(&codex_home, thread_id);
+        let updated_at = Utc::now();
+
+        runtime
+            .apply_rollout_items(
+                &builder,
+                &[token_transaction("reused-id", 61)],
+                None,
+                Some(updated_at),
+            )
+            .await
+            .unwrap();
+        assert_eq!(runtime.delete_thread(thread_id).await.unwrap(), 1);
+        runtime
+            .apply_rollout_items(
+                &builder,
+                &[token_transaction("reused-id", 62)],
+                None,
+                Some(updated_at),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            runtime
+                .get_thread(thread_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .tokens_used,
+            62
+        );
+    }
+
+    #[tokio::test]
+    async fn full_rollout_bootstrap_rebuilds_transaction_identity_after_restart() {
+        let codex_home = unique_temp_dir();
+        let thread_id =
+            ThreadId::from_string("00000000-0000-0000-0000-000000000798").expect("valid thread id");
+        let builder = test_builder(&codex_home, thread_id);
+        let updated_at = Utc::now();
+        let first_runtime = StateRuntime::init(codex_home.clone(), "test-provider".to_string())
+            .await
+            .expect("first runtime should initialize");
+        first_runtime
+            .apply_rollout_items(
+                &builder,
+                &[token_transaction("bootstrap-id", 71)],
+                None,
+                Some(updated_at),
+            )
+            .await
+            .unwrap();
+        first_runtime.close().await;
+        drop(first_runtime);
+
+        let restarted = StateRuntime::init(codex_home.clone(), "test-provider".to_string())
+            .await
+            .expect("restarted runtime should initialize");
+        restarted
+            .apply_rollout_items(
+                &builder,
+                &[token_transaction("bootstrap-id", 71)],
+                None,
+                Some(updated_at),
+            )
+            .await
+            .expect("full rollout bootstrap should succeed");
+        restarted
+            .apply_rollout_items(
+                &builder,
+                &[token_transaction("bootstrap-id", 72)],
+                None,
+                Some(updated_at),
+            )
+            .await
+            .expect("incremental duplicate should be ignored");
+        assert_eq!(
+            restarted
+                .get_thread(thread_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .tokens_used,
+            71
+        );
     }
 
     #[tokio::test]

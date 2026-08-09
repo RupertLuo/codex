@@ -202,7 +202,8 @@ mod tests {
         let imported = load_session_for_import(&path)
             .expect("load")
             .expect("session");
-        let turns = build_turns_from_rollout_items(&imported.rollout_items);
+        let turns = build_turns_from_rollout_items(&imported.rollout_items)
+            .expect("imported rollout history should traverse");
 
         assert_eq!(turns.len(), 2);
         assert_eq!(turns[0].items.len(), 2);
@@ -236,7 +237,8 @@ mod tests {
         let imported = load_session_for_import(&path)
             .expect("load")
             .expect("session");
-        let turns = build_turns_from_rollout_items(&imported.rollout_items);
+        let turns = build_turns_from_rollout_items(&imported.rollout_items)
+            .expect("imported rollout history should traverse");
 
         assert_eq!(turns.len(), 1);
         assert_eq!(

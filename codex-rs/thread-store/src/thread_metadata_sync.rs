@@ -189,10 +189,16 @@ impl ThreadMetadataSync {
                 return None;
             }
         };
-        let affects_metadata = items
-            .iter()
-            .copied()
-            .any(codex_state::rollout_item_affects_thread_metadata);
+        let affects_metadata = match items.iter().copied().try_fold(false, |affects, item| {
+            codex_state::rollout_item_affects_thread_metadata(item)
+                .map(|item_affects| affects || item_affects)
+        }) {
+            Ok(affects_metadata) => affects_metadata,
+            Err(err) => {
+                tracing::warn!(%err, "failed to inspect appended rollout metadata");
+                return None;
+            }
+        };
         let advances_recency = items
             .iter()
             .copied()

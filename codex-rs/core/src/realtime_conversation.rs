@@ -2276,8 +2276,12 @@ async fn close_realtime_conversation_with_guard(
                     &**lifecycle,
                     crate::session::session::PersistenceLifecycle::Writable
                 );
-                Session::quarantine_persistence(lifecycle, quarantine_reason.clone());
-                sess.cancel_active_task_for_persistence_quarantine(&claim.sub_id)
+                Session::quarantine_persistence(
+                    lifecycle,
+                    quarantine_reason.clone(),
+                    &claim.sub_id,
+                );
+                sess.cancel_active_task_for_persistence_quarantine(lifecycle, &claim.sub_id)
                     .await;
                 if transitioned_to_quarantine {
                     sess.deliver_persistence_quarantine_error(

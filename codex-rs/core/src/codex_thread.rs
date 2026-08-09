@@ -554,6 +554,44 @@ impl CodexThread {
             .await;
     }
 
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) async fn context_persistence_test_snapshot(
+        &self,
+    ) -> (
+        Option<codex_protocol::protocol::TurnContextItem>,
+        Option<serde_json::Value>,
+    ) {
+        self.codex.session.context_persistence_test_snapshot().await
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) async fn record_step_world_state_from_empty_for_test(
+        &self,
+    ) -> ThreadStoreResult<()> {
+        self.codex
+            .session
+            .record_step_world_state_from_empty_for_test()
+            .await
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) async fn record_deferred_context_update_for_test(&self) -> ThreadStoreResult<()> {
+        self.codex
+            .session
+            .record_deferred_context_update_for_test()
+            .await
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) async fn establish_stale_deferred_context_baseline_for_test(
+        &self,
+    ) -> ThreadStoreResult<()> {
+        self.codex
+            .session
+            .establish_stale_deferred_context_baseline_for_test()
+            .await
+    }
+
     /// Records a user-role session-prefix message without creating a new user turn boundary.
     pub(crate) async fn inject_user_message_without_turn(&self, message: String) {
         let item = ResponseItem::Message {

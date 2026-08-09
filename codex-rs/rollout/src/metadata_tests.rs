@@ -74,7 +74,8 @@ async fn extract_metadata_from_rollout_uses_session_meta() {
 
     let builder = builder_from_session_meta(&session_meta_line, path.as_path()).expect("builder");
     let mut expected = builder.build("openai");
-    apply_rollout_item(&mut expected, &rollout_line.item, "openai");
+    apply_rollout_item(&mut expected, &rollout_line.item, "openai")
+        .expect("test rollout item should traverse");
     expected.updated_at = file_modified_time_utc(&path).await.expect("mtime");
     expected.recency_at = expected.updated_at;
 
@@ -205,7 +206,9 @@ fn builder_from_items_falls_back_to_filename() {
         checkpoint: None,
     })];
 
-    let builder = builder_from_items(items.as_slice(), path.as_path()).expect("builder");
+    let builder = builder_from_items(items.as_slice(), path.as_path())
+        .expect("history should traverse")
+        .expect("builder");
     let naive = NaiveDateTime::parse_from_str("2026-01-27T12-34-56", "%Y-%m-%dT%H-%M-%S")
         .expect("timestamp");
     let created_at = DateTime::<Utc>::from_naive_utc_and_offset(naive, Utc)

@@ -72,6 +72,7 @@ impl AutoCompactWindow {
         self.ids = ids;
     }
 
+    #[cfg(test)]
     pub(super) fn advance(&mut self) -> (u64, AutoCompactWindowIds) {
         let prepared = self.prepare_advance();
         let committed = self.commit_prepared_advance(prepared.0, prepared.1);

@@ -36,6 +36,7 @@ use chrono::DateTime;
 use chrono::Utc;
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::RolloutItem;
+use codex_protocol::protocol::RolloutItemFlattener;
 use log::LevelFilter;
 use serde_json::Value;
 use sqlx::ConnectOptions;
@@ -51,6 +52,7 @@ use sqlx::sqlite::SqliteJournalMode;
 use sqlx::sqlite::SqlitePoolOptions;
 use sqlx::sqlite::SqliteSynchronous;
 use std::collections::BTreeSet;
+use std::collections::HashMap;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -163,6 +165,8 @@ pub struct StateRuntime {
     memories: MemoryStore,
     thread_updated_at_millis: Arc<AtomicI64>,
     thread_recency_at_millis: Arc<AtomicI64>,
+    rollout_item_flatteners:
+        Arc<tokio::sync::Mutex<HashMap<ThreadId, Arc<tokio::sync::Mutex<RolloutItemFlattener>>>>>,
 }
 
 impl StateRuntime {
@@ -304,6 +308,7 @@ impl StateRuntime {
             default_provider,
             thread_updated_at_millis: Arc::new(AtomicI64::new(thread_updated_at_millis)),
             thread_recency_at_millis: Arc::new(AtomicI64::new(thread_recency_at_millis)),
+            rollout_item_flatteners: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         });
         if let Err(err) = runtime.run_logs_startup_maintenance().await {
             warn!(

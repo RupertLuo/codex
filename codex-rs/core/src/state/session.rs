@@ -184,12 +184,13 @@ impl SessionState {
         self.auto_compact_window.restore(window_number, ids);
     }
 
-    pub(crate) fn advance_auto_compact_window(&mut self) -> (u64, AutoCompactWindowIds) {
-        self.auto_compact_window.advance()
-    }
-
     pub(crate) fn prepare_auto_compact_window_advance(&self) -> (u64, AutoCompactWindowIds) {
         self.auto_compact_window.prepare_advance()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn advance_auto_compact_window(&mut self) -> (u64, AutoCompactWindowIds) {
+        self.auto_compact_window.advance()
     }
 
     pub(crate) fn commit_prepared_auto_compact_window_advance(
@@ -216,12 +217,6 @@ impl SessionState {
 
     pub(crate) fn take_new_context_window_request(&mut self) -> bool {
         self.auto_compact_window.take_new_context_window_request()
-    }
-
-    pub(crate) fn start_new_context_window(&mut self) -> (u64, AutoCompactWindowIds) {
-        let window = self.auto_compact_window.advance();
-        self.auto_compact_window.clear_prefill();
-        window
     }
 
     pub(crate) fn token_info(&self) -> Option<TokenUsageInfo> {

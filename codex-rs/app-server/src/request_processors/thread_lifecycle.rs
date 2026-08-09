@@ -560,11 +560,19 @@ pub(super) async fn handle_pending_thread_resume_request(
     let connection_id = request_id.connection_id;
     let mut thread = pending.thread_summary;
     if pending.include_turns {
-        populate_thread_turns_from_history(
+        if let Err(err) = populate_thread_turns_from_history(
             &mut thread,
             &pending.history_items,
             active_turn.as_ref(),
-        );
+        ) {
+            outgoing
+                .send_error(
+                    request_id,
+                    internal_error(format!("failed to traverse thread rollout history: {err}")),
+                )
+                .await;
+            return;
+        }
     }
 
     let thread_status = thread_watch_manager
@@ -675,7 +683,8 @@ pub(super) async fn handle_pending_thread_resume_request(
         let token_usage_turn_id = latest_token_usage_turn_id_from_rollout_items(
             &pending.history_items,
             token_usage_thread.turns.as_slice(),
-        );
+        )
+        .expect("turn projection already validated rollout traversal");
         // Rejoining a loaded thread has the same UI contract as a cold resume, but
         // uses the live conversation state instead of reconstructing a new session.
         send_thread_token_usage_update_to_connection(
@@ -747,12 +756,13 @@ pub(crate) fn populate_thread_turns_from_history(
     thread: &mut Thread,
     items: &[RolloutItem],
     active_turn: Option<&Turn>,
-) {
-    let mut turns = build_api_turns_from_rollout_items(items);
+) -> Result<(), codex_protocol::protocol::RolloutItemTraversalError> {
+    let mut turns = build_api_turns_from_rollout_items(items)?;
     if let Some(active_turn) = active_turn {
         merge_turn_history_with_active_turn(&mut turns, active_turn.clone());
     }
     thread.turns = turns;
+    Ok(())
 }
 
 pub(super) async fn resolve_pending_server_request(

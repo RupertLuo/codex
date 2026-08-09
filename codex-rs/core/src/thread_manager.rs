@@ -1035,7 +1035,7 @@ impl ThreadManager {
                 &options.config,
                 inherited_multi_agent_version,
             ),
-        );
+        )?;
         self.start_thread_with_options_and_fork_source(options, Some(forked_from_thread_id))
             .await
     }
@@ -1419,7 +1419,7 @@ impl ThreadManager {
         let interrupted_marker =
             InterruptedTurnHistoryMarker::from_config_and_version(&config, multi_agent_version);
         let history = logical_history_for_fork(history)?;
-        let history = fork_history_from_snapshot(snapshot, history, interrupted_marker);
+        let history = fork_history_from_snapshot(snapshot, history, interrupted_marker)?;
         let environments = default_thread_environment_selections(
             self.state.environment_manager.as_ref(),
             &config.cwd,
@@ -2192,11 +2192,15 @@ struct SnapshotTurnState {
     active_turn_start_index: Option<usize>,
 }
 
-fn snapshot_turn_state(history: &InitialHistory) -> SnapshotTurnState {
+fn snapshot_turn_state(history: &InitialHistory) -> CodexResult<SnapshotTurnState> {
     let rollout_items = history.get_rollout_items();
     let mut builder = ThreadHistoryBuilder::new();
     for item in rollout_items {
-        builder.handle_rollout_item(item);
+        builder.handle_rollout_item(item).map_err(|err| {
+            CodexErr::Fatal(format!(
+                "cannot project corrupt fork snapshot history: {err}"
+            ))
+        })?;
     }
     let active_turn_id = builder.active_turn_id_if_explicit();
     if builder.has_active_turn() && active_turn_id.is_some() {
@@ -2205,35 +2209,35 @@ fn snapshot_turn_state(history: &InitialHistory) -> SnapshotTurnState {
             .as_ref()
             .is_some_and(|turn| turn.status != TurnStatus::InProgress)
         {
-            return SnapshotTurnState {
+            return Ok(SnapshotTurnState {
                 ends_mid_turn: false,
                 active_turn_id: None,
                 active_turn_start_index: None,
-            };
+            });
         }
 
-        return SnapshotTurnState {
+        return Ok(SnapshotTurnState {
             ends_mid_turn: true,
             active_turn_id,
             active_turn_start_index: builder.active_turn_start_index(),
-        };
+        });
     }
 
     let Some(last_user_position) = truncation::user_message_positions_in_rollout(rollout_items)
         .last()
         .copied()
     else {
-        return SnapshotTurnState {
+        return Ok(SnapshotTurnState {
             ends_mid_turn: false,
             active_turn_id: None,
             active_turn_start_index: None,
-        };
+        });
     };
 
     // Synthetic fork/resume histories can contain user/assistant response items
     // without explicit turn lifecycle events. If the persisted snapshot has no
     // terminating boundary after its last user message, treat it as mid-turn.
-    SnapshotTurnState {
+    Ok(SnapshotTurnState {
         ends_mid_turn: !rollout_items[last_user_position + 1..].iter().any(|item| {
             matches!(
                 item,
@@ -2242,16 +2246,16 @@ fn snapshot_turn_state(history: &InitialHistory) -> SnapshotTurnState {
         }),
         active_turn_id: None,
         active_turn_start_index: None,
-    }
+    })
 }
 
 fn fork_history_from_snapshot(
     snapshot: ForkSnapshot,
     history: InitialHistory,
     interrupted_marker: InterruptedTurnHistoryMarker,
-) -> InitialHistory {
-    let snapshot_state = snapshot_turn_state(&history);
-    match snapshot {
+) -> CodexResult<InitialHistory> {
+    let snapshot_state = snapshot_turn_state(&history)?;
+    Ok(match snapshot {
         ForkSnapshot::TruncateBeforeNthUserMessage(nth_user_message) => {
             truncate_before_nth_user_message(history, nth_user_message, &snapshot_state)
         }
@@ -2295,7 +2299,7 @@ fn fork_history_from_snapshot(
                 history
             }
         }
-    }
+    })
 }
 
 fn logical_history_for_fork(history: InitialHistory) -> CodexResult<InitialHistory> {

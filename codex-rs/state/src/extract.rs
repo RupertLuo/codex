@@ -2,6 +2,7 @@ use crate::model::ThreadMetadata;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::RolloutItem;
+use codex_protocol::protocol::RolloutItemTraversalError;
 use codex_protocol::protocol::SessionMetaLine;
 use codex_protocol::protocol::TurnContextItem;
 use codex_protocol::protocol::USER_MESSAGE_BEGIN;
@@ -17,7 +18,7 @@ pub fn apply_rollout_item(
     metadata: &mut ThreadMetadata,
     item: &RolloutItem,
     default_provider: &str,
-) {
+) -> Result<(), RolloutItemTraversalError> {
     match item {
         RolloutItem::SessionMeta(meta_line) => apply_session_meta_from_item(metadata, meta_line),
         RolloutItem::TurnContext(turn_ctx) => apply_turn_context(metadata, turn_ctx),
@@ -37,23 +38,24 @@ pub fn apply_rollout_item(
             }
         }
         RolloutItem::WorldState(_) => {}
-        RolloutItem::Transaction(_) => match flatten_rollout_items(std::slice::from_ref(item)) {
-            Ok(flattened) => {
-                for logical_item in flattened.items() {
-                    apply_rollout_item(metadata, logical_item, default_provider);
-                }
+        RolloutItem::Transaction(_) => {
+            let flattened = flatten_rollout_items(std::slice::from_ref(item))?;
+            for logical_item in flattened.items() {
+                apply_rollout_item(metadata, logical_item, default_provider)?;
             }
-            Err(err) => tracing::warn!(%err, "failed to traverse rollout transaction metadata"),
-        },
+        }
     }
     if metadata.model_provider.is_empty() {
         metadata.model_provider = default_provider.to_string();
     }
+    Ok(())
 }
 
 /// Return whether this rollout item can mutate thread metadata stored in SQLite.
-pub fn rollout_item_affects_thread_metadata(item: &RolloutItem) -> bool {
-    match item {
+pub fn rollout_item_affects_thread_metadata(
+    item: &RolloutItem,
+) -> Result<bool, RolloutItemTraversalError> {
+    Ok(match item {
         RolloutItem::SessionMeta(_) | RolloutItem::TurnContext(_) => true,
         RolloutItem::Compacted(compacted) => compacted.checkpoint.is_some(),
         RolloutItem::EventMsg(
@@ -64,16 +66,15 @@ pub fn rollout_item_affects_thread_metadata(item: &RolloutItem) -> bool {
         | RolloutItem::InterAgentCommunication(_)
         | RolloutItem::InterAgentCommunicationMetadata { .. }
         | RolloutItem::WorldState(_) => false,
-        RolloutItem::Transaction(_) => {
-            flatten_rollout_items(std::slice::from_ref(item)).is_ok_and(|flattened| {
-                flattened
-                    .items()
-                    .iter()
-                    .copied()
-                    .any(rollout_item_affects_thread_metadata)
-            })
-        }
-    }
+        RolloutItem::Transaction(_) => flatten_rollout_items(std::slice::from_ref(item))?
+            .items()
+            .iter()
+            .copied()
+            .map(rollout_item_affects_thread_metadata)
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .any(|affects| affects),
+    })
 }
 
 fn apply_session_meta_from_item(metadata: &mut ThreadMetadata, meta_line: &SessionMetaLine) {
@@ -187,7 +188,7 @@ pub(crate) fn enum_to_string<T: Serialize>(value: &T) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::apply_rollout_item;
+    use super::apply_rollout_item as try_apply_rollout_item;
     use crate::model::ThreadMetadata;
     use chrono::DateTime;
     use chrono::Utc;
@@ -209,6 +210,15 @@ mod tests {
     use codex_protocol::protocol::ThreadGoalStatus;
     use codex_protocol::protocol::ThreadGoalUpdatedEvent;
     use codex_protocol::protocol::ThreadHistoryMode;
+
+    fn apply_rollout_item(
+        metadata: &mut ThreadMetadata,
+        item: &RolloutItem,
+        default_provider: &str,
+    ) {
+        try_apply_rollout_item(metadata, item, default_provider)
+            .expect("test rollout item should traverse");
+    }
     use codex_protocol::protocol::TokenCountEvent;
     use codex_protocol::protocol::TokenUsage;
     use codex_protocol::protocol::TokenUsageInfo;
@@ -623,7 +633,10 @@ mod tests {
         apply_rollout_item(&mut metadata, &item, "test-provider");
 
         assert_eq!(metadata.tokens_used, 321);
-        assert!(super::rollout_item_affects_thread_metadata(&item));
+        assert!(
+            super::rollout_item_affects_thread_metadata(&item)
+                .expect("test transaction should traverse")
+        );
     }
 
     fn metadata_for_test() -> ThreadMetadata {

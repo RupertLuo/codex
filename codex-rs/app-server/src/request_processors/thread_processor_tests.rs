@@ -217,7 +217,10 @@ mod thread_processor_behavior_tests {
             }),
         ];
 
-        assert_eq!(preview_from_rollout_items(&items), "FIRST_WINNING_PREVIEW");
+        assert_eq!(
+            preview_from_rollout_items(&items).expect("test rollout history should traverse"),
+            "FIRST_WINNING_PREVIEW"
+        );
     }
 
     #[test]
@@ -354,7 +357,8 @@ mod thread_processor_behavior_tests {
             ThreadStatus::Idle,
             /*has_live_running_thread*/ false,
             Some(active_turn.clone()),
-        );
+        )
+        .expect("test rollout history should traverse");
 
         assert_eq!(turns.last(), Some(&active_turn));
     }

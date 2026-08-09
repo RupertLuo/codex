@@ -618,12 +618,14 @@ pub(crate) use self::thread_summary::summary_to_thread;
 pub(crate) use self::thread_summary::thread_settings_from_config_snapshot;
 pub(crate) use self::thread_summary::thread_settings_from_core_snapshot;
 
-pub(crate) fn build_api_turns_from_rollout_items(items: &[RolloutItem]) -> Vec<Turn> {
+pub(crate) fn build_api_turns_from_rollout_items(
+    items: &[RolloutItem],
+) -> Result<Vec<Turn>, codex_protocol::protocol::RolloutItemTraversalError> {
     let mut builder = ThreadHistoryBuilder::new();
     for item in items {
         if is_persisted_rollout_item(item) {
-            builder.handle_rollout_item(item);
+            builder.handle_rollout_item(item)?;
         }
     }
-    builder.finish()
+    Ok(builder.finish())
 }

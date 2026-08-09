@@ -265,7 +265,7 @@ async fn run_remote_compact_task_inner_impl(
             &responses_metadata,
         )
         .await?;
-    let (new_window_number, new_window_ids) = sess.advance_auto_compact_window().await;
+    let (new_window_number, new_window_ids) = sess.prepare_auto_compact_window_advance().await;
     let (new_history, world_state_baseline) = process_compacted_history(
         sess.as_ref(),
         turn_context.as_ref(),
@@ -302,8 +302,10 @@ async fn run_remote_compact_task_inner_impl(
         reference_context_item,
         world_state_baseline,
         compacted_item,
+        new_window_number,
+        new_window_ids,
     )
-    .await;
+    .await?;
     sess.recompute_token_usage(turn_context).await;
 
     sess.emit_turn_item_completed(turn_context, compaction_item)

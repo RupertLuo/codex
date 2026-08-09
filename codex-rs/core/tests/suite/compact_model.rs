@@ -8,10 +8,14 @@ use codex_core::test_support::CompactCommitTestHook;
 use codex_core::test_support::RealtimeStartTestHook;
 use codex_core::test_support::auth_manager_from_auth;
 use codex_core::test_support::clear_reference_context_item_for_direct_mutation_test;
+use codex_core::test_support::context_persistence_test_snapshot;
 use codex_core::test_support::conversation_history_for_test;
 use codex_core::test_support::direct_mutation_test_snapshot;
+use codex_core::test_support::establish_stale_deferred_context_baseline_for_test;
 use codex_core::test_support::inject_no_new_turn_for_test;
 use codex_core::test_support::realtime_close_pending_for_test;
+use codex_core::test_support::record_deferred_context_update_for_test;
+use codex_core::test_support::record_step_world_state_from_empty_for_test;
 use codex_core::test_support::with_compact_commit_test_hook;
 use codex_core::test_support::with_realtime_start_test_hook;
 use codex_login::CodexAuth;
@@ -303,6 +307,227 @@ fn logical_history_item_counts(items: &[RolloutItem], expected: &str) -> (usize,
         })
         .count();
     (response_items, raw_events)
+}
+
+fn durable_context_persistence_snapshot(
+    items: &[RolloutItem],
+) -> (
+    Option<codex_protocol::protocol::TurnContextItem>,
+    Option<serde_json::Value>,
+) {
+    let flattened = flatten_rollout_items(items).expect("context rollout should flatten");
+    let mut turn_context = None;
+    let mut world_state = None;
+    for item in flattened.items() {
+        match item {
+            RolloutItem::TurnContext(item) => turn_context = Some(item.clone()),
+            RolloutItem::WorldState(item) if item.full => world_state = Some(item.state.clone()),
+            RolloutItem::WorldState(item) => {
+                let target = world_state.get_or_insert_with(|| serde_json::json!({}));
+                apply_json_merge_patch(target, &item.state);
+            }
+            RolloutItem::SessionMeta(_)
+            | RolloutItem::ResponseItem(_)
+            | RolloutItem::InterAgentCommunication(_)
+            | RolloutItem::InterAgentCommunicationMetadata { .. }
+            | RolloutItem::Compacted(_)
+            | RolloutItem::EventMsg(_)
+            | RolloutItem::Transaction(_) => {}
+        }
+    }
+    (turn_context, world_state)
+}
+
+fn apply_json_merge_patch(target: &mut serde_json::Value, patch: &serde_json::Value) {
+    let serde_json::Value::Object(patch) = patch else {
+        *target = patch.clone();
+        return;
+    };
+    if !target.is_object() {
+        *target = serde_json::json!({});
+    }
+    let target = target
+        .as_object_mut()
+        .expect("target was normalized to an object");
+    for (key, value) in patch {
+        if value.is_null() {
+            target.remove(key);
+        } else {
+            apply_json_merge_patch(
+                target.entry(key.clone()).or_insert(serde_json::Value::Null),
+                value,
+            );
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ContextEnvelopeMode {
+    Step,
+    Initial,
+    Deferred,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ContextEnvelopeFault {
+    DurableThenError,
+    PrewriteRetry,
+    PrewriteExhaustion,
+    Ambiguous,
+}
+
+impl ContextEnvelopeFault {
+    fn expects_commit(self) -> bool {
+        matches!(self, Self::DurableThenError | Self::PrewriteRetry)
+    }
+}
+
+async fn assert_context_envelope_outcome(
+    store_id: &'static str,
+    mode: ContextEnvelopeMode,
+    fault: ContextEnvelopeFault,
+) {
+    InMemoryThreadStore::remove_id(store_id);
+    let thread_store = InMemoryThreadStore::for_id(store_id);
+    let server = start_mock_server().await;
+    let mut builder = test_codex()
+        .with_model(ACTIVE_MODEL)
+        .with_config(move |config| {
+            config.experimental_thread_store = ThreadStoreConfig::InMemory {
+                id: store_id.to_string(),
+            };
+        });
+    let test = builder
+        .build_with_auto_env(&server)
+        .await
+        .expect("build context envelope test thread");
+    if matches!(mode, ContextEnvelopeMode::Deferred) {
+        test.codex
+            .inject_response_items(vec![injected_assistant_item(
+                "DEFERRED_MATRIX_INITIAL_BASELINE",
+            )])
+            .await
+            .expect("establish deferred initial context");
+        establish_stale_deferred_context_baseline_for_test(&test.codex)
+            .await
+            .expect("establish durable stale deferred baseline");
+    }
+
+    let live_before = context_persistence_test_snapshot(&test.codex).await;
+    let durable_before = ThreadStore::load_history(
+        thread_store.as_ref(),
+        LoadThreadHistoryParams {
+            thread_id: test.session_configured.thread_id,
+            include_archived: true,
+        },
+    )
+    .await
+    .expect("load context history before fault");
+    let durable_before = durable_context_persistence_snapshot(&durable_before.items);
+    assert_eq!(
+        live_before, durable_before,
+        "test baseline must start live/cold equal"
+    );
+    let observed_before = thread_store.observed_transaction_ids().await.len();
+
+    match fault {
+        ContextEnvelopeFault::DurableThenError => {
+            thread_store
+                .fail_next_append_after_items(1, "injected durable transaction error")
+                .await;
+        }
+        ContextEnvelopeFault::PrewriteRetry => {
+            thread_store
+                .fail_next_transaction_append("injected retryable prewrite error")
+                .await;
+        }
+        ContextEnvelopeFault::PrewriteExhaustion => {
+            thread_store
+                .fail_next_transaction_appends(3, "injected exhausted prewrite error")
+                .await;
+        }
+        ContextEnvelopeFault::Ambiguous => {
+            thread_store
+                .fail_next_transaction_append("injected ambiguous prewrite error")
+                .await;
+            thread_store
+                .fail_next_history_loads(3, "injected context reconciliation failure")
+                .await;
+        }
+    }
+
+    let result = match mode {
+        ContextEnvelopeMode::Step => record_step_world_state_from_empty_for_test(&test.codex).await,
+        ContextEnvelopeMode::Initial => test
+            .codex
+            .inject_response_items(vec![injected_assistant_item(
+                "INITIAL_CONTEXT_MATRIX_REQUESTED",
+            )])
+            .await
+            .map_err(|err| codex_thread_store::ThreadStoreError::InvalidRequest {
+                message: err.to_string(),
+            }),
+        ContextEnvelopeMode::Deferred => record_deferred_context_update_for_test(&test.codex).await,
+    };
+
+    let live_after = context_persistence_test_snapshot(&test.codex).await;
+    let durable_after = ThreadStore::load_history(
+        thread_store.as_ref(),
+        LoadThreadHistoryParams {
+            thread_id: test.session_configured.thread_id,
+            include_archived: true,
+        },
+    )
+    .await
+    .expect("load context history after fault");
+    let durable_after = durable_context_persistence_snapshot(&durable_after.items);
+    let observed = thread_store.observed_transaction_ids().await;
+    let attempt_ids = &observed[observed_before..];
+
+    if fault.expects_commit() {
+        assert!(
+            result.is_ok(),
+            "{mode:?}/{fault:?} should commit: {result:?}"
+        );
+        assert_eq!(
+            live_after, durable_after,
+            "{mode:?}/{fault:?} diverged live/cold"
+        );
+        match mode {
+            ContextEnvelopeMode::Step => assert!(live_after.1.is_some()),
+            ContextEnvelopeMode::Initial => {
+                assert!(live_after.0.is_some());
+                assert!(live_after.1.is_some());
+            }
+            ContextEnvelopeMode::Deferred => {
+                assert!(live_after.0.is_some());
+                assert_ne!(live_after.0, live_before.0);
+            }
+        }
+    } else {
+        assert!(result.is_err(), "{mode:?}/{fault:?} should fail explicitly");
+        assert_eq!(
+            live_after, live_before,
+            "failed {mode:?}/{fault:?} mutated live"
+        );
+        assert_eq!(
+            durable_after, durable_before,
+            "failed {mode:?}/{fault:?} mutated cold state"
+        );
+    }
+
+    match fault {
+        ContextEnvelopeFault::DurableThenError => assert!(!attempt_ids.is_empty()),
+        ContextEnvelopeFault::Ambiguous => assert_eq!(attempt_ids.len(), 1),
+        ContextEnvelopeFault::PrewriteRetry => {
+            assert!(attempt_ids.len() >= 2);
+            assert_eq!(attempt_ids[0], attempt_ids[1]);
+        }
+        ContextEnvelopeFault::PrewriteExhaustion => {
+            assert_eq!(attempt_ids.len(), 3);
+            assert!(attempt_ids.windows(2).all(|ids| ids[0] == ids[1]));
+        }
+    }
 }
 
 async fn only_atomic_compaction_checkpoint(
@@ -1745,6 +1970,182 @@ async fn ambiguous_compact_persistence_quarantines_until_reload() {
     .await;
 }
 
+#[derive(Clone, Copy, Debug)]
+enum QuarantinedOwnerAbortAction {
+    Interrupt,
+    Shutdown,
+}
+
+async fn assert_quarantined_owner_abort_is_no_terminal(
+    store_id: &'static str,
+    action: QuarantinedOwnerAbortAction,
+) {
+    InMemoryThreadStore::remove_id(store_id);
+    let thread_store = InMemoryThreadStore::for_id(store_id);
+    let server = start_mock_server().await;
+    let response_mock = mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![
+                ev_response_created("resp-before-owner-abort-race"),
+                ev_assistant_message("first-message", "FIRST_REPLY"),
+                ev_completed("resp-before-owner-abort-race"),
+            ]),
+            sse(vec![
+                ev_assistant_message("compact-message", "AMBIGUOUS_OWNER_ABORT_SUMMARY"),
+                ev_completed("compact-owner-abort-race"),
+            ]),
+        ],
+    )
+    .await;
+    let commit_hook = CompactCommitTestHook::new();
+    commit_hook.pause_after_persistence_fatal_once();
+    let mut builder = in_memory_atomic_compact_builder(store_id, commit_hook.clone());
+    let test = builder
+        .build_with_auto_env(&server)
+        .await
+        .expect("build codex");
+
+    test.submit_turn("FIRST_USER_TURN")
+        .await
+        .expect("submit first user turn");
+    test.codex
+        .submit(Op::Compact)
+        .await
+        .expect("submit compact operation");
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        commit_hook.wait_until_commit_paused(),
+    )
+    .await
+    .expect("compact commit should reach the deterministic pause");
+    thread_store
+        .fail_next_append_after_items(1, "injected uncertain owner append")
+        .await;
+    thread_store
+        .fail_next_history_loads(3, "injected owner reconciliation failure")
+        .await;
+    commit_hook.release_commit();
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        commit_hook.wait_until_persistence_fatal_paused(),
+    )
+    .await
+    .expect("owner should pause after fatal and before wrapper cleanup");
+
+    let fatal = wait_for_event(&test.codex, |event| {
+        matches!(
+            event,
+            EventMsg::Error(error) if error.message.contains("persistence outcome is uncertain")
+        )
+    })
+    .await;
+    assert!(matches!(fatal, EventMsg::Error(_)));
+    let calls_before_abort = thread_store.calls().await;
+    let requests_before_abort = response_mock.requests().len();
+
+    let op = match action {
+        QuarantinedOwnerAbortAction::Interrupt => Op::Interrupt,
+        QuarantinedOwnerAbortAction::Shutdown => Op::Shutdown,
+    };
+    test.codex
+        .submit(op)
+        .await
+        .expect("submit owner abort action");
+
+    let mut saw_ordinary_terminal = false;
+    match action {
+        QuarantinedOwnerAbortAction::Interrupt => {
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    let snapshot = direct_mutation_test_snapshot(&test.codex).await;
+                    if !snapshot.has_active_turn && !snapshot.has_pending_input {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("interrupt must immediately clear the quarantined owner");
+            saw_ordinary_terminal = tokio::time::timeout(
+                Duration::from_millis(250),
+                wait_for_event(&test.codex, |event| {
+                    matches!(
+                        event,
+                        EventMsg::TurnComplete(_) | EventMsg::TurnAborted(_) | EventMsg::Warning(_)
+                    )
+                }),
+            )
+            .await
+            .is_ok();
+        }
+        QuarantinedOwnerAbortAction::Shutdown => {
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    let event = test.codex.next_event().await.expect("shutdown event").msg;
+                    if matches!(
+                        event,
+                        EventMsg::TurnComplete(_) | EventMsg::TurnAborted(_) | EventMsg::Warning(_)
+                    ) {
+                        saw_ordinary_terminal = true;
+                    }
+                    if matches!(event, EventMsg::ShutdownComplete) {
+                        break;
+                    }
+                }
+            })
+            .await
+            .expect("shutdown must complete while the owner wrapper remains paused");
+        }
+    }
+
+    let snapshot = direct_mutation_test_snapshot(&test.codex).await;
+    assert!(
+        !snapshot.has_active_turn && !snapshot.has_pending_input,
+        "owner abort must clear active and pending state: {snapshot:?}"
+    );
+    assert!(
+        !saw_ordinary_terminal,
+        "owner abort emitted an ordinary terminal"
+    );
+    assert_eq!(
+        commit_hook.turn_abort_lifecycle_calls(),
+        0,
+        "uncertain owner cleanup must not emit turn-abort lifecycle"
+    );
+    assert_eq!(
+        thread_store.calls().await.append_items,
+        calls_before_abort.append_items,
+        "owner abort must not append"
+    );
+    assert_eq!(
+        response_mock.requests().len(),
+        requests_before_abort,
+        "owner abort must not issue another model request"
+    );
+    commit_hook.release_persistence_fatal();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn interrupt_cannot_emit_terminal_for_paused_persistence_uncertain_owner() {
+    skip_if_no_network!();
+    assert_quarantined_owner_abort_is_no_terminal(
+        "ambiguous-owner-interrupt-after-fatal",
+        QuarantinedOwnerAbortAction::Interrupt,
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shutdown_cannot_emit_terminal_or_wait_for_paused_persistence_uncertain_owner() {
+    skip_if_no_network!();
+    assert_quarantined_owner_abort_is_no_terminal(
+        "ambiguous-owner-shutdown-after-fatal",
+        QuarantinedOwnerAbortAction::Shutdown,
+    )
+    .await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn user_input_waiting_before_start_gate_cannot_mutate_after_quarantine() {
     skip_if_no_network!();
@@ -2261,6 +2662,285 @@ async fn ordinary_history_prewrite_failure_retries_same_transaction_and_commits_
         .flush_rollout()
         .await
         .expect("successful retry must leave persistence writable");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn step_world_state_metadata_shares_its_context_transaction() {
+    skip_if_no_network!();
+
+    const STORE_ID: &str = "step-world-state-stable-transaction";
+    InMemoryThreadStore::remove_id(STORE_ID);
+    let thread_store = InMemoryThreadStore::for_id(STORE_ID);
+    let server = start_mock_server().await;
+    let mut builder = test_codex().with_model(ACTIVE_MODEL).with_config(|config| {
+        config.experimental_thread_store = ThreadStoreConfig::InMemory {
+            id: STORE_ID.to_string(),
+        };
+    });
+    let test = builder
+        .build_with_auto_env(&server)
+        .await
+        .expect("build codex");
+    let append_blocker = thread_store.block_next_append().await;
+    let codex = Arc::clone(&test.codex);
+    let record =
+        tokio::spawn(
+            async move { record_step_world_state_from_empty_for_test(codex.as_ref()).await },
+        );
+    tokio::time::timeout(Duration::from_secs(5), append_blocker.wait_until_blocked())
+        .await
+        .expect("step context transaction should block at the store");
+    thread_store
+        .fail_next_append_after_items(1, "injected durable step metadata failure")
+        .await;
+    append_blocker.release();
+    let result = record.await.expect("step record task should not panic");
+
+    let live_snapshot = context_persistence_test_snapshot(&test.codex).await;
+    let durable_history = ThreadStore::load_history(
+        thread_store.as_ref(),
+        LoadThreadHistoryParams {
+            thread_id: test.session_configured.thread_id,
+            include_archived: true,
+        },
+    )
+    .await
+    .expect("load durable step context history");
+    let durable_snapshot = durable_context_persistence_snapshot(&durable_history.items);
+    let standalone_world_state = durable_history
+        .items
+        .iter()
+        .filter(|item| matches!(item, RolloutItem::WorldState(_)))
+        .count();
+
+    assert!(
+        result.is_ok(),
+        "step metadata must commit with its model-visible context: {result:?}"
+    );
+    assert_eq!(live_snapshot.1, durable_snapshot.1);
+    assert!(
+        live_snapshot.1.is_some(),
+        "step WorldState must install live"
+    );
+    assert_eq!(standalone_world_state, 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn deferred_context_turn_context_shares_its_logical_transaction() {
+    skip_if_no_network!();
+
+    const STORE_ID: &str = "deferred-context-stable-transaction";
+    const INITIAL: &str = "INITIAL_CONTEXT_BASELINE";
+    InMemoryThreadStore::remove_id(STORE_ID);
+    let thread_store = InMemoryThreadStore::for_id(STORE_ID);
+    let server = start_mock_server().await;
+    let mut builder = test_codex().with_model(ACTIVE_MODEL).with_config(|config| {
+        config.experimental_thread_store = ThreadStoreConfig::InMemory {
+            id: STORE_ID.to_string(),
+        };
+    });
+    let test = builder
+        .build_with_auto_env(&server)
+        .await
+        .expect("build codex");
+    test.codex
+        .inject_response_items(vec![injected_assistant_item(INITIAL)])
+        .await
+        .expect("establish initial context baseline");
+    establish_stale_deferred_context_baseline_for_test(&test.codex)
+        .await
+        .expect("establish durable stale deferred baseline");
+    let append_blocker = thread_store.block_next_append().await;
+    let codex = Arc::clone(&test.codex);
+    let record =
+        tokio::spawn(async move { record_deferred_context_update_for_test(codex.as_ref()).await });
+    tokio::time::timeout(Duration::from_secs(5), append_blocker.wait_until_blocked())
+        .await
+        .expect("deferred context transaction should block at the store");
+    thread_store
+        .fail_next_append_after_items(1, "injected durable deferred metadata failure")
+        .await;
+    append_blocker.release();
+    let result = record.await.expect("deferred record task should not panic");
+
+    let live_snapshot = context_persistence_test_snapshot(&test.codex).await;
+    let durable_history = ThreadStore::load_history(
+        thread_store.as_ref(),
+        LoadThreadHistoryParams {
+            thread_id: test.session_configured.thread_id,
+            include_archived: true,
+        },
+    )
+    .await
+    .expect("load durable deferred context history");
+    let durable_snapshot = durable_context_persistence_snapshot(&durable_history.items);
+    let standalone_turn_context = durable_history
+        .items
+        .iter()
+        .filter(|item| matches!(item, RolloutItem::TurnContext(_)))
+        .count();
+
+    assert!(
+        result.is_ok(),
+        "deferred TurnContext must commit with its logical context: {result:?}"
+    );
+    assert_eq!(live_snapshot, durable_snapshot);
+    assert!(
+        live_snapshot.0.is_some(),
+        "deferred TurnContext must install live"
+    );
+    assert_eq!(standalone_turn_context, 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn step_context_envelope_outcome_matrix() {
+    skip_if_no_network!();
+    for (store_id, fault) in [
+        (
+            "step-context-durable-then-error",
+            ContextEnvelopeFault::DurableThenError,
+        ),
+        (
+            "step-context-prewrite-retry",
+            ContextEnvelopeFault::PrewriteRetry,
+        ),
+        (
+            "step-context-prewrite-exhaustion",
+            ContextEnvelopeFault::PrewriteExhaustion,
+        ),
+        ("step-context-ambiguous", ContextEnvelopeFault::Ambiguous),
+    ] {
+        assert_context_envelope_outcome(store_id, ContextEnvelopeMode::Step, fault).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn initial_context_envelope_outcome_matrix() {
+    skip_if_no_network!();
+    for (store_id, fault) in [
+        (
+            "initial-context-durable-then-error",
+            ContextEnvelopeFault::DurableThenError,
+        ),
+        (
+            "initial-context-prewrite-retry",
+            ContextEnvelopeFault::PrewriteRetry,
+        ),
+        (
+            "initial-context-prewrite-exhaustion-r8",
+            ContextEnvelopeFault::PrewriteExhaustion,
+        ),
+        (
+            "initial-context-ambiguous-r8",
+            ContextEnvelopeFault::Ambiguous,
+        ),
+    ] {
+        assert_context_envelope_outcome(store_id, ContextEnvelopeMode::Initial, fault).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn deferred_context_envelope_outcome_matrix() {
+    skip_if_no_network!();
+    for (store_id, fault) in [
+        (
+            "deferred-context-durable-then-error",
+            ContextEnvelopeFault::DurableThenError,
+        ),
+        (
+            "deferred-context-prewrite-retry",
+            ContextEnvelopeFault::PrewriteRetry,
+        ),
+        (
+            "deferred-context-prewrite-exhaustion",
+            ContextEnvelopeFault::PrewriteExhaustion,
+        ),
+        (
+            "deferred-context-ambiguous",
+            ContextEnvelopeFault::Ambiguous,
+        ),
+    ] {
+        assert_context_envelope_outcome(store_id, ContextEnvelopeMode::Deferred, fault).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn initial_context_metadata_and_requested_item_share_stable_transactions() {
+    skip_if_no_network!();
+
+    const STORE_ID: &str = "initial-context-metadata-stable-transaction";
+    const REQUESTED: &str = "REQUESTED_AFTER_INITIAL_CONTEXT_METADATA";
+    InMemoryThreadStore::remove_id(STORE_ID);
+    let thread_store = InMemoryThreadStore::for_id(STORE_ID);
+    let server = start_mock_server().await;
+    let mut builder = test_codex().with_model(ACTIVE_MODEL).with_config(|config| {
+        config.experimental_thread_store = ThreadStoreConfig::InMemory {
+            id: STORE_ID.to_string(),
+        };
+    });
+    let test = builder
+        .build_with_auto_env(&server)
+        .await
+        .expect("build codex");
+    let append_blocker = thread_store.block_next_append().await;
+    let codex = Arc::clone(&test.codex);
+    let injection = tokio::spawn(async move {
+        codex
+            .inject_response_items(vec![injected_assistant_item(REQUESTED)])
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(5), append_blocker.wait_until_blocked())
+        .await
+        .expect("initial context transaction should block at the store");
+    thread_store
+        .fail_next_append_after_items(1, "injected durable metadata companion failure")
+        .await;
+    append_blocker.release();
+    let result = injection.await.expect("injection task should not panic");
+
+    let live_snapshot = context_persistence_test_snapshot(&test.codex).await;
+    let durable_history = ThreadStore::load_history(
+        thread_store.as_ref(),
+        LoadThreadHistoryParams {
+            thread_id: test.session_configured.thread_id,
+            include_archived: true,
+        },
+    )
+    .await
+    .expect("load durable context history");
+    let durable_snapshot = durable_context_persistence_snapshot(&durable_history.items);
+    let standalone_metadata = durable_history
+        .items
+        .iter()
+        .filter(|item| {
+            matches!(
+                item,
+                RolloutItem::WorldState(_) | RolloutItem::TurnContext(_)
+            )
+        })
+        .count();
+
+    assert!(
+        result.is_ok(),
+        "metadata must not remain a failure-prone append after its context transaction: {result:?}"
+    );
+    assert_eq!(
+        logical_history_item_counts(&durable_history.items, REQUESTED),
+        (1, 1)
+    );
+    assert_eq!(live_snapshot, durable_snapshot);
+    assert!(
+        live_snapshot.0.is_some(),
+        "TurnContext must commit live and cold"
+    );
+    assert!(
+        live_snapshot.1.is_some(),
+        "WorldState must commit live and cold"
+    );
+    assert_eq!(
+        standalone_metadata, 0,
+        "WorldState and TurnContext must be inside stable transaction envelopes"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -56,7 +56,10 @@ pub(crate) struct Session {
 #[derive(Debug)]
 pub(crate) enum PersistenceLifecycle {
     Writable,
-    Quarantined(String),
+    Quarantined {
+        reason: String,
+        transition_owner: String,
+    },
 }
 
 #[derive(Debug)]
@@ -79,7 +82,7 @@ impl codex_thread_store::ThreadMetadataMutationGate for SessionThreadMetadataMut
                     SessionThreadMetadataMutationPermit { _guard: guard },
                 )
                     as Box<dyn codex_thread_store::ThreadMetadataMutationPermit>),
-                PersistenceLifecycle::Quarantined(_) => None,
+                PersistenceLifecycle::Quarantined { .. } => None,
             }
         })
     }

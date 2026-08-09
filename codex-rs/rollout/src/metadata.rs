@@ -66,14 +66,8 @@ pub(crate) fn builder_from_session_meta(
 pub fn builder_from_items(
     items: &[RolloutItem],
     rollout_path: &Path,
-) -> Option<ThreadMetadataBuilder> {
-    let flattened = match flatten_rollout_items(items) {
-        Ok(flattened) => flattened,
-        Err(err) => {
-            warn!(%err, "failed to traverse rollout history for metadata builder");
-            return None;
-        }
-    };
+) -> Result<Option<ThreadMetadataBuilder>, codex_protocol::protocol::RolloutItemTraversalError> {
+    let flattened = flatten_rollout_items(items)?;
     if let Some(session_meta) = flattened
         .items()
         .iter()
@@ -91,21 +85,32 @@ pub fn builder_from_items(
         })
         && let Some(builder) = builder_from_session_meta(session_meta, rollout_path)
     {
-        return Some(builder);
+        return Ok(Some(builder));
     }
 
-    let file_name = rollout_path.file_name()?.to_str()?;
-    let file_name = compression::parse_rollout_file_name(file_name)?;
-    let (created_ts, uuid) = parse_timestamp_uuid_from_filename(file_name)?;
-    let created_at =
-        DateTime::<Utc>::from_timestamp(created_ts.unix_timestamp(), 0)?.with_nanosecond(0)?;
-    let id = ThreadId::from_string(&uuid.to_string()).ok()?;
-    Some(ThreadMetadataBuilder::new(
+    let Some(file_name) = rollout_path.file_name().and_then(|name| name.to_str()) else {
+        return Ok(None);
+    };
+    let Some(file_name) = compression::parse_rollout_file_name(file_name) else {
+        return Ok(None);
+    };
+    let Some((created_ts, uuid)) = parse_timestamp_uuid_from_filename(file_name) else {
+        return Ok(None);
+    };
+    let Some(created_at) = DateTime::<Utc>::from_timestamp(created_ts.unix_timestamp(), 0)
+        .and_then(|timestamp| timestamp.with_nanosecond(0))
+    else {
+        return Ok(None);
+    };
+    let Ok(id) = ThreadId::from_string(&uuid.to_string()) else {
+        return Ok(None);
+    };
+    Ok(Some(ThreadMetadataBuilder::new(
         id,
         rollout_path.to_path_buf(),
         created_at,
         SessionSource::default(),
-    ))
+    )))
 }
 
 pub async fn extract_metadata_from_rollout(
@@ -126,7 +131,7 @@ pub async fn extract_metadata_from_rollout(
             rollout_path.display()
         )
     })?;
-    let builder = builder_from_items(items.as_slice(), rollout_path).ok_or_else(|| {
+    let builder = builder_from_items(items.as_slice(), rollout_path)?.ok_or_else(|| {
         anyhow::anyhow!(
             "rollout missing metadata builder: {}",
             rollout_path.display()
@@ -134,7 +139,7 @@ pub async fn extract_metadata_from_rollout(
     })?;
     let mut metadata = builder.build(default_provider);
     for item in flattened.items() {
-        apply_rollout_item(&mut metadata, item, default_provider);
+        apply_rollout_item(&mut metadata, item, default_provider)?;
     }
     if let Some(updated_at) = file_modified_time_utc(rollout_path).await {
         metadata.updated_at = updated_at;

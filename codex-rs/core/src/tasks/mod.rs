@@ -607,6 +607,7 @@ impl Session {
     )]
     pub(crate) async fn cancel_active_task_for_persistence_quarantine(
         &self,
+        _lifecycle: &tokio::sync::MutexGuard<'_, crate::session::session::PersistenceLifecycle>,
         transition_owner_turn_id: &str,
     ) {
         let mut active = self.active_turn.lock().await;
@@ -653,16 +654,36 @@ impl Session {
             .await;
     }
 
+    #[allow(
+        clippy::await_holding_invalid_type,
+        reason = "task abort cleanup must remain serialized with the persistence lifecycle transition"
+    )]
     pub async fn abort_all_tasks(self: &Arc<Self>, reason: TurnAbortReason) {
+        let mut lifecycle = self.acquire_persistence_task_cleanup_capability().await;
+        if let crate::session::session::PersistenceLifecycle::Quarantined {
+            transition_owner, ..
+        } = &*lifecycle
+        {
+            let transition_owner = transition_owner.clone();
+            self.cleanup_persistence_uncertain_owner_with_guard(&lifecycle, &transition_owner)
+                .await;
+            return;
+        }
+
         let mut aborted_turn = false;
         let mut active_turn_to_clear = None;
         let mut turn_context = None;
         if let Some(mut active_turn) = self.take_active_turn().await {
             let task = active_turn.task.take();
             aborted_turn = task.is_some();
-            turn_context = task.as_ref().map(|task| Arc::clone(&task.turn_context));
             if let Some(task) = task {
-                self.handle_task_abort(task, reason.clone()).await;
+                let task_turn_context = Arc::clone(&task.turn_context);
+                if self
+                    .handle_task_abort_with_persistence_guard(&mut lifecycle, task, reason.clone())
+                    .await
+                {
+                    turn_context = Some(task_turn_context);
+                }
             }
             if aborted_turn {
                 active_turn_to_clear = Some(active_turn);
@@ -678,6 +699,7 @@ impl Session {
             // in-flight approval wait can surface as a model-visible rejection before TurnAborted.
             self.input_queue.clear_pending(&active_turn).await;
         }
+        drop(lifecycle);
         if reason == TurnAbortReason::Interrupted && aborted_turn {
             self.maybe_start_turn_for_pending_work().await;
         }
@@ -749,32 +771,60 @@ impl Session {
         }
     }
 
+    #[allow(
+        clippy::await_holding_invalid_type,
+        reason = "uncertain-owner cleanup must remain serialized with the quarantined lifecycle state"
+    )]
     async fn finish_persistence_uncertain_task(&self, turn_context: &Arc<TurnContext>) {
-        turn_context
-            .turn_metadata_state
-            .cancel_git_enrichment_task();
+        let lifecycle = self.acquire_persistence_task_cleanup_capability().await;
+        let crate::session::session::PersistenceLifecycle::Quarantined {
+            transition_owner, ..
+        } = &*lifecycle
+        else {
+            return;
+        };
+        if transition_owner.as_str() != turn_context.sub_id {
+            return;
+        }
+        let transition_owner = transition_owner.clone();
+        self.cleanup_persistence_uncertain_owner_with_guard(&lifecycle, &transition_owner)
+            .await;
+    }
+
+    #[allow(
+        clippy::await_holding_invalid_type,
+        reason = "uncertain-owner cleanup is atomic under lifecycle-first ownership and never performs persistence"
+    )]
+    async fn cleanup_persistence_uncertain_owner_with_guard(
+        &self,
+        _lifecycle: &tokio::sync::MutexGuard<'_, crate::session::session::PersistenceLifecycle>,
+        transition_owner: &str,
+    ) {
         let mut active_turn = {
             let mut active = self.active_turn.lock().await;
             let owner_is_active = active
                 .as_ref()
                 .and_then(|active_turn| active_turn.task.as_ref())
-                .is_some_and(|task| task.turn_context.sub_id == turn_context.sub_id);
+                .is_some_and(|task| task.turn_context.sub_id == transition_owner);
             owner_is_active.then(|| active.take()).flatten()
         };
-        let Some(active_turn) = active_turn.as_mut() else {
-            return;
-        };
-        if let Some(task) = active_turn.task.take() {
+        if let Some(active_turn) = active_turn.as_mut()
+            && let Some(task) = active_turn.task.take()
+        {
+            task.cancellation_token.cancel();
+            task.turn_context
+                .turn_metadata_state
+                .cancel_git_enrichment_task();
             task.handle.detach();
         }
         self.input_queue
-            .clear_for_persistence_quarantine(Some(active_turn))
+            .clear_for_persistence_quarantine(active_turn.as_ref())
             .await;
         self.services
             .guardian_rejection_circuit_breaker
             .lock()
             .await
-            .clear_turn(&turn_context.sub_id);
+            .clear_turn(transition_owner);
     }
 
     pub async fn on_task_finished(
@@ -1107,6 +1157,108 @@ impl Session {
         if let Err(err) = self.flush_rollout_with_guard(lifecycle).await {
             warn!("failed to flush rollout after emitting terminal turn event: {err}");
         }
+    }
+
+    async fn handle_task_abort_with_persistence_guard(
+        self: &Arc<Self>,
+        lifecycle: &mut tokio::sync::MutexGuard<'_, crate::session::session::PersistenceLifecycle>,
+        task: RunningTask,
+        reason: TurnAbortReason,
+    ) -> bool {
+        let sub_id = task.turn_context.sub_id.clone();
+        if task.cancellation_token.is_cancelled() {
+            return false;
+        }
+
+        trace!(task_kind = ?task.kind, sub_id, "aborting running task with persistence guard");
+        task.cancellation_token.cancel();
+        task.turn_context
+            .turn_metadata_state
+            .cancel_git_enrichment_task();
+        let session_task = task.task;
+
+        select! {
+            _ = task.done.notified() => {
+            },
+            _ = tokio::time::sleep(Duration::from_millis(GRACEFULL_INTERRUPTION_TIMEOUT_MS)) => {
+                warn!("task {sub_id} didn't complete gracefully after {}ms", GRACEFULL_INTERRUPTION_TIMEOUT_MS);
+            }
+        }
+
+        task.handle.abort();
+        let session_ctx = Arc::new(SessionTaskContext::new(
+            Arc::clone(self),
+            Arc::clone(&task.turn_extension_data),
+        ));
+        session_task
+            .abort(session_ctx, Arc::clone(&task.turn_context))
+            .await;
+
+        if reason == TurnAbortReason::Interrupted
+            && let Some(marker) = interrupted_turn_history_marker(
+                InterruptedTurnHistoryMarker::from_config_and_version(
+                    task.turn_context.config.as_ref(),
+                    task.turn_context.multi_agent_version,
+                ),
+            )
+        {
+            if let Err(err) = self
+                .try_record_conversation_items_with_guard(
+                    lifecycle,
+                    task.turn_context.as_ref(),
+                    std::slice::from_ref(&marker),
+                )
+                .await
+            {
+                warn!("failed to persist interrupted-turn marker: {err}");
+            }
+            if matches!(
+                &**lifecycle,
+                crate::session::session::PersistenceLifecycle::Quarantined { .. }
+            ) {
+                self.services
+                    .guardian_rejection_circuit_breaker
+                    .lock()
+                    .await
+                    .clear_turn(&sub_id);
+                return false;
+            }
+            if let Err(err) = self.flush_rollout_with_guard(lifecycle).await {
+                warn!("failed to flush interrupted-turn marker before emitting TurnAborted: {err}");
+            }
+        }
+
+        let (completed_at, duration_ms) = task
+            .turn_context
+            .turn_timing_state
+            .completed_at_and_duration_ms()
+            .await;
+        self.services
+            .analytics_events_client
+            .track_turn_profile(TurnProfileFact {
+                turn_id: task.turn_context.sub_id.clone(),
+                profile: task.turn_context.turn_timing_state.complete_profile(),
+            });
+        self.send_event_with_persistence_guard(
+            lifecycle,
+            task.turn_context.as_ref(),
+            EventMsg::TurnAborted(TurnAbortedEvent {
+                turn_id: Some(task.turn_context.sub_id.clone()),
+                reason,
+                completed_at,
+                duration_ms,
+            }),
+        )
+        .await;
+        self.services
+            .guardian_rejection_circuit_breaker
+            .lock()
+            .await
+            .clear_turn(&task.turn_context.sub_id);
+        if let Err(err) = self.flush_rollout_with_guard(lifecycle).await {
+            warn!("failed to flush rollout after emitting terminal turn event: {err}");
+        }
+        true
     }
 
     async fn handle_task_abort(self: &Arc<Self>, task: RunningTask, reason: TurnAbortReason) {

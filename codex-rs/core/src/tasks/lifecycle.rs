@@ -60,6 +60,9 @@ impl Session {
         reason: TurnAbortReason,
         turn_store: &ExtensionData,
     ) {
+        if let Some(hook) = self.services.compact_commit_test_hook.as_ref() {
+            hook.notify_turn_abort_lifecycle();
+        }
         for contributor in self.services.extensions.turn_lifecycle_contributors() {
             contributor
                 .on_turn_abort(codex_extension_api::TurnAbortInput {

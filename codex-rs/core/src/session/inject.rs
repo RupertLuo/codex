@@ -42,7 +42,7 @@ impl Session {
     ) -> Result<(), InjectIfRunningError> {
         if matches!(
             &**lifecycle,
-            crate::session::session::PersistenceLifecycle::Quarantined(_)
+            crate::session::session::PersistenceLifecycle::Quarantined { .. }
         ) {
             return Err(InjectIfRunningError::new(
                 InjectIfRunningRejectionReason::PersistenceQuarantined,
@@ -220,7 +220,9 @@ impl Session {
         items: Vec<ResponseItem>,
         current_turn_context: Option<&TurnContext>,
     ) -> codex_thread_store::ThreadStoreResult<()> {
-        if let crate::session::session::PersistenceLifecycle::Quarantined(reason) = &**lifecycle {
+        if let crate::session::session::PersistenceLifecycle::Quarantined { reason, .. } =
+            &**lifecycle
+        {
             return Err(codex_thread_store::ThreadStoreError::InvalidRequest {
                 message: reason.clone(),
             });

@@ -70,19 +70,13 @@ struct TokenUsageTurnOwner {
 pub(super) fn latest_token_usage_turn_id_from_rollout_items(
     rollout_items: &[RolloutItem],
     turns: &[Turn],
-) -> Option<String> {
+) -> Result<Option<String>, codex_protocol::protocol::RolloutItemTraversalError> {
     let mut builder = ThreadHistoryBuilder::new();
     let mut flattener = RolloutItemFlattener::default();
     let mut token_usage_turn_owner = None;
 
     for item in rollout_items {
-        let logical_items = match flattener.flatten(std::slice::from_ref(item)) {
-            Ok(items) => items,
-            Err(err) => {
-                tracing::warn!(%err, "failed to traverse rollout for token usage attribution");
-                return None;
-            }
-        };
+        let logical_items = flattener.flatten(std::slice::from_ref(item))?;
         for item in logical_items {
             if matches!(item, RolloutItem::EventMsg(EventMsg::TokenCount(_))) {
                 token_usage_turn_owner =
@@ -93,18 +87,20 @@ pub(super) fn latest_token_usage_turn_id_from_rollout_items(
                             position: builder.active_turn_position(),
                         });
             }
-            builder.handle_rollout_item(item);
+            builder.handle_rollout_item(item)?;
         }
     }
 
-    let owner = token_usage_turn_owner?;
+    let Some(owner) = token_usage_turn_owner else {
+        return Ok(None);
+    };
     if turns.iter().any(|turn| turn.id == owner.id) {
-        Some(owner.id)
+        Ok(Some(owner.id))
     } else {
-        owner
+        Ok(owner
             .position
             .and_then(|position| turns.get(position))
-            .map(|turn| turn.id.clone())
+            .map(|turn| turn.id.clone()))
     }
 }
 
@@ -137,10 +133,12 @@ mod tests {
     #[test]
     fn replay_attribution_uses_already_loaded_history() {
         let rollout_items = token_usage_history();
-        let turns = build_turns_from_rollout_items(&rollout_items);
+        let turns = build_turns_from_rollout_items(&rollout_items)
+            .expect("test rollout history should traverse");
 
         assert_eq!(
-            latest_token_usage_turn_id_from_rollout_items(&rollout_items, turns.as_slice()),
+            latest_token_usage_turn_id_from_rollout_items(&rollout_items, turns.as_slice())
+                .expect("test rollout history should traverse"),
             Some(turns[0].id.clone())
         );
     }
@@ -148,11 +146,13 @@ mod tests {
     #[test]
     fn replay_attribution_falls_back_to_rebuilt_turn_position() {
         let rollout_items = token_usage_history();
-        let mut turns = build_turns_from_rollout_items(&rollout_items);
+        let mut turns = build_turns_from_rollout_items(&rollout_items)
+            .expect("test rollout history should traverse");
         turns[0].id = "rebuilt-turn-id".to_string();
 
         assert_eq!(
-            latest_token_usage_turn_id_from_rollout_items(&rollout_items, turns.as_slice()),
+            latest_token_usage_turn_id_from_rollout_items(&rollout_items, turns.as_slice())
+                .expect("test rollout history should traverse"),
             Some("rebuilt-turn-id".to_string())
         );
     }
@@ -178,10 +178,12 @@ mod tests {
                 ))],
             }),
         ];
-        let turns = build_turns_from_rollout_items(&rollout_items);
+        let turns = build_turns_from_rollout_items(&rollout_items)
+            .expect("test rollout history should traverse");
 
         assert_eq!(
-            latest_token_usage_turn_id_from_rollout_items(&rollout_items, turns.as_slice()),
+            latest_token_usage_turn_id_from_rollout_items(&rollout_items, turns.as_slice())
+                .expect("test rollout history should traverse"),
             Some(turns[0].id.clone())
         );
     }

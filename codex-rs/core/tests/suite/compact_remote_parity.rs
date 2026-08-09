@@ -10,6 +10,7 @@ use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
 use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::RolloutLine;
+use codex_protocol::protocol::flatten_rollout_items;
 use codex_protocol::user_input::UserInput;
 use core_test_support::hooks::trust_discovered_hooks;
 use core_test_support::responses;
@@ -787,15 +788,19 @@ fn replacement_history_from_rollout(path: &Path) -> Result<Value> {
         let Ok(entry) = serde_json::from_str::<RolloutLine>(line) else {
             continue;
         };
-        if let RolloutItem::Compacted(compacted) = entry.item
-            && compacted.message.is_empty()
-            && let Some(items) = compacted.replacement_history
-        {
-            let values = items
-                .into_iter()
-                .map(|item| serde_json::to_value(item).expect("serialize replacement item"))
-                .collect::<Vec<_>>();
-            replacement_history = Some(Value::Array(values));
+        let logical_items = flatten_rollout_items(std::slice::from_ref(&entry.item))
+            .expect("rollout transaction should traverse");
+        for item in logical_items.items() {
+            if let RolloutItem::Compacted(compacted) = item
+                && compacted.message.is_empty()
+                && let Some(items) = compacted.replacement_history.as_ref()
+            {
+                let values = items
+                    .iter()
+                    .map(|item| serde_json::to_value(item).expect("serialize replacement item"))
+                    .collect::<Vec<_>>();
+                replacement_history = Some(Value::Array(values));
+            }
         }
     }
     let replacement_history =
