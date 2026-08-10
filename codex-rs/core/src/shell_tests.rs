@@ -3,6 +3,16 @@ use std::path::PathBuf;
 use std::process::Command;
 
 #[test]
+fn catalyst_profile_environment_is_ignored_off_windows() {
+    assert_eq!(
+        PowerShellProfileMode::from_environment_value(Some(std::ffi::OsStr::new(
+            "/runtime/Catalyst.Profile.ps1",
+        ))),
+        PowerShellProfileMode::Standard
+    );
+}
+
+#[test]
 #[cfg(target_os = "macos")]
 fn detects_zsh() {
     let zsh_shell = get_shell(ShellType::Zsh, /*path*/ None).unwrap();

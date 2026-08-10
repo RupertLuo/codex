@@ -22,9 +22,21 @@ enum PowerShellProfileMode {
 
 impl PowerShellProfileMode {
     fn from_environment() -> Self {
-        if std::env::var_os(CATALYST_POWERSHELL_PROFILE_ENV).is_some() {
+        let profile = std::env::var_os(CATALYST_POWERSHELL_PROFILE_ENV);
+        Self::from_environment_value(profile.as_deref())
+    }
+
+    fn from_environment_value(profile: Option<&std::ffi::OsStr>) -> Self {
+        #[cfg(windows)]
+        if profile.is_some() {
             Self::Catalyst
         } else {
+            Self::Standard
+        }
+
+        #[cfg(not(windows))]
+        {
+            let _ = profile;
             Self::Standard
         }
     }
