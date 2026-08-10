@@ -27,6 +27,13 @@ fn standard_powershell_invocation_preserves_existing_profile_behavior() {
 
 #[test]
 fn catalyst_powershell_invocation_loads_only_the_managed_profile() {
+    assert_eq!(
+        PowerShellProfileMode::from_environment_value(Some(std::ffi::OsStr::new(
+            r"C:\runtime\Catalyst.Profile.ps1",
+        ))),
+        PowerShellProfileMode::Catalyst
+    );
+
     let expected_script = concat!(
         "if ([string]::IsNullOrWhiteSpace($env:CATALYST_POWERSHELL_PROFILE) ",
         "-or -not (Test-Path -LiteralPath $env:CATALYST_POWERSHELL_PROFILE -PathType Leaf)) ",
