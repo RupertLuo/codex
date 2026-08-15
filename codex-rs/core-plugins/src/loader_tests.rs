@@ -66,6 +66,147 @@ fn configured_plugins_from_stack_merges_user_layers() {
     );
 }
 
+#[test]
+fn configured_plugins_from_stack_accepts_only_catalyst_bundled_session_plugins() {
+    let temp_dir = TempDir::new().expect("tempdir");
+    let stack = ConfigLayerStack::new(
+        vec![
+            user_layer(
+                user_config_path(&temp_dir, "config.toml"),
+                "[plugins.user]\nenabled = true\n",
+            ),
+            ConfigLayerEntry::new(
+                ConfigLayerSource::SessionFlags,
+                toml::from_str(
+                    r#"
+[plugins."cata-office@catalyst-bundled"]
+enabled = true
+
+[plugins."evil@catalyst-bundled"]
+enabled = true
+
+[plugins."ignored@other-marketplace"]
+enabled = true
+"#,
+                )
+                .expect("session config toml"),
+            ),
+        ],
+        ConfigRequirements::default(),
+        ConfigRequirementsToml::default(),
+    )
+    .expect("valid config layer stack");
+
+    let plugins = configured_plugins_from_stack(&stack, temp_dir.path());
+
+    assert_eq!(
+        plugins,
+        HashMap::from([
+            (
+                "cata-office@catalyst-bundled".to_string(),
+                PluginConfig {
+                    enabled: true,
+                    mcp_servers: HashMap::new(),
+                },
+            ),
+            (
+                "user".to_string(),
+                PluginConfig {
+                    enabled: true,
+                    mcp_servers: HashMap::new(),
+                },
+            ),
+        ])
+    );
+}
+
+#[test]
+fn configured_plugins_from_stack_isolates_cata_from_malformed_unrelated_session_plugins() {
+    let temp_dir = TempDir::new().expect("tempdir");
+    let stack = ConfigLayerStack::new(
+        vec![ConfigLayerEntry::new(
+            ConfigLayerSource::SessionFlags,
+            toml::from_str(
+                r#"
+[plugins."cata-office@catalyst-bundled"]
+enabled = true
+
+[plugins."ignored@other-marketplace"]
+enabled = "not-a-boolean"
+"#,
+            )
+            .expect("session config toml"),
+        )],
+        ConfigRequirements::default(),
+        ConfigRequirementsToml::default(),
+    )
+    .expect("valid config layer stack");
+
+    let plugins = configured_plugins_from_stack(&stack, temp_dir.path());
+
+    assert_eq!(
+        plugins,
+        HashMap::from([(
+            "cata-office@catalyst-bundled".to_string(),
+            PluginConfig {
+                enabled: true,
+                mcp_servers: HashMap::new(),
+            },
+        )])
+    );
+}
+
+#[tokio::test]
+async fn loads_catalyst_bundled_plugin_enabled_by_session_config() {
+    let temp_dir = TempDir::new().expect("tempdir");
+    let plugin_root = temp_dir
+        .path()
+        .join("plugins/cache/catalyst-bundled/cata-office/local");
+    write_file(
+        &plugin_root.join(".codex-plugin/plugin.json"),
+        r#"{"name":"cata-office"}"#,
+    );
+    write_file(
+        &plugin_root.join("skills/word/SKILL.md"),
+        "---\nname: word\ndescription: Cata Office Word\n---\n",
+    );
+    let stack = ConfigLayerStack::new(
+        vec![ConfigLayerEntry::new(
+            ConfigLayerSource::SessionFlags,
+            toml::from_str(
+                r#"
+[plugins."cata-office@catalyst-bundled"]
+enabled = true
+"#,
+            )
+            .expect("session config toml"),
+        )],
+        ConfigRequirements::default(),
+        ConfigRequirementsToml::default(),
+    )
+    .expect("valid config layer stack");
+    let store = PluginStore::new(temp_dir.path().to_path_buf());
+
+    let plugins = load_plugins_from_layer_stack(
+        &stack,
+        HashMap::new(),
+        &store,
+        /*plugin_skill_snapshots*/ None,
+        Some(Product::Codex),
+        /*remote_global_catalog_active*/ false,
+    )
+    .await;
+
+    assert_eq!(plugins.len(), 1);
+    let plugin = &plugins[0];
+    assert_eq!(plugin.config_name, "cata-office@catalyst-bundled");
+    assert!(plugin.enabled);
+    assert_eq!(plugin.manifest_name.as_deref(), Some("cata-office"));
+    assert_eq!(plugin.skill_roots.len(), 1);
+    assert_eq!(plugin.root.as_path(), plugin_root);
+    assert_eq!(plugin.error, None);
+}
+
 #[tokio::test]
 async fn hooks_only_scope_shares_plugin_resolution_without_loading_other_capabilities() {
     let temp_dir = TempDir::new().expect("tempdir");

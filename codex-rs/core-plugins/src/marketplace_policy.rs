@@ -1,3 +1,5 @@
+use crate::CATA_OFFICE_PLUGIN_NAME;
+use crate::CATALYST_BUNDLED_MARKETPLACE_NAME;
 use crate::OPENAI_API_CURATED_MARKETPLACE_NAME;
 use crate::OPENAI_BUNDLED_ALPHA_MARKETPLACE_NAME;
 use crate::OPENAI_BUNDLED_MARKETPLACE_NAME;
@@ -11,7 +13,9 @@ use crate::marketplace_add::MarketplaceSource;
 use crate::marketplace_add::parse_marketplace_source;
 use crate::startup_sync::curated_plugins_api_marketplace_path;
 use crate::startup_sync::curated_plugins_repo_path;
+use codex_config::ConfigLayerSource;
 use codex_config::ConfigLayerStack;
+use codex_config::ConfigLayerStackOrdering;
 use codex_config::ConfigRequirements;
 use codex_config::MarketplaceAllowedSourceKind;
 use codex_config::MarketplaceAllowedSourceToml;
@@ -285,19 +289,53 @@ pub(crate) fn configured_plugins_from_stack(
     config_layer_stack: &ConfigLayerStack,
     codex_home: &Path,
 ) -> HashMap<String, PluginConfig> {
-    let Some(user_config) = project_effective_user_config(config_layer_stack, codex_home) else {
-        return HashMap::new();
-    };
-    let Some(plugins_value) = user_config.get("plugins") else {
-        return HashMap::new();
-    };
-    match plugins_value.clone().try_into() {
-        Ok(plugins) => plugins,
-        Err(err) => {
-            tracing::warn!("invalid plugins config: {err}");
-            HashMap::new()
+    let mut plugins: HashMap<String, PluginConfig> =
+        project_effective_user_config(config_layer_stack, codex_home)
+            .as_ref()
+            .and_then(|user_config| user_config.get("plugins"))
+            .and_then(|plugins_value| match plugins_value.clone().try_into() {
+                Ok(plugins) => Some(plugins),
+                Err(err) => {
+                    tracing::warn!("invalid user plugins config: {err}");
+                    None
+                }
+            })
+            .unwrap_or_default();
+
+    for layer in config_layer_stack.get_layers(
+        ConfigLayerStackOrdering::LowestPrecedenceFirst,
+        /*include_disabled*/ false,
+    ) {
+        if layer.name != ConfigLayerSource::SessionFlags {
+            continue;
+        }
+        let Some(plugins_value) = layer.config.get("plugins") else {
+            continue;
+        };
+        let Some(session_plugins) = plugins_value.as_table() else {
+            tracing::warn!("invalid session plugins config: expected a table");
+            continue;
+        };
+        for (plugin_key, plugin_value) in session_plugins {
+            let Ok(plugin_id) = PluginId::parse(plugin_key) else {
+                continue;
+            };
+            if plugin_id.plugin_name != CATA_OFFICE_PLUGIN_NAME
+                || plugin_id.marketplace_name != CATALYST_BUNDLED_MARKETPLACE_NAME
+            {
+                continue;
+            }
+            match plugin_value.clone().try_into() {
+                Ok(plugin_config) => {
+                    plugins.insert(plugin_key.clone(), plugin_config);
+                }
+                Err(err) => {
+                    tracing::warn!("invalid Cata Office session plugin config: {err}");
+                }
+            }
         }
     }
+    plugins
 }
 
 pub(crate) fn validate_marketplace_source_for_add(
