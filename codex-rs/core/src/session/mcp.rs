@@ -115,13 +115,18 @@ impl Session {
         let available_environment_ids =
             Self::available_selected_environment_ids(selected_capability_roots);
         let current = self.services.latest_mcp_runtime();
-        if current.available_environment_ids() == available_environment_ids {
+        let requires_step_revalidation = self.services.mcp_manager.requires_step_revalidation();
+        if current.available_environment_ids() == available_environment_ids
+            && !requires_step_revalidation
+        {
             return current;
         }
 
         let _guard = self.services.mcp_projection_lock.lock().await;
         let current = self.services.latest_mcp_runtime();
-        if current.available_environment_ids() == available_environment_ids {
+        if current.available_environment_ids() == available_environment_ids
+            && !requires_step_revalidation
+        {
             return current;
         }
         let mcp_config = self
@@ -152,6 +157,9 @@ impl Session {
                 .has_same_servers(&mcp_config.mcp_server_catalog)
             && current.config().connector_snapshot == mcp_config.connector_snapshot
         {
+            if current.available_environment_ids() == available_environment_ids {
+                return current;
+            }
             // Availability is only an input to the MCP projection. When that input changes but
             // the projected servers and connectors do not, advance the input key without
             // replacing the live manager and restarting its processes.

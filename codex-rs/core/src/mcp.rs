@@ -70,6 +70,15 @@ impl McpManager {
         self.codex_apps_tools_cache.clone()
     }
 
+    /// Returns whether any host MCP contribution can change without an environment-selection
+    /// change. Sessions use this to avoid serving a stale cached MCP projection.
+    pub fn requires_step_revalidation(&self) -> bool {
+        self.extensions
+            .mcp_server_contributors()
+            .iter()
+            .any(|contributor| contributor.requires_step_revalidation())
+    }
+
     /// Returns the MCP config after applying compatibility built-ins and
     /// runtime-only extension overlays.
     pub async fn runtime_config(&self, config: &Config) -> McpConfig {

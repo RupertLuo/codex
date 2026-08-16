@@ -62,6 +62,15 @@ pub trait McpServerContributor<C: Sync>: Send + Sync {
     /// Stable identity used for registration provenance and conflict diagnostics.
     fn id(&self) -> &'static str;
 
+    /// Whether the contributor's projection can change while the thread's selected environments
+    /// remain unchanged.
+    ///
+    /// Dynamic host capabilities should opt in so the MCP catalog is re-evaluated at each step.
+    /// The live connection manager is still reused when the resulting catalog is unchanged.
+    fn requires_step_revalidation(&self) -> bool {
+        false
+    }
+
     fn contribute<'a>(
         &'a self,
         context: McpServerContributionContext<'a, C>,

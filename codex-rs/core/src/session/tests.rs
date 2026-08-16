@@ -7853,6 +7853,95 @@ async fn refresh_mcp_servers_keeps_the_previous_runtime_alive() {
 }
 
 #[tokio::test]
+async fn step_revalidating_mcp_contributor_withdraws_a_cached_server() {
+    struct RevalidatingContributor {
+        available: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl codex_extension_api::McpServerContributor<Config> for RevalidatingContributor {
+        fn id(&self) -> &'static str {
+            "step_revalidating_test"
+        }
+
+        fn requires_step_revalidation(&self) -> bool {
+            true
+        }
+
+        fn contribute<'a>(
+            &'a self,
+            _context: codex_extension_api::McpServerContributionContext<'a, Config>,
+        ) -> codex_extension_api::ExtensionFuture<'a, Vec<codex_extension_api::McpServerContribution>>
+        {
+            Box::pin(async move {
+                if !self.available.load(std::sync::atomic::Ordering::SeqCst) {
+                    return vec![codex_extension_api::McpServerContribution::Remove {
+                        name: "volatile".to_string(),
+                    }];
+                }
+                vec![codex_extension_api::McpServerContribution::Set {
+                    name: "volatile".to_string(),
+                    config: Box::new(McpServerConfig {
+                        auth: Default::default(),
+                        transport: McpServerTransportConfig::StreamableHttp {
+                            url: "http://127.0.0.1:1/mcp".to_string(),
+                            bearer_token_env_var: None,
+                            http_headers: None,
+                            env_http_headers: None,
+                        },
+                        environment_id: DEFAULT_MCP_SERVER_ENVIRONMENT_ID.to_string(),
+                        enabled: false,
+                        required: false,
+                        supports_parallel_tool_calls: false,
+                        disabled_reason: None,
+                        startup_timeout_sec: None,
+                        tool_timeout_sec: None,
+                        default_tools_approval_mode: None,
+                        enabled_tools: None,
+                        disabled_tools: None,
+                        scopes: None,
+                        oauth: None,
+                        oauth_resource: None,
+                        tools: HashMap::new(),
+                    }),
+                }]
+            })
+        }
+    }
+
+    let (mut session, turn_context) = make_session_and_context().await;
+    let available = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let mut builder = codex_extension_api::ExtensionRegistryBuilder::<Config>::new();
+    builder.mcp_server_contributor(Arc::new(RevalidatingContributor {
+        available: Arc::clone(&available),
+    }));
+    let extensions = Arc::new(builder.build());
+    session.services.extensions = Arc::clone(&extensions);
+    session.services.mcp_manager = Arc::new(McpManager::new_with_extensions(
+        Arc::clone(&session.services.plugins_manager),
+        extensions,
+    ));
+    let session = Arc::new(session);
+    let turn_context = Arc::new(turn_context);
+
+    let available_step = session
+        .capture_step_context(Arc::clone(&turn_context))
+        .await;
+    assert!(
+        codex_mcp::configured_mcp_servers(available_step.mcp.config()).contains_key("volatile")
+    );
+    let unchanged_step = session
+        .capture_step_context(Arc::clone(&turn_context))
+        .await;
+    assert!(Arc::ptr_eq(&available_step.mcp, &unchanged_step.mcp));
+
+    available.store(false, std::sync::atomic::Ordering::SeqCst);
+    let withdrawn_step = session.capture_step_context(turn_context).await;
+    assert!(
+        !codex_mcp::configured_mcp_servers(withdrawn_step.mcp.config()).contains_key("volatile")
+    );
+}
+
+#[tokio::test]
 async fn built_tools_uses_the_step_mcp_runtime() -> anyhow::Result<()> {
     let (session, turn_context) = make_session_and_context().await;
     let session = Arc::new(session);
