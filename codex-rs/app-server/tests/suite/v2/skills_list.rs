@@ -752,6 +752,85 @@ async fn skills_list_excludes_plugin_skills_when_workspace_codex_plugins_disable
 }
 
 #[tokio::test]
+async fn skills_list_keeps_session_owned_cata_plugin_when_workspace_plugins_disabled() -> Result<()>
+{
+    let codex_home = TempDir::new()?;
+    let cwd = TempDir::new()?;
+    let server = MockServer::start().await;
+    let plugin_root = codex_home
+        .path()
+        .join("plugins/cache/catalyst-bundled/cata-office/local");
+    std::fs::create_dir_all(plugin_root.join(".codex-plugin"))?;
+    std::fs::write(
+        plugin_root.join(".codex-plugin/plugin.json"),
+        r#"{"name":"cata-office"}"#,
+    )?;
+    let skill_root = plugin_root.join("skills/word");
+    std::fs::create_dir_all(&skill_root)?;
+    std::fs::write(
+        skill_root.join("SKILL.md"),
+        "---\nname: word\ndescription: Edit Word documents through Cata.\n---\n",
+    )?;
+    std::fs::write(
+        codex_home.path().join("config.toml"),
+        format!("chatgpt_base_url = \"{}/backend-api/\"\n", server.uri()),
+    )?;
+    write_chatgpt_auth(
+        codex_home.path(),
+        ChatGptAuthFixture::new("chatgpt-token")
+            .account_id("account-123")
+            .chatgpt_user_id("user-123")
+            .chatgpt_account_id("account-123")
+            .plan_type("team"),
+        AuthCredentialsStoreMode::File,
+    )?;
+    Mock::given(method("GET"))
+        .and(path("/backend-api/accounts/account-123/settings"))
+        .and(header("authorization", "Bearer chatgpt-token"))
+        .and(header("chatgpt-account-id", "account-123"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(r#"{"beta_settings":{"enable_plugins":false}}"#),
+        )
+        .mount(&server)
+        .await;
+
+    let mut mcp = TestAppServer::new_with_args(
+        codex_home.path(),
+        &[
+            "-c",
+            "features.plugins=true",
+            "-c",
+            "plugins.cata-office@catalyst-bundled.enabled=true",
+        ],
+    )
+    .await?;
+    timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
+    let request_id = mcp
+        .send_skills_list_request(SkillsListParams {
+            cwds: vec![cwd.path().to_path_buf()],
+            force_reload: true,
+        })
+        .await?;
+    let response: JSONRPCResponse = timeout(
+        DEFAULT_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
+    )
+    .await??;
+    let SkillsListResponse { data } = to_response(response)?;
+
+    assert_eq!(data.len(), 1);
+    assert!(
+        data[0]
+            .skills
+            .iter()
+            .any(|skill| skill.name == "cata-office:word"),
+        "the process-owned Cata Plugin is independent of the remote workspace Plugin service"
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn skills_list_skips_cwd_roots_when_environment_disabled() -> Result<()> {
     let codex_home = TempDir::new()?;
     let cwd = TempDir::new()?;

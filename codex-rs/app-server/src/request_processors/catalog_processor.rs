@@ -1,5 +1,6 @@
 use super::*;
 use codex_core::config::permission_profile_catalog;
+use codex_core_plugins::CATALYST_BUNDLED_CATA_OFFICE_PLUGIN_ID;
 use futures::StreamExt;
 
 #[derive(Clone)]
@@ -522,17 +523,20 @@ impl CatalogRequestProcessor {
                             );
                         }
                     };
-                    let effective_skill_roots = if workspace_codex_plugins_enabled {
-                        let plugins_input = config.plugins_config_input();
-                        plugins_manager
-                            .effective_skill_roots_for_layer_stack(
-                                &config_layer_stack,
-                                &plugins_input,
-                            )
-                            .await
-                    } else {
-                        Vec::new()
-                    };
+                    let plugins_input = config.plugins_config_input();
+                    let mut effective_skill_roots = plugins_manager
+                        .effective_skill_roots_for_layer_stack(&config_layer_stack, &plugins_input)
+                        .await;
+                    if !workspace_codex_plugins_enabled {
+                        // Catalyst's bundled Office Plugin is enabled only through the exact
+                        // process-owned SessionFlags override. It is a local product capability,
+                        // not a workspace/remote Plugin entitlement. Preserve only that root when
+                        // the workspace Plugin service is unavailable; every user or remote Plugin
+                        // remains gated by the workspace setting.
+                        effective_skill_roots.retain(|root| {
+                            root.plugin_id == CATALYST_BUNDLED_CATA_OFFICE_PLUGIN_ID
+                        });
+                    }
                     let skills_input = codex_core::skills::SkillsLoadInput::new(
                         cwd_abs.clone(),
                         effective_skill_roots,

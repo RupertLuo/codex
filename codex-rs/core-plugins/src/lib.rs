@@ -29,6 +29,7 @@ pub(crate) const OPENAI_BUNDLED_ALPHA_MARKETPLACE_NAME: &str = "openai-bundled-a
 pub(crate) const OPENAI_PRIMARY_RUNTIME_MARKETPLACE_NAME: &str = "openai-primary-runtime";
 pub(crate) const CATA_OFFICE_PLUGIN_NAME: &str = "cata-office";
 pub(crate) const CATALYST_BUNDLED_MARKETPLACE_NAME: &str = "catalyst-bundled";
+pub const CATALYST_BUNDLED_CATA_OFFICE_PLUGIN_ID: &str = "cata-office@catalyst-bundled";
 
 pub fn is_openai_curated_marketplace_name(marketplace_name: &str) -> bool {
     marketplace_name == OPENAI_CURATED_MARKETPLACE_NAME
