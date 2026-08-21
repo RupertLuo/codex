@@ -1032,6 +1032,20 @@ ON CONFLICT(id) DO UPDATE SET
             .iter()
             .map(ThreadId::to_string)
             .collect::<Vec<_>>();
+        let agent_job_table_count: i64 = sqlx::query_scalar(
+            r#"
+SELECT COUNT(*)
+FROM sqlite_master
+WHERE type = 'table' AND name IN ('agent_jobs', 'agent_job_items')
+            "#,
+        )
+        .fetch_one(self.pool.as_ref())
+        .await?;
+        let agent_job_tables_exist = match agent_job_table_count {
+            0 => false,
+            2 => true,
+            count => anyhow::bail!("incomplete agent job schema: found {count} of 2 tables"),
+        };
         for (thread_id, thread_id_string) in thread_ids.iter().zip(&thread_id_strings) {
             sqlx::query("DELETE FROM logs WHERE thread_id = ?")
                 .bind(thread_id_string)
@@ -1044,11 +1058,12 @@ ON CONFLICT(id) DO UPDATE SET
         let now = Utc::now().timestamp();
         let mut tx = self.pool.begin().await?;
         for thread_id_string in &thread_id_strings {
-            for parent_thread_id_string in &thread_id_strings {
-                // If both the job runner and worker are being deleted, requeueing
-                // the worker item would leave a running job with no loop to consume it.
-                sqlx::query(
-                    r#"
+            if agent_job_tables_exist {
+                for parent_thread_id_string in &thread_id_strings {
+                    // If both the job runner and worker are being deleted, requeueing
+                    // the worker item would leave a running job with no loop to consume it.
+                    sqlx::query(
+                        r#"
 UPDATE agent_jobs
 SET status = ?, updated_at = ?, completed_at = ?, last_error = ?
 WHERE status IN (?, ?)
@@ -1058,26 +1073,28 @@ WHERE status IN (?, ?)
     JOIN thread_spawn_edges AS edge ON edge.child_thread_id = item.assigned_thread_id
     WHERE item.status = ? AND item.assigned_thread_id = ? AND edge.parent_thread_id = ?
   )
-                    "#,
-                )
-                .bind(AgentJobStatus::Cancelled.as_str())
-                .bind(now)
-                .bind(now)
-                .bind("agent job runner thread was deleted")
-                .bind(AgentJobStatus::Pending.as_str())
-                .bind(AgentJobStatus::Running.as_str())
-                .bind(AgentJobItemStatus::Running.as_str())
-                .bind(thread_id_string)
-                .bind(parent_thread_id_string)
-                .execute(&mut *tx)
-                .await?;
+                        "#,
+                    )
+                    .bind(AgentJobStatus::Cancelled.as_str())
+                    .bind(now)
+                    .bind(now)
+                    .bind("agent job runner thread was deleted")
+                    .bind(AgentJobStatus::Pending.as_str())
+                    .bind(AgentJobStatus::Running.as_str())
+                    .bind(AgentJobItemStatus::Running.as_str())
+                    .bind(thread_id_string)
+                    .bind(parent_thread_id_string)
+                    .execute(&mut *tx)
+                    .await?;
+                }
             }
             sqlx::query("DELETE FROM thread_dynamic_tools WHERE thread_id = ?")
                 .bind(thread_id_string)
                 .execute(&mut *tx)
                 .await?;
-            sqlx::query(
-                r#"
+            if agent_job_tables_exist {
+                sqlx::query(
+                    r#"
 UPDATE agent_job_items
 SET
     status = ?,
@@ -1085,26 +1102,27 @@ SET
     updated_at = ?,
     last_error = ?
 WHERE assigned_thread_id = ? AND status = ?
-            "#,
-            )
-            .bind(AgentJobItemStatus::Pending.as_str())
-            .bind(now)
-            .bind("assigned thread was deleted")
-            .bind(thread_id_string)
-            .bind(AgentJobItemStatus::Running.as_str())
-            .execute(&mut *tx)
-            .await?;
-            sqlx::query(
-                r#"
+                    "#,
+                )
+                .bind(AgentJobItemStatus::Pending.as_str())
+                .bind(now)
+                .bind("assigned thread was deleted")
+                .bind(thread_id_string)
+                .bind(AgentJobItemStatus::Running.as_str())
+                .execute(&mut *tx)
+                .await?;
+                sqlx::query(
+                    r#"
 UPDATE agent_job_items
 SET assigned_thread_id = NULL, updated_at = ?
 WHERE assigned_thread_id = ?
-            "#,
-            )
-            .bind(now)
-            .bind(thread_id_string)
-            .execute(&mut *tx)
-            .await?;
+                    "#,
+                )
+                .bind(now)
+                .bind(thread_id_string)
+                .execute(&mut *tx)
+                .await?;
+            }
         }
         for thread_id_string in &thread_id_strings {
             sqlx::query(
@@ -1653,6 +1671,78 @@ mod tests {
 
         assert_eq!(runtime.delete_thread(missing_thread_id).await?, 0);
         assert_thread_cleanup_state(&runtime, missing_thread_id).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn delete_thread_tolerates_newer_schema_without_agent_job_tables() -> Result<()> {
+        let codex_home = unique_temp_dir();
+        let runtime = StateRuntime::init(codex_home.clone(), "test-provider".to_string()).await?;
+        let thread_id = ThreadId::from_string("00000000-0000-0000-0000-000000000407")?;
+        runtime
+            .upsert_thread(&test_thread_metadata(
+                &codex_home,
+                thread_id,
+                codex_home.clone(),
+            ))
+            .await?;
+
+        sqlx::query("DROP TABLE agent_job_items")
+            .execute(runtime.pool.as_ref())
+            .await?;
+        sqlx::query("DROP TABLE agent_jobs")
+            .execute(runtime.pool.as_ref())
+            .await?;
+
+        assert_eq!(runtime.delete_thread(thread_id).await?, 1);
+        assert!(runtime.get_thread(thread_id).await?.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn delete_thread_rejects_partial_agent_job_schema_before_cleanup() -> Result<()> {
+        let codex_home = unique_temp_dir();
+        let runtime = StateRuntime::init(codex_home.clone(), "test-provider".to_string()).await?;
+        let thread_id = ThreadId::from_string("00000000-0000-0000-0000-000000000408")?;
+        let child_thread_id = ThreadId::from_string("00000000-0000-0000-0000-000000000409")?;
+        runtime
+            .upsert_thread(&test_thread_metadata(
+                &codex_home,
+                thread_id,
+                codex_home.clone(),
+            ))
+            .await?;
+        seed_thread_cleanup_state(&runtime, thread_id, child_thread_id).await?;
+
+        sqlx::query("DROP TABLE agent_job_items")
+            .execute(runtime.pool.as_ref())
+            .await?;
+
+        let error = runtime
+            .delete_thread(thread_id)
+            .await
+            .expect_err("partial agent job schema should fail closed");
+
+        assert!(error.to_string().contains("incomplete agent job schema"));
+        assert!(runtime.get_thread(thread_id).await?.is_some());
+        assert_eq!(
+            runtime.list_thread_spawn_descendants(thread_id).await?,
+            vec![child_thread_id]
+        );
+        let goal = runtime
+            .thread_goals()
+            .get_thread_goal(thread_id)
+            .await?
+            .expect("goal should remain");
+        assert_eq!(goal.objective, "test goal");
+        assert_eq!(goal.status, crate::ThreadGoalStatus::Active);
+        let logs = runtime
+            .query_logs(&LogQuery {
+                thread_ids: vec![thread_id.to_string()],
+                ..Default::default()
+            })
+            .await?;
+        assert_eq!(logs.len(), 1);
         Ok(())
     }
 
