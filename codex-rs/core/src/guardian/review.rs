@@ -75,11 +75,10 @@ pub(crate) async fn guardian_rejection_message(session: &Session, review_id: &st
         .lock()
         .await
         .remove(review_id)
-        .filter(|rejection| !rejection.rationale.trim().is_empty())
-        .unwrap_or_else(|| GuardianRejection {
-            rationale: "Auto-reviewer denied the action without a specific rationale.".to_string(),
-            source: GuardianAssessmentDecisionSource::Agent,
-        });
+        .filter(|rejection| !rejection.rationale.trim().is_empty());
+    let Some(rejection) = rejection else {
+        return "rejected by user".to_string();
+    };
     match rejection.source {
         GuardianAssessmentDecisionSource::Agent => format!(
             "This action was rejected due to unacceptable risk.\nReason: {}\n{}",
@@ -280,6 +279,7 @@ async fn run_guardian_review(
     retry_reason: Option<String>,
     approval_request_source: GuardianApprovalRequestSource,
     external_cancel: Option<CancellationToken>,
+    fallback_to_user_on_failure: bool,
 ) -> ReviewDecision {
     let target_item_id = guardian_request_target_item_id(&request).map(str::to_string);
     let assessment_turn_id = guardian_request_turn_id(&request, &turn.sub_id).to_string();
@@ -355,6 +355,8 @@ async fn run_guardian_review(
     }
 
     let schema = guardian_output_schema();
+    let manual_fallback_request = request.clone();
+    let manual_fallback_reason = retry_reason.clone();
     let terminal_action = action_summary.clone();
     let (outcome, analytics_result) = Box::pin(run_guardian_review_session_with_retry(
         session.clone(),
@@ -437,13 +439,25 @@ async fn run_guardian_review(
                             status: GuardianAssessmentStatus::TimedOut,
                             risk_level: None,
                             user_authorization: None,
-                            rationale: Some(rationale),
+                            rationale: Some(rationale.clone()),
                             decision_source: Some(GuardianAssessmentDecisionSource::Agent),
                             action: terminal_action,
                         }),
                     )
                     .await;
                 record_guardian_non_denial(&session, &assessment_turn_id).await;
+                if fallback_to_user_on_failure
+                    && let Some(decision) = request_user_approval_after_guardian_failure(
+                        session.as_ref(),
+                        turn.as_ref(),
+                        manual_fallback_request,
+                        manual_fallback_reason,
+                        &rationale,
+                    )
+                    .await
+                {
+                    return decision;
+                }
                 return ReviewDecision::TimedOut;
             }
             GuardianReviewError::Cancelled => {
@@ -506,6 +520,46 @@ async fn run_guardian_review(
                     },
                     completed_at_ms.try_into().unwrap_or_default(),
                 );
+                if fallback_to_user_on_failure {
+                    session
+                        .send_event(
+                            turn.as_ref(),
+                            EventMsg::GuardianWarning(WarningEvent {
+                                message: format!("{rationale}. Requesting user approval instead."),
+                            }),
+                        )
+                        .await;
+                    session
+                        .send_event(
+                            turn.as_ref(),
+                            EventMsg::GuardianAssessment(GuardianAssessmentEvent {
+                                id: review_id.clone(),
+                                target_item_id: target_item_id.clone(),
+                                turn_id: assessment_turn_id.clone(),
+                                started_at_ms,
+                                completed_at_ms: Some(completed_at_ms),
+                                status: GuardianAssessmentStatus::Aborted,
+                                risk_level: None,
+                                user_authorization: None,
+                                rationale: Some(rationale.clone()),
+                                decision_source: Some(GuardianAssessmentDecisionSource::Agent),
+                                action: terminal_action.clone(),
+                            }),
+                        )
+                        .await;
+                    record_guardian_non_denial(&session, &assessment_turn_id).await;
+                    if let Some(decision) = request_user_approval_after_guardian_failure(
+                        session.as_ref(),
+                        turn.as_ref(),
+                        manual_fallback_request,
+                        manual_fallback_reason,
+                        &rationale,
+                    )
+                    .await
+                    {
+                        return decision;
+                    }
+                }
                 (
                     GuardianAssessment {
                         risk_level: GuardianRiskLevel::High,
@@ -590,6 +644,63 @@ async fn run_guardian_review(
     }
 }
 
+async fn request_user_approval_after_guardian_failure(
+    session: &Session,
+    turn: &TurnContext,
+    request: GuardianApprovalRequest,
+    retry_reason: Option<String>,
+    failure_reason: &str,
+) -> Option<ReviewDecision> {
+    let (id, command, cwd, additional_permissions, justification) = match request {
+        GuardianApprovalRequest::Shell {
+            id,
+            command,
+            cwd,
+            additional_permissions,
+            justification,
+            ..
+        }
+        | GuardianApprovalRequest::ExecCommand {
+            id,
+            command,
+            cwd,
+            additional_permissions,
+            justification,
+            ..
+        } => (id, command, cwd, additional_permissions, justification),
+        GuardianApprovalRequest::ApplyPatch { .. }
+        | GuardianApprovalRequest::NetworkAccess { .. }
+        | GuardianApprovalRequest::McpToolCall { .. }
+        | GuardianApprovalRequest::RequestPermissions { .. } => return None,
+        #[cfg(unix)]
+        GuardianApprovalRequest::Execve { .. } => return None,
+    };
+    let original_reason = retry_reason.or(justification);
+    let reason = Some(match original_reason {
+        Some(original_reason) => {
+            format!("{original_reason}\n\nAutomatic approval was unavailable: {failure_reason}")
+        }
+        None => format!("Automatic approval was unavailable: {failure_reason}"),
+    });
+    Some(
+        session
+            .request_command_approval(
+                turn,
+                id,
+                /*approval_id*/ None,
+                /*environment_id*/ None,
+                command,
+                cwd,
+                reason,
+                /*network_approval_context*/ None,
+                /*proposed_execpolicy_amendment*/ None,
+                additional_permissions,
+                /*available_decisions*/ None,
+            )
+            .await,
+    )
+}
+
 /// Public entrypoint for approval requests that should be reviewed by guardian.
 pub(crate) async fn review_approval_request(
     session: &Arc<Session>,
@@ -608,6 +719,28 @@ pub(crate) async fn review_approval_request(
         retry_reason,
         GuardianApprovalRequestSource::MainTurn,
         /*external_cancel*/ None,
+        /*fallback_to_user_on_failure*/ false,
+    ))
+    .await
+}
+
+/// Reviews a command approval automatically and asks the user when the reviewer itself fails.
+pub(crate) async fn review_approval_request_with_user_fallback(
+    session: &Arc<Session>,
+    turn: &Arc<TurnContext>,
+    review_id: String,
+    request: GuardianApprovalRequest,
+    retry_reason: Option<String>,
+) -> ReviewDecision {
+    Box::pin(run_guardian_review(
+        Arc::clone(session),
+        Arc::clone(turn),
+        review_id,
+        request,
+        retry_reason,
+        GuardianApprovalRequestSource::MainTurn,
+        /*external_cancel*/ None,
+        /*fallback_to_user_on_failure*/ true,
     ))
     .await
 }
@@ -629,6 +762,7 @@ pub(crate) async fn review_approval_request_with_cancel(
         retry_reason,
         approval_request_source,
         Some(cancel_token),
+        /*fallback_to_user_on_failure*/ false,
     )
     .await
 }

@@ -2375,6 +2375,90 @@ async fn guardian_review_surfaces_responses_api_errors_in_rejection_reason() -> 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn guardian_command_review_failure_falls_back_to_user_approval() -> anyhow::Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+    let error_message = "The selected model does not support the requested response controls.";
+    let request_log = mount_response_sequence(
+        &server,
+        vec![
+            wiremock::ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "error": {
+                    "message": error_message,
+                    "type": "invalid_request_error",
+                    "param": "text"
+                }
+            })),
+        ],
+    )
+    .await;
+
+    let (mut session, mut turn, rx) =
+        crate::session::tests::make_session_and_context_with_rx().await;
+    let mut config = (*turn.config).clone();
+    config.model_provider.base_url = Some(format!("{}/v1", server.uri()));
+    let config = Arc::new(config);
+    let models_manager = test_support::models_manager_with_provider(
+        config.codex_home.to_path_buf(),
+        Arc::clone(&session.services.auth_manager),
+        config.model_provider.clone(),
+    );
+    Arc::get_mut(&mut session)
+        .expect("session should be uniquely owned")
+        .services
+        .models_manager = models_manager;
+    let turn_mut = Arc::get_mut(&mut turn).expect("turn should be uniquely owned");
+    turn_mut.config = Arc::clone(&config);
+    turn_mut.provider =
+        create_model_provider(config.model_provider.clone(), turn_mut.auth_manager.clone());
+    seed_guardian_parent_history(&session, &turn).await;
+
+    let review = tokio::spawn({
+        let session = Arc::clone(&session);
+        let turn = Arc::clone(&turn);
+        async move {
+            review_approval_request_with_user_fallback(
+                &session,
+                &turn,
+                "review-shell-user-fallback".to_string(),
+                GuardianApprovalRequest::Shell {
+                    id: "shell-user-fallback".to_string(),
+                    command: vec!["git".to_string(), "push".to_string()],
+                    cwd: test_path_buf("/repo/codex-rs/core").abs(),
+                    sandbox_permissions: crate::sandboxing::SandboxPermissions::UseDefault,
+                    additional_permissions: None,
+                    justification: Some("Need to push the reviewed docs fix.".to_string()),
+                },
+                /*retry_reason*/ None,
+            )
+            .await
+        }
+    });
+
+    let approval = loop {
+        let event = rx.recv().await.expect("event channel should remain open");
+        if let EventMsg::ExecApprovalRequest(approval) = event.msg {
+            break approval;
+        }
+    };
+    assert_eq!(approval.call_id, "shell-user-fallback");
+    assert!(
+        approval
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains(error_message))
+    );
+    session
+        .notify_approval(&approval.call_id, ReviewDecision::Approved)
+        .await;
+
+    assert_eq!(review.await?, ReviewDecision::Approved);
+    assert_eq!(request_log.requests().len(), 1);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn guardian_review_retries_transient_session_failure_then_approves() -> anyhow::Result<()> {
     skip_if_no_network!(Ok(()));
 

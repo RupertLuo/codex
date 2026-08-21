@@ -12,7 +12,7 @@ use crate::command_canonicalization::canonicalize_command_for_approval;
 use crate::exec::ExecCapturePolicy;
 use crate::guardian::GuardianApprovalRequest;
 use crate::guardian::GuardianNetworkAccessTrigger;
-use crate::guardian::review_approval_request;
+use crate::guardian::review_approval_request_with_user_fallback;
 use crate::sandboxing::ExecOptions;
 use crate::sandboxing::SandboxPermissions;
 use crate::sandboxing::execute_env;
@@ -153,7 +153,7 @@ impl Approvable<ShellRequest> for ShellRuntime {
         let guardian_review_id = ctx.guardian_review_id.clone();
         Box::pin(async move {
             if let Some(review_id) = guardian_review_id {
-                return review_approval_request(
+                return review_approval_request_with_user_fallback(
                     session,
                     turn,
                     review_id,

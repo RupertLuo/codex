@@ -809,7 +809,10 @@ async fn run_review_on_session(
         params.external_cancel.as_ref(),
         Box::pin(review_session.codex.submit(Op::UserInput {
             items: prompt_items.items,
-            final_output_json_schema: Some(params.schema.clone()),
+            final_output_json_schema: guardian_final_output_json_schema(
+                &params.model,
+                &params.schema,
+            ),
             responsesapi_client_metadata: None,
             additional_context: Default::default(),
             thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
@@ -990,6 +993,12 @@ fn event_matches_turn(event: &Event, expected_turn_id: &str) -> bool {
         }
         _ => true,
     }
+}
+
+fn guardian_final_output_json_schema(model: &str, schema: &Value) -> Option<Value> {
+    // Namespaced model IDs are served through third-party Responses-compatible transports.
+    // Several reject `text.format`; the guardian prompt and parser still enforce this contract.
+    (!model.contains('/')).then(|| schema.clone())
 }
 
 pub(crate) fn build_guardian_review_session_config(
@@ -1847,5 +1856,19 @@ mod tests {
             .expect("drain current turn");
 
         assert!(review_session.codex.rx_event.try_recv().is_err());
+    }
+
+    #[test]
+    fn namespaced_guardian_models_use_prompt_validated_json() {
+        let schema = serde_json::json!({"type": "object"});
+
+        assert_eq!(
+            guardian_final_output_json_schema("deepseek/deepseek-v4-pro", &schema),
+            None
+        );
+        assert_eq!(
+            guardian_final_output_json_schema("gpt-5.4", &schema),
+            Some(schema)
+        );
     }
 }
