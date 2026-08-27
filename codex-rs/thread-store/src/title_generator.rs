@@ -41,4 +41,7 @@ pub trait ThreadMetadataMutationGate: Send + Sync + std::fmt::Debug {
     /// Acquires an owned mutation capability, or returns `None` when mutations are permanently
     /// disabled for the thread lifecycle.
     fn acquire<'a>(&'a self) -> ThreadMetadataMutationPermitFuture<'a>;
+
+    /// Publishes a successfully persisted automatic title to the live host.
+    fn title_updated(&self, _title: String) {}
 }

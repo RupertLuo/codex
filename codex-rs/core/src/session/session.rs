@@ -65,6 +65,7 @@ pub(crate) enum PersistenceLifecycle {
 #[derive(Debug)]
 struct SessionThreadMetadataMutationGate {
     persistence_lifecycle: Arc<Mutex<PersistenceLifecycle>>,
+    tx_event: Sender<Event>,
 }
 
 struct SessionThreadMetadataMutationPermit {
@@ -85,6 +86,15 @@ impl codex_thread_store::ThreadMetadataMutationGate for SessionThreadMetadataMut
                 PersistenceLifecycle::Quarantined { .. } => None,
             }
         })
+    }
+
+    fn title_updated(&self, title: String) {
+        let _ = self.tx_event.try_send(Event {
+            id: String::new(),
+            msg: EventMsg::ThreadNameUpdated(codex_protocol::protocol::ThreadNameUpdatedEvent {
+                name: title,
+            }),
+        });
     }
 }
 
@@ -647,6 +657,7 @@ impl Session {
         let thread_metadata_mutation_gate: Arc<dyn codex_thread_store::ThreadMetadataMutationGate> =
             Arc::new(SessionThreadMetadataMutationGate {
                 persistence_lifecycle: Arc::clone(&persistence_lifecycle),
+                tx_event: tx_event.clone(),
             });
         // Kick off independent async setup tasks in parallel to reduce startup latency.
         //

@@ -578,7 +578,7 @@ fn spawn_llm_title_task(
         else {
             return;
         };
-        let _mutation_permit = match metadata_mutation_gate {
+        let _mutation_permit = match metadata_mutation_gate.as_ref() {
             Some(gate) => {
                 let Some(permit) = gate.acquire().await else {
                     return;
@@ -610,7 +610,7 @@ fn spawn_llm_title_task(
                     .update_thread_metadata(UpdateThreadMetadataParams {
                         thread_id,
                         patch: ThreadMetadataPatch {
-                            title: Some(title),
+                            title: Some(title.clone()),
                             ..Default::default()
                         },
                         include_archived: true,
@@ -618,6 +618,8 @@ fn spawn_llm_title_task(
                     .await
                 {
                     warn!("failed to persist generated thread title for {thread_id}: {err}");
+                } else if let Some(gate) = metadata_mutation_gate.as_ref() {
+                    gate.title_updated(title);
                 }
             }
             Ok(_) => {}
@@ -691,6 +693,7 @@ mod tests {
         acquire_attempted: Arc<AtomicBool>,
         permit_held: Arc<AtomicBool>,
         permit_released: Arc<AtomicBool>,
+        title_notified: Arc<AtomicBool>,
     }
 
     struct TrackingMutationPermit {
@@ -721,6 +724,10 @@ mod tests {
                 })
                     as Box<dyn crate::ThreadMetadataMutationPermit>)
             })
+        }
+
+        fn title_updated(&self, _title: String) {
+            self.title_notified.store(true, Ordering::SeqCst);
         }
     }
 
@@ -1177,11 +1184,13 @@ mod tests {
         let permit_held = Arc::new(AtomicBool::new(false));
         let acquire_attempted = Arc::new(AtomicBool::new(false));
         let permit_released = Arc::new(AtomicBool::new(false));
+        let title_notified = Arc::new(AtomicBool::new(false));
         let gate = Arc::new(TrackingMutationGate {
             allow: true,
             acquire_attempted: Arc::clone(&acquire_attempted),
             permit_held: Arc::clone(&permit_held),
             permit_released: Arc::clone(&permit_released),
+            title_notified: Arc::clone(&title_notified),
         });
         let store = Arc::new(PermitObservingThreadStore::new(Arc::clone(&permit_held)));
         store.set_title_generator(Arc::new(StubTitleGenerator));
@@ -1215,6 +1224,7 @@ mod tests {
         assert!(store.title_read_while_held.load(Ordering::SeqCst));
         assert!(store.title_update_while_held.load(Ordering::SeqCst));
         assert!(permit_released.load(Ordering::SeqCst));
+        assert!(title_notified.load(Ordering::SeqCst));
         assert!(!permit_held.load(Ordering::SeqCst));
         assert!(
             store.inner.calls().await.update_thread_metadata > updates_before_title,
@@ -1227,11 +1237,13 @@ mod tests {
         let permit_held = Arc::new(AtomicBool::new(false));
         let acquire_attempted = Arc::new(AtomicBool::new(false));
         let permit_released = Arc::new(AtomicBool::new(false));
+        let title_notified = Arc::new(AtomicBool::new(false));
         let gate = Arc::new(TrackingMutationGate {
             allow: false,
             acquire_attempted: Arc::clone(&acquire_attempted),
             permit_held: Arc::clone(&permit_held),
             permit_released: Arc::clone(&permit_released),
+            title_notified: Arc::clone(&title_notified),
         });
         let store = Arc::new(PermitObservingThreadStore::new(Arc::clone(&permit_held)));
         store.set_title_generator(Arc::new(StubTitleGenerator));
@@ -1268,5 +1280,6 @@ mod tests {
         assert!(!store.title_update_seen.load(Ordering::SeqCst));
         assert!(!permit_held.load(Ordering::SeqCst));
         assert!(!permit_released.load(Ordering::SeqCst));
+        assert!(!title_notified.load(Ordering::SeqCst));
     }
 }
