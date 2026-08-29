@@ -4,6 +4,7 @@
 //! into another, especially while Plan mode is active.
 
 use super::*;
+use crate::model_runtime::OnboardingProvider;
 
 const ULTRA_REASONING_CONCURRENCY_WARNING_THRESHOLD: usize = 8;
 
@@ -187,6 +188,37 @@ impl ChatWidget {
     }
 
     pub(crate) fn open_all_models_popup(&mut self, presets: Vec<ModelPreset>) {
+        self.open_all_models_popup_with_context(
+            presets,
+            "Select Model and Effort".to_string(),
+            /*on_cancel*/ None,
+        );
+    }
+
+    pub(crate) fn open_onboarding_model_popup_with_presets(
+        &mut self,
+        provider: OnboardingProvider,
+        presets: Vec<ModelPreset>,
+    ) {
+        let presets = presets
+            .into_iter()
+            .filter(|preset| provider.model_ids.contains(&preset.model))
+            .collect();
+        self.open_all_models_popup_with_context(
+            presets,
+            format!("Select {} Model", provider.display_name),
+            Some(Box::new(|tx| {
+                tx.send(AppEvent::BeginModelRuntimeOnboarding);
+            })),
+        );
+    }
+
+    fn open_all_models_popup_with_context(
+        &mut self,
+        presets: Vec<ModelPreset>,
+        title: String,
+        on_cancel: Option<Box<dyn Fn(&AppEventSender) + Send + Sync>>,
+    ) {
         if presets.is_empty() {
             self.add_info_message(
                 "No additional models are available right now.".to_string(),
@@ -209,10 +241,14 @@ impl ChatWidget {
                 });
             })];
             items.push(SelectionItem {
-                name: preset.model.clone(),
+                name: preset.display_name.clone(),
                 description,
                 is_current,
                 is_default: preset.is_default,
+                search_value: Some(format!(
+                    "{} {} {}",
+                    preset.model, preset.display_name, preset.description
+                )),
                 actions,
                 dismiss_on_select: single_supported_effort,
                 dismiss_parent_on_child_accept: !single_supported_effort,
@@ -221,13 +257,16 @@ impl ChatWidget {
         }
 
         let header = self.model_menu_header(
-            "Select Model and Effort",
+            &title,
             "Access legacy models by running codex -m <model_name> or in your config.toml",
         );
         self.bottom_pane.show_selection_view(SelectionViewParams {
             footer_hint: Some(self.bottom_pane.standard_popup_hint_line()),
             items,
             header,
+            is_searchable: true,
+            search_placeholder: Some("Search models or providers".to_string()),
+            on_cancel,
             ..Default::default()
         });
     }
@@ -253,12 +292,11 @@ impl ChatWidget {
                     effort: effort_for_action.clone(),
                 });
             } else {
-                tx.send(AppEvent::UpdateModel(model_for_action.clone()));
-                tx.send(AppEvent::UpdateReasoningEffort(effort_for_action.clone()));
-                tx.send(AppEvent::PersistModelSelection {
+                tx.send(AppEvent::RequestModelSelection(PendingModelSelection {
                     model: model_for_action.clone(),
                     effort: effort_for_action.clone(),
-                });
+                    update_plan_mode_effort: false,
+                }));
             }
             if let Some(warning) = warning.clone() {
                 tx.send(AppEvent::InsertHistoryCell(Box::new(
@@ -351,14 +389,11 @@ impl ChatWidget {
             }
         })];
         let all_modes_actions: Vec<SelectionAction> = vec![Box::new(move |tx| {
-            tx.send(AppEvent::UpdateModel(model.clone()));
-            tx.send(AppEvent::UpdateReasoningEffort(effort.clone()));
-            tx.send(AppEvent::UpdatePlanModeReasoningEffort(effort.clone()));
-            tx.send(AppEvent::PersistPlanModeReasoningEffort(effort.clone()));
-            tx.send(AppEvent::PersistModelSelection {
+            tx.send(AppEvent::RequestModelSelection(PendingModelSelection {
                 model: model.clone(),
                 effort: effort.clone(),
-            });
+                update_plan_mode_effort: true,
+            }));
             if let Some(warning) = warning.clone() {
                 tx.send(AppEvent::InsertHistoryCell(Box::new(
                     history_cell::new_warning_event(warning),
@@ -682,27 +717,21 @@ impl ChatWidget {
         ))
     }
 
-    pub(super) fn apply_model_and_effort_without_persist(
-        &self,
-        model: String,
-        effort: Option<ReasoningEffortConfig>,
-    ) {
-        let warning = effort
-            .as_ref()
-            .and_then(|effort| self.ultra_reasoning_concurrency_warning(effort));
-        self.app_event_tx.send(AppEvent::UpdateModel(model));
+    fn apply_model_and_effort(&self, model: String, effort: Option<ReasoningEffortConfig>) {
         self.app_event_tx
-            .send(AppEvent::UpdateReasoningEffort(effort));
-        if let Some(warning) = warning {
-            self.app_event_tx.send(AppEvent::InsertHistoryCell(Box::new(
-                history_cell::new_warning_event(warning),
-            )));
-        }
+            .send(AppEvent::RequestModelSelection(PendingModelSelection {
+                model,
+                effort,
+                update_plan_mode_effort: false,
+            }));
     }
 
-    fn apply_model_and_effort(&self, model: String, effort: Option<ReasoningEffortConfig>) {
-        self.apply_model_and_effort_without_persist(model.clone(), effort.clone());
-        self.app_event_tx
-            .send(AppEvent::PersistModelSelection { model, effort });
+    pub(crate) fn defer_model_selection_for_credential(
+        &mut self,
+        entry: CredentialEntry,
+        selection: PendingModelSelection,
+    ) {
+        self.pending_model_selection_for_credential = Some((entry, selection));
+        self.open_model_credential_prompt();
     }
 }

@@ -21,8 +21,7 @@ fn absolute_path(path: &str) -> AbsolutePathBuf {
 
 fn test_socket_path() -> AbsolutePathBuf {
     let root = tempfile::tempdir().expect("temporary directory").keep();
-    AbsolutePathBuf::from_absolute_path(root.join("app-server.sock"))
-        .expect("absolute socket path")
+    AbsolutePathBuf::from_absolute_path(root.join("app-server.sock")).expect("absolute socket path")
 }
 
 fn non_loopback_transport() -> AppServerTransport {

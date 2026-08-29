@@ -1,5 +1,9 @@
 use super::*;
 use crate::bottom_pane::slash_commands::ServiceTierCommand;
+use crate::model_runtime::CredentialEntry;
+use crate::model_runtime::CredentialGroup;
+use crate::model_runtime::CredentialStatus;
+use crate::model_runtime::OnboardingProvider;
 use pretty_assertions::assert_eq;
 use serial_test::serial;
 
@@ -32,6 +36,206 @@ fn fast_tier_command() -> ServiceTierCommand {
         id: ServiceTier::Fast.request_value().to_string(),
         name: "fast".to_string(),
         description: "Fastest inference with increased plan usage".to_string(),
+    }
+}
+
+fn credential_entry(
+    id: &str,
+    display_name: &str,
+    environment_variable: &str,
+    status: CredentialStatus,
+) -> CredentialEntry {
+    CredentialEntry {
+        id: id.to_string(),
+        display_name: display_name.to_string(),
+        environment_variable: environment_variable.to_string(),
+        status,
+        group: CredentialGroup::ModelProviders,
+    }
+}
+
+fn onboarding_provider(
+    id: &str,
+    display_name: &str,
+    status: CredentialStatus,
+    model_ids: &[&str],
+) -> OnboardingProvider {
+    OnboardingProvider {
+        id: id.to_string(),
+        display_name: display_name.to_string(),
+        credential: credential_entry(
+            id,
+            display_name,
+            &format!("{}_API_KEY", id.to_ascii_uppercase()),
+            status,
+        ),
+        model_ids: model_ids.iter().map(|model| (*model).to_string()).collect(),
+    }
+}
+
+#[tokio::test]
+async fn provider_onboarding_lists_active_service_providers_first() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+
+    chat.open_onboarding_provider_popup(vec![onboarding_provider(
+        "deepseek",
+        "DeepSeek",
+        CredentialStatus::Missing,
+        &["deepseek/deepseek-v4-pro"],
+    )]);
+
+    let popup = render_bottom_popup(&chat, /*width*/ 100);
+    assert!(popup.contains("Select Service Provider"), "{popup}");
+    assert!(popup.contains("DeepSeek"), "{popup}");
+    assert!(popup.contains("API key required"), "{popup}");
+}
+
+#[tokio::test]
+async fn provider_onboarding_collects_masked_credential_before_models() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    while rx.try_recv().is_ok() {}
+    let provider = onboarding_provider(
+        "deepseek",
+        "DeepSeek",
+        CredentialStatus::Missing,
+        &["deepseek/deepseek-v4-pro"],
+    );
+
+    chat.open_onboarding_credential_prompt(provider.clone());
+    chat.handle_paste("seeded-secret-marker".to_string());
+    let popup = render_bottom_popup(&chat, /*width*/ 100);
+    assert!(popup.contains("Enter DeepSeek API key"), "{popup}");
+    assert!(!popup.contains("seeded-secret-marker"), "{popup}");
+    chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
+
+    match rx.try_recv() {
+        Ok(AppEvent::StoreOnboardingCredential {
+            provider: selected,
+            value,
+        }) => {
+            assert_eq!(selected, provider);
+            assert_eq!(value.expose_secret(), "seeded-secret-marker");
+        }
+        other => panic!("expected onboarding credential submission, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn credentials_popup_shows_generic_status_labels() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.open_credentials_popup_with_entries(vec![
+        credential_entry(
+            "environment",
+            "Environment credential",
+            "ENVIRONMENT_MODEL_KEY",
+            CredentialStatus::EnvironmentOverride,
+        ),
+        credential_entry(
+            "verified",
+            "Verified credential",
+            "VERIFIED_MODEL_KEY",
+            CredentialStatus::Verified,
+        ),
+        credential_entry(
+            "unverified",
+            "Unverified credential",
+            "UNVERIFIED_MODEL_KEY",
+            CredentialStatus::Unverified,
+        ),
+        credential_entry(
+            "missing",
+            "Missing credential",
+            "MISSING_MODEL_KEY",
+            CredentialStatus::Missing,
+        ),
+    ]);
+
+    let popup = render_bottom_popup(&chat, /*width*/ 100);
+    for expected in ["Environment override", "Verified", "Unverified", "Missing"] {
+        assert!(
+            popup.contains(expected),
+            "missing {expected:?} in:\n{popup}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn credential_actions_match_the_credential_status() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    while rx.try_recv().is_ok() {}
+
+    chat.open_credential_actions(credential_entry(
+        "environment",
+        "Environment credential",
+        "ENVIRONMENT_MODEL_KEY",
+        CredentialStatus::EnvironmentOverride,
+    ));
+    let environment = render_bottom_popup(&chat, /*width*/ 100);
+    assert!(
+        environment
+            .contains("Change ENVIRONMENT_MODEL_KEY in the environment that launches Codex.")
+    );
+    assert!(!environment.contains("Replace credential"));
+    chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
+    assert!(
+        std::iter::from_fn(|| rx.try_recv().ok()).all(|event| !matches!(
+            event,
+            AppEvent::StoreCredential { .. } | AppEvent::DeleteCredential(_)
+        ))
+    );
+    chat.handle_key_event(KeyEvent::from(KeyCode::Esc));
+
+    chat.open_credential_actions(credential_entry(
+        "verified",
+        "Verified credential",
+        "VERIFIED_MODEL_KEY",
+        CredentialStatus::Verified,
+    ));
+    let verified = render_bottom_popup(&chat, /*width*/ 100);
+    assert!(verified.contains("Replace credential"));
+    assert!(verified.contains("Revalidate credential"));
+    assert!(verified.contains("Delete credential"));
+    chat.handle_key_event(KeyEvent::from(KeyCode::Esc));
+
+    chat.open_credential_actions(credential_entry(
+        "missing",
+        "Missing credential",
+        "MISSING_MODEL_KEY",
+        CredentialStatus::Missing,
+    ));
+    let missing = render_bottom_popup(&chat, /*width*/ 100);
+    assert!(missing.contains("Enter credential"));
+    assert!(!missing.contains("Delete credential"));
+}
+
+#[tokio::test]
+async fn credential_prompt_submits_only_the_masked_sensitive_owner() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    while rx.try_recv().is_ok() {}
+    chat.open_credential_prompt(credential_entry(
+        "missing",
+        "Missing credential",
+        "MISSING_MODEL_KEY",
+        CredentialStatus::Missing,
+    ));
+
+    chat.handle_paste("seeded-secret-marker".to_string());
+    let rendered = render_bottom_popup(&chat, /*width*/ 100);
+    assert!(!rendered.contains("seeded-secret-marker"));
+    assert!(rendered.contains("••••"));
+    chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
+
+    match rx.try_recv() {
+        Ok(AppEvent::StoreCredential {
+            entry,
+            value,
+            continuation,
+        }) => {
+            assert_eq!(entry.id, "missing");
+            assert_eq!(value.expose_secret(), "seeded-secret-marker");
+            assert!(continuation.is_none());
+        }
+        other => panic!("expected masked credential submission, got {other:?}"),
     }
 }
 
@@ -425,6 +629,10 @@ async fn queued_settings_selection_applies_before_next_input() {
     while let Ok(event) = rx.try_recv() {
         match event {
             AppEvent::OpenReasoningPopup { model } => chat.open_reasoning_popup(model),
+            AppEvent::RequestModelSelection(selection) => {
+                chat.set_model(&selection.model);
+                chat.set_reasoning_effort(selection.effort);
+            }
             AppEvent::UpdateModel(model) => chat.set_model(&model),
             AppEvent::UpdateReasoningEffort(effort) => chat.set_reasoning_effort(effort),
             AppEvent::SettingsSelectionClosed => {

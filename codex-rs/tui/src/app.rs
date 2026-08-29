@@ -10,6 +10,7 @@ use crate::app_event::AppEvent;
 use crate::app_event::ExitMode;
 use crate::app_event::FeedbackCategory;
 use crate::app_event::HistoryLookupResponse;
+use crate::app_event::PendingModelSelection;
 use crate::app_event::PermissionProfileSelection;
 use crate::app_event::PluginLocation;
 use crate::app_event::PluginRemoteSectionError;
@@ -62,6 +63,7 @@ use crate::model_catalog::ModelCatalog;
 use crate::model_migration::ModelMigrationOutcome;
 use crate::model_migration::migration_copy_for_models;
 use crate::model_migration::run_model_migration_prompt;
+use crate::model_runtime::TuiModelRuntime;
 use crate::multi_agents::agent_picker_status_dot_spans;
 use crate::multi_agents::format_agent_picker_item_name;
 use crate::multi_agents::next_agent_shortcut_matches;
@@ -520,8 +522,49 @@ struct InitialHistoryReplayBuffer {
     was_truncated: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CustomRuntimeStartupModel {
+    pub(crate) model: String,
+    pub(crate) open_picker: bool,
+    pub(crate) persist_default: bool,
+    pub(crate) warning: Option<String>,
+}
+
+pub(crate) fn custom_runtime_startup_model(
+    configured_model: Option<&str>,
+    models: &[ModelPreset],
+) -> CustomRuntimeStartupModel {
+    if let Some(configured) = configured_model
+        && models.iter().any(|model| model.model == configured)
+    {
+        return CustomRuntimeStartupModel {
+            model: configured.to_string(),
+            open_picker: false,
+            persist_default: false,
+            warning: None,
+        };
+    }
+    let model = models
+        .iter()
+        .find(|model| model.is_default)
+        .or_else(|| models.first())
+        .expect("custom model runtime requires a non-empty catalog")
+        .model
+        .clone();
+    let warning = configured_model.map(|configured| {
+        format!("The previously selected model {configured} is unavailable. Choose another model.")
+    });
+    CustomRuntimeStartupModel {
+        model,
+        open_picker: true,
+        persist_default: true,
+        warning,
+    }
+}
+
 pub(crate) struct App {
     model_catalog: Arc<ModelCatalog>,
+    model_runtime: Option<Arc<dyn TuiModelRuntime>>,
     pub(crate) session_telemetry: SessionTelemetry,
     pub(crate) app_event_tx: AppEventSender,
     pub(crate) chat_widget: ChatWidget,
@@ -538,6 +581,7 @@ pub(crate) struct App {
     cloud_config_bundle: CloudConfigBundleLoader,
     runtime_approval_policy_override: Option<AskForApproval>,
     runtime_permission_profile_override: Option<RuntimePermissionProfileOverride>,
+    model_selection_apply_pending: bool,
 
     pub(crate) file_search: FileSearchManager,
 
@@ -718,6 +762,9 @@ impl App {
             has_chatgpt_account: self.chat_widget.has_chatgpt_account(),
             has_codex_backend_auth: self.chat_widget.has_codex_backend_auth(),
             model_catalog: self.model_catalog.clone(),
+            model_runtime: self.model_runtime.clone(),
+            startup_model_picker_pending: false,
+            startup_model_warning: None,
             feedback: self.feedback.clone(),
             is_first_run: false,
             status_account_display: self.chat_widget.status_account_display().cloned(),

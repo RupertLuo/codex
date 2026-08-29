@@ -18,6 +18,7 @@ pub(super) async fn make_test_app() -> App {
 
     App {
         model_catalog: chat_widget.model_catalog(),
+        model_runtime: None,
         session_telemetry,
         app_event_tx,
         chat_widget,
@@ -32,6 +33,7 @@ pub(super) async fn make_test_app() -> App {
         cloud_config_bundle: CloudConfigBundleLoader::default(),
         runtime_approval_policy_override: None,
         runtime_permission_profile_override: None,
+        model_selection_apply_pending: false,
         file_search,
         transcript_cells: Vec::new(),
         last_rendered_history_tail: None,

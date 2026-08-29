@@ -43,6 +43,7 @@ use std::cell::RefCell;
 use std::ops::Range;
 use std::sync::Arc;
 use unicode_segmentation::UnicodeSegmentation;
+use zeroize::Zeroize;
 
 mod vim;
 mod vim_commands;
@@ -177,6 +178,15 @@ impl TextArea {
             vim_operator_keymap: defaults.vim_operator,
             vim_text_object_keymap: defaults.vim_text_object,
         }
+    }
+
+    pub(crate) fn take_sensitive_text(&mut self) -> String {
+        self.cursor_pos = 0;
+        self.elements.clear();
+        self.wrap_cache.replace(None);
+        self.preferred_col = None;
+        self.kill_buffer.zeroize();
+        std::mem::take(&mut self.text)
     }
 
     /// Replace the editor and Vim keymaps used by subsequent text-editing input.

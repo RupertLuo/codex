@@ -1051,6 +1051,7 @@ async fn run_ratatui_app(
     runtime_options: TuiRuntimeOptions,
 ) -> color_eyre::Result<AppExitInfo> {
     let uses_remote_workspace = app_server_target.uses_remote_workspace();
+    let model_runtime = runtime_options.model_runtime.clone();
     let workload_identity_selected = is_workload_identity_selected();
     color_eyre::install()?;
 
@@ -1751,13 +1752,23 @@ async fn run_ratatui_app(
         shutdown_startup_session(Some(app_server), &mut terminal_restore_guard).await;
         return Err(err.into());
     }
-    let startup_bootstrap = match startup_bootstrap {
+    let mut startup_bootstrap = match startup_bootstrap {
         Ok(startup_bootstrap) => Some(startup_bootstrap),
         Err(err) => {
             shutdown_startup_session(Some(app_server), &mut terminal_restore_guard).await;
             return Err(err);
         }
     };
+    let custom_runtime_startup_model = model_runtime.as_ref().map(|_| {
+        let bootstrap = startup_bootstrap
+            .as_mut()
+            .expect("successful startup bootstrap is present");
+        let decision =
+            app::custom_runtime_startup_model(config.model.as_deref(), &bootstrap.available_models);
+        config.model = Some(decision.model.clone());
+        bootstrap.default_model = decision.model.clone();
+        decision
+    });
     let startup_elapsed_before_app = startup_prefetch_started_at.elapsed();
     let startup_hooks_review = maybe_run_startup_hooks_review(
         &mut app_server,
@@ -1798,6 +1809,8 @@ async fn run_ratatui_app(
         startup_bootstrap,
         startup_hooks_browser,
         startup_draft,
+        model_runtime,
+        custom_runtime_startup_model,
     )
     .await;
 

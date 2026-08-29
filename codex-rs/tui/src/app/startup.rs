@@ -78,6 +78,8 @@ impl App {
         startup_bootstrap: Option<AppServerBootstrap>,
         startup_hooks_browser: Option<HooksListEntry>,
         mut startup_draft: StartupDraftPump,
+        model_runtime: Option<Arc<dyn TuiModelRuntime>>,
+        custom_runtime_startup_model: Option<CustomRuntimeStartupModel>,
     ) -> Result<AppExitInfo> {
         use tokio_stream::StreamExt;
 
@@ -271,6 +273,13 @@ impl App {
                     has_chatgpt_account,
                     has_codex_backend_auth,
                     model_catalog: model_catalog.clone(),
+                    model_runtime: model_runtime.clone(),
+                    startup_model_picker_pending: custom_runtime_startup_model
+                        .as_ref()
+                        .is_some_and(|decision| decision.open_picker),
+                    startup_model_warning: custom_runtime_startup_model
+                        .as_ref()
+                        .and_then(|decision| decision.warning.clone()),
                     feedback: feedback.clone(),
                     is_first_run,
                     status_account_display: status_account_display.clone(),
@@ -342,6 +351,9 @@ impl App {
                     has_chatgpt_account,
                     has_codex_backend_auth,
                     model_catalog: model_catalog.clone(),
+                    model_runtime: model_runtime.clone(),
+                    startup_model_picker_pending: false,
+                    startup_model_warning: None,
                     feedback: feedback.clone(),
                     is_first_run,
                     status_account_display: status_account_display.clone(),
@@ -403,6 +415,9 @@ impl App {
                     has_chatgpt_account,
                     has_codex_backend_auth,
                     model_catalog: model_catalog.clone(),
+                    model_runtime: model_runtime.clone(),
+                    startup_model_picker_pending: false,
+                    startup_model_warning: None,
                     feedback: feedback.clone(),
                     is_first_run,
                     status_account_display: status_account_display.clone(),
@@ -437,6 +452,7 @@ See the Codex keymap documentation for supported actions and examples."
 
         let mut app = Self {
             model_catalog,
+            model_runtime,
             session_telemetry: session_telemetry.clone(),
             app_event_tx,
             chat_widget,
@@ -451,6 +467,7 @@ See the Codex keymap documentation for supported actions and examples."
             cloud_config_bundle,
             runtime_approval_policy_override: None,
             runtime_permission_profile_override: None,
+            model_selection_apply_pending: false,
             file_search,
             enhanced_keys_supported,
             keymap: runtime_keymap,
@@ -498,6 +515,19 @@ See the Codex keymap documentation for supported actions and examples."
             pending_plugin_enabled_writes: HashMap::new(),
             pending_hook_enabled_writes: HashMap::new(),
         };
+        if let Some(decision) = custom_runtime_startup_model
+            .as_ref()
+            .filter(|decision| decision.persist_default)
+        {
+            let effort = available_models
+                .iter()
+                .find(|preset| preset.model == decision.model)
+                .map(|preset| preset.default_reasoning_effort.clone());
+            app.app_event_tx.send(AppEvent::PersistModelSelection {
+                model: decision.model.clone(),
+                effort,
+            });
+        }
         if start_in_agents_overview {
             app.open_agents_overview(&app_server);
         }

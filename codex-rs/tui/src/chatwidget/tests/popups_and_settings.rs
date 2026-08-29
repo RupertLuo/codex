@@ -1,6 +1,10 @@
 use super::*;
 use crate::app_event::ConnectorsSnapshot;
 use crate::chatwidget::connectors::ConnectorsCacheState;
+use crate::model_runtime::CredentialEntry;
+use crate::model_runtime::CredentialGroup;
+use crate::model_runtime::CredentialStatus;
+use crate::model_runtime::OnboardingProvider;
 use codex_app_server_protocol::HookErrorInfo;
 use codex_app_server_protocol::HooksListEntry;
 use codex_app_server_protocol::HooksListResponse;
@@ -13,6 +17,69 @@ use codex_app_server_protocol::PluginSource;
 use codex_connectors::AppInfo;
 use codex_features::Stage;
 use pretty_assertions::assert_eq;
+
+fn model_preset(slug: &str, display_name: &str, description: &str) -> ModelPreset {
+    ModelPreset {
+        id: slug.to_string(),
+        model: slug.to_string(),
+        display_name: display_name.to_string(),
+        description: description.to_string(),
+        default_reasoning_effort: ReasoningEffortConfig::Medium,
+        supported_reasoning_efforts: vec![ReasoningEffortPreset {
+            effort: ReasoningEffortConfig::Medium,
+            description: "Balanced reasoning".to_string(),
+        }],
+        supports_personality: false,
+        model_specialty: None,
+        additional_speed_tiers: Vec::new(),
+        service_tiers: Vec::new(),
+        default_service_tier: None,
+        is_default: false,
+        upgrade: None,
+        show_in_picker: true,
+        availability_nux: None,
+        supported_in_api: true,
+        input_modalities: default_input_modalities(),
+        multi_agent_version: None,
+    }
+}
+
+#[tokio::test]
+async fn provider_onboarding_filters_models_before_reasoning_selection() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("deepseek/deepseek-v4-pro")).await;
+    let provider = OnboardingProvider {
+        id: "deepseek".to_string(),
+        display_name: "DeepSeek".to_string(),
+        credential: CredentialEntry {
+            id: "deepseek".to_string(),
+            display_name: "DeepSeek".to_string(),
+            environment_variable: "CATALYST_DEEPSEEK_API_KEY".to_string(),
+            status: CredentialStatus::Verified,
+            group: CredentialGroup::ModelProviders,
+        },
+        model_ids: vec![
+            "deepseek/deepseek-v4-pro".to_string(),
+            "deepseek/deepseek-v4-flash".to_string(),
+        ],
+    };
+
+    chat.open_onboarding_model_popup_with_presets(
+        provider,
+        vec![
+            model_preset(
+                "deepseek/deepseek-v4-pro",
+                "DeepSeek V4 Pro",
+                "DeepSeek · quality-first coding",
+            ),
+            model_preset("glm/glm-code", "GLM Code", "GLM · coding model"),
+        ],
+    );
+
+    let popup = render_bottom_popup(&chat, /*width*/ 100);
+    assert!(popup.contains("Select DeepSeek Model"), "{popup}");
+    assert!(popup.contains("DeepSeek V4 Pro"), "{popup}");
+    assert!(!popup.contains("GLM Code"), "{popup}");
+}
 
 #[tokio::test]
 async fn experimental_mode_plan_is_ignored_on_startup() {
@@ -44,6 +111,9 @@ async fn experimental_mode_plan_is_ignored_on_startup() {
         has_chatgpt_account: false,
         has_codex_backend_auth: false,
         model_catalog: test_model_catalog(&cfg),
+        model_runtime: None,
+        startup_model_picker_pending: false,
+        startup_model_warning: None,
         feedback: codex_feedback::CodexFeedback::new(),
         is_first_run: true,
         status_account_display: None,
@@ -3300,6 +3370,58 @@ async fn model_picker_hides_show_in_picker_false_models_from_cache() {
 }
 
 #[tokio::test]
+async fn model_picker_is_flat_searchable_and_searches_description() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("glm/glm-4")).await;
+    chat.thread_id = Some(ThreadId::new());
+    chat.open_model_popup_with_presets(vec![
+        model_preset("glm/glm-4", "GLM 4", "Zhipu · balanced coding model"),
+        model_preset(
+            "deepseek/deepseek-chat",
+            "DeepSeek Chat",
+            "DeepSeek · efficient chat model",
+        ),
+    ]);
+
+    let initial = render_bottom_popup(&chat, /*width*/ 80);
+    assert!(initial.contains("GLM 4"));
+    assert!(initial.contains("DeepSeek Chat"));
+
+    for character in "deepseek".chars() {
+        chat.handle_key_event(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
+    }
+    let filtered = render_bottom_popup(&chat, /*width*/ 80);
+    assert!(!filtered.contains("GLM 4"));
+    assert!(filtered.contains("DeepSeek Chat"));
+}
+
+#[tokio::test]
+async fn model_selection_waits_for_readiness() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(Some("glm/glm-4")).await;
+    chat.open_reasoning_popup(model_preset(
+        "deepseek/deepseek-chat",
+        "DeepSeek Chat",
+        "DeepSeek · efficient chat model",
+    ));
+
+    let events = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+    assert!(
+        events
+            .iter()
+            .all(|event| !matches!(event, AppEvent::UpdateModel(_)))
+    );
+    assert!(
+        events
+            .iter()
+            .all(|event| !matches!(event, AppEvent::PersistModelSelection { .. }))
+    );
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AppEvent::RequestModelSelection(selection)
+            if selection.model == "deepseek/deepseek-chat"
+    )));
+}
+
+#[tokio::test]
 async fn server_overloaded_error_does_not_switch_models() {
     let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(Some("gpt-5.2")).await;
     chat.set_model("gpt-5.2");
@@ -3399,20 +3521,14 @@ async fn model_reasoning_selection_popup_applies_custom_effort() {
     chat.handle_key_event(KeyEvent::from(KeyCode::Down));
     chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
 
-    let selected_effort_events = std::iter::from_fn(|| rx.try_recv().ok())
-        .filter_map(|event| match event {
-            AppEvent::UpdateReasoningEffort(effort) => Some((None, effort)),
-            AppEvent::PersistModelSelection { model, effort } => Some((Some(model), effort)),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(
-        selected_effort_events,
-        vec![
-            (None, Some(custom_effort.clone())),
-            (Some("gpt-5.4".to_string()), Some(custom_effort)),
-        ]
-    );
+    let events = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+    assert!(matches!(
+        events.as_slice(),
+        [AppEvent::RequestModelSelection(selection)]
+            if selection.model == "gpt-5.4"
+                && selection.effort == Some(custom_effort)
+                && !selection.update_plan_mode_effort
+    ));
 }
 
 async fn select_ultra_with_multi_agent_thread_limit(max_threads: usize) -> (bool, Vec<String>) {
@@ -3787,12 +3903,13 @@ async fn single_reasoning_option_skips_selection() {
         events.push(ev);
     }
 
-    assert!(
-        events
-            .iter()
-            .any(|ev| matches!(ev, AppEvent::UpdateReasoningEffort(Some(effort)) if *effort == ReasoningEffortConfig::High)),
-        "expected reasoning effort to be applied automatically; events: {events:?}"
-    );
+    assert!(matches!(
+        events.as_slice(),
+        [AppEvent::RequestModelSelection(selection)]
+            if selection.model == "model-with-single-reasoning"
+                && selection.effort == Some(ReasoningEffortConfig::High)
+                && !selection.update_plan_mode_effort
+    ));
 }
 
 #[tokio::test]

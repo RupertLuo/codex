@@ -1,5 +1,12 @@
 use super::*;
 use crate::app_event::ConnectorsSnapshot;
+use crate::model_runtime::CredentialEntry;
+use crate::model_runtime::CredentialMutation;
+use crate::model_runtime::ModelReadiness;
+use crate::model_runtime::ModelRuntimeError;
+use crate::model_runtime::ModelRuntimeFuture;
+use crate::model_runtime::SensitiveInput;
+use crate::model_runtime::TuiModelRuntime;
 use codex_protocol::models::ManagedFileSystemPermissions;
 use codex_protocol::permissions::FileSystemAccessMode;
 use codex_protocol::permissions::FileSystemPath;
@@ -8,6 +15,191 @@ use codex_protocol::permissions::FileSystemSpecialPath;
 use codex_protocol::permissions::NetworkSandboxPolicy;
 use pretty_assertions::assert_eq;
 use std::collections::VecDeque;
+use std::sync::Arc;
+
+#[derive(Debug)]
+struct SubmissionRuntime;
+
+impl TuiModelRuntime for SubmissionRuntime {
+    fn list_credentials(
+        &self,
+    ) -> ModelRuntimeFuture<Result<Vec<CredentialEntry>, ModelRuntimeError>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+
+    fn model_readiness(
+        &self,
+        _model_id: String,
+    ) -> ModelRuntimeFuture<Result<ModelReadiness, ModelRuntimeError>> {
+        Box::pin(async { Ok(ModelReadiness::Ready) })
+    }
+
+    fn store_credential(
+        &self,
+        _credential_id: String,
+        _value: SensitiveInput,
+    ) -> ModelRuntimeFuture<Result<CredentialMutation, ModelRuntimeError>> {
+        Box::pin(async { Ok(CredentialMutation::Verified) })
+    }
+
+    fn revalidate_credential(
+        &self,
+        _credential_id: String,
+    ) -> ModelRuntimeFuture<Result<CredentialMutation, ModelRuntimeError>> {
+        Box::pin(async { Ok(CredentialMutation::Verified) })
+    }
+
+    fn delete_credential(
+        &self,
+        _credential_id: String,
+    ) -> ModelRuntimeFuture<Result<(), ModelRuntimeError>> {
+        Box::pin(async { Ok(()) })
+    }
+}
+
+fn submission_session(model: &str) -> crate::session_state::ThreadSessionState {
+    crate::session_state::ThreadSessionState {
+        thread_id: ThreadId::new(),
+        forked_from_id: None,
+        fork_parent_title: None,
+        thread_name: None,
+        model: model.to_string(),
+        model_provider_id: "test-provider".to_string(),
+        service_tier: None,
+        approval_policy: AskForApproval::Never,
+        approvals_reviewer: ApprovalsReviewer::User,
+        permission_profile: PermissionProfile::read_only(),
+        active_permission_profile: None,
+        cwd: test_path_buf("/home/user/project").abs(),
+        runtime_workspace_roots: Vec::new(),
+        instruction_source_paths: Vec::new(),
+        reasoning_effort: Some(ReasoningEffortConfig::default()),
+        collaboration_mode: None,
+        personality: None,
+        message_history: None,
+        network_proxy: None,
+        rollout_path: None,
+    }
+}
+
+#[tokio::test]
+async fn custom_runtime_startup_requests_provider_onboarding_before_model_picker() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(Some("test-model")).await;
+    chat.startup_model_picker_pending = true;
+
+    chat.handle_thread_session(submission_session("test-model"));
+
+    assert!(
+        std::iter::from_fn(|| rx.try_recv().ok())
+            .any(|event| { matches!(event, AppEvent::BeginModelRuntimeOnboarding) })
+    );
+}
+
+#[tokio::test]
+async fn custom_runtime_startup_does_not_submit_initial_prompt_before_onboarding() {
+    let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(Some("test-model")).await;
+    chat.startup_model_picker_pending = true;
+    chat.initial_user_message =
+        create_initial_user_message(Some("wait for setup".to_string()), Vec::new(), Vec::new());
+
+    chat.handle_thread_session(submission_session("test-model"));
+
+    assert_no_submit_op(&mut op_rx);
+    assert!(chat.initial_user_message.is_some());
+}
+
+#[tokio::test]
+async fn completing_custom_runtime_onboarding_releases_initial_prompt() {
+    let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(Some("test-model")).await;
+    chat.startup_model_picker_pending = true;
+    chat.initial_user_message =
+        create_initial_user_message(Some("send after setup".to_string()), Vec::new(), Vec::new());
+    chat.handle_thread_session(submission_session("test-model"));
+    assert_no_submit_op(&mut op_rx);
+
+    chat.complete_model_runtime_onboarding();
+
+    assert!(matches!(next_submit_op(&mut op_rx), Op::UserTurn { .. }));
+}
+
+#[tokio::test]
+async fn completing_inactive_model_runtime_onboarding_preserves_other_suppression() {
+    let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(Some("test-model")).await;
+    chat.initial_user_message =
+        create_initial_user_message(Some("keep waiting".to_string()), Vec::new(), Vec::new());
+    chat.set_initial_user_message_submit_suppressed(true);
+
+    chat.complete_model_runtime_onboarding();
+
+    assert_no_submit_op(&mut op_rx);
+    assert!(chat.initial_user_message.is_some());
+}
+
+#[tokio::test]
+async fn turn_submission_waits_for_model_readiness() {
+    let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(Some("test-model")).await;
+    chat.handle_thread_session(submission_session("test-model"));
+    drain_insert_history(&mut rx);
+    while op_rx.try_recv().is_ok() {}
+    chat.model_runtime = Some(Arc::new(SubmissionRuntime));
+
+    let text = "send this".to_string();
+    let text_elements = vec![TextElement::new((0..text.len()).into(), Some(text.clone()))];
+    chat.submit_user_message(UserMessage {
+        text: text.clone(),
+        local_images: Vec::new(),
+        remote_image_urls: Vec::new(),
+        text_elements: text_elements.clone(),
+        mention_bindings: Vec::new(),
+    });
+
+    let premature_op = op_rx.try_recv();
+    assert!(
+        premature_op.is_err(),
+        "submission escaped readiness gate: {premature_op:?}"
+    );
+    let model = std::iter::from_fn(|| rx.try_recv().ok())
+        .find_map(|event| match event {
+            AppEvent::CheckModelReadyForSubmission { model } => Some(model),
+            _ => None,
+        })
+        .expect("readiness check should be requested");
+    assert_eq!(model, "test-model");
+
+    chat.resume_model_ready_submission(model);
+    let items = match next_submit_op(&mut op_rx) {
+        Op::UserTurn { items, .. } => items,
+        other => panic!("expected one resumed user turn, got {other:?}"),
+    };
+    assert_eq!(
+        items,
+        vec![UserInput::Text {
+            text,
+            text_elements: text_elements.into_iter().map(Into::into).collect(),
+        }]
+    );
+    assert!(op_rx.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn shell_submission_bypasses_model_readiness() {
+    let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(Some("test-model")).await;
+    chat.handle_thread_session(submission_session("test-model"));
+    drain_insert_history(&mut rx);
+    while op_rx.try_recv().is_ok() {}
+    chat.model_runtime = Some(Arc::new(SubmissionRuntime));
+
+    chat.submit_user_message(UserMessage::from("!echo local".to_string()));
+
+    match op_rx.try_recv() {
+        Ok(Op::RunUserShellCommand { command }) => assert_eq!(command, "echo local"),
+        other => panic!("expected local shell command, got {other:?}"),
+    }
+    assert!(
+        std::iter::from_fn(|| rx.try_recv().ok())
+            .all(|event| !matches!(event, AppEvent::CheckModelReadyForSubmission { .. }))
+    );
+}
 
 fn paste_hidden_shell_payload(chat: &mut ChatWidget) -> String {
     let payload = format!("!echo {}", "x".repeat(1000));

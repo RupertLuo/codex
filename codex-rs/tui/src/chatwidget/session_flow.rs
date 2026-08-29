@@ -150,6 +150,17 @@ impl ChatWidget {
         self.refresh_skills_for_current_cwd(/*force_reload*/ true);
         self.refresh_connector_mentions(/*force_refresh*/ false);
         let initial_user_message_pending = self.initial_user_message.is_some();
+        if display == SessionConfiguredDisplay::Normal {
+            if let Some(warning) = self.startup_model_warning.take() {
+                self.add_info_message(warning, /*hint*/ None);
+            }
+            if std::mem::take(&mut self.startup_model_picker_pending) {
+                self.model_runtime_onboarding_active = true;
+                self.set_initial_user_message_submit_suppressed(true);
+                self.app_event_tx
+                    .send(AppEvent::BeginModelRuntimeOnboarding);
+            }
+        }
         self.submit_initial_user_message_if_pending();
         if self.mcp_startup_status.is_none()
             && (!initial_user_message_pending || self.is_user_turn_pending_or_running())

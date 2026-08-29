@@ -61,6 +61,7 @@ mod approval_overlay;
 mod mcp_server_elicitation;
 mod multi_select_picker;
 mod request_user_input;
+pub(crate) mod sensitive_prompt_view;
 mod status_line_setup;
 mod status_line_style;
 mod status_surface_preview;
@@ -377,6 +378,11 @@ impl BottomPane {
 
     pub fn set_token_activity_command_enabled(&mut self, enabled: bool) {
         self.composer.set_token_activity_command_enabled(enabled);
+        self.request_redraw();
+    }
+
+    pub fn set_model_runtime_enabled(&mut self, enabled: bool) {
+        self.composer.set_model_runtime_enabled(enabled);
         self.request_redraw();
     }
 

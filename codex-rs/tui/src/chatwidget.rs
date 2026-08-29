@@ -60,6 +60,8 @@ use crate::legacy_core::config::PermissionProfileSnapshot;
 use crate::mention_codec::LinkedMention;
 use crate::mention_codec::encode_history_mentions;
 use crate::model_catalog::ModelCatalog;
+use crate::model_runtime::CredentialEntry;
+use crate::model_runtime::TuiModelRuntime;
 use crate::multi_agents;
 use crate::multi_agents::AgentMetadata;
 use crate::session_state::SessionNetworkProxyRuntime;
@@ -264,6 +266,7 @@ fn normalize_thread_name(name: &str) -> Option<String> {
 
 use crate::app_event::AppEvent;
 use crate::app_event::ExitMode;
+use crate::app_event::PendingModelSelection;
 use crate::app_event::PermissionProfileSelection;
 use crate::app_event::RateLimitRefreshOrigin;
 #[cfg(target_os = "windows")]
@@ -385,6 +388,7 @@ use self::plugins::PluginListFetchState;
 use self::plugins::PluginsCacheState;
 mod plan_implementation;
 use self::plan_implementation::PLAN_IMPLEMENTATION_TITLE;
+mod credential_popups;
 mod model_popups;
 mod notifications;
 use self::notifications::Notification;
@@ -512,6 +516,9 @@ pub(crate) struct ChatWidgetInit {
     pub(crate) has_chatgpt_account: bool,
     pub(crate) has_codex_backend_auth: bool,
     pub(crate) model_catalog: Arc<ModelCatalog>,
+    pub(crate) model_runtime: Option<Arc<dyn TuiModelRuntime>>,
+    pub(crate) startup_model_picker_pending: bool,
+    pub(crate) startup_model_warning: Option<String>,
     pub(crate) feedback: codex_feedback::CodexFeedback,
     pub(crate) is_first_run: bool,
     pub(crate) status_account_display: Option<StatusAccountDisplay>,
@@ -524,6 +531,12 @@ pub(crate) struct ChatWidgetInit {
     // Shared latch so we only warn once about invalid terminal-title item IDs.
     pub(crate) terminal_title_invalid_items_warned: Arc<AtomicBool>,
     pub(crate) session_telemetry: SessionTelemetry,
+}
+
+struct PendingReadySubmission {
+    user_message: UserMessage,
+    history_record: UserMessageHistoryRecord,
+    shell_escape_policy: ShellEscapePolicy,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -564,6 +577,14 @@ pub(crate) struct ChatWidget {
     has_chatgpt_account: bool,
     has_codex_backend_auth: bool,
     model_catalog: Arc<ModelCatalog>,
+    model_runtime_enabled: bool,
+    model_runtime: Option<Arc<dyn TuiModelRuntime>>,
+    pending_model_selection_for_credential: Option<(CredentialEntry, PendingModelSelection)>,
+    startup_model_picker_pending: bool,
+    model_runtime_onboarding_active: bool,
+    startup_model_warning: Option<String>,
+    pending_ready_submission: Option<PendingReadySubmission>,
+    approved_submission_model: Option<String>,
     session_telemetry: SessionTelemetry,
     session_header: SessionHeader,
     initial_user_message: Option<UserMessage>,

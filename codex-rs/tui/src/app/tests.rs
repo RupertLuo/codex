@@ -45,6 +45,16 @@ use crate::history_cell::HistoryCell;
 use crate::history_cell::PlainHistoryCell;
 use crate::history_cell::UserHistoryCell;
 use crate::history_cell::new_session_info;
+use crate::model_runtime::CredentialEntry;
+use crate::model_runtime::CredentialGroup;
+use crate::model_runtime::CredentialMutation;
+use crate::model_runtime::CredentialStatus;
+use crate::model_runtime::ModelReadiness;
+use crate::model_runtime::ModelRuntimeError;
+use crate::model_runtime::ModelRuntimeFuture;
+use crate::model_runtime::OnboardingProvider;
+use crate::model_runtime::SensitiveInput;
+use crate::model_runtime::TuiModelRuntime;
 use crate::multi_agents::AgentPickerThreadEntry;
 use crate::multi_agents::SubAgentActivityDisplay;
 use assert_matches::assert_matches;
@@ -137,9 +147,293 @@ use ratatui::prelude::Line;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
+
+#[derive(Debug)]
+struct ReadinessRuntime {
+    readiness: ModelReadiness,
+    calls: Arc<Mutex<Vec<String>>>,
+}
+
+impl TuiModelRuntime for ReadinessRuntime {
+    fn list_credentials(
+        &self,
+    ) -> ModelRuntimeFuture<Result<Vec<CredentialEntry>, ModelRuntimeError>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+
+    fn model_readiness(
+        &self,
+        model_id: String,
+    ) -> ModelRuntimeFuture<Result<ModelReadiness, ModelRuntimeError>> {
+        self.calls
+            .lock()
+            .expect("readiness calls lock")
+            .push(model_id);
+        let readiness = self.readiness.clone();
+        Box::pin(async move { Ok(readiness) })
+    }
+
+    fn store_credential(
+        &self,
+        _credential_id: String,
+        _value: SensitiveInput,
+    ) -> ModelRuntimeFuture<Result<CredentialMutation, ModelRuntimeError>> {
+        Box::pin(async { Ok(CredentialMutation::Verified) })
+    }
+
+    fn revalidate_credential(
+        &self,
+        _credential_id: String,
+    ) -> ModelRuntimeFuture<Result<CredentialMutation, ModelRuntimeError>> {
+        Box::pin(async { Ok(CredentialMutation::Verified) })
+    }
+
+    fn delete_credential(
+        &self,
+        _credential_id: String,
+    ) -> ModelRuntimeFuture<Result<(), ModelRuntimeError>> {
+        Box::pin(async { Ok(()) })
+    }
+}
+
+#[tokio::test]
+async fn ready_model_selection_runs_custom_readiness_before_native_events() {
+    let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
+    while app_event_rx.try_recv().is_ok() {}
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    app.model_runtime = Some(Arc::new(ReadinessRuntime {
+        readiness: ModelReadiness::Ready,
+        calls: Arc::clone(&calls),
+    }));
+
+    app.request_model_selection(PendingModelSelection {
+        model: "provider/product-model".to_string(),
+        effort: Some(ReasoningEffortConfig::High),
+        update_plan_mode_effort: false,
+    })
+    .await;
+
+    assert_eq!(
+        calls.lock().expect("readiness calls lock").as_slice(),
+        &["provider/product-model".to_string()]
+    );
+    assert!(matches!(
+        app_event_rx.try_recv(),
+        Ok(AppEvent::ApplyModelSelection(PendingModelSelection { model, .. }))
+            if model == "provider/product-model"
+    ));
+}
+
+#[tokio::test]
+async fn missing_submission_credential_blocks_resume_and_opens_prompt() {
+    let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
+    while app_event_rx.try_recv().is_ok() {}
+    app.model_runtime = Some(Arc::new(ReadinessRuntime {
+        readiness: ModelReadiness::MissingCredential(CredentialEntry {
+            id: "test-credential".to_string(),
+            display_name: "Test credential".to_string(),
+            environment_variable: "TEST_MODEL_API_KEY".to_string(),
+            status: CredentialStatus::Missing,
+            group: CredentialGroup::ModelProviders,
+        }),
+        calls: Arc::new(Mutex::new(Vec::new())),
+    }));
+
+    app.check_model_ready_for_submission("provider/product-model".to_string())
+        .await;
+
+    let popup = render_bottom_popup(&app.chat_widget, /*width*/ 80);
+    assert!(popup.contains("Enter credential"), "{popup}");
+    assert!(
+        std::iter::from_fn(|| app_event_rx.try_recv().ok())
+            .all(|event| !matches!(event, AppEvent::ResumeModelReadySubmission { .. }))
+    );
+}
+
+#[derive(Debug)]
+struct CredentialWorkflowRuntime {
+    store_result: CredentialMutation,
+    store_calls: Arc<Mutex<Vec<String>>>,
+}
+
+#[derive(Debug)]
+struct OnboardingRuntime {
+    providers: Vec<OnboardingProvider>,
+}
+
+impl TuiModelRuntime for OnboardingRuntime {
+    fn list_onboarding_providers(
+        &self,
+    ) -> ModelRuntimeFuture<Result<Vec<OnboardingProvider>, ModelRuntimeError>> {
+        let providers = self.providers.clone();
+        Box::pin(async move { Ok(providers) })
+    }
+
+    fn list_credentials(
+        &self,
+    ) -> ModelRuntimeFuture<Result<Vec<CredentialEntry>, ModelRuntimeError>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+
+    fn model_readiness(
+        &self,
+        _model_id: String,
+    ) -> ModelRuntimeFuture<Result<ModelReadiness, ModelRuntimeError>> {
+        Box::pin(async { Ok(ModelReadiness::Ready) })
+    }
+
+    fn store_credential(
+        &self,
+        _credential_id: String,
+        _value: SensitiveInput,
+    ) -> ModelRuntimeFuture<Result<CredentialMutation, ModelRuntimeError>> {
+        Box::pin(async { Ok(CredentialMutation::Verified) })
+    }
+
+    fn revalidate_credential(
+        &self,
+        _credential_id: String,
+    ) -> ModelRuntimeFuture<Result<CredentialMutation, ModelRuntimeError>> {
+        Box::pin(async { Ok(CredentialMutation::Verified) })
+    }
+
+    fn delete_credential(
+        &self,
+        _credential_id: String,
+    ) -> ModelRuntimeFuture<Result<(), ModelRuntimeError>> {
+        Box::pin(async { Ok(()) })
+    }
+}
+
+fn onboarding_provider_with_status(status: CredentialStatus) -> OnboardingProvider {
+    OnboardingProvider {
+        id: "deepseek".to_string(),
+        display_name: "DeepSeek".to_string(),
+        credential: CredentialEntry {
+            id: "deepseek".to_string(),
+            display_name: "DeepSeek".to_string(),
+            environment_variable: "CATALYST_DEEPSEEK_API_KEY".to_string(),
+            status,
+            group: CredentialGroup::ModelProviders,
+        },
+        model_ids: vec!["deepseek/deepseek-v4-pro".to_string()],
+    }
+}
+
+#[tokio::test]
+async fn custom_runtime_onboarding_begins_with_provider_selection() {
+    let (mut app, _app_event_rx, _op_rx) = make_test_app_with_channels().await;
+    app.model_runtime = Some(Arc::new(OnboardingRuntime {
+        providers: vec![onboarding_provider_with_status(CredentialStatus::Missing)],
+    }));
+
+    app.begin_model_runtime_onboarding().await;
+
+    let popup = render_bottom_popup(&app.chat_widget, /*width*/ 80);
+    assert!(popup.contains("Select Service Provider"), "{popup}");
+    assert!(popup.contains("DeepSeek"), "{popup}");
+}
+
+#[tokio::test]
+async fn custom_runtime_onboarding_requires_missing_credential_before_models() {
+    let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
+    while app_event_rx.try_recv().is_ok() {}
+    let provider = onboarding_provider_with_status(CredentialStatus::Missing);
+
+    app.select_onboarding_provider(provider).await;
+
+    let popup = render_bottom_popup(&app.chat_widget, /*width*/ 80);
+    assert!(popup.contains("Enter DeepSeek API key"), "{popup}");
+    assert!(
+        std::iter::from_fn(|| app_event_rx.try_recv().ok())
+            .all(|event| !matches!(event, AppEvent::OpenOnboardingModels(_)))
+    );
+}
+
+#[tokio::test]
+async fn verified_onboarding_credential_advances_to_provider_models() {
+    let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
+    while app_event_rx.try_recv().is_ok() {}
+    let provider = onboarding_provider_with_status(CredentialStatus::Missing);
+    app.model_runtime = Some(Arc::new(OnboardingRuntime {
+        providers: vec![provider.clone()],
+    }));
+
+    app.store_onboarding_credential(
+        provider.clone(),
+        SensitiveInput::new("seeded-secret-marker".to_string()),
+    )
+    .await;
+
+    let selected =
+        std::iter::from_fn(|| app_event_rx.try_recv().ok()).find_map(|event| match event {
+            AppEvent::OpenOnboardingModels(selected) => Some(selected),
+            _ => None,
+        });
+    assert_eq!(selected, Some(provider));
+}
+
+#[tokio::test]
+async fn custom_runtime_onboarding_opens_only_selected_provider_models() {
+    let (mut app, _app_event_rx, _op_rx) = make_test_app_with_channels().await;
+    set_fast_mode_test_catalog(&mut app.chat_widget);
+    let mut provider = onboarding_provider_with_status(CredentialStatus::Verified);
+    provider.model_ids = vec!["gpt-5.4".to_string()];
+
+    app.open_onboarding_models(provider).await;
+
+    let popup = render_bottom_popup(&app.chat_widget, /*width*/ 80);
+    assert!(popup.contains("Select DeepSeek Model"), "{popup}");
+    assert!(popup.contains("gpt-5.4"), "{popup}");
+    assert!(!popup.contains("gpt-5.3-codex"), "{popup}");
+}
+
+impl TuiModelRuntime for CredentialWorkflowRuntime {
+    fn list_credentials(
+        &self,
+    ) -> ModelRuntimeFuture<Result<Vec<CredentialEntry>, ModelRuntimeError>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+
+    fn model_readiness(
+        &self,
+        _model_id: String,
+    ) -> ModelRuntimeFuture<Result<ModelReadiness, ModelRuntimeError>> {
+        Box::pin(async { Ok(ModelReadiness::Ready) })
+    }
+
+    fn store_credential(
+        &self,
+        credential_id: String,
+        value: SensitiveInput,
+    ) -> ModelRuntimeFuture<Result<CredentialMutation, ModelRuntimeError>> {
+        assert_eq!(value.expose_secret(), "seeded-secret-marker");
+        self.store_calls
+            .lock()
+            .expect("store calls lock")
+            .push(credential_id);
+        let result = self.store_result.clone();
+        Box::pin(async move { Ok(result) })
+    }
+
+    fn revalidate_credential(
+        &self,
+        _credential_id: String,
+    ) -> ModelRuntimeFuture<Result<CredentialMutation, ModelRuntimeError>> {
+        Box::pin(async { Ok(CredentialMutation::Verified) })
+    }
+
+    fn delete_credential(
+        &self,
+        _credential_id: String,
+    ) -> ModelRuntimeFuture<Result<(), ModelRuntimeError>> {
+        Box::pin(async { Ok(()) })
+    }
+}
 use tempfile::tempdir;
 use tokio::time;
 
@@ -366,6 +660,52 @@ async fn external_editor_writable_directory_rejected_snapshot() -> Result<()> {
 }
 
 #[tokio::test]
+async fn verified_credential_resumes_the_pending_model_selection() {
+    let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
+    while app_event_rx.try_recv().is_ok() {}
+    let store_calls = Arc::new(Mutex::new(Vec::new()));
+    app.model_runtime = Some(Arc::new(CredentialWorkflowRuntime {
+        store_result: CredentialMutation::Verified,
+        store_calls: store_calls.clone(),
+    }));
+    app.model_selection_apply_pending = true;
+    let selection = PendingModelSelection {
+        model: "provider/product-model".to_string(),
+        effort: Some(ReasoningEffortConfig::Medium),
+        update_plan_mode_effort: false,
+    };
+
+    app.store_model_credential(
+        CredentialEntry {
+            id: "test-credential".to_string(),
+            display_name: "Test credential".to_string(),
+            environment_variable: "TEST_MODEL_API_KEY".to_string(),
+            status: CredentialStatus::Missing,
+            group: CredentialGroup::ModelProviders,
+        },
+        SensitiveInput::new("seeded-secret-marker".to_string()),
+        Some(selection.clone()),
+    )
+    .await;
+
+    assert_eq!(
+        store_calls.lock().expect("store calls lock").as_slice(),
+        &["test-credential".to_string()]
+    );
+    let events = std::iter::from_fn(|| app_event_rx.try_recv().ok()).collect::<Vec<_>>();
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AppEvent::ApplyModelSelection(applied)
+            if applied.model == selection.model && applied.effort == selection.effort
+    )));
+    assert!(
+        events
+            .iter()
+            .all(|event| !matches!(event, AppEvent::RefreshCredentialsPopup))
+    );
+}
+
+#[tokio::test]
 async fn enqueue_primary_thread_session_replays_buffered_approval_after_attach() -> Result<()> {
     let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
     let thread_id = ThreadId::new();
@@ -555,6 +895,9 @@ async fn enqueue_primary_thread_session_replays_turns_before_initial_prompt_subm
         has_chatgpt_account: false,
         has_codex_backend_auth: false,
         model_catalog: app.model_catalog.clone(),
+        model_runtime: None,
+        startup_model_picker_pending: false,
+        startup_model_warning: None,
         feedback: codex_feedback::CodexFeedback::new(),
         is_first_run: false,
         status_account_display: None,
@@ -5243,6 +5586,7 @@ async fn make_test_app() -> App {
 
     App {
         model_catalog: chat_widget.model_catalog(),
+        model_runtime: None,
         session_telemetry,
         app_event_tx,
         chat_widget,
@@ -5257,6 +5601,7 @@ async fn make_test_app() -> App {
         cloud_config_bundle: CloudConfigBundleLoader::default(),
         runtime_approval_policy_override: None,
         runtime_permission_profile_override: None,
+        model_selection_apply_pending: false,
         file_search,
         transcript_cells: Vec::new(),
         last_rendered_history_tail: None,
@@ -5320,6 +5665,7 @@ async fn make_test_app_with_channels() -> (
     (
         App {
             model_catalog: chat_widget.model_catalog(),
+            model_runtime: None,
             session_telemetry,
             app_event_tx,
             chat_widget,
@@ -5334,6 +5680,7 @@ async fn make_test_app_with_channels() -> (
             cloud_config_bundle: CloudConfigBundleLoader::default(),
             runtime_approval_policy_override: None,
             runtime_permission_profile_override: None,
+            model_selection_apply_pending: false,
             file_search,
             transcript_cells: Vec::new(),
             last_rendered_history_tail: None,
@@ -7344,6 +7691,9 @@ async fn replace_chat_widget_reseeds_collab_agent_metadata_for_replay() {
         has_chatgpt_account: app.chat_widget.has_chatgpt_account(),
         has_codex_backend_auth: app.chat_widget.has_codex_backend_auth(),
         model_catalog: app.model_catalog.clone(),
+        model_runtime: None,
+        startup_model_picker_pending: false,
+        startup_model_warning: None,
         feedback: app.feedback.clone(),
         is_first_run: false,
         status_account_display: app.chat_widget.status_account_display().cloned(),

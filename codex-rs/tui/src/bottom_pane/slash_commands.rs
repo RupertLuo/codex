@@ -59,6 +59,7 @@ pub(crate) struct BuiltinCommandFlags {
     pub(crate) connectors_enabled: bool,
     pub(crate) plugins_command_enabled: bool,
     pub(crate) token_activity_command_enabled: bool,
+    pub(crate) model_runtime_enabled: bool,
     pub(crate) service_tier_commands_enabled: bool,
     pub(crate) goal_command_enabled: bool,
     pub(crate) personality_command_enabled: bool,
@@ -75,6 +76,7 @@ pub(crate) fn builtins_for_input(flags: BuiltinCommandFlags) -> Vec<(&'static st
         .filter(|(_, cmd)| flags.connectors_enabled || *cmd != SlashCommand::Apps)
         .filter(|(_, cmd)| flags.plugins_command_enabled || *cmd != SlashCommand::Plugins)
         .filter(|(_, cmd)| flags.token_activity_command_enabled || *cmd != SlashCommand::Usage)
+        .filter(|(_, cmd)| flags.model_runtime_enabled || *cmd != SlashCommand::Credentials)
         .filter(|(_, cmd)| flags.goal_command_enabled || *cmd != SlashCommand::Goal)
         .filter(|(_, cmd)| flags.personality_command_enabled || *cmd != SlashCommand::Personality)
         .filter(|(_, cmd)| !flags.side_conversation_active || cmd.available_in_side_conversation())
@@ -168,12 +170,36 @@ mod tests {
             connectors_enabled: true,
             plugins_command_enabled: true,
             token_activity_command_enabled: true,
+            model_runtime_enabled: true,
             service_tier_commands_enabled: true,
             goal_command_enabled: true,
             personality_command_enabled: true,
             allow_elevate_sandbox: true,
             side_conversation_active: false,
         }
+    }
+
+    #[test]
+    fn credentials_command_requires_model_runtime() {
+        let without_runtime = builtins_for_input(BuiltinCommandFlags {
+            model_runtime_enabled: false,
+            ..all_enabled_flags()
+        });
+        assert!(
+            !without_runtime
+                .iter()
+                .any(|(_, command)| *command == SlashCommand::Credentials)
+        );
+
+        let with_runtime = builtins_for_input(BuiltinCommandFlags {
+            model_runtime_enabled: true,
+            ..all_enabled_flags()
+        });
+        assert!(
+            with_runtime
+                .iter()
+                .any(|(_, command)| *command == SlashCommand::Credentials)
+        );
     }
 
     #[test]
