@@ -35,6 +35,66 @@ use tokio::sync::Semaphore;
 /// Context for an initialized model agent
 ///
 /// A session has at most 1 running task at a time, and can be interrupted by user input.
+#[derive(Debug)]
+pub(super) struct SessionThreadMetadataMutationGate {
+    active: Arc<std::sync::atomic::AtomicBool>,
+    serial: Arc<Semaphore>,
+    tx_event: Sender<Event>,
+}
+
+#[derive(Debug)]
+struct SessionThreadMetadataMutationPermit {
+    _permit: tokio::sync::OwnedSemaphorePermit,
+}
+
+impl codex_thread_store::ThreadMetadataMutationPermit for SessionThreadMetadataMutationPermit {}
+
+impl SessionThreadMetadataMutationGate {
+    pub(super) fn new(tx_event: Sender<Event>) -> Self {
+        Self {
+            active: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            serial: Arc::new(Semaphore::new(1)),
+            tx_event,
+        }
+    }
+
+    fn disable(&self) {
+        self.active
+            .store(false, std::sync::atomic::Ordering::Release);
+    }
+
+    async fn disable_and_wait(&self) {
+        self.disable();
+        let _permit = Arc::clone(&self.serial).acquire_owned().await.ok();
+    }
+}
+
+impl codex_thread_store::ThreadMetadataMutationGate for SessionThreadMetadataMutationGate {
+    fn acquire<'a>(&'a self) -> codex_thread_store::ThreadMetadataMutationPermitFuture<'a> {
+        let active = Arc::clone(&self.active);
+        let serial = Arc::clone(&self.serial);
+        Box::pin(async move {
+            let permit = serial.acquire_owned().await.ok()?;
+            if !active.load(std::sync::atomic::Ordering::Acquire) {
+                return None;
+            }
+            Some(
+                Box::new(SessionThreadMetadataMutationPermit { _permit: permit })
+                    as Box<dyn codex_thread_store::ThreadMetadataMutationPermit>,
+            )
+        })
+    }
+
+    fn title_updated(&self, title: String) {
+        let _ = self.tx_event.try_send(Event {
+            id: String::new(),
+            msg: EventMsg::ThreadNameUpdated(codex_protocol::protocol::ThreadNameUpdatedEvent {
+                name: title,
+            }),
+        });
+    }
+}
+
 pub(crate) struct Session {
     pub(crate) thread_id: ThreadId,
     pub(crate) installation_id: String,
@@ -66,6 +126,47 @@ pub(crate) struct Session {
     pub(super) git_enrichment_policy: GitEnrichmentPolicy,
     pub(super) fork_persistence: ForkPersistence,
     pub(super) next_internal_sub_id: AtomicU64,
+    pub(super) thread_metadata_mutation_gate: Arc<SessionThreadMetadataMutationGate>,
+}
+
+#[cfg(test)]
+mod metadata_mutation_gate_tests {
+    use super::*;
+    use codex_thread_store::ThreadMetadataMutationGate;
+
+    #[tokio::test]
+    async fn publishes_persisted_title_updates() {
+        let (tx, rx) = async_channel::bounded(1);
+        let gate = SessionThreadMetadataMutationGate::new(tx);
+
+        gate.title_updated("Generated title".to_string());
+
+        let event = rx.recv().await.expect("title update event");
+        assert!(matches!(
+            event.msg,
+            EventMsg::ThreadNameUpdated(codex_protocol::protocol::ThreadNameUpdatedEvent {
+                name
+            }) if name == "Generated title"
+        ));
+    }
+
+    #[tokio::test]
+    async fn shutdown_waits_for_in_flight_mutation_and_rejects_new_ones() {
+        let gate = Arc::new(SessionThreadMetadataMutationGate::new(
+            async_channel::bounded(1).0,
+        ));
+        let permit = gate.acquire().await.expect("initial mutation permit");
+        let gate_for_close = Arc::clone(&gate);
+        let close = tokio::spawn(async move {
+            gate_for_close.disable_and_wait().await;
+        });
+        tokio::task::yield_now().await;
+        assert!(!close.is_finished());
+
+        drop(permit);
+        close.await.expect("close task");
+        assert!(gate.acquire().await.is_none());
+    }
 }
 
 #[derive(Clone)]
@@ -624,6 +725,10 @@ async fn warm_plugins_and_skills_for_session_init(
 }
 
 impl Session {
+    pub(super) async fn close_thread_metadata_mutations(&self) {
+        self.thread_metadata_mutation_gate.disable_and_wait().await;
+    }
+
     /// Returns the concrete identity for this thread.
     pub(crate) fn thread_id(&self) -> ThreadId {
         self.thread_id
@@ -820,6 +925,11 @@ impl Session {
             thread_id.to_string(),
             thread_extension_init,
         );
+        let thread_metadata_mutation_gate =
+            Arc::new(SessionThreadMetadataMutationGate::new(tx_event.clone()));
+        let thread_metadata_mutation_gate_for_live_thread: Arc<
+            dyn codex_thread_store::ThreadMetadataMutationGate,
+        > = thread_metadata_mutation_gate.clone();
         // Kick off independent async setup tasks in parallel to reduce startup latency.
         //
         // - initialize thread persistence with new or resumed session info
@@ -904,7 +1014,9 @@ impl Session {
                         .await?
                     }
                 };
-                Ok(Some(live_thread))
+                Ok(Some(live_thread.with_metadata_mutation_gate(Arc::clone(
+                    &thread_metadata_mutation_gate_for_live_thread,
+                ))))
             }
         }
         .instrument(info_span!(
@@ -1456,6 +1568,7 @@ impl Session {
                 git_enrichment_policy,
                 fork_persistence,
                 next_internal_sub_id: AtomicU64::new(0),
+                thread_metadata_mutation_gate,
             });
             if let Some(network_policy_decider_session) = network_policy_decider_session {
                 let mut guard = network_policy_decider_session.write().await;

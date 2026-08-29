@@ -5985,6 +5985,9 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
     let session = Session {
         thread_id,
         installation_id: "11111111-1111-4111-8111-111111111111".to_string(),
+        thread_metadata_mutation_gate: Arc::new(
+            super::session::SessionThreadMetadataMutationGate::new(tx_event.clone()),
+        ),
         tx_event,
         agent_status: agent_status_tx,
         state: Mutex::new(state),
@@ -8198,6 +8201,9 @@ where
     let session = Arc::new(Session {
         thread_id,
         installation_id: "11111111-1111-4111-8111-111111111111".to_string(),
+        thread_metadata_mutation_gate: Arc::new(
+            super::session::SessionThreadMetadataMutationGate::new(tx_event.clone()),
+        ),
         tx_event,
         agent_status: agent_status_tx,
         state: Mutex::new(state),

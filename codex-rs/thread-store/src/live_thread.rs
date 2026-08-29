@@ -20,6 +20,7 @@ use crate::ReadThreadParams;
 use crate::ResumeThreadParams;
 use crate::StoredThread;
 use crate::StoredThreadHistory;
+use crate::ThreadMetadataMutationGate;
 use crate::ThreadMetadataPatch;
 use crate::ThreadStore;
 use crate::ThreadStoreError;
@@ -41,6 +42,7 @@ pub struct LiveThread {
     thread_store: Arc<dyn ThreadStore>,
     metadata_sync: Arc<Mutex<ThreadMetadataSync>>,
     persistence_telemetry: RolloutPersistenceTelemetry,
+    metadata_mutation_gate: Option<Arc<dyn ThreadMetadataMutationGate>>,
 }
 
 /// Owns a live thread while session initialization is still fallible.
@@ -107,6 +109,7 @@ impl LiveThread {
             thread_store,
             metadata_sync: Arc::new(Mutex::new(metadata_sync)),
             persistence_telemetry: RolloutPersistenceTelemetry::new(thread_id),
+            metadata_mutation_gate: None,
         })
     }
 
@@ -194,7 +197,17 @@ impl LiveThread {
             thread_store,
             metadata_sync: Arc::new(Mutex::new(metadata_sync)),
             persistence_telemetry: RolloutPersistenceTelemetry::new(thread_id),
+            metadata_mutation_gate: None,
         })
+    }
+
+    /// Installs the host lifecycle gate used by detached title metadata updates.
+    pub fn with_metadata_mutation_gate(
+        mut self,
+        gate: Arc<dyn ThreadMetadataMutationGate>,
+    ) -> Self {
+        self.metadata_mutation_gate = Some(gate);
+        self
     }
 
     #[tracing::instrument(
@@ -246,6 +259,7 @@ impl LiveThread {
             generator,
             self.thread_id,
             request,
+            self.metadata_mutation_gate.clone(),
         );
     }
 
@@ -444,6 +458,7 @@ fn spawn_llm_title_task(
     generator: Arc<dyn ThreadTitleGenerator>,
     thread_id: ThreadId,
     request: ThreadTitleRequest,
+    metadata_mutation_gate: Option<Arc<dyn ThreadMetadataMutationGate>>,
 ) {
     let Ok(handle) = tokio::runtime::Handle::try_current() else {
         return;
@@ -457,6 +472,15 @@ fn spawn_llm_title_task(
             .filter(|title| !title.is_empty())
         else {
             return;
+        };
+        let _mutation_permit = match metadata_mutation_gate.as_ref() {
+            Some(gate) => {
+                let Some(permit) = gate.acquire().await else {
+                    return;
+                };
+                Some(permit)
+            }
+            None => None,
         };
         match thread_store
             .read_thread(ReadThreadParams {
@@ -474,7 +498,7 @@ fn spawn_llm_title_task(
                     .update_thread_metadata(UpdateThreadMetadataParams {
                         thread_id,
                         patch: ThreadMetadataPatch {
-                            title: Some(title),
+                            title: Some(title.clone()),
                             ..Default::default()
                         },
                         include_archived: true,
@@ -482,6 +506,8 @@ fn spawn_llm_title_task(
                     .await
                 {
                     warn!("failed to persist generated thread title for {thread_id}: {err}");
+                } else if let Some(gate) = metadata_mutation_gate.as_ref() {
+                    gate.title_updated(title);
                 }
             }
             Ok(_) => {}
