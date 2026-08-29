@@ -42,6 +42,7 @@ use crate::transport::TransportEvent;
 use crate::transport::acquire_app_server_startup_lock;
 use crate::transport::app_server_startup_lock_path;
 use crate::transport::auth::policy_from_settings;
+use crate::transport::extension_transport_context;
 use crate::transport::prepare_control_socket_path;
 use crate::transport::route_outgoing_envelope;
 use crate::transport::start_control_socket_acceptor;
@@ -1118,12 +1119,13 @@ pub async fn run_main_with_transport_options_and_overrides(
                                                 request,
                                                 &transport,
                                                 Arc::clone(&connection_state.session),
-                                                AppServerRpcContext::new(match connection_state.origin {
-                                                    ConnectionOrigin::Stdio => AppServerRpcTransportContext::Stdio,
-                                                    ConnectionOrigin::InProcess => AppServerRpcTransportContext::InProcess,
-                                                    ConnectionOrigin::WebSocket => AppServerRpcTransportContext::AuthenticatedWebSocket,
-                                                    ConnectionOrigin::RemoteControl => AppServerRpcTransportContext::RemoteControl,
-                                                }),
+                                                AppServerRpcContext::new(
+                                                    extension_transport_context(
+                                                        connection_state.origin,
+                                                        &transport,
+                                                        &auth,
+                                                    ),
+                                                ),
                                             )
                                             .await;
                                         let opted_out_notification_methods_snapshot = connection_state
