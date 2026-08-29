@@ -1,12 +1,10 @@
 use std::collections::HashSet;
-use std::sync::Arc;
-use std::sync::Mutex;
 use std::time::Duration;
 
 use codex_mcp::CODEX_APPS_MCP_SERVER_NAME;
-use codex_mcp::McpResourceClientCacheKey;
 use codex_protocol::mcp::Resource;
 use codex_protocol::mcp::ResourceContent;
+use codex_protocol::protocol::SkillScope;
 use url::Url;
 
 use crate::catalog::SkillAuthority;
@@ -18,6 +16,7 @@ use crate::catalog::SkillReadResult;
 use crate::catalog::SkillResourceId;
 use crate::catalog::SkillSearchResult;
 use crate::catalog::SkillSourceKind;
+use crate::provider::MAX_SKILL_RESOURCE_CONTENT_BYTES;
 use crate::provider::SkillListQuery;
 use crate::provider::SkillProvider;
 use crate::provider::SkillProviderFuture;
@@ -26,69 +25,60 @@ use crate::provider::SkillSearchRequest;
 
 const ORCHESTRATOR_SKILL_MIME_TYPE: &str = "mcp/skill";
 const ORCHESTRATOR_SKILL_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(10);
+const ORCHESTRATOR_SKILL_DISCOVERY_DURATION_METRIC: &str =
+    "codex.skills.orchestrator.discovery.duration_ms";
+const ORCHESTRATOR_SKILL_DISCOVERY_RESOURCES_METRIC: &str =
+    "codex.skills.orchestrator.discovery.resources_total";
 const ORCHESTRATOR_SKILL_READ_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_RESOURCE_PAGES: usize = 10;
 const MAX_ORCHESTRATOR_SKILLS: usize = 100;
+const MAX_HIDDEN_ORCHESTRATOR_SKILLS: usize = MAX_RESOURCE_PAGES * MAX_ORCHESTRATOR_SKILLS;
 const MAX_SKILL_NAME_CHARS: usize = 64;
 const MAX_QUALIFIED_SKILL_NAME_CHARS: usize = 128;
 const MAX_SKILL_PACKAGE_URI_CHARS: usize = 1_024;
 const MAX_SKILL_RESOURCE_URI_CHARS: usize = 2_048;
-const MAX_SKILL_RESOURCE_CONTENT_BYTES: usize = 1024 * 1024;
-
 /// Discovers and reads skills owned by the orchestrator.
 ///
 /// The provider uses session-scoped resources without exposing the transport or
 /// resource server to callers that configure the skills extension.
-#[derive(Clone, Default)]
-pub struct OrchestratorSkillProvider {
-    authorized_catalogs: Arc<Mutex<Vec<AuthorizedCatalog>>>,
-}
-
-impl std::fmt::Debug for OrchestratorSkillProvider {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("OrchestratorSkillProvider")
-            .finish_non_exhaustive()
-    }
-}
+#[derive(Clone, Debug, Default)]
+pub struct OrchestratorSkillProvider;
 
 impl OrchestratorSkillProvider {
     pub fn new() -> Self {
-        Self::default()
+        Self
     }
 }
 
 impl SkillProvider for OrchestratorSkillProvider {
     fn list(&self, query: SkillListQuery) -> SkillProviderFuture<'_, SkillCatalog> {
-        let authorized_catalogs = Arc::clone(&self.authorized_catalogs);
         Box::pin(async move {
-            let generation = query.mcp_resource_generation.or_else(|| {
-                query
-                    .mcp_resources
-                    .as_ref()
-                    .map(|client| client.capture_generation())
-            });
-            let Some(generation) = generation else {
+            let Some(client) = query.mcp_resources else {
                 return Ok(SkillCatalog::default());
             };
-            if !generation.has_server(CODEX_APPS_MCP_SERVER_NAME) {
+            if !client.has_server(CODEX_APPS_MCP_SERVER_NAME).await {
                 return Ok(SkillCatalog::default());
             }
 
+            let _discovery_timer =
+                codex_otel::start_global_timer(ORCHESTRATOR_SKILL_DISCOVERY_DURATION_METRIC, &[])
+                    .ok();
             let discovery_deadline =
                 tokio::time::Instant::now() + ORCHESTRATOR_SKILL_DISCOVERY_TIMEOUT;
             let mut catalog = SkillCatalog::default();
             let mut cursor = None;
             let mut seen_cursors = HashSet::new();
-            let mut skill_resources_seen = 0usize;
+            let mut visible_skills_seen = 0usize;
+            let mut hidden_skills_seen = 0usize;
             let mut skipped_resources = 0usize;
             let mut truncated = false;
             let mut completed_pages = 0usize;
+            let mut total_resources = 0usize;
 
             for _ in 0..MAX_RESOURCE_PAGES {
                 let page = match tokio::time::timeout_at(
                     discovery_deadline,
-                    generation.list_resources(CODEX_APPS_MCP_SERVER_NAME, cursor.clone()),
+                    client.list_resources(CODEX_APPS_MCP_SERVER_NAME, cursor.clone()),
                 )
                 .await
                 {
@@ -119,25 +109,33 @@ impl SkillProvider for OrchestratorSkillProvider {
                     }
                 };
                 completed_pages = completed_pages.saturating_add(1);
+                total_resources = total_resources.saturating_add(result.resources.len());
 
                 for resource in &result.resources {
                     if resource.mime_type.as_deref() != Some(ORCHESTRATOR_SKILL_MIME_TYPE) {
                         continue;
                     }
-                    if skill_resources_seen >= MAX_ORCHESTRATOR_SKILLS {
-                        truncated = true;
-                        break;
-                    }
-                    skill_resources_seen = skill_resources_seen.saturating_add(1);
                     match catalog_entry_from_resource(resource) {
-                        Some(entry) => catalog.push_entry(entry),
+                        Some(entry) => {
+                            if entry.prompt_visible {
+                                if visible_skills_seen >= MAX_ORCHESTRATOR_SKILLS {
+                                    truncated = true;
+                                    continue;
+                                }
+                                visible_skills_seen = visible_skills_seen.saturating_add(1);
+                            } else {
+                                if hidden_skills_seen >= MAX_HIDDEN_ORCHESTRATOR_SKILLS {
+                                    truncated = true;
+                                    continue;
+                                }
+                                hidden_skills_seen = hidden_skills_seen.saturating_add(1);
+                            }
+                            catalog.push_entry(entry);
+                        }
                         None => skipped_resources = skipped_resources.saturating_add(1),
                     }
                 }
 
-                if truncated {
-                    break;
-                }
                 let Some(next_cursor) = result.next_cursor else {
                     cursor = None;
                     break;
@@ -155,7 +153,7 @@ impl SkillProvider for OrchestratorSkillProvider {
 
             if cursor.is_some() || truncated {
                 catalog.warnings.push(format!(
-                    "Orchestrator skill discovery was truncated at {MAX_ORCHESTRATOR_SKILLS} skills or {MAX_RESOURCE_PAGES} resource pages."
+                    "Orchestrator skill discovery was truncated at {MAX_ORCHESTRATOR_SKILLS} visible skills, {MAX_HIDDEN_ORCHESTRATOR_SKILLS} hidden skills, or {MAX_RESOURCE_PAGES} resource pages."
                 ));
             }
             if skipped_resources > 0 {
@@ -164,14 +162,19 @@ impl SkillProvider for OrchestratorSkillProvider {
                 ));
             }
 
-            authorize_catalog(&authorized_catalogs, generation.cache_key(), &catalog);
+            if let Some(metrics) = codex_otel::global() {
+                let _ = metrics.histogram(
+                    ORCHESTRATOR_SKILL_DISCOVERY_RESOURCES_METRIC,
+                    i64::try_from(total_resources).unwrap_or(i64::MAX),
+                    &[],
+                );
+            }
 
             Ok(catalog)
         })
     }
 
     fn read(&self, request: SkillReadRequest) -> SkillProviderFuture<'_, SkillReadResult> {
-        let authorized_catalogs = Arc::clone(&self.authorized_catalogs);
         Box::pin(async move {
             if request.authority
                 != SkillAuthority::new(SkillSourceKind::Orchestrator, CODEX_APPS_MCP_SERVER_NAME)
@@ -187,32 +190,14 @@ impl SkillProvider for OrchestratorSkillProvider {
                 ));
             }
 
-            let generation = request.mcp_resource_generation.or_else(|| {
-                request
-                    .mcp_resources
-                    .as_ref()
-                    .map(|client| client.capture_generation())
-            });
-            let authorized = generation.as_ref().is_some_and(|generation| {
-                is_authorized(
-                    &authorized_catalogs,
-                    &generation.cache_key(),
-                    &request.package,
-                    &request.resource,
-                )
-            });
-            if !authorized {
+            let Some(client) = request.mcp_resources.as_ref() else {
                 return Err(SkillProviderError::new(
-                    "orchestrator skill package is not authorized by discovery",
+                    "session MCP resource client is not configured",
                 ));
-            }
-
-            let Some(generation) = generation else {
-                unreachable!("authorized orchestrator reads have an MCP resource generation");
             };
             let result = tokio::time::timeout(
                 ORCHESTRATOR_SKILL_READ_TIMEOUT,
-                generation.read_resource(CODEX_APPS_MCP_SERVER_NAME, request.resource.as_str()),
+                client.read_resource(CODEX_APPS_MCP_SERVER_NAME, request.resource.as_str()),
             )
             .await
             .map_err(|_| {
@@ -260,68 +245,17 @@ impl SkillProvider for OrchestratorSkillProvider {
     }
 }
 
-struct AuthorizedCatalog {
-    client: McpResourceClientCacheKey,
-    resources: HashSet<AuthorizedResource>,
-}
-
-#[derive(Hash, PartialEq, Eq)]
-struct AuthorizedResource {
-    package: SkillPackageId,
-    resource: SkillResourceId,
-}
-
-fn authorize_catalog(
-    authorized_catalogs: &Mutex<Vec<AuthorizedCatalog>>,
-    client: McpResourceClientCacheKey,
-    catalog: &SkillCatalog,
-) {
-    let resources = catalog
-        .entries
-        .iter()
-        .filter(|entry| entry.enabled)
-        .map(|entry| AuthorizedResource {
-            package: entry.id.clone(),
-            resource: entry.main_prompt.clone(),
-        })
-        .collect();
-    let mut authorized_catalogs = authorized_catalogs
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    authorized_catalogs.retain(|catalog| catalog.client.is_alive());
-    if let Some(position) = authorized_catalogs
-        .iter()
-        .position(|catalog| catalog.client == client)
-    {
-        authorized_catalogs.remove(position);
-    }
-    authorized_catalogs.push(AuthorizedCatalog { client, resources });
-}
-
-fn is_authorized(
-    authorized_catalogs: &Mutex<Vec<AuthorizedCatalog>>,
-    client: &McpResourceClientCacheKey,
-    package: &SkillPackageId,
-    resource: &SkillResourceId,
-) -> bool {
-    authorized_catalogs
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .iter()
-        .find(|catalog| &catalog.client == client)
-        .is_some_and(|catalog| {
-            catalog.resources.contains(&AuthorizedResource {
-                package: package.clone(),
-                resource: resource.clone(),
-            })
-        })
-}
-
 fn catalog_entry_from_resource(resource: &Resource) -> Option<SkillCatalogEntry> {
     let uri = validated_skill_uri(resource.uri.as_str(), MAX_SKILL_PACKAGE_URI_CHARS)?;
+    let namespace = uri.strip_prefix("skill://")?.split_once('/')?.0;
     let meta = resource.meta.as_ref()?.as_object()?;
+    let allow_implicit_invocation = meta
+        .get("allow_implicit_invocation")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(true);
     let skill_name = normalized_label(meta.get("skill_name")?.as_str()?, MAX_SKILL_NAME_CHARS)?;
-    let name = if meta.get("source").and_then(|value| value.as_str()) == Some("user") {
+    let user_owned = meta.get("source").and_then(|value| value.as_str()) == Some("user");
+    let name = if user_owned {
         skill_name
     } else {
         let plugin_name =
@@ -333,16 +267,26 @@ fn catalog_entry_from_resource(resource: &Resource) -> Option<SkillCatalogEntry>
     let description = normalized_description(resource.description.as_deref().unwrap_or_default())?;
     let main_prompt = main_prompt_uri(uri);
 
-    Some(
-        SkillCatalogEntry::new(
-            SkillPackageId(uri.to_string()),
-            SkillAuthority::new(SkillSourceKind::Orchestrator, CODEX_APPS_MCP_SERVER_NAME),
-            name,
-            description,
-            SkillResourceId::new(main_prompt),
-        )
-        .with_display_path(uri),
+    let mut entry = SkillCatalogEntry::new(
+        SkillPackageId(uri.to_string()),
+        SkillAuthority::new(SkillSourceKind::Orchestrator, CODEX_APPS_MCP_SERVER_NAME),
+        name,
+        description,
+        SkillResourceId::new(main_prompt),
     )
+    .with_display_path(uri)
+    .with_alias_root(format!("skill://{namespace}"));
+    entry.canonical_skill_id = meta
+        .get("skill_id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned);
+    entry.analytics_scope = user_owned.then_some(SkillScope::User);
+
+    Some(if allow_implicit_invocation {
+        entry
+    } else {
+        entry.hidden_from_prompt()
+    })
 }
 
 fn validated_skill_uri(uri: &str, max_chars: usize) -> Option<&str> {

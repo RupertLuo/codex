@@ -75,28 +75,29 @@ fn config_schema_hides_unsupported_inline_mcp_bearer_token() {
 }
 
 #[test]
-fn config_schema_exposes_model_auto_compact_enabled() {
+fn shell_environment_policy_schema_rejects_mixed_filter_representations() {
     let schema_json = config_schema_json().expect("serialize config schema");
     let schema_value: serde_json::Value =
         serde_json::from_slice(&schema_json).expect("decode schema json");
-    let properties = schema_value
-        .get("properties")
-        .expect("ConfigToml properties should exist")
-        .as_object()
-        .expect("ConfigToml properties should be an object");
+    let constraints = schema_value
+        .pointer("/definitions/ShellEnvironmentPolicyToml/allOf")
+        .and_then(serde_json::Value::as_array)
+        .expect("shell environment policy constraints should be an array");
+    let required_pairs = constraints
+        .iter()
+        .map(|constraint| {
+            constraint
+                .pointer("/not/required")
+                .expect("constraint should prohibit a required-field pair")
+                .clone()
+        })
+        .collect::<Vec<_>>();
 
-    assert!(properties.contains_key("model_auto_compact_enabled"));
-}
-
-#[test]
-fn config_schema_exposes_compact_model() {
-    let schema_json = config_schema_json().expect("serialize config schema");
-    let schema: serde_json::Value =
-        serde_json::from_slice(&schema_json).expect("decode schema json");
-    let properties = schema
-        .get("properties")
-        .expect("ConfigToml properties should exist")
-        .as_object()
-        .expect("ConfigToml properties should be an object");
-    assert!(properties.contains_key("compact_model"));
+    assert_eq!(
+        required_pairs,
+        vec![
+            serde_json::json!(["exclude", "filters"]),
+            serde_json::json!(["filters", "include_only"]),
+        ]
+    );
 }

@@ -2,20 +2,22 @@ use super::CodexErrorInfo;
 use super::ThreadItem;
 use super::ThreadStatus;
 use super::TurnStatus;
+use crate::JsonSchema;
+use crate::TS;
 use codex_experimental_api_macros::ExperimentalApi;
 use codex_protocol::protocol::SessionSource as CoreSessionSource;
 use codex_protocol::protocol::SubAgentSource as CoreSubAgentSource;
 use codex_protocol::protocol::ThreadHistoryMode as CoreThreadHistoryMode;
 use codex_protocol::protocol::ThreadSource as CoreThreadSource;
 use codex_utils_absolute_path::AbsolutePathBuf;
-use schemars::JsonSchema;
+#[cfg(test)]
 use schemars::r#gen::SchemaGenerator;
+#[cfg(test)]
 use schemars::schema::Schema;
 use serde::Deserialize;
 use serde::Serialize;
 use std::path::PathBuf;
 use thiserror::Error;
-use ts_rs::TS;
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
@@ -103,6 +105,7 @@ pub enum ThreadSource {
     MemoryConsolidation,
 }
 
+#[cfg(test)]
 impl JsonSchema for ThreadSource {
     fn schema_name() -> String {
         "ThreadSource".to_string()
@@ -164,7 +167,30 @@ pub struct GitInfo {
     pub origin_url: Option<String>,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS, ExperimentalApi)]
+/// An independently persisted, user-visible thread section.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct ThreadSection {
+    /// Opaque UUIDv7 identity that remains stable when the section is renamed.
+    pub id: String,
+    /// The current user-visible section name.
+    pub name: String,
+    /// Optional appearance synchronized across clients.
+    #[serde(default)]
+    pub appearance: Option<ThreadSectionAppearance>,
+}
+
+/// Extensible visual presentation for a custom thread section.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct ThreadSectionAppearance {
+    pub icon: Option<String>,
+    pub color: Option<String>,
+}
+
+#[derive(Serialize, Debug, Clone, PartialEq, JsonSchema, TS, ExperimentalApi)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
 pub struct Thread {
@@ -183,6 +209,19 @@ pub struct Thread {
     pub preview: String,
     /// Whether the thread is ephemeral and should not be materialized on disk.
     pub ephemeral: bool,
+    /// The independently persisted section selected for this thread, if any.
+    #[serde(default)]
+    pub section: Option<ThreadSection>,
+    /// Unix timestamp in seconds when the thread entered its current section.
+    #[serde(default)]
+    #[ts(type = "number | null")]
+    pub section_entered_at: Option<i64>,
+    /// Canonical project assignment owned by app-server, if any.
+    #[schemars(
+        required,
+        schema_with = "crate::protocol::serde_helpers::nullable_string_schema"
+    )]
+    pub project_id: Option<String>,
     /// Persisted thread history contract selected when this thread was created.
     #[experimental("thread.historyMode")]
     #[serde(default)]
@@ -208,6 +247,10 @@ pub struct Thread {
     pub cli_version: String,
     /// Origin of the thread (CLI, VSCode, codex exec, codex app-server, etc.).
     pub source: SessionSource,
+    /// Whether the app server accepts direct turn input for this loaded thread.
+    /// `None` means the capability is unavailable, such as for an unloaded stored thread.
+    #[experimental("thread.canAcceptDirectInput")]
+    pub can_accept_direct_input: Option<bool>,
     /// Optional analytics source classification for this thread.
     pub thread_source: Option<ThreadSource>,
     /// Optional random unique nickname assigned to an AgentControl-spawned sub-agent.
@@ -223,6 +266,82 @@ pub struct Thread {
     /// For all other responses and notifications returning a Thread,
     /// the turns field will be an empty list.
     pub turns: Vec<Turn>,
+}
+
+// TODO: Remove this compatibility decoder after app-server versions that omitted
+// `projectId` have aged out of the supported TUI -> remote app-server version-skew window.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ThreadCompatibility {
+    id: String,
+    extra: Option<ThreadExtra>,
+    session_id: String,
+    forked_from_id: Option<String>,
+    parent_thread_id: Option<String>,
+    preview: String,
+    ephemeral: bool,
+    #[serde(default)]
+    section: Option<ThreadSection>,
+    #[serde(default)]
+    section_entered_at: Option<i64>,
+    #[serde(default)]
+    project_id: Option<String>,
+    #[serde(default)]
+    history_mode: ThreadHistoryMode,
+    model_provider: String,
+    created_at: i64,
+    updated_at: i64,
+    recency_at: Option<i64>,
+    status: ThreadStatus,
+    path: Option<PathBuf>,
+    cwd: AbsolutePathBuf,
+    cli_version: String,
+    source: SessionSource,
+    can_accept_direct_input: Option<bool>,
+    thread_source: Option<ThreadSource>,
+    agent_nickname: Option<String>,
+    agent_role: Option<String>,
+    git_info: Option<GitInfo>,
+    name: Option<String>,
+    turns: Vec<Turn>,
+}
+
+impl<'de> Deserialize<'de> for Thread {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let thread = ThreadCompatibility::deserialize(deserializer)?;
+        Ok(Self {
+            id: thread.id,
+            extra: thread.extra,
+            session_id: thread.session_id,
+            forked_from_id: thread.forked_from_id,
+            parent_thread_id: thread.parent_thread_id,
+            preview: thread.preview,
+            ephemeral: thread.ephemeral,
+            section: thread.section,
+            section_entered_at: thread.section_entered_at,
+            project_id: thread.project_id,
+            history_mode: thread.history_mode,
+            model_provider: thread.model_provider,
+            created_at: thread.created_at,
+            updated_at: thread.updated_at,
+            recency_at: thread.recency_at,
+            status: thread.status,
+            path: thread.path,
+            cwd: thread.cwd,
+            cli_version: thread.cli_version,
+            source: thread.source,
+            can_accept_direct_input: thread.can_accept_direct_input,
+            thread_source: thread.thread_source,
+            agent_nickname: thread.agent_nickname,
+            agent_role: thread.agent_role,
+            git_info: thread.git_info,
+            name: thread.name,
+            turns: thread.turns,
+        })
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]

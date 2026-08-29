@@ -1,15 +1,26 @@
 use std::sync::Arc;
 use std::sync::Weak;
+use std::time::Duration;
 
 use anyhow::Context;
 use anyhow::Result;
-use arc_swap::ArcSwap;
+use anyhow::anyhow;
 use codex_protocol::mcp::Resource;
 use codex_protocol::mcp::ResourceContent;
+use codex_rmcp_client::CancellableEventStreamRequest;
 use rmcp::model::PaginatedRequestParams;
 use rmcp::model::ReadResourceRequestParams;
+use rmcp::model::ServerResult;
+use rmcp::service::ServiceError;
+use serde::Deserialize;
+use serde_json::Map;
+use serde_json::Value;
+use serde_json::json;
+use tokio::runtime::Handle;
 
-use crate::McpConnectionManager;
+use crate::McpRuntime;
+use crate::connection_manager::McpConnectionSet;
+use crate::mcp::CODEX_APPS_MCP_SERVER_NAME;
 
 /// One page of resources returned by an MCP server.
 #[derive(Clone, Debug, PartialEq)]
@@ -27,24 +38,113 @@ pub struct McpResourceReadResult {
     pub contents: Vec<ResourceContent>,
 }
 
-/// Session-scoped access to MCP resources through the currently installed manager.
-///
-/// The client retains the manager's shared publication handle rather than a manager
-/// snapshot, so calls automatically use replacements installed during startup and refresh.
+/// An event advertised by an MCP server.
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct McpEventDefinition {
+    pub name: String,
+    pub description: String,
+    pub delivery: Vec<String>,
+    pub input_schema: Value,
+    pub payload_schema: Value,
+}
+
+/// Events returned from one stable MCP connection generation.
+pub struct McpEventCatalogSnapshot {
+    pub cache_key: McpResourceClientCacheKey,
+    pub events: Vec<McpEventDefinition>,
+}
+
+/// One unmodified lifecycle notification from an MCP event subscription.
+#[derive(Clone, Debug, PartialEq)]
+pub struct McpEventNotification {
+    pub method: String,
+    pub params: Option<Value>,
+}
+
+/// Owns an MCP event subscription and cancels its request when dropped.
+pub struct McpEventStream {
+    request: Option<CancellableEventStreamRequest>,
+    runtime_handle: Handle,
+    _connections: Arc<McpConnectionSet>,
+}
+
+impl McpEventStream {
+    /// Receives the next raw lifecycle notification for this subscription.
+    pub async fn recv(&mut self) -> Result<Option<McpEventNotification>> {
+        let Some(request) = self.request.as_mut() else {
+            return Ok(None);
+        };
+
+        tokio::select! {
+            biased;
+
+            notification = request.notifications.recv() => {
+                match notification {
+                    Some(notification) => Ok(Some(McpEventNotification {
+                        method: notification.method,
+                        params: notification.params,
+                    })),
+                    None => {
+                        let response = (&mut request.handle.rx).await;
+                        self.request = None;
+                        match response {
+                            Ok(Ok(_)) | Ok(Err(ServiceError::Cancelled { .. })) => Ok(None),
+                            Ok(Err(error)) => Err(error.into()),
+                            Err(error) => Err(error.into()),
+                        }
+                    }
+                }
+            }
+            response = &mut request.handle.rx => {
+                self.request = None;
+
+                match response {
+                    Ok(Ok(_)) | Ok(Err(ServiceError::Cancelled { .. })) => Ok(None),
+                    Ok(Err(error)) => Err(error.into()),
+                    Err(error) => Err(error.into()),
+                }
+            }
+        }
+    }
+}
+
+impl Drop for McpEventStream {
+    fn drop(&mut self) {
+        if let Some(CancellableEventStreamRequest {
+            handle,
+            notifications,
+        }) = self.request.take()
+        {
+            drop(notifications);
+            let connections = Arc::clone(&self._connections);
+            self.runtime_handle.spawn(async move {
+                let _ = tokio::time::timeout(
+                    Duration::from_secs(30),
+                    handle.cancel(Some("event subscription closed".to_string())),
+                )
+                .await;
+                drop(connections);
+            });
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct McpEventListResult {
+    events: Vec<McpEventDefinition>,
+}
+
+/// Access to MCP resources and event subscriptions through the latest runtime.
 #[derive(Clone)]
 pub struct McpResourceClient {
-    manager: Arc<ArcSwap<McpConnectionManager>>,
+    runtime: Arc<McpRuntime>,
 }
 
-/// One stable MCP connection-manager generation used for a multi-call operation.
+/// Opaque identity for the connection set currently used by an MCP resource client.
 #[derive(Clone)]
-pub struct McpResourceClientGeneration {
-    manager: Arc<McpConnectionManager>,
-}
-
-/// Opaque identity for the manager currently used by an MCP resource client.
-#[derive(Clone)]
-pub struct McpResourceClientCacheKey(Weak<McpConnectionManager>);
+pub struct McpResourceClientCacheKey(Weak<McpConnectionSet>);
 
 impl PartialEq for McpResourceClientCacheKey {
     fn eq(&self, other: &Self) -> bool {
@@ -54,13 +154,6 @@ impl PartialEq for McpResourceClientCacheKey {
 
 impl Eq for McpResourceClientCacheKey {}
 
-impl McpResourceClientCacheKey {
-    /// Returns whether the manager generation represented by this key is still retained.
-    pub fn is_alive(&self) -> bool {
-        self.0.strong_count() > 0
-    }
-}
-
 impl std::fmt::Debug for McpResourceClient {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -69,37 +162,22 @@ impl std::fmt::Debug for McpResourceClient {
     }
 }
 
-impl std::fmt::Debug for McpResourceClientGeneration {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("McpResourceClientGeneration")
-            .finish_non_exhaustive()
-    }
-}
-
 impl McpResourceClient {
-    /// Creates a resource client backed by the session's replaceable MCP manager.
-    pub fn new(manager: Arc<ArcSwap<McpConnectionManager>>) -> Self {
-        Self { manager }
+    /// Creates a resource client that follows the thread's latest published runtime.
+    pub fn new(runtime: Arc<McpRuntime>) -> Self {
+        Self { runtime }
     }
 
-    /// Captures the currently published manager for a generation-consistent operation.
-    pub fn capture_generation(&self) -> McpResourceClientGeneration {
-        McpResourceClientGeneration {
-            manager: self.manager.load_full(),
-        }
-    }
-
-    /// Returns an identity that changes whenever the published manager changes.
+    /// Returns the identity of the connection set used by this client.
     pub fn cache_key(&self) -> McpResourceClientCacheKey {
-        self.capture_generation().cache_key()
+        McpResourceClientCacheKey(Arc::downgrade(&self.runtime.latest_connections()))
     }
 
-    /// Returns whether the current manager contains the named server.
+    /// Returns whether this client can address the named server.
     ///
-    /// This does not wait for server startup or imply that startup succeeded.
+    /// This does not wait for server startup.
     pub async fn has_server(&self, server: &str) -> bool {
-        self.capture_generation().has_server(server)
+        self.runtime.latest_connections().contains_server(server)
     }
 
     /// Lists one resource page from the named server.
@@ -110,45 +188,11 @@ impl McpResourceClient {
     ) -> Result<McpResourcePage> {
         let params =
             cursor.map(|cursor| PaginatedRequestParams::default().with_cursor(Some(cursor)));
-        self.capture_generation()
-            .list_resources_with_params(server, params)
-            .await
-    }
-
-    /// Reads one resource using the manager generation current at call start.
-    pub async fn read_resource(&self, server: &str, uri: &str) -> Result<McpResourceReadResult> {
-        self.capture_generation().read_resource(server, uri).await
-    }
-}
-
-impl McpResourceClientGeneration {
-    /// Returns the identity of this exact manager generation.
-    pub fn cache_key(&self) -> McpResourceClientCacheKey {
-        McpResourceClientCacheKey(Arc::downgrade(&self.manager))
-    }
-
-    /// Returns whether this generation contains the named server.
-    pub fn has_server(&self, server: &str) -> bool {
-        self.manager.contains_server(server)
-    }
-
-    /// Lists one resource page through this exact manager generation.
-    pub async fn list_resources(
-        &self,
-        server: &str,
-        cursor: Option<String>,
-    ) -> Result<McpResourcePage> {
-        let params =
-            cursor.map(|cursor| PaginatedRequestParams::default().with_cursor(Some(cursor)));
-        self.list_resources_with_params(server, params).await
-    }
-
-    async fn list_resources_with_params(
-        &self,
-        server: &str,
-        params: Option<PaginatedRequestParams>,
-    ) -> Result<McpResourcePage> {
-        let result = self.manager.list_resources(server, params).await?;
+        let result = self
+            .runtime
+            .latest_connections()
+            .list_resources(server, params)
+            .await?;
         let resources = result
             .resources
             .into_iter()
@@ -160,11 +204,13 @@ impl McpResourceClientGeneration {
         })
     }
 
-    /// Reads one resource through this exact manager generation.
+    /// Reads one resource from the named server.
     pub async fn read_resource(&self, server: &str, uri: &str) -> Result<McpResourceReadResult> {
+        let params = ReadResourceRequestParams::new(uri.to_string());
         let result = self
-            .manager
-            .read_resource(server, ReadResourceRequestParams::new(uri.to_string()))
+            .runtime
+            .latest_connections()
+            .read_resource(server, params)
             .await?;
         let contents = result
             .contents
@@ -172,6 +218,63 @@ impl McpResourceClientGeneration {
             .map(resource_content_from_rmcp)
             .collect::<Result<Vec<_>>>()?;
         Ok(McpResourceReadResult { contents })
+    }
+
+    /// Lists the events advertised by the hosted Plugin Runtime.
+    pub async fn list_events(&self) -> Result<McpEventCatalogSnapshot> {
+        let connections = self.runtime.latest_connections();
+        let cache_key = McpResourceClientCacheKey(Arc::downgrade(&connections));
+        let (managed, request_timeout) = connections
+            .client_by_name(CODEX_APPS_MCP_SERVER_NAME)
+            .await?;
+        let result = managed
+            .client
+            .send_custom_request_with_timeout("events/list", /*params*/ None, request_timeout)
+            .await
+            .context("events/list failed for hosted Plugin Runtime")?;
+        let ServerResult::CustomResult(result) = result else {
+            return Err(anyhow!("events/list returned an unexpected MCP result"));
+        };
+        let result = result
+            .result_as::<McpEventListResult>()
+            .context("events/list returned invalid event definitions")?;
+
+        Ok(McpEventCatalogSnapshot {
+            cache_key,
+            events: result.events,
+        })
+    }
+
+    /// Opens an MCP event subscription with the supplied event arguments.
+    pub async fn open_event_stream(
+        &self,
+        event_name: &str,
+        arguments: &Value,
+        request_meta: Option<&Map<String, Value>>,
+    ) -> Result<McpEventStream> {
+        let mut params = json!({
+            "name": event_name,
+            "arguments": arguments,
+        });
+        if let Some(request_meta) = request_meta {
+            params["_meta"] = Value::Object(request_meta.clone());
+        }
+
+        let connections = self.runtime.latest_connections();
+        let (managed, _) = connections
+            .client_by_name(CODEX_APPS_MCP_SERVER_NAME)
+            .await?;
+        let request = managed
+            .client
+            .send_event_stream_request(Some(params))
+            .await
+            .context("events/stream failed for hosted Plugin Runtime")?;
+
+        Ok(McpEventStream {
+            request: Some(request),
+            runtime_handle: Handle::current(),
+            _connections: connections,
+        })
     }
 }
 

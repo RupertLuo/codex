@@ -1,3 +1,4 @@
+use crate::AppServerCodeModeHostArgs;
 use crate::AppServerProcessOverrides;
 use crate::AppServerRuntimeOptions;
 use crate::AppServerTransport;
@@ -6,15 +7,12 @@ use crate::AppServerWebsocketAuthArgs;
 use crate::PluginStartupTasks;
 use crate::RemoteControlStartupMode;
 use crate::run_main_with_transport_options_and_overrides;
-use clap::Parser;
 use codex_arg0::Arg0DispatchPaths;
 use codex_config::LoaderOverrides;
 use codex_protocol::protocol::SessionSource;
 use codex_utils_cli::CliConfigOverrides;
 use std::path::PathBuf;
 
-// Debug-only test hooks: let integration tests point the server at a temporary
-// managed config file without writing to /etc.
 #[cfg(debug_assertions)]
 const MANAGED_CONFIG_PATH_ENV_VAR: &str = "CODEX_APP_SERVER_MANAGED_CONFIG_PATH";
 #[cfg(debug_assertions)]
@@ -25,8 +23,9 @@ pub struct AppServerServeArgs {
     #[command(flatten)]
     config_overrides: CliConfigOverrides,
 
-    /// Transport endpoint URL. Supported values: `stdio://` (default),
-    /// `unix://`, `unix://PATH`, `ws://IP:PORT`, `off`.
+    #[command(flatten)]
+    code_mode_host: AppServerCodeModeHostArgs,
+
     #[arg(
         long = "listen",
         value_name = "URL",
@@ -34,7 +33,6 @@ pub struct AppServerServeArgs {
     )]
     listen: AppServerTransport,
 
-    /// Session source used to derive product restrictions and metadata.
     #[arg(
         long = "session-source",
         value_name = "SOURCE",
@@ -46,39 +44,34 @@ pub struct AppServerServeArgs {
     #[command(flatten)]
     auth: AppServerWebsocketAuthArgs,
 
-    /// Fail if config.toml contains unknown configuration fields.
     #[arg(long = "strict-config", default_value_t = false)]
     strict_config: bool,
 
-    /// Hidden debug-only test hook used by integration tests that spawn the
-    /// production app-server binary.
     #[cfg(debug_assertions)]
     #[arg(long = "disable-plugin-startup-tasks-for-tests", hide = true)]
     disable_plugin_startup_tasks_for_tests: bool,
 
-    /// Enable remote control for this app-server process without changing persistence.
     #[arg(long = "remote-control", hide = true)]
     remote_control: bool,
 }
 
+#[derive(Debug, clap::Parser)]
+#[command(version)]
+pub struct AppServerCli {
+    #[command(flatten)]
+    pub serve: AppServerServeArgs,
+}
+
 impl AppServerServeArgs {
-    /// Raw `-c key=value` overrides, including ones clap propagated here from a
-    /// sibling subcommand because the flag is global.
     pub fn raw_config_overrides(&self) -> &[String] {
         &self.config_overrides.raw_overrides
     }
 
     pub fn prepend_config_overrides(&mut self, values: impl IntoIterator<Item = String>) {
-        let values = values.into_iter().collect::<Vec<_>>();
-        self.config_overrides.raw_overrides.splice(0..0, values);
+        self.config_overrides
+            .raw_overrides
+            .splice(0..0, values.into_iter().collect::<Vec<_>>());
     }
-}
-
-#[derive(Debug, Parser)]
-#[command(version)]
-pub struct AppServerCli {
-    #[command(flatten)]
-    pub serve: AppServerServeArgs,
 }
 
 pub async fn run_app_server_serve(
@@ -89,6 +82,7 @@ pub async fn run_app_server_serve(
 ) -> anyhow::Result<()> {
     let AppServerServeArgs {
         config_overrides,
+        code_mode_host,
         listen,
         session_source,
         auth,
@@ -105,7 +99,10 @@ pub async fn run_app_server_serve(
             .unwrap_or_default()
     };
     let auth = auth.try_into_settings()?;
-    let mut runtime_options = AppServerRuntimeOptions::default();
+    let mut runtime_options = AppServerRuntimeOptions {
+        code_mode_host_transport: code_mode_host.into(),
+        ..Default::default()
+    };
     #[cfg(debug_assertions)]
     if disable_plugin_startup_tasks_for_tests {
         runtime_options.plugin_startup_tasks = PluginStartupTasks::Skip;
@@ -134,26 +131,16 @@ pub async fn run_app_server_serve(
 
 fn disable_managed_config_from_debug_env() -> bool {
     #[cfg(debug_assertions)]
-    {
-        if let Ok(value) = std::env::var(DISABLE_MANAGED_CONFIG_ENV_VAR) {
-            return matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES");
-        }
+    if let Ok(value) = std::env::var(DISABLE_MANAGED_CONFIG_ENV_VAR) {
+        return matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES");
     }
-
     false
 }
 
 fn managed_config_path_from_debug_env() -> Option<PathBuf> {
     #[cfg(debug_assertions)]
-    {
-        if let Ok(value) = std::env::var(MANAGED_CONFIG_PATH_ENV_VAR) {
-            return if value.is_empty() {
-                None
-            } else {
-                Some(PathBuf::from(value))
-            };
-        }
+    if let Ok(value) = std::env::var(MANAGED_CONFIG_PATH_ENV_VAR) {
+        return (!value.is_empty()).then(|| PathBuf::from(value));
     }
-
     None
 }

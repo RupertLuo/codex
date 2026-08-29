@@ -2,6 +2,7 @@ use super::*;
 use crate::compact::InitialContextInjection;
 use crate::exec_policy::ExecPolicyManager;
 use crate::guardian::GUARDIAN_REVIEWER_NAME;
+use crate::plugins::plugins_manager_for_config;
 use crate::sandboxing::SandboxPermissions;
 use crate::session::step_context::StepContext;
 use crate::test_support::models_manager_with_provider;
@@ -38,6 +39,7 @@ use core_test_support::responses::ev_completed;
 use core_test_support::responses::ev_response_created;
 use core_test_support::responses::mount_response_once;
 use core_test_support::responses::mount_sse_once;
+use core_test_support::responses::mount_sse_sequence;
 use core_test_support::responses::sse;
 use core_test_support::responses::sse_response;
 use core_test_support::responses::start_mock_server;
@@ -68,12 +70,13 @@ where
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn request_permissions_routes_to_guardian_when_reviewer_is_enabled() {
     let server = start_mock_server().await;
-    let guardian_request_log = mount_sse_once(
+    let guardian_request_log = mount_sse_sequence(
         &server,
-        sse(vec![
+        vec![
+            sse(vec![
             ev_response_created("resp-guardian"),
             ev_assistant_message(
                 "msg-guardian",
@@ -86,13 +89,17 @@ async fn request_permissions_routes_to_guardian_when_reviewer_is_enabled() {
                 .to_string(),
             ),
             ev_completed("resp-guardian"),
-        ]),
+        ]);
+            2
+        ],
     )
     .await;
 
     let (mut session, mut turn_context_raw) = make_session_and_context().await;
+    Arc::make_mut(&mut turn_context_raw.model_info).node_repl_auto_review_required = true;
     *session.active_turn.lock().await = Some(ActiveTurn::default());
-    turn_context_raw
+    Arc::make_mut(&mut turn_context_raw.config)
+        .permissions
         .approval_policy
         .set(AskForApproval::OnRequest)
         .expect("test setup should allow updating approval policy");
@@ -115,6 +122,16 @@ async fn request_permissions_routes_to_guardian_when_reviewer_is_enabled() {
         config.model_provider.clone(),
         turn_context_raw.auth_manager.clone(),
     );
+    let image_url = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==";
+    let evidence = session
+        .services
+        .thread_extension_data
+        .get_or_init(crate::context::NodeReplReviewEvidence::default);
+    let image = UserInput::Image {
+        image_url: image_url.to_string(),
+        detail: None,
+    };
+    evidence.record("js", "cell", "image", vec![image]);
     let session = Arc::new(session);
     let turn_context = Arc::new(turn_context_raw);
 
@@ -139,7 +156,7 @@ async fn request_permissions_routes_to_guardian_when_reviewer_is_enabled() {
                 reason: Some("need network".to_string()),
                 permissions: requested_permissions.clone(),
             },
-            environment,
+            environment.clone(),
             CancellationToken::new(),
         ),
     )
@@ -154,6 +171,20 @@ async fn request_permissions_routes_to_guardian_when_reviewer_is_enabled() {
             strict_auto_review: false,
         })
     );
+    let second_response = session
+        .request_permissions_for_environment(
+            &turn_context,
+            "perm-call-2".to_string(),
+            RequestPermissionsArgs {
+                environment_id: None,
+                reason: Some("need network".to_string()),
+                permissions: requested_permissions.clone(),
+            },
+            environment,
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(second_response, response);
     assert_eq!(
         session
             .granted_turn_permissions(codex_exec_server::LOCAL_ENVIRONMENT_ID)
@@ -161,8 +192,13 @@ async fn request_permissions_routes_to_guardian_when_reviewer_is_enabled() {
         Some(requested_permissions.into())
     );
 
-    let guardian_request = guardian_request_log.single_request();
+    let guardian_requests = guardian_request_log.requests();
+    assert_eq!(guardian_requests.len(), 2);
+    let guardian_request = &guardian_requests[0];
     assert_eq!(guardian_request.path(), "/v1/responses");
+    for request in &guardian_requests {
+        assert_eq!(request.message_input_image_urls("user"), [image_url]);
+    }
     assert!(guardian_request.body_contains_text("request_permissions"));
     assert!(guardian_request.body_contains_text("need network"));
 }
@@ -180,7 +216,8 @@ async fn request_permissions_guardian_review_stops_when_cancelled() {
     let (mut session, mut turn_context, rx_event) = make_session_and_context_with_rx().await;
     *session.active_turn.lock().await = Some(ActiveTurn::default());
     let turn_context_raw = Arc::get_mut(&mut turn_context).expect("single turn context ref");
-    turn_context_raw
+    Arc::make_mut(&mut turn_context_raw.config)
+        .permissions
         .approval_policy
         .set(AskForApproval::OnRequest)
         .expect("test setup should allow updating approval policy");
@@ -293,7 +330,8 @@ async fn guardian_allows_shell_command_additional_permissions_requests_past_poli
     .await;
 
     let (mut session, mut turn_context_raw) = make_session_and_context().await;
-    turn_context_raw
+    Arc::make_mut(&mut turn_context_raw.config)
+        .permissions
         .approval_policy
         .set(AskForApproval::OnRequest)
         .expect("test setup should allow updating approval policy");
@@ -301,8 +339,18 @@ async fn guardian_allows_shell_command_additional_permissions_requests_past_poli
         .features
         .enable(Feature::ExecPermissionApprovals)
         .expect("test setup should allow enabling request permissions");
-    turn_context_raw.permission_profile = codex_protocol::models::PermissionProfile::Disabled;
     let mut config = (*turn_context_raw.config).clone();
+    config
+        .permissions
+        .set_permission_profile(codex_protocol::models::PermissionProfile::Disabled)
+        .expect("test setup should allow disabling the permission profile");
+    let TurnEnvironmentState::Ready(environment) =
+        &mut turn_context_raw.environments.environments[0]
+    else {
+        panic!("primary environment should be ready");
+    };
+    environment.config_mut().permission_profile =
+        config.permissions.permission_profile_state().snapshot();
     config.codex_linux_sandbox_exe = codex_linux_sandbox_exe_or_skip!();
     config
         .features
@@ -408,12 +456,23 @@ async fn strict_auto_review_turn_grant_forces_guardian_for_shell_command_policy_
         )
         .await;
 
-    turn_context_raw
+    Arc::make_mut(&mut turn_context_raw.config)
+        .permissions
         .approval_policy
         .set(AskForApproval::Never)
         .expect("test setup should allow updating approval policy");
-    turn_context_raw.permission_profile = codex_protocol::models::PermissionProfile::Disabled;
     let mut config = (*turn_context_raw.config).clone();
+    config
+        .permissions
+        .set_permission_profile(codex_protocol::models::PermissionProfile::Disabled)
+        .expect("test setup should allow disabling the permission profile");
+    let TurnEnvironmentState::Ready(environment) =
+        &mut turn_context_raw.environments.environments[0]
+    else {
+        panic!("primary environment should be ready");
+    };
+    environment.config_mut().permission_profile =
+        config.permissions.permission_profile_state().snapshot();
     config.approvals_reviewer = ApprovalsReviewer::User;
     config.model_provider.base_url = Some(format!("{}/v1", server.uri()));
     let config = Arc::new(config);
@@ -430,6 +489,17 @@ async fn strict_auto_review_turn_grant_forces_guardian_for_shell_command_policy_
     );
     let session = Arc::new(session);
     let turn_context = Arc::new(turn_context_raw);
+    session
+        .start_task(
+            Arc::clone(&turn_context),
+            Vec::new(),
+            super::NeverEndingTask {
+                kind: crate::state::TaskKind::Regular,
+                listen_to_cancellation_token: true,
+            },
+            crate::tasks::MailboxParentProvenance::Ignore,
+        )
+        .await;
 
     let handler = crate::tools::handlers::ShellCommandHandler::from(
         codex_tools::ShellCommandBackendConfig::Classic,
@@ -468,7 +538,8 @@ async fn strict_auto_review_turn_grant_forces_guardian_for_shell_command_policy_
 #[tokio::test]
 async fn guardian_allows_unified_exec_additional_permissions_requests_past_policy_validation() {
     let (mut session, mut turn_context_raw) = make_session_and_context().await;
-    turn_context_raw
+    Arc::make_mut(&mut turn_context_raw.config)
+        .permissions
         .approval_policy
         .set(AskForApproval::OnRequest)
         .expect("test setup should allow updating approval policy");
@@ -520,7 +591,7 @@ async fn guardian_allows_unified_exec_additional_permissions_requests_past_polic
 #[tokio::test]
 async fn process_compacted_history_preserves_separate_guardian_developer_message() {
     let (session, mut turn_context) = make_session_and_context().await;
-    let guardian_policy = crate::guardian::guardian_policy_prompt();
+    let guardian_policy = "guardian policy".to_string();
     let guardian_source =
         SessionSource::SubAgent(SubAgentSource::Other(GUARDIAN_REVIEWER_NAME.to_string()));
 
@@ -531,12 +602,20 @@ async fn process_compacted_history_preserves_separate_guardian_developer_message
     turn_context.session_source = guardian_source;
     turn_context.developer_instructions = Some(guardian_policy.clone());
     let turn_context = Arc::new(turn_context);
-    let world_state = Arc::new(build_world_state_from_turn_context(&session, &turn_context).await);
-    let initial_context_injection = InitialContextInjection::BeforeLastUserMessage(world_state);
+    let step_context = StepContext::for_test(Arc::clone(&turn_context));
+    let world_state = Arc::new(
+        session
+            .build_world_state_for_step(&step_context)
+            .await
+            .expect("world state should build"),
+    );
+    let initial_context_injection = InitialContextInjection::BeforeLastUserMessage {
+        world_state,
+        step_context,
+    };
 
     let (refreshed, _) = crate::compact_remote::process_compacted_history(
         &session,
-        &turn_context,
         vec![
             ResponseItem::Message {
                 id: None,
@@ -705,8 +784,11 @@ async fn guardian_subagent_does_not_inherit_parent_exec_policy_rules() {
         auth_manager.clone(),
         config.model_provider.clone(),
     );
-    let plugins_manager = Arc::new(PluginsManager::new(config.codex_home.to_path_buf()));
-    let skills_service = Arc::new(SkillsService::new(
+    let plugins_manager = Arc::new(plugins_manager_for_config(
+        &config,
+        Arc::clone(&auth_manager),
+    ));
+    let skills_service = Arc::new(HostSkillsService::new(
         config.codex_home.clone(),
         /*bundled_skills_enabled*/ true,
     ));
@@ -716,8 +798,10 @@ async fn guardian_subagent_does_not_inherit_parent_exec_policy_rules() {
         /*state_db*/ None,
     ));
 
-    let CodexSpawnOk { codex, .. } = Codex::spawn(CodexSpawnArgs {
+    let (session, io) = Session::spawn(SessionSpawnArgs {
         config,
+        http_transport: None,
+        model_runtime_policies: Default::default(),
         allow_provider_model_fallback: false,
         user_instructions: Default::default(),
         installation_id: "11111111-1111-4111-8111-111111111111".to_string(),
@@ -727,10 +811,11 @@ async fn guardian_subagent_does_not_inherit_parent_exec_policy_rules() {
         skills_service,
         plugins_manager,
         mcp_manager,
-        code_mode_session_provider: Arc::new(codex_code_mode::InProcessCodeModeSessionProvider),
+        code_mode_session_provider: Arc::new(codex_code_mode::DisabledCodeModeSessionProvider),
         extensions: codex_extension_api::empty_extension_registry(),
         conversation_history: InitialHistory::New,
         requested_history_mode: None,
+        fork_persistence: ForkPersistence::Copied,
         session_source: SessionSource::SubAgent(SubAgentSource::Other(
             GUARDIAN_REVIEWER_NAME.to_string(),
         )),
@@ -748,22 +833,22 @@ async fn guardian_subagent_does_not_inherit_parent_exec_policy_rules() {
         parent_trace: None,
         environment_selections: Vec::new(),
         thread_extension_init: codex_extension_api::ExtensionDataInit::default(),
-        supports_openai_form_elicitation: false,
+        client_mcp_extensions: ClientMcpExtensions::default(),
+        reserved_thread_id: None,
         analytics_events_client: None,
         thread_store,
-        http_transport: None,
-        compact_commit_test_hook: None,
-        realtime_start_test_hook: None,
         attestation_provider: None,
         external_time_provider: None,
         inherited_multi_agent_version: None,
+        git_enrichment_policy: GitEnrichmentPolicy::Skip,
+        windows_sandbox_proxy_settings_mode:
+            codex_sandboxing::WindowsSandboxProxySettingsMode::Preserve,
     })
     .await
     .expect("spawn guardian subagent");
 
     assert_eq!(
-        codex
-            .session
+        session
             .services
             .exec_policy
             .current()
@@ -776,5 +861,5 @@ async fn guardian_subagent_does_not_inherit_parent_exec_policy_rules() {
             }],
         }
     );
-    drop(codex);
+    drop(io);
 }

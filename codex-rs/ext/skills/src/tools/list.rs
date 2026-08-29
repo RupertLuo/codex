@@ -1,3 +1,4 @@
+use codex_extension_api::FunctionCallError;
 use codex_extension_api::ToolCall;
 use codex_extension_api::ToolExecutor;
 use codex_extension_api::ToolExecutorFuture;
@@ -8,32 +9,38 @@ use serde::Deserialize;
 use serde::Serialize;
 
 use crate::catalog::SkillCatalogEntry;
+use crate::render::MAX_SKILL_NAME_BYTES;
 use crate::render::truncate_catalog_skill_description;
 use crate::render::truncate_utf8_to_bytes;
+use crate::warnings::bounded_warnings;
 
 use super::MAX_HANDLE_BYTES;
-use super::SkillToolAddress;
 use super::SkillToolAuthority;
+use super::SkillToolAuthoritySelector;
 use super::SkillToolContext;
-use super::external_json_output;
 use super::is_bounded_handle;
+use super::pagination_cursor;
 use super::parse_args;
+use super::parse_pagination_cursor;
+use super::serialized_len;
 use super::skill_function_tool;
+use super::skill_json_output;
 use super::skill_tool_name;
 
 const TOOL_NAME: &str = "list";
-const MAX_WARNINGS: usize = 4;
-const MAX_WARNING_BYTES: usize = 256;
-const MAX_DEPENDENCIES_PER_SKILL: usize = 32;
-const MAX_DEPENDENCIES_PER_RESPONSE: usize = 100;
+const MAX_SKILLS_PER_PAGE: usize = 20;
+const MAX_LIST_RESPONSE_BYTES: usize = 512 * 1024;
+const OVERSIZED_ENTRY_WARNING: &str =
+    "Some skills were omitted because their metadata is too large.";
 
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct ListArgs {
-    authority: SkillToolAuthority,
+    authority: SkillToolAuthoritySelector,
+    cursor: Option<String>,
 }
 
-#[derive(Debug, Eq, JsonSchema, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, Hash, JsonSchema, PartialEq, Serialize)]
 #[schemars(deny_unknown_fields)]
 struct ListedSkill {
     authority: SkillToolAuthority,
@@ -45,7 +52,7 @@ struct ListedSkill {
     dependencies: Vec<ListedSkillDependency>,
 }
 
-#[derive(Debug, Eq, JsonSchema, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, Hash, JsonSchema, PartialEq, Serialize)]
 #[schemars(deny_unknown_fields)]
 struct ListedSkillDependency {
     authority: SkillToolAuthority,
@@ -57,6 +64,7 @@ struct ListedSkillDependency {
 struct ListResponse {
     skills: Vec<ListedSkill>,
     warnings: Vec<String>,
+    next_cursor: Option<String>,
 }
 
 #[derive(Clone)]
@@ -72,67 +80,85 @@ impl ToolExecutor<ToolCall> for ListTool {
     fn spec(&self) -> ToolSpec {
         skill_function_tool::<ListArgs, ListResponse>(
             TOOL_NAME,
-            "List enabled skills owned by an orchestrator or custom authority. Use authority kind `custom` to discover every custom authority. Reuse each returned authority, opaque package, and main-resource handle exactly when calling skills.read.",
+            "List skills owned by the requested authority. Returns each skill's authority, package, and main_resource. Pass the package to skills.read, and pass next_cursor back as cursor to continue.",
         )
     }
 
     fn handle(&self, call: ToolCall) -> ToolExecutorFuture<'_> {
         Box::pin(async move {
             let args: ListArgs = parse_args(&call)?;
-            args.authority.to_authority()?;
-            let requested_authority = args.authority.clone();
-            let catalog = self.context.catalog(&call.turn_id, args.authority).await;
-            let mut dependency_state = DependencyListState {
-                remaining: MAX_DEPENDENCIES_PER_RESPONSE,
-                ..Default::default()
+            args.authority.validate()?;
+            let catalog = self.context.catalog(&call.turn_id, &args.authority).await;
+            let mut omitted_oversized_entry = false;
+            let skills = catalog
+                .entries
+                .into_iter()
+                .filter(|entry| {
+                    entry.is_model_visible() && args.authority.matches(&entry.authority)
+                })
+                .filter_map(|entry| {
+                    let listed = listed_skill(entry).filter(single_entry_response_is_bounded);
+                    omitted_oversized_entry |= listed.is_none();
+                    listed
+                })
+                .collect::<Vec<_>>();
+            let start = parse_pagination_cursor(args.cursor.as_deref(), &skills, "skills.list")?;
+            if start > skills.len() {
+                return Err(FunctionCallError::RespondToModel(
+                    "skills.list cursor is invalid".to_string(),
+                ));
+            }
+            let mut warnings = if start == 0 {
+                let mut warnings = catalog.warnings;
+                if omitted_oversized_entry {
+                    warnings.push(OVERSIZED_ENTRY_WARNING.to_string());
+                }
+                bounded_warnings(&warnings)
+            } else {
+                Vec::new()
             };
-            let response = ListResponse {
-                skills: catalog
-                    .entries
-                    .into_iter()
-                    .filter(|entry| {
-                        entry.enabled && requested_authority.matches_authority(&entry.authority)
-                    })
-                    .filter_map(|entry| listed_skill(entry, &mut dependency_state))
-                    .collect(),
-                warnings: bounded_warnings(dependency_state.warnings(catalog.warnings)),
-            };
-
-            external_json_output(&response)
+            let mut end = (start + MAX_SKILLS_PER_PAGE).min(skills.len());
+            loop {
+                let response = ListResponse {
+                    skills: skills[start..end].to_vec(),
+                    warnings: warnings.clone(),
+                    next_cursor: (end < skills.len()).then(|| pagination_cursor(&skills, end)),
+                };
+                if serialized_len(&response)? <= MAX_LIST_RESPONSE_BYTES {
+                    return skill_json_output(&response, &args.authority);
+                }
+                if end.saturating_sub(start) > 1 {
+                    end -= 1;
+                } else if !warnings.is_empty() {
+                    warnings.clear();
+                } else {
+                    return Err(FunctionCallError::RespondToModel(
+                        "skill metadata is too large to list".to_string(),
+                    ));
+                }
+            }
         })
     }
 }
 
-#[derive(Default)]
-struct DependencyListState {
-    remaining: usize,
-    invalid: bool,
-    truncated: bool,
+fn single_entry_response_is_bounded(skill: &ListedSkill) -> bool {
+    serialized_len(&ListResponse {
+        skills: vec![skill.clone()],
+        warnings: Vec::new(),
+        next_cursor: Some(pagination_cursor(skill, usize::MAX)),
+    })
+    .is_ok_and(|size| size <= MAX_LIST_RESPONSE_BYTES)
 }
 
-impl DependencyListState {
-    fn warnings(self, catalog_warnings: Vec<String>) -> Vec<String> {
-        let mut warnings = Vec::new();
-        if self.invalid {
-            warnings.push(invalid_dependency_warning());
-        }
-        if self.truncated {
-            warnings.push(
-                "skill dependencies were truncated to bounded per-skill and response limits"
-                    .to_string(),
-            );
-        }
-        warnings.extend(catalog_warnings);
-        warnings
+fn listed_skill(entry: SkillCatalogEntry) -> Option<ListedSkill> {
+    let authority = SkillToolAuthority::from_authority(&entry.authority)?;
+    if !is_bounded_handle(&entry.authority.id, MAX_HANDLE_BYTES)
+        || !is_bounded_handle(&entry.id.0, MAX_HANDLE_BYTES)
+        || !is_bounded_handle(entry.main_prompt.as_str(), MAX_HANDLE_BYTES)
+    {
+        return None;
     }
-}
-
-fn listed_skill(
-    entry: SkillCatalogEntry,
-    dependency_state: &mut DependencyListState,
-) -> Option<ListedSkill> {
-    let address = SkillToolAddress::from_entry(&entry)?;
-    let Some(addressable_dependencies) = entry
+    let dependencies = entry
         .package_dependencies
         .into_iter()
         .map(|dependency| {
@@ -144,43 +170,47 @@ fn listed_skill(
                 },
             )
         })
-        .collect::<Option<Vec<_>>>()
-    else {
-        dependency_state.invalid = true;
-        return None;
-    };
-    let mut dependencies = Vec::new();
-    for dependency in addressable_dependencies {
-        if dependencies.len() >= MAX_DEPENDENCIES_PER_SKILL || dependency_state.remaining == 0 {
-            dependency_state.truncated = true;
-            continue;
-        }
-        dependencies.push(dependency);
-        dependency_state.remaining = dependency_state.remaining.saturating_sub(1);
-    }
+        .collect::<Option<Vec<_>>>()?;
 
     Some(ListedSkill {
-        authority: address.authority,
-        package: address.package,
-        name: entry.name,
+        authority,
+        package: entry.id.0,
+        name: truncate_utf8_to_bytes(&entry.name, MAX_SKILL_NAME_BYTES).0,
         description: truncate_catalog_skill_description(&entry.description).into_owned(),
-        main_resource: address.main_resource,
+        main_resource: entry.main_prompt.as_str().to_string(),
         dependencies,
     })
 }
 
-fn invalid_dependency_warning() -> String {
-    "Skill was omitted because a dependency authority or package handle is not tool-addressable"
-        .to_string()
-}
+#[cfg(test)]
+mod tests {
+    use super::listed_skill;
+    use crate::catalog::SkillAuthority;
+    use crate::catalog::SkillCatalogEntry;
+    use crate::catalog::SkillPackageDependency;
+    use crate::catalog::SkillPackageId;
+    use crate::catalog::SkillResourceId;
+    use crate::catalog::SkillSourceKind;
 
-fn bounded_warnings(warnings: Vec<String>) -> Vec<String> {
-    warnings
-        .into_iter()
-        .take(MAX_WARNINGS)
-        .map(|warning| {
-            let (warning, _) = truncate_utf8_to_bytes(&warning, MAX_WARNING_BYTES);
-            warning
-        })
-        .collect()
+    #[test]
+    fn listed_skill_preserves_addressable_package_dependencies() {
+        let authority = SkillAuthority::new(SkillSourceKind::custom("private"), "catalyst");
+        let entry = SkillCatalogEntry::new(
+            SkillPackageId("private/parent".to_string()),
+            authority.clone(),
+            "parent",
+            "Parent Skill",
+            SkillResourceId::new("skill://private/parent/SKILL.md"),
+        )
+        .with_package_dependencies(vec![SkillPackageDependency {
+            authority,
+            package: SkillPackageId("private/child".to_string()),
+        }]);
+
+        let listed = listed_skill(entry).expect("private skill should be addressable");
+
+        assert_eq!(listed.dependencies.len(), 1);
+        assert_eq!(listed.dependencies[0].package, "private/child");
+        assert_eq!(listed.dependencies[0].authority.kind, "private");
+    }
 }

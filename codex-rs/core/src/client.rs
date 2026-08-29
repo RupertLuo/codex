@@ -57,17 +57,21 @@ use codex_api::ResponsesWebsocketConnection as ApiWebSocketConnection;
 use codex_api::ResponsesWsRequest;
 use codex_api::SharedAuthProvider;
 use codex_api::SseTelemetry;
+use codex_api::StreamOptions;
 use codex_api::TransportError;
 use codex_api::WebsocketTelemetry;
 use codex_api::auth_header_telemetry;
 use codex_api::build_session_headers;
 use codex_api::create_text_param_for_request;
 use codex_api::response_create_client_metadata;
+use codex_http_client::ClientRouteClass;
+use codex_http_client::HttpClientFactory;
 use codex_login::AuthManager;
 use codex_login::CodexAuth;
 use codex_login::RefreshTokenError;
 use codex_login::UnauthorizedRecovery;
-use codex_login::default_client::build_reqwest_client;
+use codex_login::default_client::add_originator_header;
+use codex_login::default_client::create_client_for_route;
 use codex_otel::SessionTelemetry;
 use codex_otel::current_span_w3c_trace_context;
 use codex_protocol::auth::AuthMode;
@@ -87,13 +91,14 @@ use codex_rollout_trace::CompactionTraceContext;
 use codex_rollout_trace::InferenceTraceAttempt;
 use codex_rollout_trace::InferenceTraceContext;
 use codex_tools::create_tools_json_for_responses_api;
+use codex_tools::create_tools_json_for_responses_lite;
+use codex_tools::create_tools_raw_json_for_responses_api;
 use eventsource_stream::Event;
 use eventsource_stream::EventStreamError;
 use futures::StreamExt;
 use http::HeaderMap as ApiHeaderMap;
 use http::HeaderValue;
-use http::StatusCode as HttpStatusCode;
-use reqwest::StatusCode;
+use http::StatusCode;
 use std::time::Duration;
 use std::time::Instant;
 use tokio::sync::mpsc;
@@ -124,6 +129,7 @@ use codex_login::auth_env_telemetry::AuthEnvTelemetry;
 use codex_login::auth_env_telemetry::collect_auth_env_telemetry;
 use codex_model_provider::AgentIdentitySessionFallback;
 use codex_model_provider::ProviderAuthScope;
+use codex_model_provider::ProviderUnauthorizedRecovery;
 use codex_model_provider::SharedModelProvider;
 use codex_model_provider::create_model_provider;
 #[cfg(test)]
@@ -139,6 +145,7 @@ use codex_response_debug_context::telemetry_transport_error_message;
 
 pub const OPENAI_BETA_HEADER: &str = "OpenAI-Beta";
 pub const X_CODEX_INSTALLATION_ID_HEADER: &str = "x-codex-installation-id";
+pub const X_CODEX_ROUTING_HINT_HEADER: &str = "x-codex-routing-hint";
 pub const X_CODEX_TURN_STATE_HEADER: &str = "x-codex-turn-state";
 pub const X_CODEX_TURN_METADATA_HEADER: &str = "x-codex-turn-metadata";
 pub const X_CODEX_PARENT_THREAD_ID_HEADER: &str = "x-codex-parent-thread-id";
@@ -154,6 +161,7 @@ const WS_REQUEST_HEADER_RESPONSES_LITE_CLIENT_METADATA_KEY: &str =
 const RESPONSES_WEBSOCKETS_V2_BETA_HEADER_VALUE: &str = "responses_websockets=2026-02-06";
 const X_OPENAI_INTERNAL_CODEX_RESPONSES_LITE_HEADER: &str =
     "x-openai-internal-codex-responses-lite";
+const REALTIME_CALLS_ENDPOINT: &str = "/realtime/calls";
 const RESPONSES_ENDPOINT: &str = "/responses";
 const RESPONSES_COMPACT_ENDPOINT: &str = "/responses/compact";
 // `/responses/compact` is unary, so the timeout covers the full response rather than one idle
@@ -172,7 +180,7 @@ pub(crate) struct CompactConversationRequestSettings {
 
 fn reasoning_effort_for_request(effort: ReasoningEffortConfig) -> ReasoningEffortConfig {
     match effort {
-        ReasoningEffortConfig::Ultra => ReasoningEffortConfig::Custom("max".to_string()),
+        ReasoningEffortConfig::Ultra => ReasoningEffortConfig::Max,
         effort => effort,
     }
 }
@@ -198,7 +206,6 @@ fn session_telemetry_for_request(
 struct ModelClientState {
     thread_id: ThreadId,
     provider: SharedModelProvider,
-    http_transport: Option<HttpTransportHandle>,
     auth_env_telemetry: AuthEnvTelemetry,
     session_source: SessionSource,
     originator: String,
@@ -206,12 +213,26 @@ struct ModelClientState {
     enable_request_compression: bool,
     include_timing_metrics: bool,
     beta_features_header: Option<String>,
-    item_ids_enabled: bool,
+    concurrent_reasoning_summaries_enabled: bool,
     include_attestation: bool,
     attestation_provider: Option<Arc<dyn AttestationProvider>>,
     disable_websockets: AtomicBool,
     agent_identity_session_fallback: AgentIdentitySessionFallback,
     cached_websocket_session: StdMutex<WebsocketSession>,
+}
+
+/// Host-supplied behavior for a model endpoint that is not part of the public model catalog.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ModelRuntimePolicy {
+    pub supports_http_incremental_requests: bool,
+    pub relocates_tool_output_images: bool,
+    pub max_request_body_bytes: Option<u64>,
+}
+
+#[derive(Debug, Default)]
+struct HttpIncrementalSession {
+    last_request: Option<Box<ResponsesApiRequest>>,
+    last_response_rx: Option<oneshot::Receiver<LastResponse>>,
 }
 
 /// Resolved API client setup for a single request attempt.
@@ -252,6 +273,10 @@ pub struct ModelClient {
     state: Arc<ModelClientState>,
     agent_identity_policy: AgentIdentityAuthPolicy,
     prompt_cache_key_override: Option<String>,
+    http_client_factory: HttpClientFactory,
+    http_transport: Option<HttpTransportHandle>,
+    model_runtime_policies: Arc<HashMap<String, ModelRuntimePolicy>>,
+    http_incremental_session: Arc<StdMutex<HttpIncrementalSession>>,
 }
 
 /// A turn-scoped streaming session created from a [`ModelClient`].
@@ -270,19 +295,6 @@ pub struct ModelClient {
 pub struct ModelClientSession {
     client: ModelClient,
     websocket_session: WebsocketSession,
-    /// What this session last sent over HTTP and what came back, so its next request can be a
-    /// delta naming the rest with `previous_response_id`.
-    ///
-    /// Session-scoped on purpose, matching the websocket tracking beside it. Compaction builds its
-    /// own `ModelClientSession`, and its request carries the history it is about to throw away —
-    /// the conversation behind its response id still holds all of it, so adopting that id as the
-    /// thread's baseline would hand the model back everything compaction removed. Keeping this per
-    /// session means compaction cannot reach the thread's baseline at all, rather than being
-    /// stopped by a check that happens to reject it.
-    ///
-    /// A turn hands its baseline to the next one explicitly, through
-    /// [`ModelClientSession::take_incremental_baseline`].
-    http_session: HttpIncrementalSession,
     /// Turn state for sticky routing.
     ///
     /// This is an `OnceLock` that stores the turn state value received from the server
@@ -300,20 +312,6 @@ pub struct ModelClientSession {
 struct LastResponse {
     response_id: String,
     items_added: Vec<ResponseItem>,
-}
-
-/// What the HTTP path last sent and what came back, so the next request can be a delta.
-///
-/// Deliberately not shared with [`WebsocketSession`]. The websocket's `previous_response_id`
-/// names a response on that connection; the HTTP one names a response the provider is holding.
-/// They mean different things, and a transport fallback mid-thread would otherwise hand one
-/// path's id to the other.
-#[derive(Debug, Default)]
-pub struct HttpIncrementalSession {
-    /// Boxed rather than inlined: `ModelClientSession` is moved by value and already carries one
-    /// request inside its websocket state, so a second one is worth keeping off the stack.
-    last_request: Option<Box<ResponsesApiRequest>>,
-    last_response_rx: Option<oneshot::Receiver<LastResponse>>,
 }
 
 #[derive(Debug, Default)]
@@ -342,14 +340,12 @@ fn responses_request_properties_match(
         reasoning: previous_reasoning,
         store: previous_store,
         stream: previous_stream,
+        stream_options: _,
         include: previous_include,
         service_tier: previous_service_tier,
         prompt_cache_key: previous_prompt_cache_key,
         text: previous_text,
         client_metadata: _,
-        // Ignored, like `input`: this is the pointer at the conversation the request continues,
-        // so it differs on every request that uses it and comparing it would report every pair as
-        // mismatched. What has to match is the shape around it, which is everything above.
         previous_response_id: _,
     } = previous;
     let ResponsesApiRequest {
@@ -362,6 +358,7 @@ fn responses_request_properties_match(
         reasoning: current_reasoning,
         store: current_store,
         stream: current_stream,
+        stream_options: _,
         include: current_include,
         service_tier: current_service_tier,
         prompt_cache_key: current_prompt_cache_key,
@@ -378,10 +375,27 @@ fn responses_request_properties_match(
         && previous_reasoning == current_reasoning
         && previous_store == current_store
         && previous_stream == current_stream
+        // Stream options control delivery for this response, not the context
+        // referenced by `previous_response_id`.
         && previous_include == current_include
         && previous_service_tier == current_service_tier
         && previous_prompt_cache_key == current_prompt_cache_key
         && previous_text == current_text
+}
+
+fn response_items_equal_ignoring_internal_metadata(
+    previous: &ResponseItem,
+    current: &ResponseItem,
+) -> bool {
+    if previous == current {
+        return true;
+    }
+
+    let mut previous = previous.clone();
+    previous.clear_internal_chat_message_metadata_passthrough();
+    let mut current = current.clone();
+    current.clear_internal_chat_message_metadata_passthrough();
+    previous == current
 }
 
 impl WebsocketSession {
@@ -432,7 +446,9 @@ impl ModelClient {
     /// Creates a new session-scoped `ModelClient`.
     ///
     /// All arguments are expected to be stable for the lifetime of a Codex session. Per-turn values
-    /// are passed to [`ModelClientSession::stream`] (and other turn-scoped methods) explicitly.
+    /// are passed to [`ModelClientSession::stream`] (and other turn-scoped methods) explicitly. The
+    /// HTTP client factory must come from the effective session configuration so every transport
+    /// observes the resolved outbound proxy policy.
     pub fn new(
         auth_manager: Option<Arc<AuthManager>>,
         agent_identity_policy: AgentIdentityAuthPolicy,
@@ -444,8 +460,9 @@ impl ModelClient {
         enable_request_compression: bool,
         include_timing_metrics: bool,
         beta_features_header: Option<String>,
-        item_ids_enabled: bool,
+        concurrent_reasoning_summaries_enabled: bool,
         attestation_provider: Option<Arc<dyn AttestationProvider>>,
+        http_client_factory: HttpClientFactory,
     ) -> Self {
         let model_provider = create_model_provider(provider_info, auth_manager);
         let codex_api_key_env_enabled = model_provider
@@ -459,7 +476,6 @@ impl ModelClient {
             state: Arc::new(ModelClientState {
                 thread_id,
                 provider: model_provider,
-                http_transport: None,
                 auth_env_telemetry,
                 session_source,
                 originator,
@@ -467,7 +483,7 @@ impl ModelClient {
                 enable_request_compression,
                 include_timing_metrics,
                 beta_features_header,
-                item_ids_enabled,
+                concurrent_reasoning_summaries_enabled,
                 include_attestation,
                 attestation_provider,
                 disable_websockets: AtomicBool::new(false),
@@ -476,7 +492,63 @@ impl ModelClient {
             }),
             agent_identity_policy,
             prompt_cache_key_override: None,
+            http_client_factory,
+            http_transport: None,
+            model_runtime_policies: Arc::new(HashMap::new()),
+            http_incremental_session: Arc::new(StdMutex::new(HttpIncrementalSession::default())),
         }
+    }
+
+    /// Overrides HTTP model traffic for embedding hosts. WebSockets are disabled so all model
+    /// requests consistently pass through the supplied transport.
+    pub fn with_http_transport(mut self, http_transport: Option<HttpTransportHandle>) -> Self {
+        self.http_transport = http_transport;
+        self
+    }
+
+    pub fn with_model_runtime_policies(
+        mut self,
+        model_runtime_policies: HashMap<String, ModelRuntimePolicy>,
+    ) -> Self {
+        self.model_runtime_policies = Arc::new(model_runtime_policies);
+        self
+    }
+
+    pub(crate) fn runtime_policy(&self, model: &str) -> ModelRuntimePolicy {
+        self.model_runtime_policies
+            .get(model)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn runtime_policies(&self) -> HashMap<String, ModelRuntimePolicy> {
+        self.model_runtime_policies.as_ref().clone()
+    }
+
+    fn take_http_incremental_baseline(
+        &self,
+    ) -> (Option<Box<ResponsesApiRequest>>, Option<LastResponse>) {
+        let mut baseline = self
+            .http_incremental_session
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let taken = std::mem::take(&mut *baseline);
+        let response = taken.last_response_rx.and_then(|mut rx| rx.try_recv().ok());
+        (taken.last_request, response)
+    }
+
+    fn store_http_incremental_baseline(
+        &self,
+        request: ResponsesApiRequest,
+        response_rx: oneshot::Receiver<LastResponse>,
+    ) {
+        *self
+            .http_incremental_session
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = HttpIncrementalSession {
+            last_request: Some(Box::new(request)),
+            last_response_rx: Some(response_rx),
+        };
     }
 
     pub(crate) fn with_prompt_cache_key_override(
@@ -487,27 +559,10 @@ impl ModelClient {
         self
     }
 
-    pub(crate) fn with_http_transport(mut self, http_transport: HttpTransportHandle) -> Self {
-        let state = Arc::get_mut(&mut self.state)
-            .expect("transport override must be configured before ModelClient is cloned");
-        state.http_transport = Some(http_transport);
-        self
-    }
-
-    fn http_transport(&self) -> HttpTransportHandle {
-        self.state.http_transport.clone().unwrap_or_else(|| {
-            HttpTransportHandle::from_transport(ReqwestTransport::new(build_reqwest_client()))
-        })
-    }
-
-    pub(crate) fn http_transport_override(&self) -> Option<HttpTransportHandle> {
-        self.state.http_transport.clone()
-    }
-
-    fn prompt_cache_key(&self) -> String {
+    fn prompt_cache_key(&self, responses_metadata: &CodexResponsesMetadata) -> String {
         self.prompt_cache_key_override
             .clone()
-            .unwrap_or_else(|| self.state.thread_id.to_string())
+            .unwrap_or_else(|| responses_metadata.session_id.clone())
     }
 
     /// Creates a fresh turn-scoped streaming session.
@@ -518,10 +573,6 @@ impl ModelClient {
         ModelClientSession {
             client: self.clone(),
             websocket_session: self.take_cached_websocket_session(),
-            // Empty: a session that is handed no baseline sends the whole conversation, which is
-            // right for compaction and prewarm and for the first turn of a thread. A turn that
-            // should continue from the previous one is given its baseline explicitly.
-            http_session: HttpIncrementalSession::default(),
             turn_state: Arc::new(OnceLock::new()),
         }
     }
@@ -590,7 +641,8 @@ impl ModelClient {
             return Ok(Vec::new());
         }
         let client_setup = self.current_client_setup().await?;
-        let transport = ReqwestTransport::new(build_reqwest_client());
+        let transport =
+            self.build_api_transport(&client_setup.api_provider, RESPONSES_COMPACT_ENDPOINT)?;
         let request_telemetry = Self::build_request_telemetry(
             session_telemetry,
             AuthRequestTelemetryContext::new(
@@ -603,7 +655,6 @@ impl ModelClient {
             self.state.auth_env_telemetry.clone(),
         );
         let request = self.build_responses_request(
-            &client_setup.api_provider,
             prompt,
             model_info,
             settings.effort,
@@ -623,7 +674,7 @@ impl ModelClient {
             text,
             ..
         } = request;
-        self.prepare_response_items_for_request(&mut input, /*store*/ false);
+        self.prepare_response_items_for_request(&mut input);
         let payload = ApiCompactionInput {
             model: &model,
             input: &input,
@@ -652,6 +703,13 @@ impl ModelClient {
         ));
         if let Some(header_value) = self.generate_attestation_header_for().await {
             extra_headers.insert(X_OAI_ATTESTATION_HEADER, header_value);
+        }
+        if let Some(header_value) = self.build_routing_hint_header(
+            client_setup.auth.as_ref(),
+            &model,
+            service_tier.as_deref(),
+        ) {
+            extra_headers.insert(X_CODEX_ROUTING_HINT_HEADER, header_value);
         }
         add_responses_lite_header(&mut extra_headers, model_info.use_responses_lite);
         let compact_request_timeout = client_setup
@@ -692,8 +750,8 @@ impl ModelClient {
         sideband_headers.extend(sideband_websocket_auth_headers(
             client_setup.api_auth.as_ref(),
         ));
-        let transport = ReqwestTransport::new(build_reqwest_client());
         let api_provider = api_provider_override.unwrap_or(client_setup.api_provider);
+        let transport = self.build_api_transport(&api_provider, REALTIME_CALLS_ENDPOINT)?;
         let response = ApiRealtimeCallClient::new(transport, api_provider, client_setup.api_auth)
             .create_with_session_and_headers(sdp, session_config, extra_headers)
             .await
@@ -723,7 +781,8 @@ impl ModelClient {
         }
 
         let client_setup = self.current_client_setup().await?;
-        let transport = ReqwestTransport::new(build_reqwest_client());
+        let transport =
+            self.build_api_transport(&client_setup.api_provider, MEMORIES_SUMMARIZE_ENDPOINT)?;
         let request_telemetry = Self::build_request_telemetry(
             session_telemetry,
             AuthRequestTelemetryContext::new(
@@ -844,38 +903,24 @@ impl ModelClient {
         model_info: &ModelInfo,
         effort: Option<ReasoningEffortConfig>,
         summary: ReasoningSummaryConfig,
-    ) -> Option<Reasoning> {
-        if model_info.supports_reasoning_effort() || model_info.supports_reasoning_summaries {
-            Some(Reasoning {
-                effort: if model_info.supports_reasoning_effort() {
-                    effort
-                        .or_else(|| model_info.default_reasoning_level.clone())
-                        .map(reasoning_effort_for_request)
-                } else {
-                    None
-                },
-                summary: if model_info.supports_reasoning_summaries
-                    && summary != ReasoningSummaryConfig::None
-                {
-                    Some(summary)
-                } else {
-                    None
-                },
-                // When Responses Lite is disabled, omit context so Responses uses the default,
-                // which is currently `current_turn`.
-                context: model_info
-                    .use_responses_lite
-                    .then_some(ReasoningContext::AllTurns),
-            })
-        } else {
-            None
+    ) -> Reasoning {
+        Reasoning {
+            effort: effort
+                .or_else(|| model_info.default_reasoning_level.clone())
+                .map(reasoning_effort_for_request),
+            summary: (model_info.supports_reasoning_summary_parameter
+                && summary != ReasoningSummaryConfig::None)
+                .then_some(summary),
+            // When Responses Lite is disabled, omit context so Responses uses the default,
+            // which is currently `current_turn`.
+            context: model_info
+                .use_responses_lite
+                .then_some(ReasoningContext::AllTurns),
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn build_responses_request(
         &self,
-        provider: &codex_api::Provider,
         prompt: &Prompt,
         model_info: &ModelInfo,
         effort: Option<ReasoningEffortConfig>,
@@ -884,13 +929,25 @@ impl ModelClient {
         responses_metadata: &CodexResponsesMetadata,
     ) -> Result<ResponsesApiRequest> {
         let mut input = prompt.get_formatted_input_for_request(model_info.use_responses_lite);
-        if !self.state.provider.info().is_openai() {
-            input
-                .iter_mut()
-                .for_each(ResponseItem::clear_internal_chat_message_metadata_passthrough);
+        let is_openai = self.state.provider.info().is_openai();
+        if !is_openai {
+            for item in &mut input {
+                item.clear_internal_chat_message_metadata_passthrough();
+                if let ResponseItem::FunctionCall {
+                    encrypted_function_args,
+                    ..
+                } = item
+                {
+                    *encrypted_function_args = None;
+                }
+            }
         }
-        let tools = create_tools_json_for_responses_api(&prompt.tools)?;
         let (instructions, tools) = if model_info.use_responses_lite {
+            let tools = if self.state.provider.capabilities().namespace_tools {
+                create_tools_json_for_responses_lite(&prompt.tools)?
+            } else {
+                create_tools_json_for_responses_api(&prompt.tools)?
+            };
             let mut prefix = vec![ResponseItem::AdditionalTools {
                 id: None,
                 role: "developer".to_string(),
@@ -910,14 +967,19 @@ impl ModelClient {
             input.splice(0..0, prefix);
             (String::new(), None)
         } else {
-            (prompt.base_instructions.text.clone(), Some(tools))
+            (
+                prompt.base_instructions.text.clone(),
+                Some(create_tools_raw_json_for_responses_api(&prompt.tools)?.into()),
+            )
         };
         let reasoning = Self::build_reasoning(model_info, effort, summary);
-        let include = if reasoning.is_some() {
-            vec!["reasoning.encrypted_content".to_string()]
-        } else {
-            Vec::new()
-        };
+        let stream_options = (self.state.concurrent_reasoning_summaries_enabled
+            && is_openai
+            && reasoning.summary.is_some())
+        .then_some(StreamOptions {
+            reasoning_summary_delivery: codex_api::ReasoningSummaryDelivery::SequentialCutoff,
+        });
+        let include = vec!["reasoning.encrypted_content".to_string()];
         let verbosity = if model_info.support_verbosity {
             self.state.model_verbosity.or(model_info.default_verbosity)
         } else {
@@ -934,7 +996,7 @@ impl ModelClient {
             &prompt.output_schema,
             prompt.output_schema_strict,
         );
-        let prompt_cache_key = Some(self.prompt_cache_key());
+        let prompt_cache_key = Some(self.prompt_cache_key(responses_metadata));
         let service_tier = model_info.service_tier_for_request(service_tier);
         let request = ResponsesApiRequest {
             model: model_info.slug.clone(),
@@ -943,28 +1005,25 @@ impl ModelClient {
             tools,
             tool_choice: "auto".to_string(),
             parallel_tool_calls: prompt.parallel_tool_calls && !model_info.use_responses_lite,
-            reasoning,
-            store: provider.is_azure_responses_endpoint(),
+            reasoning: Some(reasoning),
+            store: false,
             stream: true,
+            stream_options,
             include,
             service_tier,
             prompt_cache_key,
             text,
             client_metadata: Some(responses_metadata.client_metadata()),
-            // Filled in later, and only when the caller has an incremental request to make: this
-            // builder does not know what was sent last.
             previous_response_id: None,
         };
         Ok(request)
     }
 
-    fn prepare_response_items_for_request(&self, input: &mut [ResponseItem], store: bool) {
-        if self.state.item_ids_enabled || store {
-            return;
-        }
-
+    fn prepare_response_items_for_request(&self, input: &mut [ResponseItem]) {
         for item in input {
-            item.set_id(/*new_id*/ None);
+            if item.id().is_some_and(|id| !id.is_prefixed()) {
+                item.set_id(/*new_id*/ None);
+            }
         }
     }
 
@@ -972,7 +1031,8 @@ impl ModelClient {
     ///
     /// WebSocket use is controlled by provider capability and session-scoped fallback state.
     pub fn responses_websocket_enabled(&self) -> bool {
-        if !self.state.provider.info().supports_websockets
+        if self.http_transport.is_some()
+            || !self.state.provider.info().supports_websockets
             || self.state.disable_websockets.load(Ordering::Relaxed)
         {
             return false;
@@ -1005,6 +1065,51 @@ impl ModelClient {
         })
     }
 
+    fn build_routing_hint_header(
+        &self,
+        auth: Option<&CodexAuth>,
+        model: &str,
+        service_tier: Option<&str>,
+    ) -> Option<HeaderValue> {
+        let provider = self.state.provider.info();
+        if !auth.is_some_and(CodexAuth::uses_codex_backend)
+            || !provider.is_openai()
+            || !provider.requires_openai_auth
+            || provider.env_key.is_some()
+            || provider.experimental_bearer_token.is_some()
+            || provider.auth.is_some()
+            || provider.aws.is_some()
+        {
+            return None;
+        }
+
+        let routing_hint = match service_tier {
+            Some(tier) => format!("model={model};tier={tier}"),
+            None => format!("model={model}"),
+        };
+        HeaderValue::from_str(&routing_hint).ok()
+    }
+
+    fn build_api_transport(
+        &self,
+        api_provider: &ApiProvider,
+        endpoint: &str,
+    ) -> Result<HttpTransportHandle> {
+        if let Some(transport) = &self.http_transport {
+            return Ok(transport.clone());
+        }
+        let request_url = api_provider.url_for_path(endpoint);
+        let client = create_client_for_route(
+            &self.http_client_factory,
+            &request_url,
+            ClientRouteClass::Api,
+        )
+        .map_err(std::io::Error::from)?;
+        Ok(HttpTransportHandle::from_transport(
+            ReqwestTransport::from_http_client(client),
+        ))
+    }
+
     pub(crate) async fn prewarm_auth(&self) -> Result<()> {
         self.current_client_setup().await.map(|_| ())
     }
@@ -1035,6 +1140,7 @@ impl ModelClient {
         let result = match tokio::time::timeout(
             websocket_connect_timeout,
             ApiWebSocketResponsesClient::new(api_provider, api_auth).connect(
+                &self.http_client_factory,
                 headers,
                 codex_login::default_client::default_headers(),
                 /*turn_state*/ None,
@@ -1115,6 +1221,9 @@ impl ModelClient {
             Some(responses_metadata.thread_id.to_string()),
         ));
         headers.extend(self.build_responses_compatibility_headers(responses_metadata));
+        if let Some(routing_hint) = &responses_metadata.routing_hint {
+            headers.insert(X_CODEX_ROUTING_HINT_HEADER, routing_hint.clone());
+        }
         if let Some(header_value) = self.generate_attestation_header_for().await {
             headers.insert(X_OAI_ATTESTATION_HEADER, header_value);
         }
@@ -1190,45 +1299,10 @@ impl ModelClientSession {
         }
     }
 
-    /// The previous response, once its stream has finished producing one.
-    ///
-    /// Takes rather than borrows: a `LastResponse` arrives through a oneshot, so it can only be
-    /// read once, and a turn that never completed its stream has none to read.
-    /// Takes the whole baseline, leaving none behind.
-    ///
-    /// Both halves move together and are only put back by a request that succeeded. Taking just
-    /// the response would leave the request behind if the send then failed, and a request without
-    /// its response computes a delta that does not strip what the server already returned — the
-    /// model's own last output would go a second time. Losing the baseline costs one full resend;
-    /// keeping half of it corrupts the conversation the provider is holding.
-    fn take_http_baseline(&mut self) -> (Option<Box<ResponsesApiRequest>>, Option<LastResponse>) {
-        let taken = std::mem::take(&mut self.http_session);
-        let response = taken.last_response_rx.and_then(|mut rx| rx.try_recv().ok());
-        (taken.last_request, response)
-    }
-
-    /// Hands this session's baseline to whoever will continue the thread.
-    ///
-    /// The receiver inside cannot be cloned, so the baseline moves rather than being copied: a
-    /// turn gives it up when it ends and the next turn is given it when it starts.
-    pub fn take_incremental_baseline(&mut self) -> HttpIncrementalSession {
-        std::mem::take(&mut self.http_session)
-    }
-
-    pub fn set_incremental_baseline(&mut self, baseline: HttpIncrementalSession) {
-        self.http_session = baseline;
-    }
-
-    pub(crate) fn has_incremental_baseline(&self) -> bool {
-        self.http_session.last_request.is_some()
-    }
-
-    /// The items this request adds on top of `previous_request` plus what the server already
-    /// returned, or `None` when the two do not line up and the whole conversation has to go again.
-    ///
-    /// Taking the previous request as an argument rather than reading one transport's state is
-    /// what lets both the websocket and HTTP paths use it; the rules below are about the requests,
-    /// not about how they travel.
+    /// Checks whether the current request is an incremental extension of the previous request.
+    /// We only reuse an incremental input delta when non-input request fields are unchanged and
+    /// `input` is a strict extension of the previous known input. Server-returned output items
+    /// are treated as part of the baseline so we do not resend them.
     fn get_incremental_items(
         &self,
         request: &ResponsesApiRequest,
@@ -1236,36 +1310,34 @@ impl ModelClientSession {
         last_response: Option<&LastResponse>,
         allow_empty_delta: bool,
     ) -> Option<Vec<ResponseItem>> {
-        // Checks whether the current request is an incremental extension of the previous request.
-        // We only reuse an incremental input delta when non-input request fields are unchanged and
-        // `input` is a strict
-        // extension of the previous known input. Server-returned output items are treated as part
-        // of the baseline so we do not resend them.
         let previous_request = previous_request?;
         if !responses_request_properties_match(previous_request, request) {
-            trace!("incremental request failed, reuse properties didn't match");
+            trace!("incremental request failed, websocket reuse properties didn't match");
             return None;
         }
 
-        let Some(after_previous_input) = request
+        let response_items =
+            last_response.map_or(&[][..], |response| response.items_added.as_slice());
+        let previous_items_len = previous_request
             .input
-            .strip_prefix(previous_request.input.as_slice())
+            .len()
+            .checked_add(response_items.len())?;
+        let Some((request_items_to_compare, incremental_items)) =
+            request.input.split_at_checked(previous_items_len)
         else {
-            trace!("incremental request failed, items didn't match");
+            trace!("incremental request failed, incompatible request length");
             return None;
         };
-        let mut response_items =
-            last_response.map_or_else(Vec::new, |response| response.items_added.clone());
-        if !self.client.state.provider.info().is_openai() {
-            response_items
-                .iter_mut()
-                .for_each(ResponseItem::clear_internal_chat_message_metadata_passthrough);
+        let previous_items = previous_request.input.iter().chain(response_items);
+        if !previous_items
+            .zip(request_items_to_compare)
+            .all(|(previous, current)| {
+                response_items_equal_ignoring_internal_metadata(previous, current)
+            })
+        {
+            trace!("incremental request failed, items didn't match");
+            return None;
         }
-        let Some(incremental_items) = after_previous_input.strip_prefix(response_items.as_slice())
-        else {
-            trace!("incremental request failed, items didn't match");
-            return None;
-        };
         if !allow_empty_delta && incremental_items.is_empty() {
             return None;
         }
@@ -1284,11 +1356,10 @@ impl ModelClientSession {
 
     fn prepare_websocket_request(
         &mut self,
-        payload: ResponseCreateWsRequest,
         request: &ResponsesApiRequest,
-    ) -> (ResponsesWsRequest, bool) {
+    ) -> (Option<(String, Vec<ResponseItem>)>, bool) {
         let Some(last_response) = self.get_last_response() else {
-            return (ResponsesWsRequest::ResponseCreate(payload), false);
+            return (None, false);
         };
         let previous_response_id_from_untraced_warmup =
             self.websocket_session.last_response_from_untraced_warmup;
@@ -1298,20 +1369,16 @@ impl ModelClientSession {
             Some(&last_response),
             /*allow_empty_delta*/ true,
         ) else {
-            return (ResponsesWsRequest::ResponseCreate(payload), false);
+            return (None, false);
         };
 
         if last_response.response_id.is_empty() {
             trace!("incremental request failed, no previous response id");
-            return (ResponsesWsRequest::ResponseCreate(payload), false);
+            return (None, false);
         }
 
         (
-            ResponsesWsRequest::ResponseCreate(ResponseCreateWsRequest {
-                previous_response_id: Some(last_response.response_id),
-                input: incremental_items,
-                ..payload
-            }),
+            Some((last_response.response_id, incremental_items)),
             previous_response_id_from_untraced_warmup,
         )
     }
@@ -1471,10 +1538,13 @@ impl ModelClientSession {
         let mut auth_recovery = auth_manager
             .as_ref()
             .map(AuthManager::unauthorized_recovery);
+        let mut provider_auth_recovery_attempted = false;
         let mut pending_retry = PendingUnauthorizedRetry::default();
         loop {
             let client_setup = self.client.current_client_setup().await?;
-            let transport = self.client.http_transport();
+            let transport = self
+                .client
+                .build_api_transport(&client_setup.api_provider, RESPONSES_ENDPOINT)?;
             let request_auth_context = AuthRequestTelemetryContext::new(
                 client_setup.auth.as_ref().map(CodexAuth::auth_mode),
                 client_setup.api_auth.as_ref(),
@@ -1497,7 +1567,6 @@ impl ModelClientSession {
                 .await;
 
             let mut request = self.client.build_responses_request(
-                &client_setup.api_provider,
                 prompt,
                 model_info,
                 effort.clone(),
@@ -1505,34 +1574,37 @@ impl ModelClientSession {
                 service_tier.clone(),
                 responses_metadata,
             )?;
-            let store = request.store;
-            if model_info.relocates_tool_output_images {
+            let runtime_policy = self.client.runtime_policy(&model_info.slug);
+            if runtime_policy.relocates_tool_output_images {
                 relocate_tool_output_images(&mut request.input);
             }
-            // Kept whole for the baseline: the delta is computed against what was logically sent,
-            // not against the id-stripped copy that goes on the wire.
             let full_request_for_baseline = request.clone();
-            let (previous_request, last_response) = if model_info.supports_incremental_requests {
-                self.take_http_baseline()
+            let use_http_incremental = runtime_policy.supports_http_incremental_requests
+                && matches!(
+                    responses_metadata.request_kind,
+                    Some(crate::responses_metadata::CodexResponsesRequestKind::Turn)
+                );
+            let (previous_request, last_response) = if use_http_incremental {
+                self.client.take_http_incremental_baseline()
             } else {
                 (None, None)
             };
             let had_baseline = previous_request.is_some();
-            let incremental_items = if model_info.supports_incremental_requests {
-                self.get_incremental_items(
-                    &request,
-                    previous_request.as_deref(),
-                    last_response.as_ref(),
-                    /*allow_empty_delta*/ false,
-                )
-                .and_then(|items| {
-                    last_response
-                        .filter(|response| !response.response_id.is_empty())
-                        .map(|response| (response.response_id, items))
+            let incremental_items = use_http_incremental
+                .then(|| {
+                    self.get_incremental_items(
+                        &request,
+                        previous_request.as_deref(),
+                        last_response.as_ref(),
+                        /*allow_empty_delta*/ false,
+                    )
+                    .and_then(|items| {
+                        last_response
+                            .filter(|response| !response.response_id.is_empty())
+                            .map(|response| (response.response_id, items))
+                    })
                 })
-            } else {
-                None
-            };
+                .flatten();
             let sent_incremental = incremental_items.is_some();
             if let Some((response_id, items)) = incremental_items {
                 info!(
@@ -1544,16 +1616,19 @@ impl ModelClientSession {
                 request.input = items;
                 request.previous_response_id = Some(response_id);
             } else if had_baseline {
-                // Falling back is normal — compaction, a fork, or anything that rewrites history
-                // breaks the strict-prefix rule — but silently falling back on every call would
-                // look exactly like the feature working, so it says which one happened.
-                info!(
-                    target: "codex_incremental",
-                    "falling back to a full HTTP request"
-                );
+                info!(target: "codex_incremental", "falling back to a full HTTP request");
+            }
+            if let Some(header_value) = self.client.build_routing_hint_header(
+                client_setup.auth.as_ref(),
+                &request.model,
+                request.service_tier.as_deref(),
+            ) {
+                options
+                    .extra_headers
+                    .insert(X_CODEX_ROUTING_HINT_HEADER, header_value);
             }
             self.client
-                .prepare_response_items_for_request(&mut request.input, store);
+                .prepare_response_items_for_request(&mut request.input);
             let request_session_telemetry =
                 session_telemetry_for_request(session_telemetry, &request);
             let inference_trace_attempt = inference_trace.start_attempt();
@@ -1575,18 +1650,21 @@ impl ModelClientSession {
                         inference_trace_attempt,
                         Arc::clone(&self.client.state.provider),
                     );
-                    // The receiver used to be dropped here, which is why the HTTP path could never
-                    // send a delta: without the response id and the items the server added, there
-                    // is nothing to compute one against.
-                    if model_info.supports_incremental_requests {
-                        self.http_session.last_request = Some(Box::new(full_request_for_baseline));
-                        self.http_session.last_response_rx = Some(last_response_rx);
+                    if use_http_incremental {
+                        self.client.store_http_incremental_baseline(
+                            full_request_for_baseline,
+                            last_response_rx,
+                        );
                     }
                     return Ok(stream);
                 }
-                Err(ApiError::Transport(
-                    unauthorized_transport @ TransportError::Http { status, .. },
-                )) if status == StatusCode::UNAUTHORIZED => {
+                Err(ApiError::Transport(unauthorized_transport))
+                    if self
+                        .client
+                        .state
+                        .provider
+                        .is_recoverable_auth_error(&unauthorized_transport) =>
+                {
                     let response_debug_context =
                         extract_response_debug_context(&unauthorized_transport);
                     inference_trace_attempt.record_failed(
@@ -1598,6 +1676,7 @@ impl ModelClientSession {
                         handle_unauthorized(
                             unauthorized_transport,
                             &mut auth_recovery,
+                            &mut provider_auth_recovery_attempted,
                             session_telemetry,
                             &self.client.state.provider,
                         )
@@ -1606,11 +1685,6 @@ impl ModelClientSession {
                     continue;
                 }
                 Err(err) if sent_incremental && is_unknown_previous_response(&err) => {
-                    // The id named a conversation the provider no longer has: it lasts seven days,
-                    // and one that was swept or belongs elsewhere looks the same. Nothing is wrong
-                    // with the thread, only with the shortcut, so the baseline is dropped and the
-                    // loop sends the whole history once — the same path a thread's first request
-                    // takes, which is why resuming an old conversation needs nothing special.
                     let response_debug_context =
                         extract_response_debug_context_from_api_error(&err);
                     inference_trace_attempt.record_failed(
@@ -1620,10 +1694,8 @@ impl ModelClientSession {
                     );
                     info!(
                         target: "codex_incremental",
-                        "the provider no longer has that conversation; resending it in full"
+                        "provider no longer has the previous response; resending in full"
                     );
-                    // The baseline was taken at the top of this iteration, so there is nothing
-                    // left to clear — the retry carries the whole history by construction.
                     continue;
                 }
                 Err(err) => {
@@ -1669,11 +1741,13 @@ impl ModelClientSession {
         request_trace: Option<W3cTraceContext>,
         inference_trace: &InferenceTraceContext,
     ) -> Result<WebsocketStreamOutcome> {
-        let auth_manager = self.client.state.provider.auth_manager();
+        let provider = Arc::clone(&self.client.state.provider);
+        let auth_manager = provider.auth_manager();
 
         let mut auth_recovery = auth_manager
             .as_ref()
             .map(AuthManager::unauthorized_recovery);
+        let mut provider_auth_recovery_attempted = false;
         let mut pending_retry = PendingUnauthorizedRetry::default();
         loop {
             let client_setup = self.client.current_client_setup().await?;
@@ -1683,8 +1757,7 @@ impl ModelClientSession {
                 client_setup.agent_identity_telemetry.clone(),
                 pending_retry,
             );
-            let request = self.client.build_responses_request(
-                &client_setup.api_provider,
+            let mut request = self.client.build_responses_request(
                 prompt,
                 model_info,
                 effort.clone(),
@@ -1692,6 +1765,12 @@ impl ModelClientSession {
                 service_tier.clone(),
                 responses_metadata,
             )?;
+            let mut websocket_metadata = responses_metadata.clone();
+            websocket_metadata.routing_hint = self.client.build_routing_hint_header(
+                client_setup.auth.as_ref(),
+                &request.model,
+                request.service_tier.as_deref(),
+            );
             let request_session_telemetry = if warmup {
                 // `generate=false` prewarm is connection setup, not an inference request.
                 session_telemetry.clone()
@@ -1704,23 +1783,12 @@ impl ModelClientSession {
             if let Some(turn_state) = self.turn_state.get() {
                 client_metadata.insert(X_CODEX_TURN_STATE_HEADER.to_string(), turn_state.clone());
             }
-            let mut ws_payload = ResponseCreateWsRequest {
-                client_metadata: response_create_client_metadata(
-                    Some(client_metadata),
-                    request_trace.as_ref(),
-                ),
-                ..ResponseCreateWsRequest::from(&request)
-            };
-            if warmup {
-                ws_payload.generate = Some(false);
-            }
-
             match self
                 .websocket_connection(WebsocketConnectParams {
                     session_telemetry,
                     api_provider: client_setup.api_provider,
                     api_auth: client_setup.api_auth,
-                    responses_metadata,
+                    responses_metadata: &websocket_metadata,
                     auth_context: request_auth_context,
                     request_route_telemetry: RequestRouteTelemetry::for_endpoint(
                         RESPONSES_ENDPOINT,
@@ -1734,25 +1802,26 @@ impl ModelClientSession {
                 {
                     return Ok(WebsocketStreamOutcome::FallbackToHttp);
                 }
-                Err(ApiError::Transport(
-                    unauthorized_transport @ TransportError::Http { status, .. },
-                )) if status == StatusCode::UNAUTHORIZED => {
+                Err(ApiError::Transport(unauthorized_transport))
+                    if provider.is_recoverable_auth_error(&unauthorized_transport) =>
+                {
                     pending_retry = PendingUnauthorizedRetry::from_recovery(
                         handle_unauthorized(
                             unauthorized_transport,
                             &mut auth_recovery,
+                            &mut provider_auth_recovery_attempted,
                             session_telemetry,
-                            &self.client.state.provider,
+                            &provider,
                         )
                         .await?,
                     );
                     continue;
                 }
-                Err(err) => return Err(self.client.state.provider.map_api_error(err)),
+                Err(err) => return Err(provider.map_api_error(err)),
             }
 
-            let (mut ws_request, previous_response_id_from_untraced_warmup) =
-                self.prepare_websocket_request(ws_payload, &request);
+            let (incremental_request, previous_response_id_from_untraced_warmup) =
+                self.prepare_websocket_request(&request);
             let inference_trace_attempt = if warmup {
                 // Prewarm sends `generate=false`; it is connection setup, not a
                 // model inference attempt that should appear in rollout traces.
@@ -1760,21 +1829,47 @@ impl ModelClientSession {
             } else {
                 inference_trace.start_attempt()
             };
-            stamp_ws_stream_request_start_ms(&mut ws_request);
-            let ResponsesWsRequest::ResponseCreate(ws_payload) = &mut ws_request;
-            let store = ws_payload.store;
-            self.client
-                .prepare_response_items_for_request(&mut ws_payload.input, store);
             if previous_response_id_from_untraced_warmup {
                 // The transport can reuse an untraced warmup response id and omit the
                 // already-sent input, but rollout replay needs the logical model-visible
                 // request rather than the compressed websocket delta.
                 inference_trace_attempt.record_started(&request);
+            }
+
+            let (previous_response_id, mut incremental_items) = match incremental_request {
+                Some((response_id, items)) => (Some(response_id), Some(items)),
+                None => (None, None),
+            };
+            let original_item_ids = if let Some(incremental_items) = &mut incremental_items {
+                self.client
+                    .prepare_response_items_for_request(incremental_items);
+                None
             } else {
+                let original_item_ids = request
+                    .input
+                    .iter()
+                    .map(|item| item.id().cloned())
+                    .collect::<Vec<_>>();
+                self.client
+                    .prepare_response_items_for_request(&mut request.input);
+                Some(original_item_ids)
+            };
+            let ws_payload = ResponseCreateWsRequest {
+                previous_response_id,
+                input: incremental_items.as_deref().unwrap_or(&request.input),
+                generate: if warmup { Some(false) } else { None },
+                client_metadata: response_create_client_metadata(
+                    Some(client_metadata),
+                    request_trace.as_ref(),
+                ),
+                ..ResponseCreateWsRequest::from(&request)
+            };
+            let mut ws_request = ResponsesWsRequest::ResponseCreate(ws_payload);
+            stamp_ws_stream_request_start_ms(&mut ws_request);
+            if !previous_response_id_from_untraced_warmup {
                 inference_trace_attempt.record_started(&ws_request);
             }
-            self.websocket_session.last_request = Some(request);
-            self.websocket_session.last_response_from_untraced_warmup = warmup;
+
             let websocket_connection =
                 self.websocket_session.connection.as_ref().ok_or_else(|| {
                     self.client.state.provider.map_api_error(ApiError::Stream(
@@ -1787,18 +1882,24 @@ impl ModelClientSession {
                     self.websocket_session.connection_reused(),
                     Some(Arc::clone(&self.turn_state)),
                 )
-                .await
-                .map_err(|err| {
-                    let response_debug_context =
-                        extract_response_debug_context_from_api_error(&err);
-                    let err = self.client.state.provider.map_api_error(err);
-                    inference_trace_attempt.record_failed(
-                        &err,
-                        response_debug_context.request_id.as_deref(),
-                        /*output_items*/ &[],
-                    );
-                    err
-                })?;
+                .await;
+            if let Some(original_item_ids) = original_item_ids {
+                for (item, original_item_id) in request.input.iter_mut().zip(original_item_ids) {
+                    item.set_id(original_item_id);
+                }
+            }
+            self.websocket_session.last_request = Some(request);
+            self.websocket_session.last_response_from_untraced_warmup = warmup;
+            let stream_result = stream_result.map_err(|err| {
+                let response_debug_context = extract_response_debug_context_from_api_error(&err);
+                let err = self.client.state.provider.map_api_error(err);
+                inference_trace_attempt.record_failed(
+                    &err,
+                    response_debug_context.request_id.as_deref(),
+                    /*output_items*/ &[],
+                );
+                err
+            })?;
             let (stream, last_request_rx) = map_response_stream(
                 stream_result,
                 request_session_telemetry,
@@ -1983,7 +2084,7 @@ impl ModelClientSession {
 ///
 /// Meant to be called just before sending the request over the socket, to capture realistic
 /// transport timing.
-fn stamp_ws_stream_request_start_ms(request: &mut ResponsesWsRequest) {
+fn stamp_ws_stream_request_start_ms(request: &mut ResponsesWsRequest<'_>) {
     let ResponsesWsRequest::ResponseCreate(payload) = request;
     payload
         .client_metadata
@@ -2020,22 +2121,6 @@ fn build_responses_headers(
     headers
 }
 
-pub(crate) fn add_originator_header(headers: &mut ApiHeaderMap, originator: &str) {
-    let default_originator = codex_login::default_client::originator();
-    if originator == default_originator.value.as_str() {
-        return;
-    }
-
-    match HeaderValue::from_str(originator) {
-        Ok(header_value) => {
-            headers.insert("originator", header_value);
-        }
-        Err(err) => {
-            warn!("ignoring invalid thread originator header value: {err}");
-        }
-    }
-}
-
 fn add_responses_lite_header(headers: &mut ApiHeaderMap, use_responses_lite: bool) {
     if use_responses_lite {
         headers.insert(
@@ -2048,26 +2133,48 @@ fn add_responses_lite_header(headers: &mut ApiHeaderMap, use_responses_lite: boo
 const RESPONSE_STREAM_CHANNEL_CAPACITY: usize = 1600;
 const STREAM_DROPPED_REASON: &str = "response stream dropped before provider terminal event";
 
-/// Whether a failure is the provider saying it does not have the conversation the request named.
-///
-/// Read from the message rather than the code. DashScope answers
-/// `{"code":"InvalidParameter","message":"Not found previous_response_id: ..."}`, and that code
-/// covers every malformed field — retrying on it alone would resend the whole conversation for
-/// errors a resend cannot fix, turning a small failed request into a large one.
 fn is_unknown_previous_response(error: &ApiError) -> bool {
-    let rendered = error.to_string();
-    rendered.contains("previous_response_id")
-        && (rendered.contains("Not found") || rendered.contains("not found"))
+    let (status, body) = match error {
+        ApiError::Transport(TransportError::Http { status, body, .. }) => {
+            (*status, body.as_deref().unwrap_or_default())
+        }
+        ApiError::Api { status, message } => (*status, message.as_str()),
+        ApiError::InvalidRequest { message } => (StatusCode::BAD_REQUEST, message.as_str()),
+        _ => return false,
+    };
+    if status != StatusCode::BAD_REQUEST && status != StatusCode::NOT_FOUND {
+        return false;
+    }
+
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(body) {
+        let detail = value.get("error").unwrap_or(&value);
+        let code = detail
+            .get("code")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let param = detail
+            .get("param")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        let message = detail
+            .get("message")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if code.contains("previous_response") && code.contains("not_found") {
+            return true;
+        }
+        if param == "previous_response_id" && message.contains("not found") {
+            return true;
+        }
+    }
+
+    let body = body.to_ascii_lowercase();
+    body.contains("previous_response_id")
+        && (body.contains("not found") || body.contains("not_found"))
 }
 
-/// Lift images out of tool results and append each as its own user message.
-///
-/// For backends that do not reliably consume an image from a function call's output. Done here,
-/// while the request is still being assembled, so that the item list this produces is the one the
-/// baseline records and the one the backend receives — a rewrite further down the line would leave
-/// an incremental request naming a conversation with more items in it than we ever counted.
-///
-/// The text of the output stays where it is, so the model still sees which call the image answers.
 fn relocate_tool_output_images(input: &mut Vec<ResponseItem>) {
     let mut relocated = Vec::with_capacity(input.len());
     for mut item in std::mem::take(input) {
@@ -2151,6 +2258,7 @@ where
         let mut logged_error = false;
         let mut tx_last_response = Some(tx_last_response);
         let mut items_added: Vec<ResponseItem> = Vec::new();
+        let (request_start, mut ttft_ms) = (Instant::now(), None);
         let mut api_stream = api_stream;
         let upstream_request_id = upstream_request_id.as_deref();
         if let Some(upstream_request_id) = upstream_request_id {
@@ -2194,13 +2302,7 @@ where
                 }) => {
                     feedback_tags!(last_model_response_id = &response_id);
                     if let Some(usage) = &token_usage {
-                        session_telemetry.sse_event_completed(
-                            usage.input_tokens,
-                            usage.output_tokens,
-                            Some(usage.cached_input_tokens),
-                            Some(usage.reasoning_output_tokens),
-                            usage.total_tokens,
-                        );
+                        session_telemetry.sse_event_completed(usage, ttft_ms);
                     }
                     inference_trace_attempt.record_completed(
                         &response_id,
@@ -2227,6 +2329,11 @@ where
                     }
                 }
                 Ok(event) => {
+                    if matches!(&event, ResponseEvent::OutputItemAdded(_)) && ttft_ms.is_none() {
+                        ttft_ms = Some(
+                            i64::try_from(request_start.elapsed().as_millis()).unwrap_or(i64::MAX),
+                        );
+                    }
                     if tx_event.send(Ok(event)).await.is_err() {
                         inference_trace_attempt.record_cancelled(
                             STREAM_DROPPED_REASON,
@@ -2327,6 +2434,7 @@ impl AuthRequestTelemetryContext {
                 AuthMode::ApiKey | AuthMode::BedrockApiKey => "ApiKey",
                 AuthMode::Chatgpt
                 | AuthMode::ChatgptAuthTokens
+                | AuthMode::Headers
                 | AuthMode::AgentIdentity
                 | AuthMode::PersonalAccessToken => "Chatgpt",
             }),
@@ -2356,10 +2464,37 @@ struct WebsocketConnectParams<'a> {
 async fn handle_unauthorized(
     transport: TransportError,
     auth_recovery: &mut Option<UnauthorizedRecovery>,
+    provider_auth_recovery_attempted: &mut bool,
     session_telemetry: &SessionTelemetry,
     provider: &SharedModelProvider,
 ) -> Result<UnauthorizedRecoveryExecution> {
     let debug = extract_response_debug_context(&transport);
+    if !*provider_auth_recovery_attempted {
+        *provider_auth_recovery_attempted = true;
+        match provider.recover_from_unauthorized().await {
+            Ok(ProviderUnauthorizedRecovery::Recovered) => {
+                return Ok(UnauthorizedRecoveryExecution {
+                    mode: "provider",
+                    phase: "provider_refresh",
+                });
+            }
+            Ok(ProviderUnauthorizedRecovery::NotConfigured) => {}
+            Err(error) => {
+                let original = provider.map_api_error(ApiError::Transport(transport));
+                warn!(
+                    error = %error,
+                    original_error = %original,
+                    "provider authentication recovery failed"
+                );
+                return Err(if error.is_retryable() {
+                    original
+                } else {
+                    error
+                });
+            }
+        }
+    }
+
     if let Some(recovery) = auth_recovery
         && recovery.has_next()
     {
@@ -2504,7 +2639,7 @@ impl RequestTelemetry for ApiTelemetry {
     fn on_request(
         &self,
         attempt: u64,
-        status: Option<HttpStatusCode>,
+        status: Option<StatusCode>,
         error: Option<&TransportError>,
         duration: Duration,
     ) {

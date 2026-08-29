@@ -2,13 +2,13 @@ use anyhow::Result;
 use app_test_support::TestAppServer;
 use app_test_support::test_path_buf_with_windows;
 use app_test_support::test_tmp_path_buf;
-use app_test_support::to_response;
 use codex_app_server_protocol::AppConfig;
 use codex_app_server_protocol::AppToolApproval;
 use codex_app_server_protocol::ApprovalsReviewer;
 use codex_app_server_protocol::AppsConfig;
 use codex_app_server_protocol::AppsDefaultConfig;
 use codex_app_server_protocol::AskForApproval;
+use codex_app_server_protocol::CliAuthCredentialsStoreMode;
 use codex_app_server_protocol::ConfigBatchWriteParams;
 use codex_app_server_protocol::ConfigEdit;
 use codex_app_server_protocol::ConfigLayerSource;
@@ -17,9 +17,9 @@ use codex_app_server_protocol::ConfigReadResponse;
 use codex_app_server_protocol::ConfigRequirementsReadResponse;
 use codex_app_server_protocol::ConfigValueWriteParams;
 use codex_app_server_protocol::ConfigWriteResponse;
+use codex_app_server_protocol::ConfiguredHookHandler;
 use codex_app_server_protocol::ForcedChatgptWorkspaceIds;
 use codex_app_server_protocol::JSONRPCError;
-use codex_app_server_protocol::JSONRPCResponse;
 use codex_app_server_protocol::MergeStrategy;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::SandboxMode;
@@ -49,66 +49,318 @@ fn write_config(codex_home: &TempDir, contents: &str) -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn config_requirements_read_includes_allow_remote_control() -> Result<()> {
+async fn managed_auth_settings_are_exposed_enforced_and_read_only() -> Result<()> {
+    let codex_home = TempDir::new()?;
+    write_config(
+        &codex_home,
+        r#"cli_auth_credentials_store = "file"
+chatgpt_base_url = "https://user.example/backend-api/"
+"#,
+    )?;
+    std::fs::write(
+        codex_home.path().join("requirements.toml"),
+        r#"cli_auth_credentials_store = "ephemeral"
+chatgpt_base_url = "https://managed.example/backend-api/"
+"#,
+    )?;
+    let mut app_server = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .build_initialized_with_timeout(DEFAULT_READ_TIMEOUT)
+        .await?;
+
+    let requirements_id = app_server.send_config_requirements_read_request().await?;
+    let requirements: ConfigRequirementsReadResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        app_server.read_response(requirements_id),
+    )
+    .await??;
+    let requirements = requirements.requirements.expect("managed requirements");
+    assert_eq!(
+        (
+            requirements.cli_auth_credentials_store,
+            requirements.chatgpt_base_url.as_deref(),
+        ),
+        (
+            Some(CliAuthCredentialsStoreMode::Ephemeral),
+            Some("https://managed.example/backend-api/"),
+        ),
+    );
+
+    let config_id = app_server
+        .send_config_read_request(ConfigReadParams {
+            include_layers: false,
+            cwd: None,
+        })
+        .await?;
+    let config: ConfigReadResponse =
+        timeout(DEFAULT_READ_TIMEOUT, app_server.read_response(config_id)).await??;
+    assert_eq!(
+        (
+            config.config.additional.get("cli_auth_credentials_store"),
+            config.config.additional.get("chatgpt_base_url"),
+        ),
+        (
+            Some(&json!("ephemeral")),
+            Some(&json!("https://managed.example/backend-api/")),
+        ),
+    );
+
+    for (field, value) in [
+        ("cli_auth_credentials_store", json!("file")),
+        (
+            "chatgpt_base_url",
+            json!("https://user.example/backend-api/"),
+        ),
+    ] {
+        let write_id = app_server
+            .send_config_value_write_request(ConfigValueWriteParams {
+                file_path: None,
+                key_path: field.to_string(),
+                value,
+                merge_strategy: MergeStrategy::Replace,
+                expected_version: None,
+            })
+            .await?;
+        let error: JSONRPCError = timeout(
+            DEFAULT_READ_TIMEOUT,
+            app_server.read_stream_until_error_message(RequestId::Integer(write_id)),
+        )
+        .await??;
+        assert_eq!(
+            error
+                .error
+                .data
+                .as_ref()
+                .and_then(|data| data.get("config_write_error_code"))
+                .and_then(serde_json::Value::as_str),
+            Some("configRequirementReadonly"),
+        );
+    }
+
+    assert_eq!(
+        std::fs::read_to_string(codex_home.path().join("config.toml"))?,
+        "cli_auth_credentials_store = \"file\"\nchatgpt_base_url = \"https://user.example/backend-api/\"\n",
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn config_requirements_read_includes_remote_control_and_managed_hooks() -> Result<()> {
     let codex_home = TempDir::new()?;
     std::fs::write(
         codex_home.path().join("requirements.toml"),
-        "allow_remote_control = false\n",
+        r#"allow_remote_control = false
+
+[hooks]
+
+[[hooks.SessionStart]]
+
+[[hooks.SessionStart.hooks]]
+type = "command"
+command = "echo managed"
+additionalContextLimit = 4096
+
+[[hooks.SessionStart.hooks]]
+type = "mcp_tool"
+server = "security"
+tool = "scan"
+input = { path = "${tool_input.file_path}", metadata = { enabled = true, retries = 2 } }
+timeout = 30
+statusMessage = "Scanning file"
+"#,
     )?;
-    let mut mcp = TestAppServer::new(codex_home.path()).await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .build_initialized_with_timeout(DEFAULT_READ_TIMEOUT)
+        .await?;
 
     let request_id = mcp.send_config_requirements_read_request().await?;
-    let response = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
-    )
-    .await??;
-    let response: ConfigRequirementsReadResponse = to_response(response)?;
+    let response: ConfigRequirementsReadResponse =
+        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(request_id)).await??;
+    let requirements = response
+        .requirements
+        .expect("managed requirements should be returned");
+    assert_eq!(requirements.allow_remote_control, Some(false));
     assert_eq!(
-        response
-            .requirements
-            .expect("managed requirements should be returned")
-            .allow_remote_control,
-        Some(false)
+        requirements
+            .hooks
+            .expect("managed hooks should be returned")
+            .session_start[0]
+            .hooks,
+        vec![
+            ConfiguredHookHandler::Command {
+                command: "echo managed".to_string(),
+                command_windows: None,
+                timeout_sec: None,
+                r#async: false,
+                status_message: None,
+                additional_context_limit: Some(4_096),
+            },
+            ConfiguredHookHandler::McpTool {
+                server: "security".to_string(),
+                tool: "scan".to_string(),
+                input: serde_json::from_value(json!({
+                    "path": "${tool_input.file_path}",
+                    "metadata": { "enabled": true, "retries": 2 },
+                }))?,
+                timeout_sec: Some(30),
+                status_message: Some("Scanning file".to_string()),
+            },
+        ]
     );
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn config_requirements_read_includes_new_thread_model_defaults() -> Result<()> {
+async fn config_requirements_read_includes_browser_use_auto_review_setting() -> Result<()> {
     let codex_home = TempDir::new()?;
     std::fs::write(
         codex_home.path().join("requirements.toml"),
         r#"
+[browser_use]
+disable_auto_review = true
+"#,
+    )?;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .build()
+        .await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+
+    let request_id = mcp.send_config_requirements_read_request().await?;
+    let response: ConfigRequirementsReadResponse =
+        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(request_id)).await??;
+    assert_eq!(
+        response
+            .requirements
+            .and_then(|requirements| requirements.browser_use)
+            .and_then(|browser_use| browser_use.disable_auto_review),
+        Some(true)
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn config_requirements_read_includes_in_app_updates_policy() -> Result<()> {
+    let codex_home = TempDir::new()?;
+    std::fs::write(
+        codex_home.path().join("requirements.toml"),
+        r#"
+[features]
+in_app_updates = false
+"#,
+    )?;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .build()
+        .await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+
+    let request_id = mcp.send_config_requirements_read_request().await?;
+    let response: ConfigRequirementsReadResponse =
+        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(request_id)).await??;
+
+    assert_eq!(
+        response
+            .requirements
+            .and_then(|requirements| requirements.feature_requirements),
+        Some(std::collections::BTreeMap::from([(
+            "in_app_updates".to_string(),
+            false,
+        )]))
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn config_requirements_read_includes_model_auto_review_and_new_thread_defaults() -> Result<()>
+{
+    let codex_home = TempDir::new()?;
+    std::fs::write(
+        codex_home.path().join("requirements.toml"),
+        r#"
+[auto_review]
+required_on_models = ["gpt-protected", "gpt-sensitive"]
+ignore_rules = ["gpt-protected"]
+
 [models.new_thread]
 model = "gpt-managed"
 model_reasoning_effort = "medium"
 service_tier = "fast"
 "#,
     )?;
-    let mut mcp = TestAppServer::new(codex_home.path()).await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .build_initialized_with_timeout(DEFAULT_READ_TIMEOUT)
+        .await?;
 
     let request_id = mcp.send_config_requirements_read_request().await?;
-    let response = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
-    )
-    .await??;
-    let response: ConfigRequirementsReadResponse = to_response(response)?;
+    let response: ConfigRequirementsReadResponse =
+        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(request_id)).await??;
 
-    let defaults = response
-        .requirements
-        .and_then(|requirements| requirements.models)
-        .and_then(|models| models.new_thread)
-        .expect("managed new-thread defaults");
+    let requirements = response.requirements.expect("managed requirements");
+    let auto_review = requirements
+        .auto_review
+        .expect("managed automatic-review requirements");
+    assert_eq!(
+        auto_review.required_on_models,
+        Some(vec![
+            "gpt-protected".to_string(),
+            "gpt-sensitive".to_string()
+        ])
+    );
+    assert_eq!(
+        auto_review.ignore_rules,
+        Some(vec!["gpt-protected".to_string()])
+    );
+    let models = requirements.models.expect("managed model requirements");
+    let defaults = models.new_thread.expect("managed new-thread defaults");
     assert_eq!(defaults.model.as_deref(), Some("gpt-managed"));
     assert_eq!(
         defaults.model_reasoning_effort,
         Some(ReasoningEffort::Medium)
     );
     assert_eq!(defaults.service_tier.as_deref(), Some("fast"));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn config_read_disables_guardian_v2_when_managed_config_requires_guardian_v1() -> Result<()> {
+    let codex_home = TempDir::new()?;
+    write_config(&codex_home, "[features]\nguardianv2 = true\n")?;
+    std::fs::write(
+        codex_home.path().join("requirements.toml"),
+        "allowed_approvals_reviewers = [\"auto_review\"]\n",
+    )?;
+
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build_initialized_with_timeout(DEFAULT_READ_TIMEOUT)
+        .await?;
+
+    let request_id = mcp
+        .send_config_read_request(ConfigReadParams {
+            include_layers: false,
+            cwd: None,
+        })
+        .await?;
+    let ConfigReadResponse { config, .. } =
+        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(request_id)).await??;
+
+    assert_eq!(
+        config
+            .additional
+            .get("features")
+            .and_then(|features| features.get("guardianv2")),
+        Some(&json!(false))
+    );
+
     Ok(())
 }
 
@@ -125,8 +377,11 @@ sandbox_mode = "workspace-write"
     let codex_home_path = codex_home.path().canonicalize()?;
     let user_file = AbsolutePathBuf::try_from(codex_home_path.join("config.toml"))?;
 
-    let mut mcp = TestAppServer::new(codex_home.path()).await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .build_initialized_with_timeout(DEFAULT_READ_TIMEOUT)
+        .await?;
 
     let request_id = mcp
         .send_config_read_request(ConfigReadParams {
@@ -134,16 +389,11 @@ sandbox_mode = "workspace-write"
             cwd: None,
         })
         .await?;
-    let resp: JSONRPCResponse = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
-    )
-    .await??;
     let ConfigReadResponse {
         config,
         origins,
         layers,
-    } = to_response(resp)?;
+    } = timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(request_id)).await??;
 
     assert_eq!(config.model.as_deref(), Some("gpt-user"));
     assert_eq!(
@@ -153,69 +403,14 @@ sandbox_mode = "workspace-write"
             profile: None,
         }
     );
+    assert!(
+        origins
+            .values()
+            .all(|origin| !matches!(&origin.name, ConfigLayerSource::PackagedDefaults { .. }))
+    );
     let layers = layers.expect("layers present");
     assert_layers_user_then_optional_system(&layers, user_file)?;
 
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn config_read_and_batch_write_round_trip_model_auto_compact_enabled() -> Result<()> {
-    let codex_home = TempDir::new()?;
-    write_config(&codex_home, "model_auto_compact_enabled = false\n")?;
-
-    let mut mcp = TestAppServer::new(codex_home.path()).await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
-
-    let request_id = mcp
-        .send_config_read_request(ConfigReadParams {
-            include_layers: false,
-            cwd: None,
-        })
-        .await?;
-    let response: JSONRPCResponse = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
-    )
-    .await??;
-    let response: ConfigReadResponse = to_response(response)?;
-
-    assert_eq!(response.config.model_auto_compact_enabled, Some(false));
-
-    let batch_id = mcp
-        .send_config_batch_write_request(ConfigBatchWriteParams {
-            file_path: None,
-            edits: vec![ConfigEdit {
-                key_path: "model_auto_compact_enabled".to_string(),
-                value: json!(true),
-                merge_strategy: MergeStrategy::Replace,
-            }],
-            expected_version: None,
-            reload_user_config: true,
-        })
-        .await?;
-    let batch_response: JSONRPCResponse = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(batch_id)),
-    )
-    .await??;
-    let batch_response: ConfigWriteResponse = to_response(batch_response)?;
-    assert_eq!(batch_response.status, WriteStatus::Ok);
-
-    let read_id = mcp
-        .send_config_read_request(ConfigReadParams {
-            include_layers: false,
-            cwd: None,
-        })
-        .await?;
-    let read_response: JSONRPCResponse = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(read_id)),
-    )
-    .await??;
-    let read_response: ConfigReadResponse = to_response(read_response)?;
-
-    assert_eq!(read_response.config.model_auto_compact_enabled, Some(true));
     Ok(())
 }
 
@@ -235,8 +430,11 @@ allowed_domains = ["example.com"]
     let codex_home_path = codex_home.path().canonicalize()?;
     let user_file = AbsolutePathBuf::try_from(codex_home_path.join("config.toml"))?;
 
-    let mut mcp = TestAppServer::new(codex_home.path()).await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .build_initialized_with_timeout(DEFAULT_READ_TIMEOUT)
+        .await?;
 
     let request_id = mcp
         .send_config_read_request(ConfigReadParams {
@@ -244,16 +442,11 @@ allowed_domains = ["example.com"]
             cwd: None,
         })
         .await?;
-    let resp: JSONRPCResponse = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
-    )
-    .await??;
     let ConfigReadResponse {
         config,
         origins,
         layers,
-    } = to_response(resp)?;
+    } = timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(request_id)).await??;
 
     let tools = config.tools.expect("tools present");
     assert_eq!(
@@ -306,8 +499,11 @@ forced_chatgpt_workspace_id = "{WORKSPACE_ID}"
         ),
     )?;
 
-    let mut mcp = TestAppServer::new(codex_home.path()).await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .build_initialized_with_timeout(DEFAULT_READ_TIMEOUT)
+        .await?;
 
     let request_id = mcp
         .send_config_read_request(ConfigReadParams {
@@ -315,12 +511,8 @@ forced_chatgpt_workspace_id = "{WORKSPACE_ID}"
             cwd: None,
         })
         .await?;
-    let resp: JSONRPCResponse = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
-    )
-    .await??;
-    let ConfigReadResponse { config, .. } = to_response(resp)?;
+    let ConfigReadResponse { config, .. } =
+        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(request_id)).await??;
 
     assert_eq!(
         config.forced_chatgpt_workspace_id,
@@ -345,8 +537,11 @@ forced_chatgpt_workspace_id = ["{WORKSPACE_ID_A}", "{WORKSPACE_ID_B}"]
         ),
     )?;
 
-    let mut mcp = TestAppServer::new(codex_home.path()).await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .build_initialized_with_timeout(DEFAULT_READ_TIMEOUT)
+        .await?;
 
     let request_id = mcp
         .send_config_read_request(ConfigReadParams {
@@ -354,12 +549,8 @@ forced_chatgpt_workspace_id = ["{WORKSPACE_ID_A}", "{WORKSPACE_ID_B}"]
             cwd: None,
         })
         .await?;
-    let resp: JSONRPCResponse = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
-    )
-    .await??;
-    let ConfigReadResponse { config, .. } = to_response(resp)?;
+    let ConfigReadResponse { config, .. } =
+        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(request_id)).await??;
 
     assert_eq!(
         config.forced_chatgpt_workspace_id,
@@ -387,8 +578,11 @@ location = { country = "US", city = "New York", timezone = "America/New_York" }
 "#,
     )?;
 
-    let mut mcp = TestAppServer::new(codex_home.path()).await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .build_initialized_with_timeout(DEFAULT_READ_TIMEOUT)
+        .await?;
 
     let request_id = mcp
         .send_config_read_request(ConfigReadParams {
@@ -396,12 +590,8 @@ location = { country = "US", city = "New York", timezone = "America/New_York" }
             cwd: None,
         })
         .await?;
-    let resp: JSONRPCResponse = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
-    )
-    .await??;
-    let ConfigReadResponse { config, .. } = to_response(resp)?;
+    let ConfigReadResponse { config, .. } =
+        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(request_id)).await??;
 
     assert_eq!(
         config.tools.expect("tools present").web_search,
@@ -431,8 +621,11 @@ web_search = true
 "#,
     )?;
 
-    let mut mcp = TestAppServer::new(codex_home.path()).await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .build_initialized_with_timeout(DEFAULT_READ_TIMEOUT)
+        .await?;
 
     let request_id = mcp
         .send_config_read_request(ConfigReadParams {
@@ -440,12 +633,8 @@ web_search = true
             cwd: None,
         })
         .await?;
-    let resp: JSONRPCResponse = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
-    )
-    .await??;
-    let ConfigReadResponse { config, .. } = to_response(resp)?;
+    let ConfigReadResponse { config, .. } =
+        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(request_id)).await??;
 
     assert_eq!(config.tools.expect("tools present").web_search, None,);
 
@@ -460,7 +649,7 @@ async fn config_read_includes_apps() -> Result<()> {
         r#"
 [apps._default]
 approvals_reviewer = "auto_review"
-default_tools_approval_mode = "approve"
+default_tools_approval_mode = "writes"
 
 [apps.app1]
 enabled = false
@@ -472,8 +661,11 @@ default_tools_approval_mode = "prompt"
     let codex_home_path = codex_home.path().canonicalize()?;
     let user_file = AbsolutePathBuf::try_from(codex_home_path.join("config.toml"))?;
 
-    let mut mcp = TestAppServer::new(codex_home.path()).await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .build_initialized_with_timeout(DEFAULT_READ_TIMEOUT)
+        .await?;
 
     let request_id = mcp
         .send_config_read_request(ConfigReadParams {
@@ -481,16 +673,11 @@ default_tools_approval_mode = "prompt"
             cwd: None,
         })
         .await?;
-    let resp: JSONRPCResponse = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
-    )
-    .await??;
     let ConfigReadResponse {
         config,
         origins,
         layers,
-    } = to_response(resp)?;
+    } = timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(request_id)).await??;
 
     assert_eq!(
         config.apps,
@@ -500,7 +687,7 @@ default_tools_approval_mode = "prompt"
                 approvals_reviewer: Some(ApprovalsReviewer::AutoReview),
                 destructive_enabled: true,
                 open_world_enabled: true,
-                default_tools_approval_mode: Some(AppToolApproval::Approve),
+                default_tools_approval_mode: Some(AppToolApproval::Writes),
             }),
             apps: std::collections::HashMap::from([(
                 "app1".to_string(),
@@ -596,8 +783,11 @@ width = 320
 "#,
     )?;
 
-    let mut mcp = TestAppServer::new(codex_home.path()).await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .build_initialized_with_timeout(DEFAULT_READ_TIMEOUT)
+        .await?;
 
     let request_id = mcp
         .send_config_read_request(ConfigReadParams {
@@ -605,12 +795,8 @@ width = 320
             cwd: None,
         })
         .await?;
-    let resp: JSONRPCResponse = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
-    )
-    .await??;
-    let ConfigReadResponse { config, .. } = to_response(resp)?;
+    let ConfigReadResponse { config, .. } =
+        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(request_id)).await??;
 
     let desktop = config.desktop.expect("desktop settings present");
     assert_eq!(desktop.get("appearanceTheme"), Some(&json!("dark")));
@@ -643,8 +829,11 @@ model_reasoning_effort = "high"
     set_project_trust_level(codex_home.path(), workspace.path(), TrustLevel::Trusted)?;
     let project_config = AbsolutePathBuf::try_from(project_config_dir)?;
 
-    let mut mcp = TestAppServer::new(codex_home.path()).await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .build_initialized_with_timeout(DEFAULT_READ_TIMEOUT)
+        .await?;
 
     let request_id = mcp
         .send_config_read_request(ConfigReadParams {
@@ -652,14 +841,9 @@ model_reasoning_effort = "high"
             cwd: Some(workspace.path().to_string_lossy().into_owned()),
         })
         .await?;
-    let resp: JSONRPCResponse = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
-    )
-    .await??;
     let ConfigReadResponse {
         config, origins, ..
-    } = to_response(resp)?;
+    } = timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(request_id)).await??;
 
     assert_eq!(config.model_reasoning_effort, Some(ReasoningEffort::High));
     assert_eq!(
@@ -669,6 +853,80 @@ model_reasoning_effort = "high"
         }
     );
 
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn config_read_respects_managed_project_root_markers() -> Result<()> {
+    let codex_home = TempDir::new()?;
+    write_config(&codex_home, "model_context_window = 16384\n")?;
+    let workspace = TempDir::new()?;
+    let ancestor_config = workspace.path().join(".codex");
+    let child = workspace.path().join("child");
+    let child_config = child.join(".codex");
+    for dir in [
+        workspace.path().join(".git"),
+        ancestor_config.clone(),
+        child_config.clone(),
+    ] {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::write(workspace.path().join(".git/HEAD"), "ref: refs/heads/main\n")?;
+    std::fs::write(
+        ancestor_config.join("config.toml"),
+        "model_context_window = 32768\n",
+    )?;
+    std::fs::write(
+        child_config.join("config.toml"),
+        "model_reasoning_effort = \"high\"\n",
+    )?;
+    set_project_trust_level(codex_home.path(), workspace.path(), TrustLevel::Trusted)?;
+    let managed_path = codex_home.path().join("managed_config.toml");
+    std::fs::write(&managed_path, "project_root_markers = []\n")?;
+    let managed_path = managed_path.to_string_lossy().into_owned();
+
+    let mut app_server = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .with_env_overrides(&[("CODEX_APP_SERVER_MANAGED_CONFIG_PATH", Some(&managed_path))])
+        .build_initialized_with_timeout(DEFAULT_READ_TIMEOUT)
+        .await?;
+    let request_id = app_server
+        .send_config_read_request(ConfigReadParams {
+            include_layers: true,
+            cwd: Some(child.to_string_lossy().into_owned()),
+        })
+        .await?;
+    let ConfigReadResponse { config, layers, .. } =
+        timeout(DEFAULT_READ_TIMEOUT, app_server.read_response(request_id)).await??;
+
+    assert_eq!(
+        (
+            config.additional.get("project_root_markers"),
+            config.model_context_window,
+            config.model_reasoning_effort,
+        ),
+        (Some(&json!([])), Some(16384), Some(ReasoningEffort::High))
+    );
+    let project_layers = layers
+        .expect("layers present")
+        .into_iter()
+        .filter_map(|layer| {
+            if let ConfigLayerSource::Project { dot_codex_folder } = layer.name {
+                Some((dot_codex_folder, layer.config, layer.disabled_reason))
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        project_layers,
+        vec![(
+            AbsolutePathBuf::try_from(child_config)?,
+            json!({"model_reasoning_effort": "high"}),
+            None,
+        )]
+    );
     Ok(())
 }
 
@@ -713,15 +971,15 @@ writable_roots = [{}]
 
     let managed_path_str = managed_path.display().to_string();
 
-    let mut mcp = TestAppServer::new_with_env(
-        codex_home.path(),
-        &[(
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .with_env_overrides(&[(
             "CODEX_APP_SERVER_MANAGED_CONFIG_PATH",
             Some(&managed_path_str),
-        )],
-    )
-    .await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+        )])
+        .build_initialized_with_timeout(DEFAULT_READ_TIMEOUT)
+        .await?;
 
     let request_id = mcp
         .send_config_read_request(ConfigReadParams {
@@ -729,16 +987,11 @@ writable_roots = [{}]
             cwd: None,
         })
         .await?;
-    let resp: JSONRPCResponse = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
-    )
-    .await??;
     let ConfigReadResponse {
         config,
         origins,
         layers,
-    } = to_response(resp)?;
+    } = timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(request_id)).await??;
 
     assert_eq!(config.model.as_deref(), Some("gpt-system"));
     assert_eq!(
@@ -809,8 +1062,11 @@ model = "gpt-old"
 "#,
     )?;
 
-    let mut mcp = TestAppServer::new(&codex_home).await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(&codex_home)
+        .without_auto_env()
+        .build_initialized_with_timeout(DEFAULT_READ_TIMEOUT)
+        .await?;
 
     let read_id = mcp
         .send_config_read_request(ConfigReadParams {
@@ -818,12 +1074,8 @@ model = "gpt-old"
             cwd: None,
         })
         .await?;
-    let read_resp: JSONRPCResponse = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(read_id)),
-    )
-    .await??;
-    let read: ConfigReadResponse = to_response(read_resp)?;
+    let read: ConfigReadResponse =
+        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(read_id)).await??;
     let expected_version = read.origins.get("model").map(|m| m.version.clone());
 
     let write_id = mcp
@@ -835,12 +1087,8 @@ model = "gpt-old"
             expected_version,
         })
         .await?;
-    let write_resp: JSONRPCResponse = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(write_id)),
-    )
-    .await??;
-    let write: ConfigWriteResponse = to_response(write_resp)?;
+    let write: ConfigWriteResponse =
+        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(write_id)).await??;
     let expected_file_path = AbsolutePathBuf::resolve_path_against_base("config.toml", codex_home);
 
     assert_eq!(write.status, WriteStatus::Ok);
@@ -853,12 +1101,8 @@ model = "gpt-old"
             cwd: None,
         })
         .await?;
-    let verify_resp: JSONRPCResponse = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(verify_id)),
-    )
-    .await??;
-    let verify: ConfigReadResponse = to_response(verify_resp)?;
+    let verify: ConfigReadResponse =
+        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(verify_id)).await??;
     assert_eq!(verify.config.model.as_deref(), Some("gpt-new"));
 
     Ok(())
@@ -870,8 +1114,11 @@ async fn config_value_write_updates_desktop_settings() -> Result<()> {
     let codex_home = temp_dir.path().canonicalize()?;
     write_config(&temp_dir, "")?;
 
-    let mut mcp = TestAppServer::new(&codex_home).await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(&codex_home)
+        .without_auto_env()
+        .build_initialized_with_timeout(DEFAULT_READ_TIMEOUT)
+        .await?;
 
     let write_id = mcp
         .send_config_value_write_request(ConfigValueWriteParams {
@@ -882,12 +1129,8 @@ async fn config_value_write_updates_desktop_settings() -> Result<()> {
             expected_version: None,
         })
         .await?;
-    let write_resp: JSONRPCResponse = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(write_id)),
-    )
-    .await??;
-    let write: ConfigWriteResponse = to_response(write_resp)?;
+    let write: ConfigWriteResponse =
+        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(write_id)).await??;
     assert_eq!(write.status, WriteStatus::Ok);
 
     let read_id = mcp
@@ -896,12 +1139,8 @@ async fn config_value_write_updates_desktop_settings() -> Result<()> {
             cwd: None,
         })
         .await?;
-    let read_resp: JSONRPCResponse = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(read_id)),
-    )
-    .await??;
-    let read: ConfigReadResponse = to_response(read_resp)?;
+    let read: ConfigReadResponse =
+        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(read_id)).await??;
     let desktop = read.config.desktop.expect("desktop settings present");
     assert_eq!(desktop.get("appearanceTheme"), Some(&json!("dark")));
 
@@ -919,8 +1158,11 @@ model = "gpt-old"
 "#,
     )?;
 
-    let mut mcp = TestAppServer::new(&codex_home).await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(&codex_home)
+        .without_auto_env()
+        .build_initialized_with_timeout(DEFAULT_READ_TIMEOUT)
+        .await?;
 
     let write_id = mcp
         .send_config_value_write_request(ConfigValueWriteParams {
@@ -938,20 +1180,12 @@ model = "gpt-old"
         })
         .await?;
 
-    let write_resp: JSONRPCResponse = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(write_id)),
-    )
-    .await??;
-    let write: ConfigWriteResponse = to_response(write_resp)?;
+    let write: ConfigWriteResponse =
+        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(write_id)).await??;
     assert_eq!(write.status, WriteStatus::Ok);
 
-    let read_resp: JSONRPCResponse = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(read_id)),
-    )
-    .await??;
-    let read: ConfigReadResponse = to_response(read_resp)?;
+    let read: ConfigReadResponse =
+        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(read_id)).await??;
     assert_eq!(read.config.model.as_deref(), Some("gpt-new"));
 
     Ok(())
@@ -967,8 +1201,11 @@ model = "gpt-old"
 "#,
     )?;
 
-    let mut mcp = TestAppServer::new(codex_home.path()).await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .build_initialized_with_timeout(DEFAULT_READ_TIMEOUT)
+        .await?;
 
     let write_id = mcp
         .send_config_value_write_request(ConfigValueWriteParams {
@@ -1002,8 +1239,11 @@ async fn config_batch_write_applies_multiple_edits() -> Result<()> {
     let codex_home = tmp_dir.path().canonicalize()?;
     write_config(&tmp_dir, "")?;
 
-    let mut mcp = TestAppServer::new(&codex_home).await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(&codex_home)
+        .without_auto_env()
+        .build_initialized_with_timeout(DEFAULT_READ_TIMEOUT)
+        .await?;
 
     let writable_root = test_tmp_path_buf();
     let batch_id = mcp
@@ -1028,12 +1268,8 @@ async fn config_batch_write_applies_multiple_edits() -> Result<()> {
             reload_user_config: false,
         })
         .await?;
-    let batch_resp: JSONRPCResponse = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(batch_id)),
-    )
-    .await??;
-    let batch_write: ConfigWriteResponse = to_response(batch_resp)?;
+    let batch_write: ConfigWriteResponse =
+        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(batch_id)).await??;
     assert_eq!(batch_write.status, WriteStatus::Ok);
     let expected_file_path = AbsolutePathBuf::resolve_path_against_base("config.toml", codex_home);
     assert_eq!(batch_write.file_path, expected_file_path);
@@ -1044,12 +1280,8 @@ async fn config_batch_write_applies_multiple_edits() -> Result<()> {
             cwd: None,
         })
         .await?;
-    let read_resp: JSONRPCResponse = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(read_id)),
-    )
-    .await??;
-    let read: ConfigReadResponse = to_response(read_resp)?;
+    let read: ConfigReadResponse =
+        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(read_id)).await??;
     assert_eq!(read.config.sandbox_mode, Some(SandboxMode::WorkspaceWrite));
     let sandbox = read
         .config
@@ -1074,8 +1306,11 @@ model = "gpt-5.3-spark"
 "#,
     )?;
 
-    let mut mcp = TestAppServer::new(&codex_home).await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(&codex_home)
+        .without_auto_env()
+        .build_initialized_with_timeout(DEFAULT_READ_TIMEOUT)
+        .await?;
 
     let batch_id = mcp
         .send_config_batch_write_request(ConfigBatchWriteParams {
@@ -1130,8 +1365,11 @@ async fn config_batch_write_updates_multiple_desktop_settings() -> Result<()> {
     let codex_home = tmp_dir.path().canonicalize()?;
     write_config(&tmp_dir, "")?;
 
-    let mut mcp = TestAppServer::new(&codex_home).await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(&codex_home)
+        .without_auto_env()
+        .build_initialized_with_timeout(DEFAULT_READ_TIMEOUT)
+        .await?;
 
     let batch_id = mcp
         .send_config_batch_write_request(ConfigBatchWriteParams {
@@ -1155,12 +1393,8 @@ async fn config_batch_write_updates_multiple_desktop_settings() -> Result<()> {
             reload_user_config: false,
         })
         .await?;
-    let batch_resp: JSONRPCResponse = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(batch_id)),
-    )
-    .await??;
-    let batch_write: ConfigWriteResponse = to_response(batch_resp)?;
+    let batch_write: ConfigWriteResponse =
+        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(batch_id)).await??;
     assert_eq!(batch_write.status, WriteStatus::Ok);
 
     let read_id = mcp
@@ -1169,12 +1403,8 @@ async fn config_batch_write_updates_multiple_desktop_settings() -> Result<()> {
             cwd: None,
         })
         .await?;
-    let read_resp: JSONRPCResponse = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(read_id)),
-    )
-    .await??;
-    let read: ConfigReadResponse = to_response(read_resp)?;
+    let read: ConfigReadResponse =
+        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(read_id)).await??;
     let desktop = read.config.desktop.expect("desktop settings present");
     assert_eq!(desktop.get("selected-avatar-id"), Some(&json!("codex")));
     assert_eq!(

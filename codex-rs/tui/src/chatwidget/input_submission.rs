@@ -24,12 +24,10 @@ impl ChatWidget {
     fn submit_shell_command(&mut self, command: &str) -> QueueDrain {
         let cmd = command.trim();
         if cmd.is_empty() {
-            self.app_event_tx.send(AppEvent::InsertHistoryCell(Box::new(
-                history_cell::new_info_event(
-                    USER_SHELL_COMMAND_HELP_TITLE.to_string(),
-                    Some(USER_SHELL_COMMAND_HELP_HINT.to_string()),
-                ),
-            )));
+            self.add_to_history(history_cell::new_info_event(
+                USER_SHELL_COMMAND_HELP_TITLE.to_string(),
+                Some(USER_SHELL_COMMAND_HELP_HINT.to_string()),
+            ));
             QueueDrain::Continue
         } else {
             self.submit_op(AppCommand::run_user_shell_command(cmd.to_string()));
@@ -101,6 +99,9 @@ impl ChatWidget {
         history_record: UserMessageHistoryRecord,
         shell_escape_policy: ShellEscapePolicy,
     ) -> (bool, Option<AppCommand>) {
+        if self.misalignment_policy_violation {
+            return (false, None);
+        }
         if !self.is_session_configured() {
             tracing::warn!("cannot submit user message before session is configured; queueing");
             self.input_queue
@@ -137,40 +138,6 @@ impl ChatWidget {
             );
             return (false, None);
         }
-
-        // Local shell commands never contact a model and do not require provider credentials.
-        if shell_escape_policy == ShellEscapePolicy::Allow
-            && let Some(stripped) = user_message.text.strip_prefix('!')
-        {
-            let app_command =
-                match self.submit_shell_command_with_history(stripped, &user_message.text) {
-                    QueueDrain::Continue => None,
-                    QueueDrain::Stop => Some(AppCommand::run_user_shell_command(
-                        stripped.trim().to_string(),
-                    )),
-                };
-            return (app_command.is_some(), app_command);
-        }
-
-        let submission_model = self.effective_collaboration_mode().model().to_string();
-        if self.model_runtime.is_some() && !submission_model.trim().is_empty() {
-            if self.approved_submission_model.as_deref() == Some(submission_model.as_str()) {
-                self.approved_submission_model = None;
-            } else {
-                self.approved_submission_model = None;
-                self.pending_ready_submission = Some(PendingReadySubmission {
-                    user_message,
-                    history_record,
-                    shell_escape_policy,
-                });
-                self.app_event_tx
-                    .send(AppEvent::CheckModelReadyForSubmission {
-                        model: submission_model,
-                    });
-                return (true, None);
-            }
-        }
-
         let UserMessage {
             text,
             local_images,
@@ -181,6 +148,19 @@ impl ChatWidget {
 
         let render_in_history = !self.turn_lifecycle.agent_turn_running;
         let mut items: Vec<UserInput> = Vec::new();
+
+        // Special-case: "!cmd" executes a local shell command instead of sending to the model.
+        if shell_escape_policy == ShellEscapePolicy::Allow
+            && let Some(stripped) = text.strip_prefix('!')
+        {
+            let app_command = match self.submit_shell_command_with_history(stripped, &text) {
+                QueueDrain::Continue => None,
+                QueueDrain::Stop => Some(AppCommand::run_user_shell_command(
+                    stripped.trim().to_string(),
+                )),
+            };
+            return (app_command.is_some(), app_command);
+        }
 
         for image_url in &remote_image_urls {
             items.push(UserInput::Image {
@@ -224,14 +204,12 @@ impl ChatWidget {
                     .strip_prefix("skill://")
                     .unwrap_or(binding.path.as_str());
                 let path = Path::new(path);
-                if let Some(skill) = skills
-                    .iter()
-                    .find(|skill| skill.path_to_skills_md.as_path() == path)
-                    && selected_skill_paths.insert(skill.path_to_skills_md.clone())
+                if let Some(skill) = skills.iter().find(|skill| skill.path.as_path() == path)
+                    && selected_skill_paths.insert(skill.path.clone())
                 {
                     items.push(UserInput::Skill {
                         name: skill.name.clone(),
-                        path: skill.path_to_skills_md.to_path_buf(),
+                        path: skill.path.to_path_buf(),
                     });
                 }
             }
@@ -239,13 +217,13 @@ impl ChatWidget {
             let skill_mentions = find_skill_mentions_with_tool_mentions(&mentions, skills);
             for skill in skill_mentions {
                 if bound_names.contains(skill.name.as_str())
-                    || !selected_skill_paths.insert(skill.path_to_skills_md.clone())
+                    || !selected_skill_paths.insert(skill.path.clone())
                 {
                     continue;
                 }
                 items.push(UserInput::Skill {
                     name: skill.name.clone(),
-                    path: skill.path_to_skills_md.to_path_buf(),
+                    path: skill.path.to_path_buf(),
                 });
             }
         }
@@ -371,6 +349,25 @@ impl ChatWidget {
             collaboration_mode,
             personality,
         );
+        let submitted_message = UserMessage {
+            text,
+            local_images,
+            remote_image_urls,
+            text_elements,
+            mention_bindings,
+        };
+
+        // App-event submissions are handled serially, and turn/start can wait on remote work.
+        // Queue the optimistic prompt first so the user's input is visible while that happens.
+        // Direct submissions do not share that queue, so keep their existing failure behavior.
+        let render_before_submit =
+            render_in_history && matches!(&self.codex_op_target, CodexOpTarget::AppEvent);
+        if render_before_submit {
+            self.on_user_message_display(user_message_display_for_history(
+                submitted_message.clone(),
+                &history_record,
+            ));
+        }
 
         if !self.submit_op(op.clone()) {
             return (false, None);
@@ -381,7 +378,8 @@ impl ChatWidget {
 
         // Persist the submitted text to cross-session message history. Mentions are encoded into
         // placeholder syntax so recall can reconstruct the mention bindings in a future session.
-        let encoded_mentions = mention_bindings
+        let encoded_mentions = submitted_message
+            .mention_bindings
             .iter()
             .map(|binding| LinkedMention {
                 sigil: binding.sigil,
@@ -390,8 +388,11 @@ impl ChatWidget {
             })
             .collect::<Vec<_>>();
         let history_text = match &history_record {
-            UserMessageHistoryRecord::UserMessageText if !text.is_empty() => {
-                Some(encode_history_mentions(&text, &encoded_mentions))
+            UserMessageHistoryRecord::UserMessageText if !submitted_message.text.is_empty() => {
+                Some(encode_history_mentions(
+                    &submitted_message.text,
+                    &encoded_mentions,
+                ))
             }
             UserMessageHistoryRecord::Override(history) if !history.text.is_empty() => {
                 Some(encode_history_mentions(&history.text, &encoded_mentions))
@@ -411,58 +412,17 @@ impl ChatWidget {
         }
 
         if render_in_history {
-            self.record_cancel_edit_candidate(UserMessage {
-                text: text.clone(),
-                local_images: local_images.clone(),
-                remote_image_urls: remote_image_urls.clone(),
-                text_elements: text_elements.clone(),
-                mention_bindings: mention_bindings.clone(),
-            });
-        }
-
-        // Show replayable user content in conversation history.
-        let display_user_message = render_in_history.then(|| {
-            user_message_display_for_history(
-                UserMessage {
-                    text,
-                    local_images,
-                    remote_image_urls,
-                    text_elements,
-                    mention_bindings,
-                },
-                &history_record,
-            )
-        });
-        if let Some(display) = display_user_message {
-            self.on_user_message_display(display);
+            self.safety_buffering_prompt = Some(submitted_message.clone());
+            if !render_before_submit {
+                self.on_user_message_display(user_message_display_for_history(
+                    submitted_message,
+                    &history_record,
+                ));
+            }
         }
 
         self.transcript.needs_final_message_separator = false;
         (true, Some(op))
-    }
-
-    pub(crate) fn resume_model_ready_submission(&mut self, model: String) {
-        let Some(pending) = self.pending_ready_submission.take() else {
-            return;
-        };
-        self.approved_submission_model = Some(model);
-        let _ = self.submit_user_message_with_history_and_shell_escape_policy(
-            pending.user_message,
-            pending.history_record,
-            pending.shell_escape_policy,
-        );
-    }
-
-    pub(crate) fn reject_model_ready_submission(&mut self, message: String) {
-        self.approved_submission_model = None;
-        if let Some(pending) = self.pending_ready_submission.take() {
-            let user_message =
-                user_message_for_restore(pending.user_message, &pending.history_record);
-            self.restore_user_message_to_composer(user_message);
-        }
-        if !message.is_empty() {
-            self.add_error_message(message);
-        }
     }
 
     /// Restore the blocked submission draft without losing mention resolution state.

@@ -19,11 +19,14 @@ impl ChatWidget {
         self.set_skills(/*skills*/ None);
         self.session_network_proxy = session.network_proxy.clone();
         let previous_thread_id = self.thread_id;
+        let connector_scope_changed = previous_thread_id != Some(session.thread_id)
+            || self.config.cwd.as_path() != session.cwd.as_path();
         self.thread_id = Some(session.thread_id);
         self.bottom_pane
             .set_queue_submissions(/*queue_submissions*/ false);
         if previous_thread_id != self.thread_id {
             self.review.recent_auto_review_denials = RecentAutoReviewDenials::default();
+            self.clear_thread_usage_state();
         }
         self.refresh_plan_mode_nudge();
         self.turn_lifecycle.reset_thread();
@@ -36,6 +39,9 @@ impl ChatWidget {
         self.current_rollout_path = session.rollout_path.clone();
         self.current_cwd = Some(session.cwd.to_path_buf());
         self.config.cwd = session.cwd.clone();
+        if connector_scope_changed {
+            self.invalidate_connector_scope();
+        }
         let runtime_workspace_roots = session.runtime_workspace_roots.clone();
         self.config.workspace_roots = runtime_workspace_roots.clone();
         self.config
@@ -83,6 +89,9 @@ impl ChatWidget {
             Some(session.reasoning_effort.clone()),
             /*developer_instructions*/ None,
         );
+        if session.reasoning_effort == Some(ReasoningEffortConfig::Ultra) {
+            self.set_plan_mode_reasoning_effort(Some(ReasoningEffortConfig::Ultra));
+        }
         match session.collaboration_mode.as_deref() {
             Some(collaboration_mode) => {
                 self.set_effective_collaboration_mode(collaboration_mode.clone());
@@ -100,6 +109,9 @@ impl ChatWidget {
                 self.refresh_plan_mode_nudge();
             }
         }
+        let effort = self.effective_reasoning_effort();
+        self.bottom_pane
+            .set_active_reasoning_effort_baseline(effort.as_ref());
         self.refresh_model_display();
         self.refresh_status_surfaces();
         self.sync_service_tier_commands();
@@ -108,7 +120,10 @@ impl ChatWidget {
         self.sync_goal_command_enabled();
         self.refresh_plugin_mentions();
         let model_for_header = self.current_model().to_string();
-        if display == SessionConfiguredDisplay::Normal {
+        if matches!(
+            display,
+            SessionConfiguredDisplay::Normal | SessionConfiguredDisplay::PromptEdit
+        ) {
             let startup_tooltip_override = self.startup_tooltip_override.take();
             let show_fast_status = self
                 .should_show_fast_status(&model_for_header, self.effective_service_tier.as_deref());
@@ -133,21 +148,14 @@ impl ChatWidget {
         }
         self.transcript.saw_copy_source_this_turn = false;
         self.refresh_skills_for_current_cwd(/*force_reload*/ true);
-        if self.connectors_enabled() {
-            self.prefetch_connectors();
-        }
-        if display == SessionConfiguredDisplay::Normal {
-            if let Some(warning) = self.startup_model_warning.take() {
-                self.add_info_message(warning, /*hint*/ None);
-            }
-            if std::mem::take(&mut self.startup_model_picker_pending) {
-                self.model_runtime_onboarding_active = true;
-                self.set_initial_user_message_submit_suppressed(true);
-                self.app_event_tx
-                    .send(AppEvent::BeginModelRuntimeOnboarding);
-            }
-        }
+        self.refresh_connector_mentions(/*force_refresh*/ false);
+        let initial_user_message_pending = self.initial_user_message.is_some();
         self.submit_initial_user_message_if_pending();
+        if self.mcp_startup_status.is_none()
+            && (!initial_user_message_pending || self.is_user_turn_pending_or_running())
+        {
+            self.maybe_send_next_queued_input();
+        }
         if display == SessionConfiguredDisplay::Normal
             && let Some(forked_from_id) = forked_from_id
         {
@@ -174,6 +182,16 @@ impl ChatWidget {
             session,
             SessionConfiguredDisplay::Quiet,
             /*fork_parent_title*/ None,
+        );
+    }
+
+    pub(crate) fn handle_prompt_edit_thread_session(&mut self, session: ThreadSessionState) {
+        self.instruction_source_paths = session.instruction_source_paths.clone();
+        let fork_parent_title = session.fork_parent_title.clone();
+        self.on_session_configured_with_display_and_fork_parent_title(
+            session,
+            SessionConfiguredDisplay::PromptEdit,
+            fork_parent_title,
         );
     }
 
@@ -213,6 +231,17 @@ impl ChatWidget {
             ]
             .into()
         };
+        self.app_event_tx.send(AppEvent::InsertHistoryCell(Box::new(
+            PlainHistoryCell::new(vec![line]),
+        )));
+    }
+
+    pub(crate) fn emit_prompt_edit_thread_event(&mut self) {
+        let line: Line<'static> = vec![
+            "• ".dim(),
+            "You’re continuing from this point in a new conversation".into(),
+        ]
+        .into();
         self.app_event_tx.send(AppEvent::InsertHistoryCell(Box::new(
             PlainHistoryCell::new(vec![line]),
         )));

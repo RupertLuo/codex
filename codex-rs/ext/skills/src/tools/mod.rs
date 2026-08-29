@@ -1,8 +1,21 @@
+use std::collections::HashMap;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::Hash;
+use std::hash::Hasher;
 use std::sync::Arc;
 
+use codex_analytics::AnalyticsEventsClient;
+use codex_analytics::InvocationType;
+use codex_analytics::SkillInvocation;
+use codex_analytics::SkillInvocationLocation;
+use codex_analytics::build_track_events_context;
+use codex_exec_server::FileSystemSandboxContext;
+use codex_extension_api::ExtensionData;
 use codex_extension_api::FunctionCallError;
 use codex_extension_api::JsonToolOutput;
 use codex_extension_api::ResponsesApiTool;
+use codex_extension_api::SelectedPluginSnapshot;
+use codex_extension_api::ThreadOriginator;
 use codex_extension_api::ToolCall;
 use codex_extension_api::ToolExecutor;
 use codex_extension_api::ToolName;
@@ -18,13 +31,17 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value;
+use tokio::sync::OnceCell;
 
 use crate::catalog::SkillAuthority;
 use crate::catalog::SkillCatalog;
 use crate::catalog::SkillCatalogEntry;
 use crate::catalog::SkillSourceKind;
 use crate::provider::SkillListQuery;
+use crate::provider::attribute_executor_plugins;
+use crate::shadow_selection_experiment::ShadowSelectionExperiment;
 use crate::sources::SkillProviders;
+use crate::state::SkillsSessionState;
 use crate::state::SkillsThreadState;
 
 mod list;
@@ -36,13 +53,39 @@ const MAX_HANDLE_BYTES: usize = 2_048;
 
 pub(crate) fn skill_tools(
     providers: SkillProviders,
-    mcp_resources: Option<Arc<McpResourceClient>>,
-    thread_state: Arc<SkillsThreadState>,
+    session_store: &ExtensionData,
+    thread_store: &ExtensionData,
+    executor_query: Option<SkillListQuery>,
+    selected_plugins: Option<Arc<SelectedPluginSnapshot>>,
+    sandbox_contexts: Option<Arc<HashMap<String, FileSystemSandboxContext>>>,
+    shadow_selection: Arc<ShadowSelectionExperiment>,
 ) -> Vec<Arc<dyn ToolExecutor<ToolCall>>> {
+    let Some(thread_state) = thread_store.get::<SkillsThreadState>() else {
+        return Vec::new();
+    };
+    let orchestrator_available =
+        providers.has_orchestrator_provider() && thread_state.orchestrator_skills_enabled();
+    if !orchestrator_available
+        && executor_query.is_none()
+        && providers.custom_provider_kinds().is_empty()
+    {
+        return Vec::new();
+    }
+    let mcp_resources = session_store
+        .get::<SkillsSessionState>()
+        .and_then(|state| state.mcp_resources.clone());
+    let analytics = SkillAnalytics::from_stores(session_store, thread_store);
     let context = SkillToolContext {
         providers,
         mcp_resources,
         thread_state,
+        analytics,
+        orchestrator_available,
+        executor_query,
+        selected_plugins,
+        sandbox_contexts,
+        executor_catalog: Arc::new(OnceCell::new()),
+        shadow_selection,
     };
     vec![
         Arc::new(list::ListTool {
@@ -53,155 +96,228 @@ pub(crate) fn skill_tools(
 }
 
 #[derive(Clone)]
+pub(crate) struct SkillAnalytics {
+    client: AnalyticsEventsClient,
+    thread_id: String,
+    product_client_id: String,
+}
+
+impl SkillAnalytics {
+    pub(crate) fn from_stores(
+        session_store: &ExtensionData,
+        thread_store: &ExtensionData,
+    ) -> Option<Self> {
+        let client = session_store.get::<AnalyticsEventsClient>()?;
+        let originator = thread_store.get::<ThreadOriginator>()?;
+
+        Some(Self {
+            client: client.as_ref().clone(),
+            thread_id: thread_store.level_id().to_string(),
+            product_client_id: originator.0.clone(),
+        })
+    }
+
+    pub(crate) fn track_skill_invocation(
+        &self,
+        skill: &SkillCatalogEntry,
+        model: String,
+        turn_id: String,
+        invocation_type: InvocationType,
+    ) {
+        self.client.track_skill_invocations(
+            build_track_events_context(
+                model,
+                self.thread_id.clone(),
+                turn_id,
+                self.product_client_id.clone(),
+            ),
+            vec![SkillInvocation {
+                skill_name: skill.name.clone(),
+                location: SkillInvocationLocation::Resource {
+                    id: skill.main_prompt.as_str().to_string(),
+                    skill_id: skill.canonical_skill_id.clone(),
+                    scope: skill.analytics_scope,
+                },
+                plugin_id: skill.plugin_id.clone(),
+                remote_plugin_id: None,
+                invocation_type,
+            }],
+        );
+    }
+}
+
+#[derive(Clone)]
 struct SkillToolContext {
     providers: SkillProviders,
     mcp_resources: Option<Arc<McpResourceClient>>,
     thread_state: Arc<SkillsThreadState>,
+    analytics: Option<SkillAnalytics>,
+    orchestrator_available: bool,
+    executor_query: Option<SkillListQuery>,
+    selected_plugins: Option<Arc<SelectedPluginSnapshot>>,
+    sandbox_contexts: Option<Arc<HashMap<String, FileSystemSandboxContext>>>,
+    executor_catalog: Arc<OnceCell<SkillCatalog>>,
+    shadow_selection: Arc<ShadowSelectionExperiment>,
 }
 
 impl SkillToolContext {
-    async fn catalog(&self, turn_id: &str, authority: SkillToolAuthority) -> SkillCatalog {
-        match authority.kind.as_str() {
-            "orchestrator" => {
-                let generation = self
-                    .mcp_resources
-                    .as_ref()
-                    .map(|client| client.capture_generation());
+    async fn catalog(&self, turn_id: &str, authority: &SkillToolAuthoritySelector) -> SkillCatalog {
+        match authority.source_kind() {
+            Some(SkillSourceKind::Orchestrator) => {
+                if !self.orchestrator_available {
+                    return SkillCatalog::default();
+                }
                 self.thread_state
                     .orchestrator_catalog_snapshot(
-                        generation.as_ref(),
-                        self.providers.list_orchestrator_for_turn(SkillListQuery {
+                        &self.providers,
+                        SkillListQuery {
                             turn_id: turn_id.to_string(),
                             executor_roots: Vec::new(),
+                            resolved_executor_roots: Vec::new(),
                             host_snapshot: None,
                             include_host_skills: false,
                             include_bundled_skills: false,
                             include_orchestrator_skills: true,
                             mcp_resources: self.mcp_resources.clone(),
-                            mcp_resource_generation: generation.clone(),
-                        }),
+                            executor_capability_discovery: None,
+                        },
                     )
                     .await
             }
-            "custom" => {
-                self.providers
-                    .list_all_custom_for_turn(SkillListQuery {
-                        turn_id: turn_id.to_string(),
-                        executor_roots: Vec::new(),
-                        host_snapshot: None,
-                        include_host_skills: false,
-                        include_bundled_skills: false,
-                        include_orchestrator_skills: false,
-                        mcp_resources: self.mcp_resources.clone(),
-                        mcp_resource_generation: None,
-                    })
+            Some(SkillSourceKind::Executor) => {
+                let Some(mut query) = self.executor_query.clone() else {
+                    return SkillCatalog::default();
+                };
+                query.turn_id = turn_id.to_string();
+                let mut catalog = self
+                    .executor_catalog
+                    .get_or_init(|| self.providers.list_executor_for_turn(query))
                     .await
+                    .clone();
+                if let Some(selected_plugins) = &self.selected_plugins {
+                    attribute_executor_plugins(&mut catalog, selected_plugins);
+                }
+                catalog
             }
-            custom_kind => {
-                let kind = SkillSourceKind::Custom(custom_kind.to_string());
+            Some(SkillSourceKind::Custom(kind)) => {
                 self.providers
                     .list_custom_for_turn(
+                        &kind,
                         SkillListQuery {
                             turn_id: turn_id.to_string(),
                             executor_roots: Vec::new(),
+                            resolved_executor_roots: Vec::new(),
                             host_snapshot: None,
                             include_host_skills: false,
                             include_bundled_skills: false,
                             include_orchestrator_skills: false,
                             mcp_resources: self.mcp_resources.clone(),
-                            mcp_resource_generation: None,
+                            executor_capability_discovery: None,
                         },
-                        &kind,
                     )
                     .await
             }
+            Some(SkillSourceKind::Host) | None => SkillCatalog::default(),
         }
+    }
+
+    fn authority_selectors(&self) -> Vec<SkillToolAuthoritySelector> {
+        let mut selectors = vec![
+            SkillToolAuthoritySelector::new("orchestrator"),
+            SkillToolAuthoritySelector::new("executor"),
+        ];
+        selectors.extend(
+            self.providers
+                .custom_provider_kinds()
+                .into_iter()
+                .filter(|kind| is_bounded_handle(kind, MAX_HANDLE_BYTES))
+                .map(SkillToolAuthoritySelector::new),
+        );
+        selectors
     }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-#[schemars(deny_unknown_fields)]
-pub(crate) struct SkillToolAuthority {
+struct SkillToolAuthoritySelector {
     kind: String,
 }
 
+impl SkillToolAuthoritySelector {
+    fn new(kind: impl Into<String>) -> Self {
+        Self { kind: kind.into() }
+    }
+
+    fn source_kind(&self) -> Option<SkillSourceKind> {
+        match self.kind.as_str() {
+            "orchestrator" => Some(SkillSourceKind::Orchestrator),
+            "executor" => Some(SkillSourceKind::Executor),
+            "host" => None,
+            kind if is_bounded_handle(kind, MAX_HANDLE_BYTES) => {
+                Some(SkillSourceKind::Custom(kind.to_string()))
+            }
+            _ => None,
+        }
+    }
+
+    fn validate(&self) -> Result<(), FunctionCallError> {
+        validate_handle("authority.kind", &self.kind, MAX_HANDLE_BYTES)?;
+        if self.kind == "host" {
+            return Err(FunctionCallError::RespondToModel(
+                "host skills are read from the filesystem and are not available through skills.list"
+                    .to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn matches(&self, authority: &SkillAuthority) -> bool {
+        self.source_kind().as_ref() == Some(&authority.kind)
+    }
+
+    fn uses_external_context(&self) -> bool {
+        self.kind != "executor"
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, Hash, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SkillToolAuthority {
+    kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    id: Option<String>,
+}
+
 impl SkillToolAuthority {
+    fn selector(&self) -> SkillToolAuthoritySelector {
+        SkillToolAuthoritySelector::new(self.kind.clone())
+    }
+
     pub(crate) fn from_authority(authority: &SkillAuthority) -> Option<Self> {
         match &authority.kind {
             SkillSourceKind::Orchestrator if authority.id == CODEX_APPS_MCP_SERVER_NAME => {
                 Some(Self {
                     kind: "orchestrator".to_string(),
+                    id: None,
                 })
             }
+            SkillSourceKind::Executor => Some(Self {
+                kind: "executor".to_string(),
+                id: Some(authority.id.clone()),
+            }),
             SkillSourceKind::Custom(kind)
-                if authority.id == *kind && is_bounded_handle(kind, MAX_HANDLE_BYTES) =>
+                if !matches!(kind.as_str(), "host" | "executor" | "orchestrator")
+                    && is_bounded_handle(kind, MAX_HANDLE_BYTES) =>
             {
-                Some(Self { kind: kind.clone() })
+                Some(Self {
+                    kind: kind.clone(),
+                    id: (authority.id != *kind).then(|| authority.id.clone()),
+                })
             }
-            SkillSourceKind::Host
-            | SkillSourceKind::Executor
-            | SkillSourceKind::Orchestrator
-            | SkillSourceKind::Custom(_) => None,
+            SkillSourceKind::Host | SkillSourceKind::Orchestrator | SkillSourceKind::Custom(_) => {
+                None
+            }
         }
-    }
-
-    fn to_authority(&self) -> Result<SkillAuthority, FunctionCallError> {
-        validate_handle("authority.kind", &self.kind, MAX_HANDLE_BYTES)?;
-        match self.kind.as_str() {
-            "orchestrator" => Ok(SkillAuthority::new(
-                SkillSourceKind::Orchestrator,
-                CODEX_APPS_MCP_SERVER_NAME,
-            )),
-            "file" => Err(FunctionCallError::RespondToModel(
-                "skills.read cannot read file-backed skills; expand the listed skill-root alias and read the resulting SKILL.md with a filesystem tool"
-                    .to_string(),
-            )),
-            "host" | "executor" => Err(FunctionCallError::RespondToModel(
-                "skills tools do not support host or executor authorities".to_string(),
-            )),
-            custom_kind => Ok(SkillAuthority::new(
-                SkillSourceKind::Custom(custom_kind.to_string()),
-                custom_kind,
-            )),
-        }
-    }
-
-    fn matches_authority(&self, authority: &SkillAuthority) -> bool {
-        match self.kind.as_str() {
-            "custom" => matches!(
-                &authority.kind,
-                SkillSourceKind::Custom(kind) if authority.id == *kind
-            ),
-            _ => Self::from_authority(authority).as_ref() == Some(self),
-        }
-    }
-
-    pub(crate) fn kind(&self) -> &str {
-        &self.kind
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct SkillToolAddress {
-    pub(crate) authority: SkillToolAuthority,
-    pub(crate) package: String,
-    pub(crate) main_resource: String,
-}
-
-impl SkillToolAddress {
-    pub(crate) fn from_entry(entry: &SkillCatalogEntry) -> Option<Self> {
-        let authority = SkillToolAuthority::from_authority(&entry.authority)?;
-        if !is_bounded_handle(&entry.id.0, MAX_HANDLE_BYTES)
-            || !is_bounded_handle(entry.main_prompt.as_str(), MAX_HANDLE_BYTES)
-        {
-            return None;
-        }
-        Some(Self {
-            authority,
-            package: entry.id.0.clone(),
-            main_resource: entry.main_prompt.as_str().to_string(),
-        })
     }
 }
 
@@ -252,9 +368,51 @@ fn is_bounded_handle(value: &str, max_bytes: usize) -> bool {
     !value.is_empty() && value.len() <= max_bytes && !value.chars().any(char::is_control)
 }
 
-fn external_json_output<T: Serialize>(value: &T) -> Result<Box<dyn ToolOutput>, FunctionCallError> {
+fn pagination_cursor(value: &(impl Hash + ?Sized), offset: usize) -> String {
+    format!("{:016x}:{offset}", value_fingerprint(value))
+}
+
+fn parse_pagination_cursor(
+    cursor: Option<&str>,
+    value: &(impl Hash + ?Sized),
+    tool: &str,
+) -> Result<usize, FunctionCallError> {
+    let Some(cursor) = cursor else {
+        return Ok(0);
+    };
+    let invalid = || FunctionCallError::RespondToModel(format!("{tool} cursor is invalid"));
+    let (fingerprint, offset) = cursor.split_once(':').ok_or_else(invalid)?;
+    if u64::from_str_radix(fingerprint, 16).ok() != Some(value_fingerprint(value)) {
+        return Err(FunctionCallError::RespondToModel(format!(
+            "{tool} cursor is stale; restart from the first page"
+        )));
+    }
+    offset.parse::<usize>().map_err(|_| invalid())
+}
+
+fn value_fingerprint(value: &(impl Hash + ?Sized)) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    value.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn serialized_len(value: &impl Serialize) -> Result<usize, FunctionCallError> {
+    serde_json::to_vec(value)
+        .map(|value| value.len())
+        .map_err(|err| FunctionCallError::Fatal(err.to_string()))
+}
+
+fn skill_json_output<T: Serialize>(
+    value: &T,
+    authority: &SkillToolAuthoritySelector,
+) -> Result<Box<dyn ToolOutput>, FunctionCallError> {
     let value = serde_json::to_value(value).map_err(|err| {
         FunctionCallError::Fatal(format!("failed to serialize tool output: {err}"))
     })?;
-    Ok(Box::new(JsonToolOutput::new(value).with_external_context()))
+    let output = JsonToolOutput::new(value);
+    Ok(if authority.uses_external_context() {
+        Box::new(output.with_external_context())
+    } else {
+        Box::new(output)
+    })
 }

@@ -1,4 +1,3 @@
-use crate::AppServerRpcTransportContext;
 use crate::message_processor::ConnectionSessionState;
 use crate::outgoing_message::OutgoingEnvelope;
 use codex_app_server_protocol::ExperimentalApi;
@@ -62,34 +61,6 @@ impl ConnectionState {
     }
 }
 
-pub(crate) fn extension_transport_context(
-    origin: ConnectionOrigin,
-    transport: &AppServerTransport,
-    auth: &auth::AppServerWebsocketAuthSettings,
-) -> AppServerRpcTransportContext {
-    match origin {
-        ConnectionOrigin::Stdio => AppServerRpcTransportContext::Stdio,
-        ConnectionOrigin::InProcess => AppServerRpcTransportContext::InProcess,
-        ConnectionOrigin::RemoteControl => AppServerRpcTransportContext::RemoteControl,
-        ConnectionOrigin::WebSocket => match transport {
-            AppServerTransport::UnixSocket { .. } => AppServerRpcTransportContext::UnixSocket,
-            AppServerTransport::WebSocket { bind_address } if bind_address.ip().is_loopback() => {
-                AppServerRpcTransportContext::LoopbackWebSocket {
-                    authenticated: auth.config.is_some(),
-                }
-            }
-            AppServerTransport::WebSocket { .. } if auth.config.is_some() => {
-                AppServerRpcTransportContext::AuthenticatedWebSocket
-            }
-            AppServerTransport::WebSocket { .. }
-            | AppServerTransport::Stdio
-            | AppServerTransport::Off => AppServerRpcTransportContext::LoopbackWebSocket {
-                authenticated: false,
-            },
-        },
-    }
-}
-
 pub(crate) struct OutboundConnectionState {
     pub(crate) initialized: Arc<AtomicBool>,
     pub(crate) experimental_api_enabled: Arc<AtomicBool>,
@@ -136,15 +107,15 @@ fn should_skip_notification_for_connection(
         return false;
     };
     match message {
-        OutgoingMessage::AppServerNotification(notification) => {
-            if notification.experimental_reason().is_some()
+        OutgoingMessage::AppServerNotification(envelope) => {
+            if envelope.notification.experimental_reason().is_some()
                 && !connection_state
                     .experimental_api_enabled
                     .load(Ordering::Acquire)
             {
                 return true;
             }
-            let method = notification.to_string();
+            let method = envelope.notification.to_string();
             opted_out_notification_methods.contains(method.as_str())
         }
         _ => false,

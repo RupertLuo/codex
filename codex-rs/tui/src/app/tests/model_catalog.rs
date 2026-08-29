@@ -9,60 +9,23 @@ fn all_model_presets() -> Vec<ModelPreset> {
     crate::test_support::TEST_MODEL_PRESETS.clone()
 }
 
-fn catalog_with_default(default_model: &str) -> Vec<ModelPreset> {
-    catalog_with_models(&[default_model])
-}
-
-fn catalog_with_models(models: &[&str]) -> Vec<ModelPreset> {
-    models
-        .iter()
-        .enumerate()
-        .map(|(index, model)| {
-            let mut preset = all_model_presets()
-                .into_iter()
-                .next()
-                .expect("test model preset");
-            preset.id = (*model).to_string();
-            preset.model = (*model).to_string();
-            preset.display_name = (*model).to_string();
-            preset.is_default = index == 0;
-            preset
-        })
-        .collect()
-}
-
-#[test]
-fn custom_runtime_missing_config_uses_catalog_default_and_opens_picker() {
-    let decision = custom_runtime_startup_model(None, &catalog_with_default("alpha/code-large"));
-    assert_eq!(decision.model, "alpha/code-large");
-    assert!(decision.open_picker);
-    assert!(decision.warning.is_none());
-    assert!(decision.persist_default);
-}
-
-#[test]
-fn custom_runtime_removed_model_warns_and_uses_catalog_default() {
-    let decision = custom_runtime_startup_model(
-        Some("removed/model"),
-        &catalog_with_default("alpha/code-large"),
-    );
-    assert_eq!(decision.model, "alpha/code-large");
-    assert!(decision.open_picker);
-    assert_eq!(
-        decision.warning.as_deref(),
-        Some("The previously selected model removed/model is unavailable. Choose another model.")
-    );
-}
-
-#[test]
-fn custom_runtime_valid_persisted_model_does_not_open_picker() {
-    let decision = custom_runtime_startup_model(
-        Some("beta/chat"),
-        &catalog_with_models(&["alpha/code-large", "beta/chat"]),
-    );
-    assert_eq!(decision.model, "beta/chat");
-    assert!(!decision.open_picker);
-    assert!(!decision.persist_default);
+fn model_presets_with_test_upgrades() -> Vec<ModelPreset> {
+    let mut presets = all_model_presets();
+    for model in ["gpt-5.2", "gpt-5.4"] {
+        let preset = presets
+            .iter_mut()
+            .find(|preset| preset.model == model)
+            .unwrap_or_else(|| panic!("{model} preset present"));
+        preset.upgrade = Some(ModelUpgrade {
+            id: "gpt-5.5".to_string(),
+            migration_config_key: "hide_test_migration_prompt".to_string(),
+            model_link: None,
+            upgrade_copy: None,
+            migration_markdown: None,
+            retirement_at: None,
+        });
+    }
+    presets
 }
 
 fn model_availability_nux_config(shown_count: &[(&str, u32)]) -> ModelAvailabilityNuxConfig {
@@ -96,23 +59,15 @@ fn model_migration_copy_to_plain_text(copy: &crate::model_migration::ModelMigrat
 #[tokio::test]
 async fn model_migration_prompt_only_shows_for_deprecated_models() {
     let seen = BTreeMap::new();
+    let presets = model_presets_with_test_upgrades();
     assert!(should_show_model_migration_prompt(
-        "gpt-5.2",
-        "gpt-5.4",
-        &seen,
-        &all_model_presets()
+        "gpt-5.2", "gpt-5.5", &seen, &presets
     ));
     assert!(should_show_model_migration_prompt(
-        "gpt-5.3-codex",
-        "gpt-5.4",
-        &seen,
-        &all_model_presets()
+        "gpt-5.4", "gpt-5.5", &seen, &presets
     ));
     assert!(!should_show_model_migration_prompt(
-        "gpt-5.3-codex",
-        "gpt-5.3-codex",
-        &seen,
-        &all_model_presets()
+        "gpt-5.4", "gpt-5.4", &seen, &presets
     ));
 }
 
@@ -142,7 +97,7 @@ fn select_model_availability_nux_picks_only_eligible_model() {
 }
 
 #[test]
-fn select_model_availability_nux_skips_missing_and_exhausted_models() {
+fn select_model_availability_nux_does_not_fall_back_to_older_announcement() {
     let mut presets = all_model_presets();
     presets.iter_mut().for_each(|preset| {
         preset.availability_nux = None;
@@ -167,13 +122,7 @@ fn select_model_availability_nux_skips_missing_and_exhausted_models() {
         &model_availability_nux_config(&[("gpt-5.4", MODEL_AVAILABILITY_NUX_MAX_SHOW_COUNT)]),
     );
 
-    assert_eq!(
-        selected,
-        Some(StartupTooltipOverride {
-            model_slug: "gpt-5.4-mini".to_string(),
-            message: "gpt-5.4-mini is available".to_string(),
-        })
-    );
+    assert_eq!(selected, None);
 }
 
 #[test]
@@ -357,6 +306,7 @@ async fn model_migration_prompt_skips_when_target_missing_or_hidden() {
         model_link: None,
         upgrade_copy: None,
         migration_markdown: None,
+        retirement_at: None,
     });
     available.retain(|preset| preset.model != "gpt-5.2");
     available.push(current.clone());
@@ -395,16 +345,16 @@ async fn model_migration_prompt_shows_for_hidden_model() {
         .await
         .expect("config");
 
-    let mut available_models = all_model_presets();
+    let mut available_models = model_presets_with_test_upgrades();
     let current = available_models
         .iter_mut()
-        .find(|preset| preset.model == "gpt-5.3-codex")
-        .expect("gpt-5.3-codex preset present");
+        .find(|preset| preset.model == "gpt-5.2")
+        .expect("gpt-5.2 preset present");
     current.show_in_picker = false;
     let current = current.clone();
     assert!(
         !current.show_in_picker,
-        "expected gpt-5.3-codex to be hidden from picker for this test"
+        "expected gpt-5.2 to be hidden from picker for this test"
     );
 
     let upgrade = current.upgrade.as_ref().expect("upgrade configured");
