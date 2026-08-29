@@ -104,6 +104,9 @@ async fn models_client_hits_models_endpoint() {
             auto_review_model_override: None,
             tool_mode: None,
             multi_agent_version: None,
+            supports_incremental_requests: false,
+            relocates_tool_output_images: false,
+            max_request_body_bytes: None,
         }],
     };
 

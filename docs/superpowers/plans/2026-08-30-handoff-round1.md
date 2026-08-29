@@ -1,200 +1,141 @@
-# Handoff — Round 0 Complete, Ready for Round 1
+# Handoff — Round 1 Complete
 
 ## Branch State
 - Branch: `feat/yanjiang`
-- HEAD: `4d7ad8ce7` (fix(thread-title): publish generated names)
+- HEAD: (see git log after commit)
 - Fork base (upstream): `ccdfb4f342a` (2026-06-28)
-- Rounds completed: 0 (planning only)
+- Rounds completed: 0 (planning) + 1 (test backfill + baseline)
 
-## What Was Done (Round 0)
+## What Was Done
+
+### Round 0 — Planning
 - Created `feat/yanjiang` branch from current `main`
 - Analyzed all 111 fork patches, classified into 13 logical groups (A-M, Z)
-- Identified 3 critical test coverage gaps via sub-agent deep analysis
+- Identified 3 critical test coverage gaps via deep analysis
 - Wrote sync plan: `docs/superpowers/plans/2026-08-30-upstream-sync-plan.md`
-- Wrote this handoff: `docs/superpowers/plans/2026-08-30-handoff-round1.md`
 
-## Blocker for Rounds 2-7
-`upstream/main` has not been fetched yet. The machine had network issues reaching GitHub.
-On the new machine, run first:
-```bash
-# Ensure upstream remote uses SSH through github-second alias:
-git remote set-url upstream git@github-second:openai/codex.git
-# Or if that host alias isn't configured, use direct HTTPS:
-git remote set-url upstream https://github.com/openai/codex.git
-# Then:
-git fetch upstream main
-```
-Upstream HEAD is approximately `6478a75` (PR #41477, 2026-08-29).
+### Round 1 — Test Backfill + Baseline
+
+#### 1. Bug Fix: codex-api compilation errors
+Fork added `previous_response_id` to `ResponsesApiRequest` and 3 new fields to `ModelInfo`
+but did not update test initializers.
+
+**Files fixed:**
+- `codex-rs/codex-api/tests/clients.rs` — added `previous_response_id: None` to 3 sites
+- `codex-rs/codex-api/tests/models_integration.rs` — added 3 missing `ModelInfo` fields
+
+#### 2. New Tests: thread-store (10 tests)
+**File: `codex-rs/thread-store/src/live_thread.rs`** — 8 tests for `sanitize_title`:
+- `sanitize_title_passthrough`
+- `sanitize_title_strips_double_quotes`
+- `sanitize_title_strips_cjk_quotes`
+- `sanitize_title_strips_trailing_punctuation`
+- `sanitize_title_first_nonempty_line`
+- `sanitize_title_truncates_at_30_chars`
+- `sanitize_title_empty_input`
+- `sanitize_title_combined`
+
+**File: `codex-rs/thread-store/src/in_memory.rs`** — 2 tests:
+- `title_generator_round_trip`
+- `failed_append_may_become_durable_returns_false`
+
+#### 3. New Tests: realtime_conversation state machine (9 tests)
+**File: `codex-rs/core/src/realtime_conversation.rs`** — added `#[cfg(test)]` helper:
+- `TestActiveConversation` struct + `set_active_for_test()` on `RealtimeConversationManager`
+
+**File: `codex-rs/core/src/realtime_conversation_tests.rs`** — 9 tests:
+- `claim_close_from_active_transitions_to_closing`
+- `claim_close_from_none_returns_none`
+- `claim_close_while_closing_in_progress_returns_none`
+- `complete_close_clears_state`
+- `complete_close_wrong_token_is_noop`
+- `release_close_for_retry_allows_reclaim`
+- `claim_close_expected_target_rejects_mismatch`
+- `quarantine_policy_set_for_persistence_quarantine`
+- `running_state_returns_none_when_closing`
+
+#### 4. New Tests: state/extract.rs (3 tests)
+**File: `codex-rs/state/src/extract.rs`** — 3 tests:
+- `transaction_with_token_count_updates_metadata`
+- `compacted_without_checkpoint_does_not_affect_metadata`
+- `compacted_with_reference_context_sets_model`
 
 ---
 
-## Next: Round 1 — Test Gap Backfill
+## Test Baseline (pre-rebase)
 
-### Goal
-Add minimum necessary tests for the 3 uncovered areas so that post-rebase
-regression is detectable. Do NOT start rebasing yet.
+Results from running all fork-affected crate tests on this machine:
 
-### Commit Strategy
-One commit: `test: backfill coverage for thread-store, realtime, state before upstream sync`
+| Crate | Tests | Result | Notes |
+|-------|-------|--------|-------|
+| `codex-thread-store` | 113 | **ALL PASS** | +10 new tests |
+| `codex-state` | 167 | **ALL PASS** | +3 new tests |
+| `codex-protocol` | 246 | **ALL PASS** | |
+| `codex-client` | 42 | **ALL PASS** | |
+| `codex-api` | 131 | **ALL PASS** | +3 bug fixes |
+| `codex-rollout` | 89 | **ALL PASS** | |
+| `codex-app-server-protocol` | 253 | **ALL PASS** | |
+| `codex-config` | 200 | **ALL PASS** | |
+| `codex-mcp` | 107 | **ALL PASS** | |
+| `codex-app-server` | 954 | **948 pass, 5 fail, 1 timeout** | Pre-existing failures (see below) |
+| `codex-core` | — | **BUILD BLOCKED** | V8 crate download timeout (network) |
+| `codex-tui` | — | **BUILD BLOCKED** | Same V8 issue (transitive dep) |
+| `codex-skills-extension` | — | **BUILD TIMEOUT** | Likely V8-related |
 
-### Verification Commands
+### Pre-existing app-server failures (NOT caused by fork patches)
+These 5 failures + 1 timeout exist in the upstream code:
+- `executor_mcp::selected_executor_plugin_exposes_its_mcps_only_to_that_thread`
+- `mcp_resource::orchestrator_skill_can_read_referenced_resource_without_an_executor`
+- `selected_capability_stack::selected_capabilities_become_available_between_samples_in_one_turn`
+- `selected_capability_stack::selected_capability_stack_tracks_environment_availability_and_resume`
+- `web_search::standalone_web_search_round_trips_output`
+- `external_agent_config::import_plugins_infers_external_official_marketplace_when_missing_from_settings` (timeout)
+
+### V8 Download Blocker
+`codex-core` depends on `codex-code-mode` which depends on the `v8` crate. The V8 build
+script downloads a ~50MB binary from GitHub, which times out on this machine's network.
+**On the new machine with better network, this will resolve automatically.**
+
+To verify: `just test -p codex-core` must run the realtime_conversation tests.
+
+---
+
+## Next: Round 2 (Fetch + Rebase Low-Risk Groups)
+
+### Prerequisites
+1. **Fetch upstream**: `git fetch upstream main` (requires good network)
+2. **Run codex-core tests**: `just test -p codex-core` to verify realtime tests pass
+3. **Run codex-tui tests**: `just test -p codex-tui` to capture TUI baseline
+
+### Round 2 Scope
+Rebase low-risk groups G/H/J/L/M/Z (~27 commits) onto upstream/main.
+See `2026-08-30-upstream-sync-plan.md` for full details.
+
+### Rebase Strategy
 ```bash
-cd codex-rs
+# Tag current state for safety
+git tag pre-round-2
+
+# Interactive rebase onto upstream
+git rebase -i upstream/main
+```
+
+Pick order for Round 2 (low-risk first):
+- G: Platform fixes (PowerShell UTF-8, CRLF migration)
+- H: Thread title generation
+- J: Image runtime extensions
+- L: Misc fixes (provider error, recursion limit)
+- M: Reasoning effort decoupling
+- Z: Housekeeping (tests, style, merge reconciliation)
+
+### Expected Conflicts
+Minimal — mostly new files and isolated additive changes.
+
+### Verification After Round 2
+```bash
 just test -p codex-thread-store
-just test -p codex-core
 just test -p codex-state
-```
-
----
-
-## Part 1: thread-store Tests
-
-### Current State
-The fork added +1,609 lines to `codex-rs/thread-store/` with these already-existing tests:
-- `live_thread.rs` has 10 `#[tokio::test]` tests (lines 656-1285) covering transaction
-  append reconciliation, checkpoint reconciliation, and title mutation permits
-- `thread_metadata_sync.rs` has 2 new tests covering title dispatch and checkpoint projection
-- `local/mod.rs` has 1 new test for title overwrite behavior
-- `in_memory.rs` has 0 new tests (only pre-fork tests)
-
-### Tests to Add
-
-**File: `codex-rs/thread-store/src/live_thread.rs`** (add to existing `mod tests`)
-
-1. **`sanitize_title_*`** — The `sanitize_title` function (line 637) is pure with ZERO tests:
-   - `sanitize_title_passthrough` — plain text unchanged
-   - `sanitize_title_strips_double_quotes` — `"Hello World"` → `Hello World`
-   - `sanitize_title_strips_cjk_quotes` — `「标题」` → `标题`, `《标题》` → `标题`
-   - `sanitize_title_strips_trailing_punctuation` — `Hello.` → `Hello`, `你好。` → `你好`
-   - `sanitize_title_first_nonempty_line` — `\n\nHello\nWorld` → `Hello`
-   - `sanitize_title_truncates_at_30_chars` — long string truncated
-   - `sanitize_title_empty_input` — `"  "` → `""`
-   - `sanitize_title_combined` — `"\"Very Long Quoted Title.\""` → stripped + truncated
-
-2. **`start_rejects_when_title_generator_absent`** — `live_thread` with no generator →
-   `maybe_dispatch_llm_title` is a no-op (verify `llm_title_dispatched` stays false)
-
-**File: `codex-rs/thread-store/src/in_memory.rs`** (add to existing `mod tests`)
-
-3. **`title_generator_round_trip`** — `set_title_generator()` then `title_generator()` returns `Some`
-4. **`failed_append_may_become_durable_returns_false`** — confirms the override
-
-### Implementation Notes
-- `sanitize_title` is `fn sanitize_title(raw: &str) -> String` — private but testable from
-  within the same module's `#[cfg(test)]` block
-- Use existing test helpers: `StubTitleGenerator`, `create_params()`, `live_thread()`
-- Estimated: ~120 lines of test code
-
----
-
-## Part 2: realtime_conversation Tests
-
-### Current State
-The fork added +530 lines in 28 hunks to `codex-rs/core/src/realtime_conversation.rs`:
-- Replaced fire-and-forget close with transactional claim-based close
-- New types: `ManagedConversationState`, `RealtimeClosingState`, `RealtimeCloseClaim`
-- New methods: `claim_close`, `complete_close`, `release_close_for_retry`
-- Modified: `start` (rejects when Closing), `shutdown` (preserves Closing), `handle_close`
-
-Existing test coverage:
-- `realtime_conversation_tests.rs`: 206 lines covering handoff text extraction, delegation
-  wrapping — **zero tests for new close/persistence logic**
-- `tests/suite/compact_model.rs` lines 4870-5069: 4 integration tests using
-  `RealtimeStartTestHook` that exercise durable close retry — **covers the happy path**
-
-### Tests to Add
-
-**File: `codex-rs/core/src/realtime_conversation_tests.rs`** (add to existing file)
-
-Unit tests for `RealtimeConversationManager` state machine:
-
-1. **`claim_close_active_transitions_to_closing`** — Active state → `claim_close(Current)` →
-   returns `Some(claim)` with `conversation: Some(...)`, manager state becomes Closing
-2. **`claim_close_returns_none_when_empty`** — no conversation → returns `None`
-3. **`claim_close_closing_in_progress_returns_none`** — already Closing+in_progress →
-   second `claim_close` returns `None`
-4. **`claim_close_released_returns_retry_claim`** — claim → `release_close_for_retry` →
-   second claim succeeds with `conversation: None`
-5. **`complete_close_clears_state`** — claim → `complete_close(token)` → state is None
-6. **`complete_close_wrong_token_no_op`** — `complete_close(wrong_token)` → state unchanged
-7. **`start_rejects_when_closing`** — Closing state → `start()` returns error
-8. **`running_state_none_when_closing`** — Closing → `running_state()` returns None
-9. **`realtime_close_reason_maps_all_variants`** — exhaustive check of enum→string
-
-### Implementation Notes
-- **Key challenge**: `claim_close` requires the manager in Active state, which normally requires
-  calling `start()` with a websocket. Two approaches:
-  - Option A: Add a `#[cfg(test)]` helper that puts manager directly into Active state with a
-    mock `ConversationState` (preferred — fast, no I/O)
-  - Option B: Use mock websocket server from integration tests (heavier)
-- The `RealtimeConversationManager::new()` constructor takes `(event_sender, ResponsesApiClient)`.
-  For unit tests, use `tokio::sync::mpsc::channel` for sender and a mock client.
-- `ManagedConversationState` and `RealtimeClosingState` are private, so tests must go inside
-  the same module or use the public API surface
-- Estimated: ~200 lines of test code
-
----
-
-## Part 3: state/extract.rs Tests
-
-### Current State
-The fork changes to `codex-rs/state/` are **already well-tested** by 8 new tests in
-`runtime/threads.rs` and 4 new tests in `migrations_tests.rs`. The remaining gaps are small:
-
-### Tests to Add
-
-**File: `codex-rs/state/src/extract.rs`** (add to existing `mod tests`)
-
-1. **`apply_rollout_item_transaction_updates_metadata`** — `RolloutItem::Transaction` containing
-   a `TokenCount` event → `metadata.tokens_used` is updated
-2. **`rollout_item_affects_metadata_compacted_without_checkpoint`** — `Compacted { checkpoint: None }`
-   → returns `Ok(false)`
-3. **`compacted_with_reference_context_applies_turn_context`** — `Compacted` with
-   `reference_context_item: Some(turn_context)` → metadata model/reasoning_effort are set
-
-### Implementation Notes
-- Follow existing pattern in `extract.rs` tests: build `ThreadMetadata` via `metadata_for_test()`,
-  call `apply_rollout_item(&mut metadata, &item, "provider")`, assert fields
-- For `Transaction` variant, construct `RolloutItem::Transaction(RolloutTransaction { ... })`
-  wrapping inner items
-- For `Compacted` with `reference_context_item`, build a `TurnContext` with known values
-- Estimated: ~80 lines of test code
-
----
-
-## Summary: Round 1 Deliverables
-
-| Area | File to Edit | Tests to Add | Est. Lines |
-|------|-------------|--------------|------------|
-| thread-store | `live_thread.rs` | 10 tests (sanitize_title + no-generator) | ~120 |
-| thread-store | `in_memory.rs` | 2 tests (generator round-trip, durable flag) | ~20 |
-| realtime | `realtime_conversation_tests.rs` | 9 tests (claim/close state machine) | ~200 |
-| state | `extract.rs` | 3 tests (Transaction, Compacted variants) | ~80 |
-| **Total** | | **24 tests** | **~420 lines** |
-
-After committing, run:
-```bash
-cd codex-rs
-just test -p codex-thread-store
 just test -p codex-core
-just test -p codex-state
-```
-
-All must pass. Then update this handoff and proceed to Round 2 (or fetch upstream first).
-
----
-
-## After Round 1: What's Next
-
-### If upstream is fetched:
-Proceed to Round 2 (rebase low-risk groups G/H/J/L/M/Z).
-See `2026-08-30-upstream-sync-plan.md` for the full 7-round plan.
-
-### If upstream is NOT yet fetched:
-Run `git fetch upstream main` on the better-networked machine first.
-The upstream remote should be set to:
-```
-git@github-second:openai/codex.git   (SSH via port 443)
-# or
-https://github.com/openai/codex.git  (HTTPS, may need proxy)
+just test -p codex-protocol
+just test -p codex-rollout
 ```

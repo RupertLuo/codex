@@ -2322,5 +2322,54 @@ fn realtime_close_reason(end: RealtimeConversationEnd) -> &'static str {
 }
 
 #[cfg(test)]
+struct TestActiveConversation {
+    realtime_active: Arc<AtomicBool>,
+    _audio_rx: async_channel::Receiver<RealtimeAudioFrame>,
+    _text_rx: async_channel::Receiver<ConversationTextParams>,
+    _handoff_rx: async_channel::Receiver<RealtimeOutbound>,
+}
+
+#[cfg(test)]
+impl RealtimeConversationManager {
+    /// Put the manager into `Active` state with a minimal [`ConversationState`].
+    fn set_active_for_test(
+        &self,
+        sub_id: &str,
+        session_kind: RealtimeSessionKind,
+    ) -> TestActiveConversation {
+        let (audio_tx, audio_rx) = async_channel::bounded(1);
+        let (text_tx, text_rx) = async_channel::bounded(1);
+        let (handoff_tx, handoff_rx) = async_channel::bounded(1);
+        let realtime_active = Arc::new(AtomicBool::new(true));
+        let handoff = RealtimeHandoffState::new(
+            handoff_tx,
+            /*client_managed_handoffs*/ false,
+            /*codex_responses_as_items*/ false,
+            /*codex_response_item_prefix*/ None,
+            /*codex_response_handoff_prefix*/ None,
+            session_kind,
+        );
+        let state = ConversationState {
+            sub_id: sub_id.to_string(),
+            audio_tx,
+            text_tx,
+            session_kind,
+            handoff,
+            input_task: tokio::spawn(std::future::pending::<()>()),
+            fanout_task: None,
+            realtime_active: Arc::clone(&realtime_active),
+        };
+        *self.state.try_lock().expect("uncontended in test setup") =
+            Some(ManagedConversationState::Active(state));
+        TestActiveConversation {
+            realtime_active,
+            _audio_rx: audio_rx,
+            _text_rx: text_rx,
+            _handoff_rx: handoff_rx,
+        }
+    }
+}
+
+#[cfg(test)]
 #[path = "realtime_conversation_tests.rs"]
 mod tests;

@@ -1282,4 +1282,57 @@ mod tests {
         assert!(!permit_released.load(Ordering::SeqCst));
         assert!(!title_notified.load(Ordering::SeqCst));
     }
+
+    #[test]
+    fn sanitize_title_passthrough() {
+        assert_eq!(sanitize_title("Hello World"), "Hello World");
+    }
+
+    #[test]
+    fn sanitize_title_strips_double_quotes() {
+        assert_eq!(sanitize_title("\"Hello World\""), "Hello World");
+    }
+
+    #[test]
+    fn sanitize_title_strips_cjk_quotes() {
+        assert_eq!(sanitize_title("「标题」"), "标题");
+        assert_eq!(sanitize_title("《标题》"), "标题");
+        assert_eq!(sanitize_title("\u{201c}Title\u{201d}"), "Title");
+    }
+
+    #[test]
+    fn sanitize_title_strips_trailing_punctuation() {
+        assert_eq!(sanitize_title("Hello."), "Hello");
+        assert_eq!(sanitize_title("你好。"), "你好");
+        assert_eq!(sanitize_title("Hello!"), "Hello");
+        assert_eq!(sanitize_title("Test？"), "Test");
+    }
+
+    #[test]
+    fn sanitize_title_first_nonempty_line() {
+        assert_eq!(sanitize_title("\n\nHello\nWorld"), "Hello");
+    }
+
+    #[test]
+    fn sanitize_title_truncates_at_30_chars() {
+        let long = "a".repeat(50);
+        let result = sanitize_title(&long);
+        assert_eq!(result.chars().count(), 30);
+    }
+
+    #[test]
+    fn sanitize_title_empty_input() {
+        assert_eq!(sanitize_title("   "), "");
+        assert_eq!(sanitize_title(""), "");
+    }
+
+    #[test]
+    fn sanitize_title_combined() {
+        // Quoted + trailing punctuation + long
+        let input = "\"This is a very long title that exceeds thirty characters.\"";
+        let result = sanitize_title(input);
+        assert!(!result.starts_with('"'));
+        assert!(!result.ends_with('"'));
+        assert!(result.chars().count() <= 30);
+    }
 }
