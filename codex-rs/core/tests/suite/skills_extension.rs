@@ -1966,7 +1966,7 @@ async fn production_turn_suppresses_only_the_superseded_host_skill_prompt() -> R
                 second_skill_path.display()
             ),
             format!(
-                "<skill>\n<name>first-host</name>\n<path>{provider_resource}</path>\n{provider_contents}\n</skill>"
+                "<skill>\n<name>first-host</name>\n<path>{provider_resource}</path>\n<resource_access>{{\"authority\":{{\"kind\":\"test\"}},\"main_resource\":\"{provider_resource}\",\"package\":\"test/first-host\"}}</resource_access>\n{provider_contents}\n</skill>"
             ),
         ]
     );
