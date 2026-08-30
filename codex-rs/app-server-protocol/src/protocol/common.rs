@@ -1419,6 +1419,11 @@ client_request_definitions! {
     },
 }
 
+/// Returns the complete set of native client request methods.
+pub const fn client_request_methods() -> &'static [&'static str] {
+    ClientRequest::client_request_methods()
+}
+
 /// Generates an `enum ServerRequest` where each variant is a request that the
 /// server can send to the client along with the corresponding params and
 /// response types. It also generates helper types used by the app/server
