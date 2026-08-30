@@ -74,7 +74,18 @@ and provider caches were not touched.
   recorded after installation.
 - v2 also uses the prepared-window CAS path, matching legacy remote compaction.
 - The remaining known gap is `record_rollout_budget_usage` mutating budget state
-  before the history commit; a future failure-aware prepared commit should make
-  that preflight side effect-free or roll it back.
+  before the history commit. The pinned upstream transaction patch preserves
+  this order because the completed provider request has already consumed the
+  shared budget; changing it requires an explicit accounting decision rather
+  than a mechanical transaction migration.
 - Static validation passed with rustfmt and `git diff --check`; tests remain
   blocked by the filesystem capacity gate.
+
+## Follow-up — legacy trace ordering
+
+- Commit: `8fda3806aa` (`fix(core): trace remote compaction after commit`).
+- Legacy remote compaction now records `CompactionCheckpointTracePayload` only
+  after the prepared-window CAS and history/rollout commit succeeds, matching
+  the v2 ordering.
+- A stale window can no longer leave an `installed` trace for history that was
+  never made live.
