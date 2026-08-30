@@ -124,3 +124,15 @@ and provider caches were not touched.
   remaining work is to propagate rollout append errors through compaction and
   add deterministic commit-pause integration coverage.
 - Tests were not executed because the filesystem remains at the capacity gate.
+
+## Follow-up — checked compaction append
+
+- Commit: `6c8e962fdc` (`fix(core): propagate compaction rollout append failures`).
+- Prepared compaction now validates the window, appends the complete compacted
+  rollout batch through a checked API, and only then mutates in-memory history,
+  baseline, and window state.
+- Append errors propagate to the caller instead of being logged and discarded;
+  durable-first ordering keeps cold-resume replay ahead of live-state mutation.
+- The existing non-prepared replacement wrapper intentionally keeps its legacy
+  fire-and-forget behavior for unrelated callers.
+- Static validation passed; Rust tests remain blocked by disk capacity.
