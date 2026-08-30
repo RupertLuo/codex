@@ -7,6 +7,22 @@ Evaluated Catalyst commits `002e7d3643` and `31e648951a` against the
 
 ## Result
 
+The type-erased transport layer has now been ported as an isolated semantic
+step into `codex-http-client`:
+
+* `HttpTransportHandle` lives beside the stable `HttpTransport` trait and is
+  re-exported from `codex-http-client`.
+* It supports cloneable callback-based construction and
+  `from_transport` erasure, with focused execute/stream delegation tests.
+* No `ModelClient`, session, or thread-manager plumbing was added yet; those
+  APIs still require a coordinated migration that preserves route-aware
+  client construction and websocket fallback behavior.
+
+The new module was formatted directly. The repository-wide `just fmt` command
+ran Rust formatting but also reported pre-existing parse failures in
+`core/src/session/turn_context.rs` and `models-manager/src/manager.rs`; the
+optional Python/Bazel formatters are unavailable (`uv`/`dotslash`).
+
 The two commits were not cherry-picked. A `git cherry-pick --no-commit
 002e7d3643` probe was aborted after a conflict in `codex-rs/codex-client/src/lib.rs`.
 The conflict is structural, not a local typo:

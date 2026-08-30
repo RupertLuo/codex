@@ -10,6 +10,7 @@ mod route_aware_client_pool;
 mod route_aware_redirect;
 mod tls_backend_fallback;
 mod transport;
+mod transport_handle;
 
 pub use crate::chatgpt_cloudflare_cookies::with_chatgpt_cloudflare_cookie_store;
 pub use crate::chatgpt_hosts::is_allowed_chatgpt_host;
@@ -57,3 +58,4 @@ pub use crate::transport::ByteStream;
 pub use crate::transport::HttpTransport;
 pub use crate::transport::ReqwestTransport;
 pub use crate::transport::StreamResponse;
+pub use crate::transport_handle::HttpTransportHandle;
