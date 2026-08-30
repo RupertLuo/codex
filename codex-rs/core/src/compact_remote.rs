@@ -29,7 +29,7 @@ use codex_analytics::CompactionReason;
 use codex_analytics::CompactionTrigger;
 use codex_history::ResponseItemEnvelope;
 use codex_protocol::error::CodexErr;
-use codex_protocol::error::Result as CodexResult;
+use codex_protocol::error::{CodexErr, Result as CodexResult};
 use codex_protocol::items::ContextCompactionItem;
 use codex_protocol::items::TurnItem;
 use codex_protocol::models::BaseInstructions;
@@ -265,7 +265,10 @@ async fn run_remote_compact_task_inner_impl(
         new_history,
         trace_input_history,
     } = attempt;
-    let (new_window_number, new_window_ids) = sess.advance_auto_compact_window().await;
+    // Prepare the window transition before processing the replacement history. The CAS-aware
+    // install below commits it only if no concurrent turn has advanced the window meanwhile.
+    let prepared_window = sess.prepare_auto_compact_window().await;
+    let (new_window_number, new_window_ids) = prepared_window;
     let (new_history, world_state_baseline) =
         process_compacted_history(sess.as_ref(), new_history, &initial_context_injection).await;
 
@@ -290,17 +293,24 @@ async fn run_remote_compact_task_inner_impl(
         .into_iter()
         .map(ResponseItemEnvelope::new)
         .collect();
-    sess.replace_compacted_history(
-        new_history,
-        reference_context_item,
-        world_state_baseline,
-        CompactedHistoryMetadata {
-            message: String::new(),
-            window_number: new_window_number,
-            window_ids: new_window_ids,
-        },
-    )
-    .await;
+    let committed = sess
+        .replace_compacted_history_with_prepared_window(
+            new_history,
+            reference_context_item,
+            world_state_baseline,
+            CompactedHistoryMetadata {
+                message: String::new(),
+                window_number: new_window_number,
+                window_ids: new_window_ids,
+            },
+            prepared_window,
+        )
+        .await;
+    if !committed {
+        return Err(CodexErr::Fatal(
+            "compaction window changed before remote commit".to_string(),
+        ));
+    }
     sess.recompute_token_usage(compaction_turn_context).await;
 
     sess.emit_turn_item_completed(compaction_turn_context, compaction_item)
