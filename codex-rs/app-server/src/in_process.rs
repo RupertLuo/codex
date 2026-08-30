@@ -76,6 +76,7 @@ use codex_app_server_protocol::ConfigWarningNotification;
 use codex_app_server_protocol::InitializeParams;
 use codex_app_server_protocol::ItemCompletedNotification;
 use codex_app_server_protocol::JSONRPCErrorError;
+use codex_app_server_protocol::JSONRPCRequest;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::Result;
 use codex_app_server_protocol::ServerNotification;
@@ -108,7 +109,8 @@ const SHUTDOWN_ACK_TIMEOUT: Duration = Duration::from_secs(35);
 /// Default bounded channel capacity for in-process runtime queues.
 pub const DEFAULT_IN_PROCESS_CHANNEL_CAPACITY: usize = CHANNEL_CAPACITY;
 
-type PendingClientRequestResponse = std::result::Result<Result, JSONRPCErrorError>;
+/// Result envelope returned by typed and raw in-process requests.
+pub type PendingClientRequestResponse = std::result::Result<Result, JSONRPCErrorError>;
 
 fn server_notification_requires_delivery(notification: &ServerNotification) -> bool {
     matches!(
@@ -195,6 +197,10 @@ enum InProcessClientMessage {
         request: Box<ClientRequest>,
         response_tx: oneshot::Sender<PendingClientRequestResponse>,
     },
+    RawRequest {
+        request: JSONRPCRequest,
+        response_tx: oneshot::Sender<PendingClientRequestResponse>,
+    },
     Notification {
         notification: ClientNotification,
     },
@@ -213,6 +219,7 @@ enum InProcessClientMessage {
 
 enum ProcessorCommand {
     Request(Box<ClientRequest>),
+    RawRequest(JSONRPCRequest),
     Notification(ClientNotification),
 }
 
@@ -232,6 +239,24 @@ impl InProcessClientSender {
             IoError::new(
                 ErrorKind::BrokenPipe,
                 format!("in-process request response channel closed: {err}"),
+            )
+        })
+    }
+
+    /// Sends a raw JSON-RPC request, including process-local extension methods.
+    pub async fn raw_request(
+        &self,
+        request: JSONRPCRequest,
+    ) -> IoResult<PendingClientRequestResponse> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.try_send_client_message(InProcessClientMessage::RawRequest {
+            request,
+            response_tx,
+        })?;
+        response_rx.await.map_err(|err| {
+            IoError::new(
+                ErrorKind::BrokenPipe,
+                format!("in-process raw request response channel closed: {err}"),
             )
         })
     }
@@ -296,6 +321,14 @@ impl InProcessClientHandle {
     /// ambiguous in the caller.
     pub async fn request(&self, request: ClientRequest) -> IoResult<PendingClientRequestResponse> {
         self.client.request(request).await
+    }
+
+    /// Sends a raw JSON-RPC request, allowing registered process-local extensions.
+    pub async fn raw_request(
+        &self,
+        request: JSONRPCRequest,
+    ) -> IoResult<PendingClientRequestResponse> {
+        self.client.raw_request(request).await
     }
 
     /// Sends a typed client notification into the in-process runtime.
@@ -501,6 +534,7 @@ async fn start_uninitialized(args: InProcessStartArgs) -> IoResult<InProcessClie
             }));
             let mut thread_created_rx = processor.thread_created_receiver();
             let session = Arc::new(ConnectionSessionState::new());
+            let in_process_transport = crate::transport::AppServerTransport::Off;
             let mut listen_for_threads = true;
 
             loop {
@@ -537,6 +571,19 @@ async fn start_uninitialized(args: InProcessStartArgs) -> IoResult<InProcessClie
                                 if !was_initialized && is_initialized {
                                     processor.send_initialize_notifications().await;
                                 }
+                            }
+                            Some(ProcessorCommand::RawRequest(request)) => {
+                                processor
+                                    .process_request(
+                                        IN_PROCESS_CONNECTION_ID,
+                                        request,
+                                        &in_process_transport,
+                                        crate::AppServerRpcContext {
+                                            transport: crate::AppServerRpcTransportContext::InProcess,
+                                        },
+                                        Arc::clone(&session),
+                                    )
+                                    .await;
                             }
                             Some(ProcessorCommand::Notification(notification)) => {
                                 processor.process_client_notification(notification).await;
@@ -602,6 +649,46 @@ async fn start_uninitialized(args: InProcessStartArgs) -> IoResult<InProcessClie
                             }
 
                             match processor_tx.try_send(ProcessorCommand::Request(Box::new(request))) {
+                                Ok(()) => {}
+                                Err(mpsc::error::TrySendError::Full(_)) => {
+                                    if let Some(response_tx) =
+                                        pending_request_responses.remove(&request_id)
+                                    {
+                                        let _ = response_tx.send(Err(JSONRPCErrorError {
+                                            code: OVERLOADED_ERROR_CODE,
+                                            message: "in-process app-server request queue is full"
+                                                .to_string(),
+                                            data: None,
+                                        }));
+                                    }
+                                }
+                                Err(mpsc::error::TrySendError::Closed(_)) => {
+                                    if let Some(response_tx) =
+                                        pending_request_responses.remove(&request_id)
+                                    {
+                                        let _ = response_tx.send(Err(internal_error(
+                                            "in-process app-server request processor is closed",
+                                        )));
+                                    }
+                                    break;
+                                }
+                            }
+                        }
+                        Some(InProcessClientMessage::RawRequest { request, response_tx }) => {
+                            let request_id = request.id.clone();
+                            match pending_request_responses.entry(request_id.clone()) {
+                                Entry::Vacant(entry) => {
+                                    entry.insert(response_tx);
+                                }
+                                Entry::Occupied(_) => {
+                                    let _ = response_tx.send(Err(invalid_request(format!(
+                                        "duplicate request id: {request_id:?}"
+                                    ))));
+                                    continue;
+                                }
+                            }
+
+                            match processor_tx.try_send(ProcessorCommand::RawRequest(request)) {
                                 Ok(()) => {}
                                 Err(mpsc::error::TrySendError::Full(_)) => {
                                     if let Some(response_tx) =
