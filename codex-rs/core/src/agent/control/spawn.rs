@@ -687,6 +687,7 @@ impl AgentControl {
                     inheritance.environments,
                     inheritance.exec_policy,
                     options.environments.clone(),
+                    options.thread_extension_init.clone(),
                 ))
                 .await?
             }
@@ -1048,7 +1049,7 @@ impl AgentControl {
                 subagent_usage_hint_message.into(),
             ));
         }
-        let mut thread_extension_init = ExtensionDataInit::new();
+        let mut thread_extension_init = options.thread_extension_init.clone();
         thread_extension_init.insert(selected_capability_roots);
 
         state
