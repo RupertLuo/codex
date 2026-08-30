@@ -427,7 +427,7 @@ pub struct ModelInfo {
     #[serde(default)]
     pub web_search_tool_type: WebSearchToolType,
     pub truncation_policy: TruncationPolicyConfig,
-     pub supports_parallel_tool_calls: bool,
+    pub supports_parallel_tool_calls: bool,
     /// Whether a request for this model may send only what it adds and name the rest with
     /// `previous_response_id`, instead of the whole conversation every time.
     ///
@@ -436,7 +436,7 @@ pub struct ModelInfo {
     /// measured, including tool calls and images. Defaults to false so a model says so explicitly,
     /// because turning it on means the backend retains the conversation on our behalf.
     #[serde(default)]
-     pub supports_incremental_requests: bool,
+    pub supports_incremental_requests: bool,
     /// Largest request body this model's backend accepts, when it has one worth compacting for.
     ///
     /// Separate from the context window because the two run out at different times: text costs
@@ -444,7 +444,7 @@ pub struct ModelInfo {
     /// thread of sixty screenshots sits comfortably inside a 249k window and is nowhere near
     /// sending inside a 6 MiB body, and only this number can see that.
     #[serde(default)]
-     pub max_request_body_bytes: Option<u64>,
+    pub max_request_body_bytes: Option<u64>,
     #[serde(default)]
     pub supports_image_detail_original: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
