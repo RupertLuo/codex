@@ -191,53 +191,6 @@ impl ThreadMetadataSync {
         self.take_pending_update()
     }
 
-    /// Returns a one-shot LLM title request when the first visible assistant
-    /// message is observed for a thread that already has a first user message.
-    ///
-    /// Subsequent calls return `None` so the best-effort summarizer never runs
-    /// more than once per live thread.
-    pub(crate) fn take_llm_title_request(
-        &mut self,
-        items: &[RolloutItem],
-    ) -> Option<ThreadTitleRequest> {
-        if self.llm_title_dispatched {
-            return None;
-        }
-        let first_user_message = self.first_user_message.clone()?;
-        let items = match self.title_item_flattener.flatten(items) {
-            Ok(items) => items,
-            Err(err) => {
-                tracing::warn!(%err, "failed to traverse appended rollout title state");
-                return None;
-            }
-        };
-        let mut first_assistant_message: Option<String> = None;
-        for item in items {
-            match item {
-                RolloutItem::EventMsg(EventMsg::TurnComplete(event)) => {
-                    if first_assistant_message.is_none()
-                        && let Some(message) = event.last_agent_message.as_deref()
-                        && !message.trim().is_empty()
-                    {
-                        first_assistant_message = Some(message.trim().to_string());
-                    }
-                }
-                RolloutItem::EventMsg(EventMsg::AgentMessage(event))
-                    if first_assistant_message.is_none() && !event.message.trim().is_empty() =>
-                {
-                    first_assistant_message = Some(event.message.trim().to_string());
-                }
-                _ => {}
-            }
-        }
-        let first_assistant_message = first_assistant_message?;
-        self.llm_title_dispatched = true;
-        Some(ThreadTitleRequest {
-            first_user_message,
-            first_assistant_message: Some(first_assistant_message),
-        })
-    }
-
     fn observe_items(&mut self, items: &[RolloutItem]) -> Option<ThreadMetadataPatch> {
         self.observe_items_with_update(
             items,
@@ -461,10 +414,7 @@ mod tests {
     use codex_protocol::models::PermissionProfile;
     use codex_protocol::openai_models::ReasoningEffort;
     use codex_protocol::protocol::AskForApproval;
-    use codex_protocol::protocol::AgentMessageEvent;
     use codex_protocol::protocol::ItemCompletedEvent;
-    use codex_protocol::protocol::CompactedItem;
-    use codex_protocol::protocol::CompactionCheckpoint;
     use codex_protocol::protocol::SessionMeta;
     use codex_protocol::protocol::SessionMetaLine;
     use codex_protocol::protocol::SessionSource;
@@ -549,32 +499,6 @@ mod tests {
 
         sync.mark_pending_update_applied(&update);
         assert!(sync.take_pending_update().is_none());
-    }
-
-    #[test]
-    fn first_visible_agent_message_dispatches_llm_title_once() {
-        let thread_id = ThreadId::new();
-        let mut sync = ThreadMetadataSync::for_resume(&resume_params(
-            thread_id,
-            vec![RolloutItem::EventMsg(EventMsg::UserMessage(user_message(
-                "first user text",
-            )))],
-        ));
-        let item = RolloutItem::EventMsg(EventMsg::AgentMessage(AgentMessageEvent {
-            message: "first visible assistant text".to_string(),
-            phase: None,
-            memory_citation: None,
-        }));
-
-        let request = sync
-            .take_llm_title_request(std::slice::from_ref(&item))
-            .expect("first visible response should trigger a title request");
-        assert_eq!(request.first_user_message, "first user text");
-        assert_eq!(
-            request.first_assistant_message.as_deref(),
-            Some("first visible assistant text")
-        );
-        assert!(sync.take_llm_title_request(&[item]).is_none());
     }
 
     #[test]
