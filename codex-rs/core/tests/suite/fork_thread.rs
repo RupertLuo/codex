@@ -154,6 +154,58 @@ async fn fork_thread_twice_drops_to_first_message() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fork_thread_last_n_turns_keeps_recent_turn() {
+    skip_if_no_network!();
+
+    let server = MockServer::start().await;
+    let response = sse(vec![ev_response_created("resp"), ev_completed("resp")]);
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_raw(response, "text/event-stream"),
+        )
+        .expect(2)
+        .mount(&server)
+        .await;
+
+    let test = test_codex()
+        .build(&server)
+        .await
+        .expect("create conversation");
+    let codex = test.codex.clone();
+    let thread_manager = test.thread_manager.clone();
+    for text in ["first", "second"] {
+        codex
+            .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+                text: text.to_string(),
+                text_elements: Vec::new(),
+            }]))
+            .await
+            .expect("submit user turn");
+        let _ = wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+    }
+
+    let source_path = codex.rollout_path().expect("source rollout path");
+    let NewThread { thread: forked, .. } = thread_manager
+        .fork_thread(
+            ForkSnapshot::LastNTurns(1),
+            test.config.clone(),
+            source_path,
+            /*thread_source*/ None,
+            /*parent_trace*/ None,
+        )
+        .await
+        .expect("fork recent turn");
+    let forked_path = forked.rollout_path().expect("forked rollout path");
+    let serialized =
+        serde_json::to_string(&read_rollout_items(&forked_path)).expect("serialize forked rollout");
+    assert!(serialized.contains("second"));
+    assert!(!serialized.contains("first"));
+}
+
 fn thread_settings_applied_item(snapshot: ThreadSettingsSnapshot) -> RolloutItem {
     RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(
         ThreadSettingsAppliedEvent {
