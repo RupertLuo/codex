@@ -1,3 +1,4 @@
+use std::fmt;
 use std::future::Future;
 use std::sync::Arc;
 
@@ -22,6 +23,14 @@ type StreamFn =
 pub struct HttpTransportHandle {
     execute: Arc<ExecuteFn>,
     stream: Arc<StreamFn>,
+}
+
+impl fmt::Debug for HttpTransportHandle {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("HttpTransportHandle")
+            .finish_non_exhaustive()
+    }
 }
 
 impl HttpTransportHandle {

@@ -46,7 +46,6 @@ use codex_api::RealtimeSessionConfig as ApiRealtimeSessionConfig;
 use codex_api::Reasoning;
 use codex_api::ReasoningContext;
 use codex_api::RequestTelemetry;
-use codex_api::ReqwestTransport;
 use codex_api::ResponseCreateWsRequest;
 use codex_api::ResponsesApiRequest;
 use codex_api::ResponsesClient as ApiResponsesClient;
@@ -66,6 +65,7 @@ use codex_api::create_text_param_for_request;
 use codex_api::response_create_client_metadata;
 use codex_http_client::ClientRouteClass;
 use codex_http_client::HttpClientFactory;
+use codex_http_client::HttpTransportHandle;
 use codex_login::AuthManager;
 use codex_login::CodexAuth;
 use codex_login::RefreshTokenError;
@@ -295,6 +295,7 @@ pub struct ModelClient {
     prompt_cache_key_override: Option<String>,
     free_guardian_enabled: bool,
     http_client_factory: HttpClientFactory,
+    http_transport: Option<HttpTransportHandle>,
 }
 
 /// A turn-scoped streaming session created from a [`ModelClient`].
@@ -548,7 +549,18 @@ impl ModelClient {
             prompt_cache_key_override: None,
             free_guardian_enabled: false,
             http_client_factory,
+            http_transport: None,
         }
+    }
+
+    /// Overrides the HTTP transport used by API endpoints created from this client.
+    ///
+    /// This is intentionally scoped to the model client so tests and embedders can inject a
+    /// transport without changing the route-aware default client factory. WebSocket connections
+    /// continue to use the normal provider-specific path.
+    pub(crate) fn with_http_transport(mut self, transport: HttpTransportHandle) -> Self {
+        self.http_transport = Some(transport);
+        self
     }
 
     pub(crate) fn with_free_guardian_enabled(mut self, free_guardian_enabled: bool) -> Self {
@@ -963,7 +975,7 @@ impl ModelClient {
                     .then_some(ReasoningContext::AllTurns),
             })
         } else {
-                None
+            None
         }
     }
 
@@ -1171,7 +1183,10 @@ impl ModelClient {
         &self,
         api_provider: &ApiProvider,
         endpoint: &str,
-    ) -> Result<ReqwestTransport> {
+    ) -> Result<HttpTransportHandle> {
+        if let Some(transport) = &self.http_transport {
+            return Ok(transport.clone());
+        }
         let request_url = api_provider.url_for_path(endpoint);
         let client = create_client_for_route(
             &self.http_client_factory,
@@ -1179,7 +1194,9 @@ impl ModelClient {
             ClientRouteClass::Api,
         )
         .map_err(std::io::Error::from)?;
-        Ok(ReqwestTransport::from_http_client(client))
+        Ok(HttpTransportHandle::from_transport(
+            codex_api::ReqwestTransport::from_http_client(client),
+        ))
     }
 
     pub(crate) async fn prewarm_auth(&self) -> Result<()> {
