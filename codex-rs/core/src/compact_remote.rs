@@ -28,7 +28,6 @@ use codex_analytics::CompactionPhase;
 use codex_analytics::CompactionReason;
 use codex_analytics::CompactionTrigger;
 use codex_history::ResponseItemEnvelope;
-use codex_protocol::error::CodexErr;
 use codex_protocol::error::{CodexErr, Result as CodexResult};
 use codex_protocol::items::ContextCompactionItem;
 use codex_protocol::items::TurnItem;
