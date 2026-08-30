@@ -1453,5 +1453,9 @@ fn test_remote_model_with_policy(
         comp_hash: None,
         effective_context_window_percent: 95,
         experimental_supported_tools: Vec::new(),
+        supports_incremental_requests: false,
+        relocates_tool_output_images: false,
+        max_request_body_bytes: None,
+        supports_parallel_tool_calls: false,
     }
 }

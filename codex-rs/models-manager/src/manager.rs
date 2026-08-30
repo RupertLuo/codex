@@ -665,6 +665,10 @@ pub(crate) fn construct_model_info_from_candidates(
             slug: model.to_string(),
             used_fallback_model_metadata: false,
             ..remote
+            supports_incremental_requests: false,
+            relocates_tool_output_images: false,
+            max_request_body_bytes: None,
+            supports_parallel_tool_calls: false,
         }
     } else {
         model_info::model_info_from_slug(model)

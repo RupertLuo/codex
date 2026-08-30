@@ -75,6 +75,10 @@ fn preset_to_info(preset: &ModelPreset, priority: i32) -> ModelInfo {
         tool_mode: None,
         multi_agent_version: preset.multi_agent_version,
         multi_agent_reasoning_effort: None,
+        supports_incremental_requests: false,
+        relocates_tool_output_images: false,
+        max_request_body_bytes: None,
+        supports_parallel_tool_calls: false,
     }
 }
 
