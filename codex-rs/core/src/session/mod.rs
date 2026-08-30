@@ -315,6 +315,7 @@ use codex_core_plugins::RecommendedPluginCandidatesInput;
 use codex_git_utils::get_git_repo_root;
 use codex_history::CompactedItem;
 use codex_history::InitialHistory;
+use codex_http_client::HttpTransportHandle;
 use codex_history::ResponseItemEnvelope;
 use codex_mcp::McpConfig;
 use codex_mcp::effective_mcp_servers;
@@ -450,6 +451,7 @@ pub(crate) struct SessionSpawnArgs {
     pub(crate) git_enrichment_policy: GitEnrichmentPolicy,
     pub(crate) windows_sandbox_proxy_settings_mode:
         codex_sandboxing::WindowsSandboxProxySettingsMode,
+    pub(crate) http_transport: Option<HttpTransportHandle>,
 }
 
 pub(crate) fn resolve_multi_agent_version(
@@ -542,6 +544,7 @@ impl Session {
             inherited_multi_agent_version,
             git_enrichment_policy,
             windows_sandbox_proxy_settings_mode,
+            http_transport,
         } = args;
         let (tx_sub, rx_sub) = async_channel::bounded(SUBMISSION_CHANNEL_CAPACITY);
         let (tx_event, rx_event) = async_channel::unbounded();
@@ -785,6 +788,7 @@ impl Session {
             multi_agent_version,
             git_enrichment_policy,
             windows_sandbox_proxy_settings_mode,
+            http_transport,
         ))
         .await
         .map_err(|e| {

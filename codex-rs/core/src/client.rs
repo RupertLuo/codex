@@ -563,6 +563,17 @@ impl ModelClient {
         self
     }
 
+    pub(crate) fn http_transport(&self) -> Option<HttpTransportHandle> {
+        self.http_transport.clone()
+    }
+
+    pub(crate) fn with_http_transport_if_some(
+        self,
+        transport: Option<HttpTransportHandle>,
+    ) -> Self {
+        transport.map_or(self, |transport| self.with_http_transport(transport))
+    }
+
     pub(crate) fn with_free_guardian_enabled(mut self, free_guardian_enabled: bool) -> Self {
         self.free_guardian_enabled = free_guardian_enabled;
         self

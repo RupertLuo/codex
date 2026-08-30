@@ -16,6 +16,7 @@ use crate::shell_snapshot::ShellSnapshot;
 use crate::state::ActiveTurn;
 use codex_extension_api::ExtensionDataInit;
 use codex_http_client::ClientRouteClass;
+use codex_http_client::HttpTransportHandle;
 use codex_http_client::RouteAwareClientPool;
 use codex_login::auth::AgentIdentityAuthPolicy;
 use codex_model_provider::SharedModelProvider;
@@ -652,6 +653,7 @@ impl Session {
         multi_agent_version: Option<MultiAgentVersion>,
         git_enrichment_policy: GitEnrichmentPolicy,
         windows_sandbox_proxy_settings_mode: codex_sandboxing::WindowsSandboxProxySettingsMode,
+        http_transport: Option<HttpTransportHandle>,
     ) -> anyhow::Result<Arc<Self>> {
         debug!(
             "Configuring session: model={}; provider={:?}",
@@ -1421,6 +1423,7 @@ impl Session {
                     attestation_provider,
                     config.http_client_factory(),
                 )
+                .with_http_transport_if_some(http_transport)
                 .with_free_guardian_enabled(config.free_guardian_enabled())
                 .with_prompt_cache_key_override(
                     crate::guardian::prompt_cache_key_override_for_review_session(

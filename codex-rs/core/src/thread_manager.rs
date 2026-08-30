@@ -37,6 +37,7 @@ use codex_features::Feature;
 use codex_history::InitialHistory;
 use codex_history::ResumedHistory;
 use codex_history::RolloutItem;
+use codex_http_client::HttpTransportHandle;
 use codex_login::AuthManager;
 use codex_login::CodexAuth;
 use codex_login::default_client::CODEX_INTERNAL_ORIGINATOR_OVERRIDE_ENV_VAR;
@@ -225,6 +226,15 @@ pub struct ThreadManager {
     _test_codex_home_guard: Option<TempCodexHomeGuard>,
 }
 
+/// Runtime-only dependencies propagated to newly spawned sessions.
+///
+/// These options are intentionally separate from persisted configuration. They allow hosts and
+/// tests to provide process-local transports without changing the `ThreadManager::new` contract.
+#[derive(Clone, Default)]
+pub struct ThreadManagerRuntimeOptions {
+    pub http_transport: Option<HttpTransportHandle>,
+}
+
 pub struct StartThreadOptions {
     pub config: Config,
     pub allow_provider_model_fallback: bool,
@@ -362,6 +372,7 @@ pub(crate) struct ThreadManagerState {
     analytics_events_client: Option<AnalyticsEventsClient>,
     // Captures submitted ops for testing purpose when test mode is enabled.
     ops_log: Option<SharedCapturedOps>,
+    runtime_options: ThreadManagerRuntimeOptions,
 }
 
 pub fn build_models_manager(
@@ -490,9 +501,19 @@ impl ThreadManager {
                 analytics_events_client,
                 ops_log: should_use_test_thread_manager_behavior()
                     .then(|| Arc::new(std::sync::Mutex::new(Vec::new()))),
+                runtime_options: ThreadManagerRuntimeOptions::default(),
             }),
             _test_codex_home_guard: None,
         }
+    }
+
+    /// Configure process-local dependencies used when creating future sessions.
+    pub fn with_runtime_options(mut self, options: ThreadManagerRuntimeOptions) -> Self {
+        let Some(state) = Arc::get_mut(&mut self.state) else {
+            unreachable!("runtime options must be set before thread manager is shared");
+        };
+        state.runtime_options = options;
+        self
     }
 
     /// Generate every new thread identifier with the caller-provided factory.
@@ -639,6 +660,7 @@ impl ThreadManager {
                 analytics_events_client: None,
                 ops_log: should_use_test_thread_manager_behavior()
                     .then(|| Arc::new(std::sync::Mutex::new(Vec::new()))),
+                runtime_options: ThreadManagerRuntimeOptions::default(),
             }),
             _test_codex_home_guard: None,
         }
@@ -2012,6 +2034,7 @@ impl ThreadManagerState {
             inherited_multi_agent_version: multi_agent_version,
             git_enrichment_policy: GitEnrichmentPolicy::Fresh,
             windows_sandbox_proxy_settings_mode,
+            http_transport: self.runtime_options.http_transport.clone(),
         }))
         .await?;
         // Enable Full Access form input only after session startup so a required MCP server cannot
