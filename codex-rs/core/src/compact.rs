@@ -47,6 +47,7 @@ use codex_protocol::models::ResponseInputItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::RawResponseCompletedEvent;
+use codex_protocol::protocol::RateLimitSnapshot;
 use codex_protocol::protocol::TurnStartedEvent;
 use codex_protocol::protocol::WarningEvent;
 use codex_protocol::user_input::UserInput;
@@ -326,7 +327,19 @@ async fn run_compact_task_inner_impl(
         .await;
 
         match attempt_result {
-            Ok(()) => {
+            Ok(attempt) => {
+                // Only install model output and response-side state after the stream completed.
+                // A cancelled or failed compaction must not contaminate the live history that the
+                // next retry uses as its baseline.
+                if !attempt.items.is_empty() {
+                    sess.record_conversation_items(turn_context, &attempt.items).await;
+                }
+                if let Some(included) = attempt.server_reasoning_included {
+                    sess.set_server_reasoning_included(included).await;
+                }
+                if let Some(snapshot) = attempt.rate_limits {
+                    sess.update_rate_limits(turn_context, snapshot).await;
+                }
                 break;
             }
             Err(err)
@@ -440,6 +453,12 @@ async fn run_compact_task_inner_impl(
     });
     sess.send_event(&turn_context, warning).await;
     Ok(summary_suffix)
+}
+
+struct CompletedCompactAttempt {
+    items: Vec<ResponseItem>,
+    server_reasoning_included: Option<bool>,
+    rate_limits: Option<RateLimitSnapshot>,
 }
 
 pub(crate) struct CompactionAnalyticsAttempt {
@@ -783,7 +802,12 @@ async fn drain_to_completed(
     client_session: &mut ModelClientSession,
     responses_metadata: &CodexResponsesMetadata,
     prompt: &Prompt,
-) -> CodexResult<()> {
+) -> CodexResult<CompletedCompactAttempt> {
+    let mut completed = CompletedCompactAttempt {
+        items: Vec::new(),
+        server_reasoning_included: None,
+        rate_limits: None,
+    };
     let mut stream = client_session
         .stream(
             prompt,
@@ -807,14 +831,13 @@ async fn drain_to_completed(
         };
         match event {
             Ok(ResponseEvent::OutputItemDone(item)) => {
-                sess.record_conversation_items(turn_context, std::slice::from_ref(&item))
-                    .await;
+                completed.items.push(item);
             }
             Ok(ResponseEvent::ServerReasoningIncluded(included)) => {
-                sess.set_server_reasoning_included(included).await;
+                completed.server_reasoning_included = Some(included);
             }
             Ok(ResponseEvent::RateLimits(snapshot)) => {
-                sess.update_rate_limits(turn_context, snapshot).await;
+                completed.rate_limits = Some(snapshot);
             }
             Ok(ResponseEvent::Completed {
                 response_id,
@@ -833,7 +856,7 @@ async fn drain_to_completed(
                 .await;
                 sess.update_token_usage_info(turn_context, token_usage.as_ref())
                     .await?;
-                return Ok(());
+                return Ok(completed);
             }
             Ok(_) => continue,
             Err(e) => return Err(e),
