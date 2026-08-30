@@ -89,3 +89,17 @@ and provider caches were not touched.
   the v2 ordering.
 - A stale window can no longer leave an `installed` trace for history that was
   never made live.
+
+## Follow-up — local completion and usage boundary
+
+- Commit: `ecf56172e9` (`fix(core): defer local compact usage until commit`).
+- Local compact attempts now return summary and response completion metadata;
+  output items are used to derive the summary but are not recorded as live
+  conversation items before replacement-history CAS.
+- `RawResponseCompleted`, server-reasoning, rate limits, and provider token
+  state are applied only after the history commit. A dedicated token updater
+  avoids calling rollout-budget accounting twice; budget is recorded once when
+  the provider request completes, before history commit, matching upstream
+  resource-accounting semantics.
+- Static validation: rustfmt and `git diff --check` passed. Tests remain
+  blocked by the filesystem capacity gate.
