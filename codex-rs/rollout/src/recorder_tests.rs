@@ -1539,6 +1539,7 @@ fn fill_missing_thread_item_metadata_preserves_identity_and_prefers_state_git_fi
                 .expect("valid git remote URL"),
         ),
         source: None,
+        thread_source: None,
         history_mode: Default::default(),
         parent_thread_id: None,
         agent_nickname: None,
@@ -1568,6 +1569,9 @@ fn fill_missing_thread_item_metadata_preserves_identity_and_prefers_state_git_fi
                 .expect("valid git remote URL"),
         ),
         source: Some(SessionSource::Exec),
+        thread_source: Some(ThreadSource::Feature(
+            "catalyst:quickstart:industry-report".to_string(),
+        )),
         history_mode: Default::default(),
         parent_thread_id: None,
         agent_nickname: Some("state-agent".to_string()),
