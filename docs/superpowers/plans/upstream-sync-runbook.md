@@ -56,6 +56,9 @@ registry/git 缓存、Bazel output/cache，以及 rusty-v8 归档。测试和构
 crate。若 tmpfs 不足，应停止并保留失败原因，不要让 Cargo 自动回写根盘或修改
 `Cargo.lock`；将意外的 lockfile 改写恢复后再继续。
 
+离线模式只能作为快速缓存完整性探针：它应在缺少 git checkout 时快速失败，不能被
+当作测试通过或源码回归。确认依赖齐全后，再在有足够磁盘的环境中执行正常联网测试。
+
 建议恢复环境后的最小检查顺序：
 
 ```text
