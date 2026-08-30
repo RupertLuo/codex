@@ -69,6 +69,11 @@ just --version && cargo nextest --version && cargo insta --version
 bazel --version                         # 应解析到 Bazel 9.x
 ```
 
+如果宿主机默认 `python3` 低于 3.10，应在运行 `just` 前把任务专用 Python
+放在 `PATH` 前面（例如 `PATH=/tmp/codex-python/bin:$PATH`）。`just fmt` 还会调用
+仓库要求的 `dotslash` 和 `uv`；缺失时应记录 formatter 阶段阻塞，不能把只完成
+Rust rustfmt 误报为完整格式化通过。
+
 安装命令需在可写的用户环境执行；若使用 CI 或容器，优先复用仓库 CI 中
 已固定版本的安装 action，而不是依赖宿主机的漂移版本。
 
