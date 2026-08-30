@@ -34,6 +34,7 @@ use codex_context_fragments::AnnotatedContent;
 use codex_context_fragments::set_annotated_content;
 use codex_history::CodexHarnessMetadata;
 use codex_history::ResponseItemEnvelope;
+use codex_protocol::ResponseUsageMetadata;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::CodexErrorDetails;
 use codex_protocol::error::Result as CodexResult;
@@ -46,8 +47,9 @@ use codex_protocol::models::InternalChatMessageMetadataPassthrough;
 use codex_protocol::models::ResponseInputItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::EventMsg;
-use codex_protocol::protocol::RawResponseCompletedEvent;
 use codex_protocol::protocol::RateLimitSnapshot;
+use codex_protocol::protocol::RawResponseCompletedEvent;
+use codex_protocol::protocol::TokenUsage;
 use codex_protocol::protocol::TurnStartedEvent;
 use codex_protocol::protocol::WarningEvent;
 use codex_protocol::user_input::UserInput;
@@ -305,7 +307,7 @@ async fn run_compact_task_inner_impl(
             CodexResponsesRequestKind::Compaction(compaction_metadata),
         );
 
-    loop {
+    let completed_attempt = loop {
         // Clone is required because of the loop
         let turn_input = history
             .clone()
@@ -317,8 +319,6 @@ async fn run_compact_task_inner_impl(
             ..Default::default()
         };
         let attempt_result = drain_to_completed(
-            &sess,
-            turn_context.as_ref(),
             compact_turn_context.as_ref(),
             &mut compact_client_session,
             &responses_metadata,
@@ -328,19 +328,15 @@ async fn run_compact_task_inner_impl(
 
         match attempt_result {
             Ok(attempt) => {
-                // Only install model output and response-side state after the stream completed.
-                // A cancelled or failed compaction must not contaminate the live history that the
-                // next retry uses as its baseline.
-                if !attempt.items.is_empty() {
-                    sess.record_conversation_items(turn_context, &attempt.items).await;
+                if let Some(token_usage) = attempt.token_usage.as_ref()
+                    && let Err(e) = sess.record_rollout_budget_usage(token_usage)
+                {
+                    sess.track_turn_codex_error(turn_context.as_ref(), &e);
+                    let event = EventMsg::Error(e.to_error_event(/*message_prefix*/ None));
+                    sess.send_event(&turn_context, event).await;
+                    return Err(e);
                 }
-                if let Some(included) = attempt.server_reasoning_included {
-                    sess.set_server_reasoning_included(included).await;
-                }
-                if let Some(snapshot) = attempt.rate_limits {
-                    sess.update_rate_limits(turn_context, snapshot).await;
-                }
-                break;
+                break attempt;
             }
             Err(err)
                 if matches!(
@@ -392,12 +388,11 @@ async fn run_compact_task_inner_impl(
                 }
             }
         }
-    }
+    };
 
     let history_snapshot = sess.clone_history().await;
     let history_items = history_snapshot.annotated_items();
-    let summary_suffix =
-        get_last_assistant_message_from_turn(history_snapshot.raw_items()).unwrap_or_default();
+    let summary_suffix = completed_attempt.summary_suffix.clone();
     let summary_text = format!("{SUMMARY_PREFIX}\n{summary_suffix}");
     let user_messages = collect_annotated_user_messages(history_items);
 
@@ -424,22 +419,39 @@ async fn run_compact_task_inner_impl(
     };
     let committed = sess
         .replace_compacted_history_with_prepared_window(
-        new_history,
-        reference_context_item,
-        world_state_baseline,
-        CompactedHistoryMetadata {
-            message: summary_text,
-            window_number,
-            window_ids,
-        },
-        prepared_window,
-    )
-    .await;
+            new_history,
+            reference_context_item,
+            world_state_baseline,
+            CompactedHistoryMetadata {
+                message: summary_text,
+                window_number,
+                window_ids,
+            },
+            prepared_window,
+        )
+        .await;
     if !committed {
         return Err(CodexErr::Fatal(
             "compaction window changed before commit".to_string(),
         ));
     }
+    sess.send_event(
+        turn_context.as_ref(),
+        EventMsg::RawResponseCompleted(RawResponseCompletedEvent {
+            response_id: completed_attempt.response_id,
+            token_usage: completed_attempt.token_usage.clone(),
+            usage_metadata: completed_attempt.usage_metadata,
+        }),
+    )
+    .await;
+    if let Some(included) = completed_attempt.server_reasoning_included {
+        sess.set_server_reasoning_included(included).await;
+    }
+    for snapshot in completed_attempt.rate_limits {
+        sess.update_rate_limits(turn_context, snapshot).await;
+    }
+    sess.update_compaction_token_usage_info(turn_context, completed_attempt.token_usage.as_ref())
+        .await?;
     sess.clear_http_incremental_baseline().await;
     if let Some(active_client_session) = active_client_session {
         active_client_session.clear_incremental_baseline();
@@ -456,9 +468,12 @@ async fn run_compact_task_inner_impl(
 }
 
 struct CompletedCompactAttempt {
-    items: Vec<ResponseItem>,
+    summary_suffix: String,
+    response_id: String,
+    token_usage: Option<TokenUsage>,
+    usage_metadata: Option<ResponseUsageMetadata>,
     server_reasoning_included: Option<bool>,
-    rate_limits: Option<RateLimitSnapshot>,
+    rate_limits: Vec<RateLimitSnapshot>,
 }
 
 pub(crate) struct CompactionAnalyticsAttempt {
@@ -796,18 +811,14 @@ fn build_compacted_history_with_limit(
 }
 
 async fn drain_to_completed(
-    sess: &Session,
-    turn_context: &TurnContext,
     compact_turn_context: &TurnContext,
     client_session: &mut ModelClientSession,
     responses_metadata: &CodexResponsesMetadata,
     prompt: &Prompt,
 ) -> CodexResult<CompletedCompactAttempt> {
-    let mut completed = CompletedCompactAttempt {
-        items: Vec::new(),
-        server_reasoning_included: None,
-        rate_limits: None,
-    };
+    let mut output_items = Vec::new();
+    let mut server_reasoning_included = None;
+    let mut rate_limits = Vec::new();
     let mut stream = client_session
         .stream(
             prompt,
@@ -831,13 +842,13 @@ async fn drain_to_completed(
         };
         match event {
             Ok(ResponseEvent::OutputItemDone(item)) => {
-                completed.items.push(item);
+                output_items.push(item);
             }
             Ok(ResponseEvent::ServerReasoningIncluded(included)) => {
-                completed.server_reasoning_included = Some(included);
+                server_reasoning_included = Some(included);
             }
             Ok(ResponseEvent::RateLimits(snapshot)) => {
-                completed.rate_limits = Some(snapshot);
+                rate_limits.push(snapshot);
             }
             Ok(ResponseEvent::Completed {
                 response_id,
@@ -845,18 +856,22 @@ async fn drain_to_completed(
                 usage_metadata,
                 ..
             }) => {
-                sess.send_event(
-                    turn_context,
-                    EventMsg::RawResponseCompleted(RawResponseCompletedEvent {
-                        response_id,
-                        token_usage: token_usage.clone(),
-                        usage_metadata,
-                    }),
-                )
-                .await;
-                sess.update_token_usage_info(turn_context, token_usage.as_ref())
-                    .await?;
-                return Ok(completed);
+                let summary_suffix = get_last_assistant_message_from_turn(&output_items)
+                    .filter(|summary| !summary.trim().is_empty())
+                    .ok_or_else(|| {
+                        CodexErr::Stream(
+                            "compact response completed without a non-empty assistant summary"
+                                .into(),
+                        )
+                    })?;
+                return Ok(CompletedCompactAttempt {
+                    summary_suffix,
+                    response_id,
+                    token_usage,
+                    usage_metadata,
+                    server_reasoning_included,
+                    rate_limits,
+                });
             }
             Ok(_) => continue,
             Err(e) => return Err(e),

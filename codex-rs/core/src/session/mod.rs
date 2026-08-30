@@ -4213,6 +4213,43 @@ impl Session {
         result
     }
 
+    /// Applies provider usage to compaction token state after the compact history commit.
+    /// Rollout-budget accounting is intentionally performed by the compaction attempt before
+    /// commit because the provider request has already consumed those resources.
+    pub(crate) async fn update_compaction_token_usage_info(
+        &self,
+        turn_context: &TurnContext,
+        token_usage: Option<&TokenUsage>,
+    ) -> CodexResult<()> {
+        if let Some(token_usage) = token_usage {
+            let token_info = {
+                let mut state = self.state.lock().await;
+                state.update_token_info_from_usage(token_usage, turn_context.model_context_window());
+                if matches!(
+                    turn_context.config.model_auto_compact_token_limit_scope,
+                    AutoCompactTokenLimitScope::BodyAfterPrefix
+                ) {
+                    state.ensure_auto_compact_window_server_prefill_from_usage(token_usage);
+                }
+                state.token_info()
+            };
+            self.send_token_count_event(turn_context).await;
+            if let Some(token_info) = token_info.as_ref() {
+                for contributor in self.services.extensions.token_usage_contributors() {
+                    contributor
+                        .on_token_usage(
+                            &self.services.session_extension_data,
+                            &self.services.thread_extension_data,
+                            turn_context.extension_data.as_ref(),
+                            token_info,
+                        )
+                        .await;
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) async fn record_token_usage_info(
         &self,
         turn_context: &TurnContext,
