@@ -113,3 +113,14 @@ and provider caches were not touched.
 - The test drains startup events first and asserts the stale primitive emits no
   event. Full orchestration completion-order coverage remains pending.
 - Test execution is still blocked by the 20 GB filesystem capacity gate.
+
+## Follow-up — append failure injection primitive
+
+- Commit: `ad3738b225` (`test(thread-store): add append failure injection`).
+- `InMemoryThreadStore` now supports a one-shot `fail_next_append` hook, with a
+  unit test proving the injected error is consumed by the next non-empty append
+  and does not poison later appends.
+- This is intentionally isolated from production persistence semantics. The
+  remaining work is to propagate rollout append errors through compaction and
+  add deterministic commit-pause integration coverage.
+- Tests were not executed because the filesystem remains at the capacity gate.
