@@ -15,6 +15,7 @@ use crate::error_code::method_not_found;
 use crate::extensions::ThreadExtensionDependencies;
 use crate::extensions::app_server_extension_event_sink;
 use crate::extensions::guardian_agent_spawner;
+use crate::extensions::native_agent_spawner;
 use crate::extensions::thread_extensions;
 use crate::external_agent_migration::ExternalAgentConfigRequestProcessor;
 use crate::external_agent_migration::ExternalAgentConfigRequestProcessorArgs;
@@ -370,7 +371,7 @@ impl MessageProcessor {
                 environment_manager,
                 thread_extensions(
                     guardian_agent_spawner(thread_manager.clone()),
-                    Arc::new(guardian_agent_spawner(thread_manager.clone())),
+                    Arc::new(native_agent_spawner(thread_manager.clone())),
                     ThreadExtensionDependencies {
                         event_sink: Arc::clone(&extension_event_sink),
                         auth_manager: auth_manager.clone(),

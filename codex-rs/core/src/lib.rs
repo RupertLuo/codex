@@ -27,9 +27,9 @@ pub use codex_protocol::turn_input::TurnStartOptions;
 pub use responses_metadata::CodexResponsesMetadata;
 pub use turn_metadata::detached_memory_responses_metadata;
 mod codex_thread;
- mod compact_model_fallback;
- #[allow(dead_code)]
- mod compact_input;
+#[allow(dead_code)]
+mod compact_input;
+mod compact_model_fallback;
 mod compact_remote;
 mod compact_remote_history;
 mod compact_remote_v2;
@@ -121,6 +121,7 @@ pub(crate) mod web_search;
 pub(crate) mod windows_sandbox_read_grants;
 pub use thread_manager::AgentSpawnerRuntimeExtensionFactory;
 pub use thread_manager::ForkSnapshot;
+pub use thread_manager::NativeAgentSpawnRequest;
 pub use thread_manager::NativeAgentSpawner;
 pub use thread_manager::NewThread;
 pub use thread_manager::StartThreadOptions;

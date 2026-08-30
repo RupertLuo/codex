@@ -18,6 +18,7 @@ use crate::session::resolve_multi_agent_version;
 use crate::session::session::Session;
 use crate::tasks::InterruptedTurnHistoryMarker;
 use crate::tasks::interrupted_turn_history_marker;
+use crate::thread_rollout_truncation::truncate_rollout_to_last_n_fork_turns;
 use codex_agent_graph_store::AgentGraphStore;
 use codex_agent_graph_store::LocalAgentGraphStore;
 use codex_analytics::AnalyticsEventsClient;
@@ -166,7 +167,12 @@ pub struct NewThread {
 /// The native app-server subagent spawning capability exposed to process-local
 /// runtime extensions without coupling those extensions to [`ThreadManager`].
 pub type NativeAgentSpawner =
-    dyn AgentSpawner<StartThreadOptions, Spawned = NewThread, Error = CodexErr>;
+    dyn AgentSpawner<NativeAgentSpawnRequest, Spawned = NewThread, Error = CodexErr>;
+
+pub struct NativeAgentSpawnRequest {
+    pub options: StartThreadOptions,
+    pub fork_snapshot: ForkSnapshot,
+}
 
 /// Creates a runtime extension after the app-server has a native subagent
 /// spawner available. This keeps native thread ownership inside the app-server
@@ -195,6 +201,9 @@ pub enum ForkSnapshot {
     /// and the source thread is already at a turn boundary, this returns the
     /// full committed history unchanged.
     TruncateBeforeNthUserMessage(usize),
+
+    /// Fork only the most recent `n` user turns from the source thread.
+    LastNTurns(usize),
 
     /// Fork the current persisted history as if the source thread had been
     /// interrupted now.
@@ -1102,7 +1111,17 @@ impl ThreadManager {
     pub async fn spawn_subagent(
         &self,
         forked_from_thread_id: ThreadId,
+        options: StartThreadOptions,
+    ) -> CodexResult<NewThread> {
+        self.spawn_subagent_with_snapshot(forked_from_thread_id, options, ForkSnapshot::Interrupted)
+            .await
+    }
+
+    pub async fn spawn_subagent_with_snapshot(
+        &self,
+        forked_from_thread_id: ThreadId,
         mut options: StartThreadOptions,
+        fork_snapshot: ForkSnapshot,
     ) -> CodexResult<NewThread> {
         let fork_source = self.get_thread(forked_from_thread_id).await?;
         // Persist queued rollout updates before reading the fork snapshot.
@@ -1123,7 +1142,7 @@ impl ThreadManager {
             .multi_agent_version()
             .unwrap_or(MultiAgentVersion::V1);
         options.initial_history = fork_history_from_snapshot(
-            ForkSnapshot::Interrupted,
+            fork_snapshot,
             history,
             InterruptedTurnHistoryMarker::from_config_and_version(
                 &options.config,
@@ -2389,6 +2408,28 @@ fn fork_history_from_snapshot(
     match snapshot {
         ForkSnapshot::TruncateBeforeNthUserMessage(nth_user_message) => {
             truncate_before_nth_user_message(history, nth_user_message, &snapshot_state)
+        }
+        ForkSnapshot::LastNTurns(0) => InitialHistory::New,
+        ForkSnapshot::LastNTurns(last_n_turns) => {
+            let rollout_items = match history {
+                InitialHistory::New | InitialHistory::Cleared => Vec::new(),
+                InitialHistory::Forked(items) => items,
+                InitialHistory::Resumed(resumed) => Arc::unwrap_or_clone(resumed.history),
+            };
+            let history = InitialHistory::Forked(truncate_rollout_to_last_n_fork_turns(
+                &rollout_items,
+                last_n_turns,
+            ));
+            if snapshot_state.ends_mid_turn {
+                append_interrupted_boundary(
+                    history,
+                    snapshot_state.active_turn_id,
+                    snapshot_state.active_turn_started_at,
+                    interrupted_marker,
+                )
+            } else {
+                history
+            }
         }
         ForkSnapshot::Interrupted => {
             let history = match history {

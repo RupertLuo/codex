@@ -66,6 +66,7 @@ mod tests {
     use super::*;
     use crate::extensions::ThreadExtensionDependencies;
     use crate::extensions::guardian_agent_spawner;
+    use crate::extensions::native_agent_spawner;
     use crate::extensions::thread_extensions;
     use codex_arg0::Arg0DispatchPaths;
     use codex_config::CloudConfigBundleLoader;
@@ -328,7 +329,7 @@ enabled = false
                 Arc::clone(&environment_manager),
                 thread_extensions(
                     guardian_agent_spawner(thread_manager.clone()),
-                    Arc::new(guardian_agent_spawner(thread_manager.clone())),
+                    Arc::new(native_agent_spawner(thread_manager.clone())),
                     ThreadExtensionDependencies {
                         event_sink: Arc::new(NoopExtensionEventSink),
                         auth_manager: auth_manager.clone(),
