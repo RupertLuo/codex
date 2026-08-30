@@ -280,12 +280,7 @@ async fn run_remote_compact_task_inner_impl(
     // Install is the semantic boundary where the compact endpoint's output becomes live
     // thread history. Keep it distinct from the later inference request so the reducer can
     // still represent repeated developer/context prefix items exactly as the model saw them.
-    if let Some(trace_input_history) = trace_input_history.as_deref() {
-        compaction_trace.record_installed(&CompactionCheckpointTracePayload {
-            input_history: trace_input_history,
-            replacement_history: &new_history,
-        });
-    }
+    let replacement_history_for_trace = trace_input_history.as_ref().map(|_| new_history.clone());
     // Legacy `/responses/compact` returns provider-normalized items without a stable link to their
     // original envelopes, so it does not preserve harness metadata. Compaction-trigger/v2 does.
     let new_history = new_history
@@ -309,6 +304,15 @@ async fn run_remote_compact_task_inner_impl(
         return Err(CodexErr::Fatal(
             "compaction window changed before remote commit".to_string(),
         ));
+    }
+    if let (Some(trace_input_history), Some(replacement_history)) = (
+        trace_input_history.as_deref(),
+        replacement_history_for_trace.as_deref(),
+    ) {
+        compaction_trace.record_installed(&CompactionCheckpointTracePayload {
+            input_history: trace_input_history,
+            replacement_history,
+        });
     }
     sess.recompute_token_usage(compaction_turn_context).await;
 
