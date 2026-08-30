@@ -383,6 +383,7 @@ impl MessageProcessor {
                         http_client_factory: config.http_client_factory(),
                         queue_service: queue_service.clone(),
                     },
+                    thread_manager_runtime_options.runtime_extensions(),
                 ),
                 Arc::new(CodexHomeUserInstructionsProvider::new(
                     config.codex_home.clone(),

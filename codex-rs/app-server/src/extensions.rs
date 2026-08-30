@@ -21,6 +21,7 @@ use codex_extension_api::ExtensionRegistryBuilder;
 use codex_extension_api::ExtensionWarning;
 use codex_extension_api::InternalSessionSpawnFuture;
 use codex_extension_api::InternalSessionSpawner;
+use codex_extension_api::RuntimeExtension;
 use codex_goal_extension::GoalExtensionConfig;
 use codex_goal_extension::GoalService;
 use codex_http_client::HttpClientFactory;
@@ -55,6 +56,7 @@ pub(crate) struct ThreadExtensionDependencies {
 pub(crate) fn thread_extensions<S>(
     guardian_agent_spawner: S,
     dependencies: ThreadExtensionDependencies,
+    runtime_extensions: &[Arc<dyn RuntimeExtension<Config>>],
 ) -> Arc<ExtensionRegistry<Config>>
 where
     S: AgentSpawner<StartThreadOptions, Spawned = NewThread, Error = CodexErr> + 'static,
@@ -131,7 +133,17 @@ where
                 .enabled(codex_features::Feature::SkillSearch),
         },
     );
+    install_runtime_extensions(&mut builder, runtime_extensions);
     Arc::new(builder.build())
+}
+
+fn install_runtime_extensions(
+    builder: &mut ExtensionRegistryBuilder<Config>,
+    runtime_extensions: &[Arc<dyn RuntimeExtension<Config>>],
+) {
+    for extension in runtime_extensions {
+        extension.install(builder);
+    }
 }
 
 pub(crate) fn app_server_extension_event_sink(
@@ -344,6 +356,13 @@ fn internal_session_spawner(
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
+    use codex_extension_api::ExtensionData;
+    use codex_extension_api::RuntimeExtension;
+    use codex_extension_api::ToolCall;
+    use codex_extension_api::ToolContributor;
+    use codex_extension_api::ToolExecutor;
     use codex_protocol::protocol::ThreadGoal as CoreThreadGoal;
     use codex_protocol::protocol::ThreadGoalStatus;
     use codex_protocol::protocol::ThreadGoalUpdatedEvent;
@@ -357,6 +376,41 @@ mod tests {
     use crate::thread_state::ConnectionCapabilities;
 
     use super::*;
+
+    #[derive(Debug)]
+    struct ProbeRuntimeExtension;
+
+    struct ProbeToolContributor;
+
+    impl ToolContributor for ProbeToolContributor {
+        fn tools(
+            &self,
+            _session_store: &ExtensionData,
+            _thread_store: &ExtensionData,
+        ) -> Vec<Arc<dyn for<'call> ToolExecutor<ToolCall<'call>>>> {
+            Vec::new()
+        }
+    }
+
+    impl RuntimeExtension<Config> for ProbeRuntimeExtension {
+        fn install(&self, builder: &mut ExtensionRegistryBuilder<Config>) {
+            builder.tool_contributor(Arc::new(ProbeToolContributor));
+        }
+    }
+
+    #[test]
+    fn runtime_extensions_install_tool_contributors() {
+        let mut empty_builder = ExtensionRegistryBuilder::<Config>::new();
+        install_runtime_extensions(&mut empty_builder, &[]);
+        assert!(empty_builder.build().tool_contributors().is_empty());
+
+        let mut builder = ExtensionRegistryBuilder::<Config>::new();
+        let extensions: Vec<Arc<dyn RuntimeExtension<Config>>> =
+            vec![Arc::new(ProbeRuntimeExtension)];
+        install_runtime_extensions(&mut builder, &extensions);
+
+        assert_eq!(builder.build().tool_contributors().len(), 1);
+    }
 
     #[tokio::test]
     async fn app_server_event_sink_uses_listener_fifo_for_goal_updates_warnings_and_clears() {

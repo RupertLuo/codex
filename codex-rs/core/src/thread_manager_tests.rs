@@ -344,6 +344,17 @@ async fn child_session_inherits_client_mcp_extensions() {
     );
 }
 
+#[derive(Debug)]
+struct ProbeRuntimeExtension;
+
+impl codex_extension_api::RuntimeExtension<crate::config::Config> for ProbeRuntimeExtension {
+    fn install(
+        &self,
+        _builder: &mut codex_extension_api::ExtensionRegistryBuilder<crate::config::Config>,
+    ) {
+    }
+}
+
 struct FakeAgentGraphStore {
     root_thread_id: ThreadId,
     descendant_thread_ids: Vec<ThreadId>,
@@ -387,6 +398,18 @@ impl codex_agent_graph_store::AgentGraphStore for FakeAgentGraphStore {
     }
 }
 
+#[test]
+fn runtime_options_report_runtime_extension_override() {
+    let default_options = ThreadManagerRuntimeOptions::default();
+    assert!(default_options.runtime_extensions().is_empty());
+    assert!(!default_options.has_runtime_extension_override());
+
+    let options = default_options.with_runtime_extension(Arc::new(ProbeRuntimeExtension));
+
+    assert_eq!(options.runtime_extensions().len(), 1);
+    assert!(options.has_runtime_extension_override());
+    assert!(options.has_process_local_overrides());
+}
 fn user_msg(text: &str) -> ResponseItem {
     ResponseItem::Message {
         id: None,
