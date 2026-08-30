@@ -257,4 +257,22 @@ mod tests {
             }
         );
     }
+
+    #[test]
+    fn prepared_advance_rejects_stale_window_without_mutation() {
+        let initial_ids = AutoCompactWindowIds::new_initial();
+        let mut window = AutoCompactWindow::new_with_ids(initial_ids);
+        let (next_number, next_ids) = window.prepare_advance();
+        let stale_ids = AutoCompactWindowIds {
+            previous_window_id: Some(Uuid::now_v7()),
+            ..next_ids
+        };
+
+        assert!(!window.commit_prepared_advance(next_number, stale_ids));
+        assert_eq!(window.window_number(), 0);
+        assert_eq!(window.ids(), initial_ids);
+        assert!(window.commit_prepared_advance(next_number, next_ids));
+        assert_eq!(window.window_number(), next_number);
+        assert_eq!(window.ids(), next_ids);
+    }
 }
