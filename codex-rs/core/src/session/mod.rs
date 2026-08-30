@@ -3628,6 +3628,7 @@ impl Session {
         .await
     }
 
+    #[allow(clippy::await_holding_invalid_type)]
     async fn replace_compacted_history_with_window(
         &self,
         mut items: Vec<ResponseItemEnvelope>,
@@ -3652,7 +3653,18 @@ impl Session {
             window_id: Some(metadata.window_ids.window_id.to_string()),
         };
         // Compaction starts a new history window, so its WorldState baseline must be full.
-        let mut world_state_item = None;
+        // Prepare the complete rollout batch before taking the state lock so cold-resume replay
+        // observes one contiguous compaction commit.
+        let world_state_snapshot = world_state_baseline.map(|world_state| world_state.snapshot());
+        let mut rollout_items = vec![RolloutItem::Compacted(compacted_item)];
+        if let Some(snapshot) = world_state_snapshot.as_ref() {
+            rollout_items.push(RolloutItem::WorldState(WorldStateItem::full(
+                snapshot.clone().into_object(),
+            )));
+        }
+        if let Some(turn_context_item) = reference_context_item.as_ref() {
+            rollout_items.push(RolloutItem::TurnContext(turn_context_item.clone()));
+        }
         {
             let mut state = self.state.lock().await;
             if let Some((window_number, window_ids)) = prepared_window
@@ -3661,27 +3673,11 @@ impl Session {
                 return false;
             }
             state.replace_annotated_history(items, reference_context_item.clone());
-            if let Some(world_state) = world_state_baseline {
-                let snapshot = world_state.snapshot();
-                world_state_item = Some(WorldStateItem::full(snapshot.clone().into_object()));
+            if let Some(snapshot) = world_state_snapshot {
                 state.history.set_world_state_baseline(snapshot);
             }
-        }
-
-        self.persist_rollout_items(&[RolloutItem::Compacted(compacted_item)])
-            .await;
-        // Persist the baseline after the replacement history that established it.
-        if let Some(world_state_item) = world_state_item {
-            self.persist_rollout_items(&[RolloutItem::WorldState(world_state_item)])
-                .await;
-        }
-        if let Some(turn_context_item) = reference_context_item {
-            self.persist_rollout_items(&[RolloutItem::TurnContext(turn_context_item)])
-                .await;
-        }
-        {
-            let mut state = self.state.lock().await;
             state.queue_pending_session_start_source(codex_hooks::SessionStartSource::Compact);
+            self.persist_rollout_items(&rollout_items).await;
         }
         true
     }
