@@ -8,3 +8,6 @@
   remains the Catalyst fork. No fetch, merge, or history rewrite was performed.
 - The stable target recorded in the runbook is therefore reproducible and
   externally verified.
+- Enumerating and version-sorting all official non-alpha `rust-v0.*` tags shows
+  `rust-v0.151.0` is also the highest stable tag currently published; the
+  selected target is not merely valid, but current.
