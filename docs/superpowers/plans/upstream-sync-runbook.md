@@ -223,3 +223,6 @@ bash scripts/upstream-sync-preflight.sh rust-v0.151.0
 
 它检查工具链、stable ancestry、`cargo metadata --no-deps --locked --offline`、
 `git diff --check` 和残留过程文件；不会 fetch、安装工具、改写配置或清理全局缓存。
+脚本还检查 `cargo-nextest`、`cargo-insta` 以及 Python 3.10+；可通过
+`SYNC_PYTHON_BIN=/path/to/python3.11` 指定任务级 Python。`dotslash`/`uv` 只作
+可选工具报告，不会被脚本悄悄安装。
