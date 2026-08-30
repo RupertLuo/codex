@@ -3600,14 +3600,15 @@ impl Session {
         world_state_baseline: Option<Arc<WorldState>>,
         metadata: CompactedHistoryMetadata,
     ) {
-        self.replace_compacted_history_with_window(
-            items,
-            reference_context_item,
-            world_state_baseline,
-            metadata,
-            None,
-        )
-        .await;
+        let _ = self
+            .replace_compacted_history_with_window(
+                items,
+                reference_context_item,
+                world_state_baseline,
+                metadata,
+                None,
+            )
+            .await;
     }
 
     pub(crate) async fn replace_compacted_history_with_prepared_window(
@@ -3617,7 +3618,7 @@ impl Session {
         world_state_baseline: Option<Arc<WorldState>>,
         metadata: CompactedHistoryMetadata,
         prepared_window: (u64, AutoCompactWindowIds),
-    ) -> bool {
+    ) -> CodexResult<bool> {
         self.replace_compacted_history_with_window(
             items,
             reference_context_item,
@@ -3636,7 +3637,7 @@ impl Session {
         world_state_baseline: Option<Arc<WorldState>>,
         metadata: CompactedHistoryMetadata,
         prepared_window: Option<(u64, AutoCompactWindowIds)>,
-    ) -> bool {
+    ) -> CodexResult<bool> {
         for envelope in &mut items {
             Self::assign_missing_response_item_id(&mut envelope.item);
         }
@@ -3668,18 +3669,24 @@ impl Session {
         {
             let mut state = self.state.lock().await;
             if let Some((window_number, window_ids)) = prepared_window
-                && !state.commit_prepared_auto_compact_window_advance(window_number, window_ids)
+                && !state.can_commit_prepared_auto_compact_window_advance(window_number, window_ids)
             {
-                return false;
+                return Ok(false);
+            }
+            self.persist_rollout_items_checked(&rollout_items).await?;
+            if let Some((window_number, window_ids)) = prepared_window {
+                debug_assert!(state.commit_prepared_auto_compact_window_advance(
+                    window_number,
+                    window_ids
+                ));
             }
             state.replace_annotated_history(items, reference_context_item.clone());
             if let Some(snapshot) = world_state_snapshot {
                 state.history.set_world_state_baseline(snapshot);
             }
             state.queue_pending_session_start_source(codex_hooks::SessionStartSource::Compact);
-            self.persist_rollout_items(&rollout_items).await;
         }
-        true
+        Ok(true)
     }
 
     pub fn enabled(&self, feature: Feature) -> bool {
@@ -4005,6 +4012,16 @@ impl Session {
         {
             error!("failed to record rollout items: {e:#}");
         }
+    }
+
+    async fn persist_rollout_items_checked(&self, items: &[RolloutItem]) -> CodexResult<()> {
+        let Some(live_thread) = self.live_thread() else {
+            return Ok(());
+        };
+        live_thread
+            .append_items(items)
+            .await
+            .map_err(|error| CodexErr::Fatal(format!("failed to record rollout items: {error:#}")))
     }
 
     pub(crate) async fn clone_history(&self) -> ContextManager {

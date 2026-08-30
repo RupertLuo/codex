@@ -299,7 +299,7 @@ async fn run_remote_compact_task_inner_impl(
             },
             prepared_window,
         )
-        .await;
+        .await?;
     if !committed {
         return Err(CodexErr::Fatal(
             "compaction window changed before remote commit".to_string(),

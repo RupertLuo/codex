@@ -1098,7 +1098,8 @@ async fn stale_prepared_compact_window_preserves_history_and_window() {
             },
             prepared_window,
         )
-        .await;
+        .await
+        .expect("stale prepared compaction should return a successful rejection");
 
     assert!(!committed);
     assert_eq!(

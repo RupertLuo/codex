@@ -222,6 +222,15 @@ impl SessionState {
             .commit_prepared_advance(window_number, ids)
     }
 
+    pub(crate) fn can_commit_prepared_auto_compact_window_advance(
+        &self,
+        window_number: u64,
+        ids: AutoCompactWindowIds,
+    ) -> bool {
+        self.auto_compact_window
+            .can_commit_prepared_advance(window_number, ids)
+    }
+
     pub(crate) fn request_new_context_window(&mut self) {
         self.auto_compact_window.request_new_context_window();
     }

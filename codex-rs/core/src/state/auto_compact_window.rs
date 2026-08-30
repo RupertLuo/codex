@@ -93,10 +93,7 @@ impl AutoCompactWindow {
         window_number: u64,
         ids: AutoCompactWindowIds,
     ) -> bool {
-        if window_number != self.window_number.saturating_add(1)
-            || ids.first_window_id != self.ids.first_window_id
-            || ids.previous_window_id != Some(self.ids.window_id)
-        {
+        if !self.can_commit_prepared_advance(window_number, ids) {
             return false;
         }
         self.window_number = window_number;
@@ -105,6 +102,16 @@ impl AutoCompactWindow {
         self.token_budget_reminder_delivered = false;
         self.auto_compact_fallback_delivered = false;
         true
+    }
+
+    pub(super) fn can_commit_prepared_advance(
+        &self,
+        window_number: u64,
+        ids: AutoCompactWindowIds,
+    ) -> bool {
+        window_number == self.window_number.saturating_add(1)
+            && ids.first_window_id == self.ids.first_window_id
+            && ids.previous_window_id == Some(self.ids.window_id)
     }
 
     pub(super) fn claim_token_budget_reminder(&mut self) -> bool {
