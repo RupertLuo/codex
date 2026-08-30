@@ -105,6 +105,11 @@ git branch sync/YYYYMMDD-<stable-tag> HEAD
 若只能使用 `upstream/main`，先固定其 SHA 并由维护者确认；后续所有命令均引用 SHA/tag，
 避免期间 remote 移动造成不可复现结果。
 
+若 `git merge-base HEAD <stable-tag>` 等于 stable tag 的 peeled commit，且
+`git merge-base --is-ancestor <stable-tag> HEAD` 成功，则说明当前分支已经以该
+稳定版为基线；此时不要重复 cherry-pick 同一批 upstream commits，应转为审计
+`<stable-tag>..HEAD` 的 Catalyst delta，并把此前的试迁移记录标为历史分析。
+
 ## 3. 建立 patch 清单和测试安全网
 
 以共同祖先为范围生成清单，并按行为域分组，而不是按文件名分组：transport、model/TUI、
