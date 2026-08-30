@@ -5,6 +5,7 @@ use crate::analytics_utils::analytics_events_client_from_config;
 use crate::config_manager::ConfigManager;
 use crate::outgoing_message::ConnectionId;
 use crate::outgoing_message::OutgoingMessageSender;
+use crate::rpc_extension::AppServerRpcRegistry;
 use crate::transport::AppServerTransport;
 use anyhow::Result;
 use app_test_support::create_mock_responses_server_repeating_assistant;
@@ -271,6 +272,7 @@ async fn build_test_processor(
         rpc_transport: AppServerRpcTransport::Stdio,
         remote_control_handle: None,
         plugin_startup_tasks: crate::PluginStartupTasks::Start,
+        rpc_registry: Arc::new(AppServerRpcRegistry::new(Vec::new()).expect("empty registry")),
     }));
     (processor, outgoing_rx)
 }

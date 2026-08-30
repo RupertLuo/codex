@@ -63,6 +63,8 @@ use crate::outgoing_message::OutgoingEnvelope;
 use crate::outgoing_message::OutgoingMessage;
 use crate::outgoing_message::OutgoingMessageSender;
 use crate::outgoing_message::QueuedOutgoingMessage;
+use crate::rpc_extension::AppServerRpcExtension;
+use crate::rpc_extension::AppServerRpcRegistry;
 use crate::transport::CHANNEL_CAPACITY;
 use crate::transport::OutboundConnectionState;
 use crate::transport::route_outgoing_envelope;
@@ -155,6 +157,8 @@ pub struct InProcessStartArgs {
     pub environment_manager: Arc<EnvironmentManager>,
     /// Process-local overrides applied to threads created by this runtime.
     pub thread_manager_runtime_options: ThreadManagerRuntimeOptions,
+    /// Trusted, process-local RPC extensions for raw in-process requests.
+    pub rpc_extensions: Vec<Arc<dyn AppServerRpcExtension>>,
     /// Startup warnings emitted after initialize succeeds.
     pub config_warnings: Vec<ConfigWarningNotification>,
     /// Session source stamped into thread/session metadata.
@@ -424,6 +428,8 @@ async fn start_uninitialized(args: InProcessStartArgs) -> IoResult<InProcessClie
         AuthManager::shared_from_config(args.config.as_ref(), args.enable_codex_api_key_env)
             .await
             .map_err(IoError::other)?;
+    let rpc_registry =
+        Arc::new(AppServerRpcRegistry::new(args.rpc_extensions.clone()).map_err(IoError::other)?);
     let (client_tx, mut client_rx) = mpsc::channel::<InProcessClientMessage>(channel_capacity);
     let (event_tx, event_rx) = mpsc::channel::<InProcessServerEvent>(channel_capacity);
 
@@ -491,6 +497,7 @@ async fn start_uninitialized(args: InProcessStartArgs) -> IoResult<InProcessClie
                 rpc_transport: AppServerRpcTransport::InProcess,
                 remote_control_handle: None,
                 plugin_startup_tasks: crate::PluginStartupTasks::Start,
+                rpc_registry: Arc::clone(&rpc_registry),
             }));
             let mut thread_created_rx = processor.thread_created_receiver();
             let session = Arc::new(ConnectionSessionState::new());
@@ -846,6 +853,7 @@ mod tests {
             state_db: Some(state_db),
             environment_manager: Arc::new(EnvironmentManager::default_for_tests()),
             thread_manager_runtime_options: ThreadManagerRuntimeOptions::default(),
+            rpc_extensions: Vec::new(),
             config_warnings: Vec::new(),
             session_source,
             enable_codex_api_key_env: false,
