@@ -6,8 +6,9 @@
 - **Fork patches**: 111 functional commits; 113 total branch commits including
   the sync plan and Round 1 test-backfill commits (+28,253 / -1,768 lines across
   243 files)
-- **Upstream target**: `upstream/main` at `28327355b` (fetched 2026-08-30)
-- **Upstream gap**: 2,098 commits from the common ancestor to the target
+- **Upstream target**: official stable tag `rust-v0.151.0` at
+  `78c290807ce710180111df227df3b7a4fe845452` (2026-08-29)
+- **Upstream gap**: 2,031 commits from the common ancestor to the stable tag
 - **Branch**: `feat/yanjiang` (currently at `188f89112`)
 - **Goal**: Rebase fork patches onto latest upstream `main`
 
@@ -101,7 +102,7 @@ Tests, style, merge reconciliation, metadata refresh.
 | `state/runtime/threads.rs` | SQL query changes | +391 | **P1** |
 | `app-server/src/cli.rs` | new file | +159 | P2 |
 
-## Current Conflict Hotspots (measured against `upstream/main@28327355b`)
+## Current Conflict Hotspots (measured against `rust-v0.151.0`)
 
 The common ancestor is `ccdfb4f342a`; 213 files are touched by both sides. The
 largest semantic collision surfaces are:

@@ -270,12 +270,10 @@ context or agent can resume without reconstructing the project state.
 - Working branch: `feat/yanjiang`
 - Current HEAD: `188f89112`
 - Fork base/common ancestor: `ccdfb4f342a`
-- Upstream target currently fetched as `upstream/main`: `28327355b`
-- Caution: Git config contains only `origin` (RupertLuo/codex); `upstream/main`
-  is a local ref without a configured `upstream` remote. Before migration,
-  verify its provenance against `https://github.com/openai/codex` and pin an
-  official stable release tag (or obtain explicit maintainer approval for a
-  commit SHA). Do not assume this local ref is the latest stable release.
+- Upstream remote is now configured as `https://github.com/openai/codex.git`.
+- Stable target is pinned to official tag `rust-v0.151.0` at
+  `78c290807ce710180111df227df3b7a4fe845452` (2026-08-29). Do not substitute
+  the moving `upstream/main` ref during this synchronization.
 - Fork delta: 113 commits, 243 files, approximately `+28,253/-1,768` lines
 - Existing safety tag: `pre-upstream-sync-20260830`
 - Round 1 test backfill and baseline are committed; no rebase has started.
@@ -345,14 +343,14 @@ config/cache locations in sanitized form; then add a read-only `upstream`
 remote for provenance and resolve an official stable release tag before making
 any rebase or merge commit.
 
-### Latest Blocked Audit (2026-08-30)
+### Latest Environment Audit (2026-08-30)
 
-The required external state is still absent after repeated checks: no Rust/Bazel
-toolchain is on `PATH`, `.git` is read-only, and no `upstream` remote or
-officially verified stable tag is configured. The durable documents are present
-in the worktree but uncommitted because Git metadata is not writable. Resume by
-provisioning the environment and writable checkout, then commit these docs
-before beginning Round 0; do not restart the rebase from this sandbox.
+Rust 1.95, Just, cargo-insta, cargo-nextest (prebuilt), Bazelisk/Bazel and
+Python 3.11 are now provisioned. A first thread-store build was attempted with
+isolated caches but exhausted the 20GB filesystem; generated target/intermediate
+files were cleaned. Keep build outputs isolated and check free space before
+large test suites. The handoff/runbook documents are committed at
+`0f549918a`; subsequent round commits must update this section.
 
 These guidelines apply to app-server protocol work in `codex-rs`, especially:
 
