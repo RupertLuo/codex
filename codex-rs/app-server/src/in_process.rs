@@ -902,6 +902,29 @@ mod tests {
     use std::path::Path;
     use tempfile::TempDir;
 
+    #[derive(Debug)]
+    struct InProcessTestExtension;
+
+    impl AppServerRpcExtension for InProcessTestExtension {
+        fn methods(&self) -> &'static [&'static str] {
+            &["test/echo"]
+        }
+
+        fn handle<'a>(
+            &'a self,
+            context: AppServerRpcContext,
+            _method: &'a str,
+            params: Option<serde_json::Value>,
+        ) -> AppServerRpcFuture<'a> {
+            Box::pin(async move {
+                Ok(serde_json::json!({
+                    "transport": format!("{:?}", context.transport),
+                    "params": params,
+                }))
+            })
+        }
+    }
+
     async fn build_test_config(codex_home: &Path) -> Config {
         match ConfigBuilder::default()
             .codex_home(codex_home.to_path_buf())
@@ -922,6 +945,15 @@ mod tests {
         session_source: SessionSource,
         channel_capacity: usize,
     ) -> InProcessClientHandle {
+        start_test_client_with_capacity_and_extensions(session_source, channel_capacity, Vec::new())
+            .await
+    }
+
+    async fn start_test_client_with_capacity_and_extensions(
+        session_source: SessionSource,
+        channel_capacity: usize,
+        rpc_extensions: Vec<Arc<dyn AppServerRpcExtension>>,
+    ) -> InProcessClientHandle {
         let codex_home = TempDir::new().expect("temp dir");
         let config = Arc::new(build_test_config(codex_home.path()).await);
         let state_db = codex_rollout::state_db::try_init(config.as_ref())
@@ -940,7 +972,7 @@ mod tests {
             state_db: Some(state_db),
             environment_manager: Arc::new(EnvironmentManager::default_for_tests()),
             thread_manager_runtime_options: ThreadManagerRuntimeOptions::default(),
-            rpc_extensions: Vec::new(),
+            rpc_extensions,
             config_warnings: Vec::new(),
             session_source,
             enable_codex_api_key_env: false,
@@ -982,6 +1014,34 @@ mod tests {
             .shutdown()
             .await
             .expect("in-process runtime should shutdown cleanly");
+    }
+
+    #[tokio::test]
+    async fn in_process_raw_request_reaches_extension() {
+        let client = start_test_client_with_capacity_and_extensions(
+            SessionSource::Cli,
+            DEFAULT_IN_PROCESS_CHANNEL_CAPACITY,
+            vec![Arc::new(InProcessTestExtension)],
+        )
+        .await;
+        let response = client
+            .raw_request(JSONRPCRequest {
+                id: RequestId::Integer(2),
+                method: "test/echo".to_string(),
+                params: Some(serde_json::json!({"value": 7})),
+                trace: None,
+            })
+            .await
+            .expect("raw request transport should work")
+            .expect("raw extension request should succeed");
+        assert_eq!(
+            response,
+            serde_json::json!({
+                "transport": "InProcess",
+                "params": {"value": 7},
+            })
+        );
+        client.shutdown().await.expect("runtime should shut down");
     }
 
     #[tokio::test]
