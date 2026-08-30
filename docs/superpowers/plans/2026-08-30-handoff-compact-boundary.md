@@ -39,5 +39,16 @@ and provider caches were not touched.
   was run because the 20 GB filesystem has only ~62 MB free; prior isolated
   `just test -p codex-thread-store` attempts exhausted it before test execution.
 - Next: couple completion/accounting with prepared-history and rollout commits,
-  then migrate remote-compaction transaction paths and re-run targeted tests
+  then audit remote-compaction response-side state and re-run targeted tests
   after safely reclaiming space.
+
+## Follow-up — remote window CAS
+
+- Commit: `71d92288e8` (`fix(core): commit remote compaction window atomically`).
+- Remote compaction now calls `prepare_auto_compact_window` before processing
+  output and installs history through
+  `replace_compacted_history_with_prepared_window`.
+- A concurrent window change rejects the commit instead of leaving the window
+  advanced while the old history remains live.
+- Static validation: `rustfmt --edition 2024` and `git diff --check` passed;
+  tests remain blocked by the 20 GB filesystem capacity gate.
