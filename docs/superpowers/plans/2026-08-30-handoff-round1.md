@@ -1,5 +1,10 @@
 # Handoff — Round 1 Complete
 
+> Continuation note (2026-08-30): `upstream/main` has since been fetched at
+> `28327355b` (2,098 commits beyond the common ancestor). The next execution
+> environment must provision `rustc`, `cargo`, `just`, and the Bazel/V8
+> prerequisites before running the listed tests or starting the rebase.
+
 ## Branch State
 - Branch: `feat/yanjiang`
 - HEAD: (see git log after commit)

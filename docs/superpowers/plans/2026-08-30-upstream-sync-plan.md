@@ -3,9 +3,12 @@
 ## Situation
 
 - **Fork base**: `ccdfb4f342a` (upstream 2026-06-28, PR #30508)
-- **Fork patches**: 111 commits (+27,406 / -1,768 lines across 238 files)
-- **Upstream gap**: ~2 months, est. 3,000-5,000 commits (PR #30508 → #41477)
-- **Branch**: `feat/yanjiang` (created from current `main`)
+- **Fork patches**: 111 functional commits; 113 total branch commits including
+  the sync plan and Round 1 test-backfill commits (+28,253 / -1,768 lines across
+  243 files)
+- **Upstream target**: `upstream/main` at `28327355b` (fetched 2026-08-30)
+- **Upstream gap**: 2,098 commits from the common ancestor to the target
+- **Branch**: `feat/yanjiang` (currently at `188f89112`)
 - **Goal**: Rebase fork patches onto latest upstream `main`
 
 ## Patch Inventory (111 commits in 13 logical groups)
@@ -98,20 +101,46 @@ Tests, style, merge reconciliation, metadata refresh.
 | `state/runtime/threads.rs` | SQL query changes | +391 | **P1** |
 | `app-server/src/cli.rs` | new file | +159 | P2 |
 
+## Current Conflict Hotspots (measured against `upstream/main@28327355b`)
+
+The common ancestor is `ccdfb4f342a`; 213 files are touched by both sides. The
+largest semantic collision surfaces are:
+
+| File | Fork delta | Upstream delta | Handling |
+|------|------------|----------------|----------|
+| `core/src/session/mod.rs` | +1,318/-166 | +1,431/-954 | upstream lifecycle first, then reapply invariants |
+| `thread-store/src/live_thread.rs` | +1,025/-9 | +126/-31 | preserve upstream metadata/title lifecycle |
+| `core/src/realtime_conversation.rs` | +648/-69 | +1,067/-306 | port state machine onto upstream reconnect/attach flow |
+| `core/src/compact.rs` | +559/-68 | +177/-90 | migrate transaction invariants one commit at a time |
+| `protocol/src/protocol.rs` | +486/-88 | +799/-577 | regenerate protocol/schema after semantic merge |
+| `core/src/thread_manager.rs` | +482/-18 | +807/-358 | retain upstream plugin/Guardian ownership boundaries |
+| `state/src/runtime/threads.rs` | +433/-42 | +663/-191 | preserve SQL behavior with old-data round-trip tests |
+| `app-server/src/extensions.rs` | +226/-1 | +424/-17 | retain upstream security and capability scoping |
+| `tui/src/app.rs` | +78/0 | +181/-592 | rebase onto current TUI orchestration, then snapshots |
+
+Because the overlap is broad, high-risk groups E/F should use behavior-level
+reapplication after the upstream structure is established, rather than blindly
+accepting either side or forcing a 113-commit mechanical rebase.
+
 ---
 
 ## Execution Plan: 7 Rounds
 
-### Pre-Round 0: Network Setup + Fetch
-**Owner**: Human (manual)
-**Task**: Get `upstream/main` fetched locally
+### Pre-Round 0: Infrastructure + Fetch
+**Owner**: Human/agent with a provisioned build environment
+**Task**: Provision the Rust/Bazel toolchain, then keep `upstream/main` fetched locally
 ```bash
 # Use proxy that works:
 git -c http.proxy=http://127.0.0.1:12334 fetch upstream main
 # Or from a faster network:
 git fetch upstream main
 ```
-**Deliverable**: `upstream/main` ref pointing to latest upstream HEAD
+**Deliverable**: `upstream/main` ref pointing to the selected stable commit,
+plus working `rustc`, `cargo`, `just`, Bazel and (where needed) rusty-v8 artifacts.
+
+**Current status**: `upstream/main` is already at `28327355b`, but this
+environment has no `rustc`, `cargo`, or `just`, so test execution and Rust
+conflict validation cannot begin until infrastructure is provisioned.
 
 ---
 

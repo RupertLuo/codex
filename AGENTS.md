@@ -259,6 +259,101 @@ Use `just bench-smoke` to dry-run the benchmark for a single iteration to ensure
 
 ## App-server API Development Best Practices
 
+## Upstream Sync Project Handoff
+
+This repository is running a staged synchronization of the Catalyst fork with
+`openai/codex`. These notes are intentionally kept in `AGENTS.md` so a later
+context or agent can resume without reconstructing the project state.
+
+### Current State (2026-08-30)
+
+- Working branch: `feat/yanjiang`
+- Current HEAD: `188f89112`
+- Fork base/common ancestor: `ccdfb4f342a`
+- Upstream target currently fetched as `upstream/main`: `28327355b`
+- Caution: Git config contains only `origin` (RupertLuo/codex); `upstream/main`
+  is a local ref without a configured `upstream` remote. Before migration,
+  verify its provenance against `https://github.com/openai/codex` and pin an
+  official stable release tag (or obtain explicit maintainer approval for a
+  commit SHA). Do not assume this local ref is the latest stable release.
+- Fork delta: 113 commits, 243 files, approximately `+28,253/-1,768` lines
+- Existing safety tag: `pre-upstream-sync-20260830`
+- Round 1 test backfill and baseline are committed; no rebase has started.
+- Known environment issue: rusty-v8 downloads may block `codex-core`/`codex-tui`
+  tests. Do not classify that network failure as a source regression.
+- Current environment also lacks `cargo`, `rustc`, and `just`; an attempted
+  `cargo install just --locked` could not start. Install the Rust toolchain and
+  `just` before changing or validating Rust code.
+- The workspace permits file edits but the Git metadata is read-only here;
+  creating `.git/index.lock` failed, so these handoff documents are currently
+  uncommitted and must be committed from an environment with writable Git
+  metadata before the sync begins.
+- Repository toolchain pins are `codex-rs/rust-toolchain.toml` (Rust 1.95.0,
+  clippy/rustfmt/rust-src) and `.bazelversion` (Bazel 9.0.0). The normal test
+  recipe uses `cargo nextest`; schema/snapshot work may also need
+  `cargo-insta`. CI uses Bazelisk 1.28.1 and DotSlash.
+- Python 3.6.8 is also below the repository's current Python requirement
+  (>=3.10); provision Python 3.11 or 3.12 for packaging and helper scripts.
+- Safe infrastructure order: install pinned Rust + components, `just`,
+  `cargo-nextest`, and `cargo-insta`; then Bazelisk/DotSlash and Linux system
+  dependencies; finally fetch/build rusty-v8 artifacts and run crate tests.
+- Before installation or testing, inventory global configuration and caches:
+  `~/.cargo/config*`, `~/.cargo/registry`, `~/.cargo/git`, Rustup toolchains,
+  `~/.cache/bazel*`, Bazel output roots, and rusty-v8 artifacts. Reuse only
+  verified compatible caches; prefer task-scoped cache/output directories when
+  possible. Never copy credentials, tokens, proxy URLs, or full global config
+  contents into handoff documents. Record only sanitized categories, versions,
+  paths, and cache hit/miss results.
+- A sanitized listing shows `~/.cache` contains unrelated provider/tool caches
+  (including a `connected-providers` category). Treat these as sensitive and
+  unrelated to this sync: do not inspect, copy, or delete them; use a dedicated
+  cache root for Rust/Bazel/V8 once the build environment is provisioned.
+
+### Handoff Rules
+
+After each synchronization round, update this section or add a dated handoff
+under `docs/superpowers/plans/` with: HEAD, upstream target, completed patch
+groups, conflict resolutions, tests run and results, blockers, and the exact
+next action. Tag each round before rewriting history. Keep temporary conflict
+files, scratch logs, and abandoned tags out of the final deliverable; remove
+them before the final commit. The durable record must be a reusable sync guide,
+not a transcript of every command.
+The reusable guide is `docs/superpowers/plans/upstream-sync-runbook.md`; consult it
+before starting a new upstream synchronization and keep dated handoffs focused on
+the facts that changed in that round.
+
+### Planned Order
+
+1. Confirm the stable upstream target and protect the current state.
+2. Finish test gaps in thread-store, state/runtime, core incremental/compact,
+   app-server RPC, and TUI snapshots.
+3. Migrate low-risk platform, title, image, error, reasoning, and housekeeping
+   patches.
+4. Migrate transport/model runtime, then skills/extensions/native-agent code.
+5. Migrate Qwen incremental request changes.
+6. Migrate compaction transactionality last, validating each invariant.
+7. Run crate-level and integration validation, regenerate schemas/locks when
+   needed, obtain approval before the complete workspace test, then clean up
+   process data and write the reusable sync record.
+
+### Exact Next Action
+
+Resume only from an environment where `.git` is writable. Provision Rust
+1.95.0 (with clippy/rustfmt/rust-src), Python 3.11/3.12, `just`,
+`cargo-nextest`, Bazelisk 1.28.1/Bazel 9, and `cargo-insta`; inventory global
+config/cache locations in sanitized form; then add a read-only `upstream`
+remote for provenance and resolve an official stable release tag before making
+any rebase or merge commit.
+
+### Latest Blocked Audit (2026-08-30)
+
+The required external state is still absent after repeated checks: no Rust/Bazel
+toolchain is on `PATH`, `.git` is read-only, and no `upstream` remote or
+officially verified stable tag is configured. The durable documents are present
+in the worktree but uncommitted because Git metadata is not writable. Resume by
+provisioning the environment and writable checkout, then commit these docs
+before beginning Round 0; do not restart the rebase from this sandbox.
+
 These guidelines apply to app-server protocol work in `codex-rs`, especially:
 
 - `app-server-protocol/src/protocol/common.rs`
