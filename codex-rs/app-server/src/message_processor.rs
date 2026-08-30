@@ -11,6 +11,7 @@ use crate::current_time::app_server_time_provider;
 use crate::error_code::internal_error;
 use crate::error_code::invalid_params;
 use crate::error_code::invalid_request;
+use crate::error_code::method_not_found;
 use crate::extensions::ThreadExtensionDependencies;
 use crate::extensions::app_server_extension_event_sink;
 use crate::extensions::guardian_agent_spawner;
@@ -50,6 +51,7 @@ use crate::request_processors::read_server_diagnostics;
 use crate::request_serialization::QueuedInitializedRequest;
 use crate::request_serialization::RequestSerializationQueueKey;
 use crate::request_serialization::RequestSerializationQueues;
+use crate::rpc_extension::AppServerRpcContext;
 use crate::rpc_extension::AppServerRpcRegistry;
 use crate::skills_watcher::SkillsWatcher;
 use crate::thread_state::ConnectionCapabilities;
@@ -607,6 +609,7 @@ impl MessageProcessor {
         connection_id: ConnectionId,
         request: JSONRPCRequest,
         transport: &AppServerTransport,
+        rpc_context: AppServerRpcContext,
         session: Arc<ConnectionSessionState>,
     ) {
         let request_method = request.method.as_str();
@@ -630,7 +633,38 @@ impl MessageProcessor {
             Arc::clone(&self.outgoing),
             request_context.clone(),
             async {
-                let codex_request = deserialize_client_request(request);
+                if let Some(extension) = self.rpc_registry.get(request_method).cloned() {
+                    if !session.initialized() {
+                        self.outgoing
+                            .send_error(request_id.clone(), invalid_request("Not initialized"))
+                            .await;
+                        return;
+                    }
+                    match extension
+                        .handle(rpc_context, request_method, request.params.clone())
+                        .await
+                    {
+                        Ok(result) => {
+                            self.outgoing
+                                .send_json_response(request_id.clone(), result)
+                                .await;
+                        }
+                        Err(error) => {
+                            self.outgoing.send_error(request_id.clone(), error).await;
+                        }
+                    }
+                    return;
+                }
+                if self.rpc_registry.contains_namespace(request_method) {
+                    self.outgoing
+                        .send_error(
+                            request_id.clone(),
+                            method_not_found(format!("Method not found: {request_method}")),
+                        )
+                        .await;
+                    return;
+                }
+                let codex_request = deserialize_client_request(&request);
                 let result = match codex_request {
                     Ok(codex_request) => {
                         // Websocket callers finalize outbound readiness in lib.rs after mirroring

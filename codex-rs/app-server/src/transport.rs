@@ -1,3 +1,4 @@
+use crate::AppServerRpcTransportContext;
 use crate::message_processor::ConnectionSessionState;
 use crate::outgoing_message::OutgoingEnvelope;
 use codex_app_server_protocol::ExperimentalApi;
@@ -58,6 +59,34 @@ impl ConnectionState {
             outbound_opted_out_notification_methods,
             session: Arc::new(ConnectionSessionState::new()),
         }
+    }
+}
+
+pub(crate) fn extension_transport_context(
+    origin: ConnectionOrigin,
+    transport: &AppServerTransport,
+    auth: &auth::AppServerWebsocketAuthSettings,
+) -> AppServerRpcTransportContext {
+    match origin {
+        ConnectionOrigin::Stdio => AppServerRpcTransportContext::Stdio,
+        ConnectionOrigin::InProcess => AppServerRpcTransportContext::InProcess,
+        ConnectionOrigin::RemoteControl => AppServerRpcTransportContext::RemoteControl,
+        ConnectionOrigin::WebSocket => match transport {
+            AppServerTransport::UnixSocket { .. } => AppServerRpcTransportContext::UnixSocket,
+            AppServerTransport::WebSocket { bind_address } if bind_address.ip().is_loopback() => {
+                AppServerRpcTransportContext::LoopbackWebSocket {
+                    authenticated: auth.config.is_some(),
+                }
+            }
+            AppServerTransport::WebSocket { .. } if auth.config.is_some() => {
+                AppServerRpcTransportContext::AuthenticatedWebSocket
+            }
+            AppServerTransport::WebSocket { .. }
+            | AppServerTransport::Stdio
+            | AppServerTransport::Off => AppServerRpcTransportContext::LoopbackWebSocket {
+                authenticated: false,
+            },
+        },
     }
 }
 
