@@ -48,6 +48,7 @@ use codex_protocol::models::AgentMessageInputContent;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::RawResponseCompletedEvent;
 use codex_protocol::protocol::TokenUsage;
 use codex_protocol::protocol::TruncationPolicy;
 use codex_protocol::protocol::TurnStartedEvent;
@@ -297,10 +298,12 @@ async fn run_remote_compact_task_inner_impl(
         prompt_input_metadata,
         compaction_output,
         token_usage,
+        response_id,
+        usage_metadata,
         owned_client_session: _owned_client_session,
     } = attempt;
-    if let Some(token_usage) = token_usage {
-        sess.record_rollout_budget_usage(&token_usage)?;
+    if let Some(token_usage) = token_usage.as_ref() {
+        sess.record_rollout_budget_usage(token_usage)?;
         analytics_details.active_context_tokens_before = Some(token_usage.input_tokens);
         analytics_details.compaction_summary_tokens = Some(token_usage.output_tokens);
         analytics_details.cached_input_tokens = Some(token_usage.cached_input_tokens);
@@ -318,7 +321,8 @@ async fn run_remote_compact_task_inner_impl(
         },
     );
     analytics_details.retained_image_count = Some(retained_images);
-    let (new_window_number, new_window_ids) = sess.advance_auto_compact_window().await;
+    let prepared_window = sess.prepare_auto_compact_window().await;
+    let (new_window_number, new_window_ids) = prepared_window;
     let (initial_context, world_state_baseline) =
         build_compaction_initial_context(sess.as_ref(), &initial_context_injection).await;
     let new_history =
@@ -330,25 +334,41 @@ async fn run_remote_compact_task_inner_impl(
             Some(compaction_turn_context.to_turn_context_item())
         }
     };
+    let replacement_history = new_history
+        .iter()
+        .map(|envelope| envelope.item.clone())
+        .collect::<Vec<_>>();
+    let committed = sess
+        .replace_compacted_history_with_prepared_window(
+            new_history,
+            reference_context_item,
+            world_state_baseline,
+            CompactedHistoryMetadata {
+                message: String::new(),
+                window_number: new_window_number,
+                window_ids: new_window_ids,
+            },
+            prepared_window,
+        )
+        .await;
+    if !committed {
+        return Err(CodexErr::Fatal(
+            "compaction window changed before remote v2 commit".to_string(),
+        ));
+    }
     if let Some(trace_input_history) = trace_input_history.as_deref() {
-        let replacement_history = new_history
-            .iter()
-            .map(|envelope| envelope.item.clone())
-            .collect::<Vec<_>>();
         compaction_trace.record_installed(&CompactionCheckpointTracePayload {
             input_history: trace_input_history,
             replacement_history: &replacement_history,
         });
     }
-    sess.replace_compacted_history(
-        new_history,
-        reference_context_item,
-        world_state_baseline,
-        CompactedHistoryMetadata {
-            message: String::new(),
-            window_number: new_window_number,
-            window_ids: new_window_ids,
-        },
+    sess.send_event(
+        compaction_turn_context,
+        EventMsg::RawResponseCompleted(RawResponseCompletedEvent {
+            response_id,
+            token_usage,
+            usage_metadata,
+        }),
     )
     .await;
     sess.recompute_token_usage(compaction_turn_context).await;

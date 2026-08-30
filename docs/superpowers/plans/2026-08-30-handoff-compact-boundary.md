@@ -52,3 +52,29 @@ and provider caches were not touched.
   advanced while the old history remains live.
 - Static validation: `rustfmt --edition 2024` and `git diff --check` passed;
   tests remain blocked by the 20 GB filesystem capacity gate.
+
+## Follow-up — contiguous rollout commit
+
+- Commit: `682e0d62a8` (`fix(core): persist compaction rollout as one commit`).
+- Compacted history, optional full world-state baseline, and reference turn
+  context are assembled into one rollout batch. The state replacement, window
+  CAS, pending session-start source, and batch append now share one commit
+  boundary under the session lock.
+- This narrows the cold-resume divergence window; persistence failures are still
+  logged by the existing rollout interface and require eventual failure-aware
+  plumbing if that API is upgraded.
+- Validation: rustfmt and `git diff --check` passed; no Rust test was attempted
+  while the filesystem remains at ~61 MB free.
+
+## Follow-up — remote v2 completion ordering
+
+- The v2 attempt now returns response ID and usage metadata instead of emitting
+  `RawResponseCompleted` immediately. The event is sent only after the prepared
+  history CAS commit succeeds; the compaction trace checkpoint is likewise
+  recorded after installation.
+- v2 also uses the prepared-window CAS path, matching legacy remote compaction.
+- The remaining known gap is `record_rollout_budget_usage` mutating budget state
+  before the history commit; a future failure-aware prepared commit should make
+  that preflight side effect-free or roll it back.
+- Static validation passed with rustfmt and `git diff --check`; tests remain
+  blocked by the filesystem capacity gate.
