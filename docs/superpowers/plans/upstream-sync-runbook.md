@@ -115,6 +115,13 @@ skills/extensions、incremental request、compaction、platform、thread metadat
 4. **Incremental requests**：按 `previous_response_id`、baseline、image cache、byte estimation、fallback、rollback 的顺序逐提交迁移，并做 wire-level 断言。
 5. **Compaction transactionality**：最后处理 compact 配置、checkpoint、持久化生命周期和 replay；每个提交先写不变量，再移植代码。
 
+Compaction 的提交顺序固定为：prepare window → 在同一 session lock 内做
+CAS 校验 → 单批 append rollout（失败立即返回）→ 更新 live history、world-state
+baseline 和 window → 再发送 `RawResponseCompleted`/completion trace。provider 已经
+消耗的 rollout budget 可在历史提交前记账，但不得重复记账。测试设施应提供 stale
+window、append failure 和 cold-resume 三类可确定注入点；禁止用不可靠的网络延迟竞态
+替代 commit-pause hook。
+
 若高风险组与上游重构高度交织，停止逐提交 rebase，记录原因后采用“先合并上游、再按行为组重新应用补丁”的方案；不得在未记录决策的情况下混用两种历史策略。
 
 ## 5. 每阶段验收矩阵
