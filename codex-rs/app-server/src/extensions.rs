@@ -581,7 +581,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn app_server_event_sink_uses_listener_fifo_for_goal_updates_and_clears() {
+    async fn app_server_event_sink_uses_listener_fifo_for_goal_updates_warnings_and_clears() {
         let (outgoing_tx, _outgoing_rx) = mpsc::channel(4);
         let outgoing = Arc::new(OutgoingMessageSender::new(
             outgoing_tx,
