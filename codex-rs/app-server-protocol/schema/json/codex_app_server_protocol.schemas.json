@@ -9029,6 +9029,12 @@
               "null"
             ]
           },
+          "model_auto_compact_enabled": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
           "model_auto_compact_token_limit": {
             "format": "int64",
             "type": [

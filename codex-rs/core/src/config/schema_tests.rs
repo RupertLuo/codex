@@ -113,4 +113,5 @@ fn config_schema_exposes_compact_model() {
         .as_object()
         .expect("ConfigToml properties should be an object");
     assert!(properties.contains_key("compact_model"));
+    assert!(properties.contains_key("model_auto_compact_enabled"));
 }

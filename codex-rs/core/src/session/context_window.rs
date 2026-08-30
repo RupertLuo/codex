@@ -27,7 +27,7 @@ pub(crate) async fn context_window_token_status(
     let active_context_tokens = sess.get_total_token_usage().await;
 
     // Count either the full active context or only the tokens added after the initial prefix.
-    let (auto_compact_scope_tokens, auto_compact_scope_limit, auto_compact_window_prefill_tokens) =
+    let (auto_compact_scope_tokens, configured_scope_limit, auto_compact_window_prefill_tokens) =
         match turn_context.config.model_auto_compact_token_limit_scope {
             AutoCompactTokenLimitScope::Total => (
                 active_context_tokens,
@@ -51,6 +51,11 @@ pub(crate) async fn context_window_token_status(
         };
 
     // The model's full context window is a hard cap, independent of the auto-compaction scope.
+    let auto_compact_scope_limit = if turn_context.config.model_auto_compact_enabled {
+        configured_scope_limit
+    } else {
+        None
+    };
     let full_context_window_limit = turn_context.model_context_window();
 
     // Report remaining tokens against the base (unbuffered) window, capped by the full context.
