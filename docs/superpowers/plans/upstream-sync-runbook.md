@@ -45,6 +45,12 @@ registry/git 缓存、Bazel output/cache，以及 rusty-v8 归档。测试和构
 若全局缓存中存在 provider/account/connected-providers 等类别，视为敏感数据，
 只记录“存在”这一事实，禁止读取、搬运或清理；为本次同步单独设置缓存根目录。
 
+注意：仅设置 `CARGO_TARGET_DIR` 不能隔离 Cargo 的 git 依赖缓存；如果
+`CARGO_HOME` 仍指向全局目录，依赖更新仍会把 packfile 写入根盘。测试前应同时
+把 `CARGO_HOME` 指向任务专用目录，并只以只读/链接方式复用已核验 registry；若一次
+失败尝试在全局 git cache 产生明确的临时 packfile，先记录来源，再只清理该次产生的
+目录，不能泛化清空全局缓存。
+
 建议恢复环境后的最小检查顺序：
 
 ```text
