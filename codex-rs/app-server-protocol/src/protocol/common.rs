@@ -253,6 +253,15 @@ macro_rules! client_request_definitions {
                 }
             }
 
+            /// Returns the complete set of methods represented by `ClientRequest`.
+            ///
+            /// The slice is generated from the same definitions as deserialization,
+            /// so callers can validate extension namespaces without maintaining a
+            /// second list that could drift from the wire protocol.
+            pub const fn client_request_methods() -> &'static [&'static str] {
+                &[$($wire,)*]
+            }
+
             pub fn serialization_scope(&self) -> Option<ClientRequestSerializationScope> {
                 match self {
                     $(
@@ -2020,6 +2029,13 @@ mod tests {
         serde_json::to_value(request)
             .and_then(serde_json::from_value)
             .map_err(|err| err.to_string())
+    }
+
+    #[test]
+    fn client_request_methods_are_unique() {
+        let methods = ClientRequest::client_request_methods();
+        let unique: std::collections::HashSet<_> = methods.iter().copied().collect();
+        assert_eq!(unique.len(), methods.len());
     }
 
     #[test]
