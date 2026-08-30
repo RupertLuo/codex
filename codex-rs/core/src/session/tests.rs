@@ -1067,6 +1067,57 @@ async fn start_managed_network_proxy_applies_execpolicy_network_rules() -> anyho
 }
 
 #[tokio::test]
+async fn stale_prepared_compact_window_preserves_history_and_window() {
+    let (session, _turn_context, rx) = make_session_and_context_with_rx().await;
+    while rx.try_recv().is_ok() {}
+
+    let history_before = session
+        .clone_history()
+        .await
+        .raw_items()
+        .cloned()
+        .collect::<Vec<_>>();
+    let prepared_window = session.prepare_auto_compact_window().await;
+    let _ = session.advance_auto_compact_window().await;
+    let window_after_concurrent_advance = session.current_window().await;
+
+    let replacement = vec![ResponseItemEnvelope::new(ResponseItem::Compaction {
+        id: None,
+        encrypted_content: "stale-summary".to_string(),
+        internal_chat_message_metadata_passthrough: None,
+    })];
+    let committed = session
+        .replace_compacted_history_with_prepared_window(
+            replacement,
+            None,
+            None,
+            CompactedHistoryMetadata {
+                message: String::new(),
+                window_number: prepared_window.0,
+                window_ids: prepared_window.1,
+            },
+            prepared_window,
+        )
+        .await;
+
+    assert!(!committed);
+    assert_eq!(
+        session
+            .clone_history()
+            .await
+            .raw_items()
+            .cloned()
+            .collect::<Vec<_>>(),
+        history_before
+    );
+    assert_eq!(
+        session.current_window().await,
+        window_after_concurrent_advance
+    );
+    assert!(rx.try_recv().is_err());
+}
+
+#[tokio::test]
 async fn start_managed_network_proxy_ignores_invalid_execpolicy_network_rules() -> anyhow::Result<()>
 {
     let permission_profile = PermissionProfile::workspace_write();
