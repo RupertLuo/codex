@@ -230,9 +230,20 @@ pub struct ThreadManager {
 ///
 /// These options are intentionally separate from persisted configuration. They allow hosts and
 /// tests to provide process-local transports without changing the `ThreadManager::new` contract.
-#[derive(Clone, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct ThreadManagerRuntimeOptions {
-    pub http_transport: Option<HttpTransportHandle>,
+    http_transport: Option<HttpTransportHandle>,
+}
+
+impl ThreadManagerRuntimeOptions {
+    pub fn with_http_transport(mut self, http_transport: HttpTransportHandle) -> Self {
+        self.http_transport = Some(http_transport);
+        self
+    }
+
+    pub(crate) fn http_transport(&self) -> Option<HttpTransportHandle> {
+        self.http_transport.clone()
+    }
 }
 
 pub struct StartThreadOptions {
@@ -2034,7 +2045,7 @@ impl ThreadManagerState {
             inherited_multi_agent_version: multi_agent_version,
             git_enrichment_policy: GitEnrichmentPolicy::Fresh,
             windows_sandbox_proxy_settings_mode,
-            http_transport: self.runtime_options.http_transport.clone(),
+            http_transport: self.runtime_options.http_transport(),
         }))
         .await?;
         // Enable Full Access form input only after session startup so a required MCP server cannot
