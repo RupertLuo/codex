@@ -36,6 +36,12 @@ When running with `--listen ws://IP:PORT`, the same listener also serves basic H
 
 Websocket transport is currently experimental and unsupported. Do not rely on it for production workloads.
 
+Process-local embedders can register trusted, namespaced RPC extensions through
+`InProcessStartArgs::rpc_extensions`. Extensions are scoped to that runtime and
+must not be persisted in configuration. Callers use
+`InProcessClientHandle::raw_request` for extension methods; the typed
+`ClientRequest` API remains limited to the native protocol methods.
+
 Pass `--code-mode-host URL` to connect this app-server process to a remote code-mode host instead of starting a local host. Use a root `http://` or `https://` URL without a path or query for gRPC. Remote hosts require the `code_mode_host` feature. This outbound connection is independent of `--listen` and is shared by the process's threads.
 
 The unix socket transport is intended for local app-server control-plane clients. `codex app-server proxy`
