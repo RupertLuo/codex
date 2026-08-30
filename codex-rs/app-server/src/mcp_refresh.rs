@@ -328,6 +328,7 @@ enabled = false
                 Arc::clone(&environment_manager),
                 thread_extensions(
                     guardian_agent_spawner(thread_manager.clone()),
+                    Arc::new(guardian_agent_spawner(thread_manager.clone())),
                     ThreadExtensionDependencies {
                         event_sink: Arc::new(NoopExtensionEventSink),
                         auth_manager: auth_manager.clone(),
@@ -341,6 +342,7 @@ enabled = false
                         http_client_factory: good_config.http_client_factory(),
                         queue_service: None,
                     },
+                    &[],
                     &[],
                 ),
                 Arc::new(CodexHomeUserInstructionsProvider::new(

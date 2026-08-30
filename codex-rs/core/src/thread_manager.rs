@@ -28,6 +28,7 @@ use codex_code_mode::DisabledCodeModeSessionProvider;
 use codex_code_mode::ProcessOwnedCodeModeSessionProvider;
 use codex_core_plugins::PluginsManager;
 use codex_exec_server::EnvironmentManager;
+use codex_extension_api::AgentSpawner;
 use codex_extension_api::ExtensionDataInit;
 use codex_extension_api::ExtensionRegistry;
 use codex_extension_api::LoadedUserInstructions;
@@ -162,6 +163,18 @@ pub struct NewThread {
     pub session_configured: SessionConfiguredEvent,
 }
 
+/// The native app-server subagent spawning capability exposed to process-local
+/// runtime extensions without coupling those extensions to [`ThreadManager`].
+pub type NativeAgentSpawner =
+    dyn AgentSpawner<StartThreadOptions, Spawned = NewThread, Error = CodexErr>;
+
+/// Creates a runtime extension after the app-server has a native subagent
+/// spawner available. This keeps native thread ownership inside the app-server
+/// while allowing process-local extensions to contribute orchestration tools.
+pub trait AgentSpawnerRuntimeExtensionFactory: std::fmt::Debug + Send + Sync {
+    fn create(&self, spawner: Arc<NativeAgentSpawner>) -> Arc<dyn RuntimeExtension<Config>>;
+}
+
 // TODO(ccunningham): Add an explicit non-interrupting live-turn snapshot once
 // core can represent sampling boundaries directly instead of relying on
 // whichever items happened to be persisted mid-turn.
@@ -236,6 +249,7 @@ pub struct ThreadManagerRuntimeOptions {
     http_transport: Option<HttpTransportHandle>,
     required_base_instructions: Option<String>,
     runtime_extensions: Vec<Arc<dyn RuntimeExtension<Config>>>,
+    agent_spawner_runtime_extension_factories: Vec<Arc<dyn AgentSpawnerRuntimeExtensionFactory>>,
 }
 
 impl ThreadManagerRuntimeOptions {
@@ -258,6 +272,13 @@ impl ThreadManagerRuntimeOptions {
         self
     }
 
+    pub fn with_agent_spawner_runtime_extension_factory(
+        mut self,
+        factory: Arc<dyn AgentSpawnerRuntimeExtensionFactory>,
+    ) -> Self {
+        self.agent_spawner_runtime_extension_factories.push(factory);
+        self
+    }
     pub fn has_http_transport_override(&self) -> bool {
         self.http_transport.is_some()
     }
@@ -274,12 +295,18 @@ impl ThreadManagerRuntimeOptions {
         self.has_http_transport_override()
             || self.has_runtime_extension_override()
             || self.required_base_instructions.is_some()
+            || !self.agent_spawner_runtime_extension_factories.is_empty()
     }
 
     pub fn runtime_extensions(&self) -> &[Arc<dyn RuntimeExtension<Config>>] {
         &self.runtime_extensions
     }
 
+    pub fn agent_spawner_runtime_extension_factories(
+        &self,
+    ) -> &[Arc<dyn AgentSpawnerRuntimeExtensionFactory>] {
+        &self.agent_spawner_runtime_extension_factories
+    }
     pub(crate) fn http_transport(&self) -> Option<HttpTransportHandle> {
         self.http_transport.clone()
     }
