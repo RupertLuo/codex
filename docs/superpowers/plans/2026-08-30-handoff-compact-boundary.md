@@ -103,3 +103,13 @@ and provider caches were not touched.
   resource-accounting semantics.
 - Static validation: rustfmt and `git diff --check` passed. Tests remain
   blocked by the filesystem capacity gate.
+
+## Follow-up — stale prepared-window regression
+
+- Commit: `0bef1ce1f9` (`test(core): cover stale compact commit preservation`).
+- Added a session-level async test that prepares a compact window, advances the
+  live window to make the prepared tuple stale, and verifies rejection leaves
+  history and the concurrent live window unchanged.
+- The test drains startup events first and asserts the stale primitive emits no
+  event. Full orchestration completion-order coverage remains pending.
+- Test execution is still blocked by the 20 GB filesystem capacity gate.
