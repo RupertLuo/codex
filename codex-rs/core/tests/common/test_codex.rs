@@ -17,6 +17,7 @@ use codex_config::CloudConfigBundleLoader;
 use codex_core::CodexThread;
 use codex_core::StartThreadOptions;
 use codex_core::ThreadManager;
+use codex_core::ThreadManagerRuntimeOptions;
 use codex_core::TimeProvider;
 pub use codex_core::TurnInputRequest;
 use codex_core::config::Config;
@@ -338,6 +339,7 @@ pub struct TestCodexBuilder {
     code_mode_host_program: Option<PathBuf>,
     history_mode: Option<ThreadHistoryMode>,
     models_manager: Option<SharedModelsManager>,
+    runtime_options: ThreadManagerRuntimeOptions,
 }
 
 impl TestCodexBuilder {
@@ -356,6 +358,11 @@ impl TestCodexBuilder {
 
     pub fn with_models_manager(mut self, models_manager: SharedModelsManager) -> Self {
         self.models_manager = Some(models_manager);
+        self
+    }
+
+    pub fn with_runtime_options(mut self, options: ThreadManagerRuntimeOptions) -> Self {
+        self.runtime_options = options;
         self
     }
 
@@ -707,7 +714,8 @@ impl TestCodexBuilder {
             installation_id,
             /*attestation_provider*/ None,
             /*external_time_provider*/ self.external_time_provider.clone(),
-        );
+        )
+        .with_runtime_options(self.runtime_options.clone());
         let code_mode_host_program = self
             .code_mode_host_program
             .take()
@@ -1361,6 +1369,7 @@ pub fn test_codex() -> TestCodexBuilder {
         code_mode_host_program: None,
         history_mode: None,
         models_manager: None,
+        runtime_options: ThreadManagerRuntimeOptions::default(),
     }
 }
 

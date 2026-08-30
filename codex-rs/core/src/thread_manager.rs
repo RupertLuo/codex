@@ -233,6 +233,7 @@ pub struct ThreadManager {
 #[derive(Clone, Debug, Default)]
 pub struct ThreadManagerRuntimeOptions {
     http_transport: Option<HttpTransportHandle>,
+    required_base_instructions: Option<String>,
 }
 
 impl ThreadManagerRuntimeOptions {
@@ -241,12 +242,41 @@ impl ThreadManagerRuntimeOptions {
         self
     }
 
+    /// Adds host-mandated instructions to every session created by this manager.
+    pub fn with_required_base_instructions(mut self, instructions: String) -> Self {
+        self.required_base_instructions = Some(instructions);
+        self
+    }
+
     pub fn has_http_transport_override(&self) -> bool {
         self.http_transport.is_some()
     }
 
+    pub fn required_base_instructions(&self) -> Option<&str> {
+        self.required_base_instructions.as_deref()
+    }
+
+    pub fn has_process_local_overrides(&self) -> bool {
+        self.has_http_transport_override() || self.required_base_instructions.is_some()
+    }
+
     pub(crate) fn http_transport(&self) -> Option<HttpTransportHandle> {
         self.http_transport.clone()
+    }
+}
+
+pub(crate) fn compose_required_base_instructions(
+    required: &str,
+    requested: Option<&str>,
+) -> String {
+    let required = required.trim();
+    let requested = requested.map(str::trim).filter(|value| !value.is_empty());
+    match requested {
+        None => required.to_string(),
+        Some(value) if value == required || value.starts_with(&format!("{required}\n\n")) => {
+            value.to_string()
+        }
+        Some(value) => format!("{required}\n\n# Additional task instructions\n\n{value}"),
     }
 }
 
@@ -1896,7 +1926,7 @@ impl ThreadManagerState {
             user_shell_override,
         } = request;
         let StartThreadOptions {
-            config,
+            mut config,
             allow_provider_model_fallback,
             initial_history,
             history_mode,
@@ -1910,6 +1940,12 @@ impl ThreadManagerState {
             client_mcp_extensions,
             reserved_thread_id,
         } = options;
+        if let Some(required) = self.runtime_options.required_base_instructions() {
+            config.base_instructions = Some(compose_required_base_instructions(
+                required,
+                config.base_instructions.as_deref(),
+            ));
+        }
         let session_source = session_source.unwrap_or_else(|| self.session_source.clone());
         let environments = environments.unwrap_or_else(|| {
             default_thread_environment_selections(

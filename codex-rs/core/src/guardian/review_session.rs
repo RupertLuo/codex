@@ -1402,10 +1402,20 @@ pub(crate) fn build_guardian_review_session_config(
     let policy_template = catalog_auto_review
         .and_then(|messages| messages.policy_template.as_deref())
         .unwrap_or(BUNDLED_GUARDIAN_POLICY_TEMPLATE);
-    guardian_config.base_instructions = Some(guardian_policy_prompt_with_config_and_template(
-        tenant_policy_config,
-        policy_template,
-    ));
+    let guardian_policy =
+        guardian_policy_prompt_with_config_and_template(tenant_policy_config, policy_template);
+    guardian_config.base_instructions = Some(
+        parent_config
+            .base_instructions
+            .as_deref()
+            .map(|base| {
+                crate::thread_manager::compose_required_base_instructions(
+                    base,
+                    Some(&guardian_policy),
+                )
+            })
+            .unwrap_or(guardian_policy),
+    );
     guardian_config.base_instructions_provenance = Some(BaseInstructionsProvenance::Custom);
     guardian_config.notify = None;
     guardian_config.developer_instructions = None;

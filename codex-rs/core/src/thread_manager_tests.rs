@@ -54,6 +54,31 @@ fn runtime_options_report_http_transport_override() {
     ));
     assert!(configured_options.has_http_transport_override());
 }
+
+#[test]
+fn runtime_options_expose_required_base_instructions() {
+    let options = ThreadManagerRuntimeOptions::default()
+        .with_required_base_instructions("product policy".to_string());
+
+    assert_eq!(options.required_base_instructions(), Some("product policy"));
+    assert!(options.has_process_local_overrides());
+}
+
+#[test]
+fn required_base_instructions_are_prefixed_once() {
+    assert_eq!(
+        compose_required_base_instructions("product policy", None),
+        "product policy"
+    );
+    assert_eq!(
+        compose_required_base_instructions("product policy", Some("review task")),
+        "product policy\n\n# Additional task instructions\n\nreview task"
+    );
+    assert_eq!(
+        compose_required_base_instructions("product policy", Some("product policy")),
+        "product policy"
+    );
+}
 use codex_protocol::protocol::SessionMetaLine;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
