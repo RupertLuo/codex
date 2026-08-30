@@ -51,6 +51,11 @@ registry/git 缓存、Bazel output/cache，以及 rusty-v8 归档。测试和构
 失败尝试在全局 git cache 产生明确的临时 packfile，先记录来源，再只清理该次产生的
 目录，不能泛化清空全局缓存。
 
+即使 `CARGO_HOME` 使用 tmpfs，也要为 registry `src`/`cache` 预留空间；`just test`
+会先对整个 workspace 做 all-features metadata，可能在真正编译前解压大量平台无关
+crate。若 tmpfs 不足，应停止并保留失败原因，不要让 Cargo 自动回写根盘或修改
+`Cargo.lock`；将意外的 lockfile 改写恢复后再继续。
+
 建议恢复环境后的最小检查顺序：
 
 ```text
