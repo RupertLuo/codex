@@ -81,7 +81,7 @@ Rust rustfmt 误报为完整格式化通过。
 
 ```text
 cd codex-rs
-just fmt --check
+cargo fmt --all -- --check
 just test -p codex-thread-store
 just test -p codex-state
 just test -p codex-api
