@@ -429,6 +429,126 @@ fn runtime_options_retain_agent_spawner_extension_factories() {
     assert_eq!(options.agent_spawner_runtime_extension_factories().len(), 1);
     assert!(options.has_process_local_overrides());
 }
+
+#[tokio::test]
+async fn native_agent_spawn_uses_parent_agent_control_and_submits_initial_operation() {
+    let temp_dir = tempdir().expect("tempdir");
+    let mut config = test_config().await;
+    config.codex_home = temp_dir.path().join("codex-home").abs();
+    config.cwd = config.codex_home.abs();
+    std::fs::create_dir_all(&config.codex_home).expect("create codex home");
+    let manager = ThreadManager::with_models_provider_and_home_for_tests(
+        CodexAuth::from_api_key("dummy"),
+        config.model_provider.clone(),
+        config.codex_home.to_path_buf(),
+        Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+    );
+    let parent = manager
+        .start_thread(config.clone())
+        .await
+        .expect("start parent thread");
+    let operation = Op::UserInput {
+        items: vec![codex_protocol::user_input::UserInput::Text {
+            text: "delegated Expert task".to_string(),
+            text_elements: Vec::new(),
+        }],
+        final_output_json_schema: None,
+        responsesapi_client_metadata: None,
+        additional_context: Default::default(),
+        thread_settings: Default::default(),
+    };
+
+    let spawned = manager
+        .spawn_native_agent(
+            parent.thread_id,
+            NativeAgentSpawnRequest {
+                config,
+                initial_operation: operation.clone(),
+                parent_spawn_call_id: "delegate-call-1".to_string(),
+                fork_turns: 0,
+                agent_role: Some("research-analyst".to_string()),
+                agent_nickname: Some("Research Analyst".to_string()),
+            },
+        )
+        .await
+        .expect("spawn native agent");
+
+    assert!(manager.get_thread(spawned.thread_id).await.is_ok());
+    assert!(
+        manager
+            .captured_ops()
+            .contains(&(spawned.thread_id, operation))
+    );
+    let child = manager.get_thread(spawned.thread_id).await.unwrap();
+    let snapshot = child.codex.thread_config_snapshot().await;
+    assert!(matches!(
+        snapshot.session_source,
+        SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+            parent_thread_id,
+            depth: 1,
+            agent_role: Some(ref role),
+            ..
+        }) if parent_thread_id == parent.thread_id && role == "research-analyst"
+    ));
+}
+
+/*
+fn injected_model(slug: &str) -> codex_protocol::openai_models::ModelInfo {
+    serde_json::from_value(serde_json::json!({
+        "slug": slug,
+        "display_name": "Injected Model",
+        "description": "Injected model description",
+        "default_reasoning_level": "medium",
+        "supported_reasoning_levels": [{
+            "effort": "medium",
+            "description": "Medium"
+        }],
+        "shell_type": "shell_command",
+        "visibility": "list",
+        "supported_in_api": true,
+        "priority": 0,
+        "upgrade": null,
+        "base_instructions": "Injected instructions",
+        "supports_reasoning_summaries": false,
+        "support_verbosity": false,
+        "default_verbosity": null,
+        "apply_patch_tool_type": null,
+        "truncation_policy": {"mode": "tokens", "limit": 100000},
+        "supports_parallel_tool_calls": true,
+        "context_window": 128000,
+        "experimental_supported_tools": []
+    }))
+    .expect("injected model metadata should deserialize")
+}
+
+#[test]
+fn runtime_options_report_every_process_local_override() {
+    let catalog = ModelsResponse {
+        models: vec![injected_model("provider/model")],
+    };
+    let options = ThreadManagerRuntimeOptions::default().with_model_catalog(catalog);
+
+    assert!(options.has_model_catalog_override());
+    assert!(options.has_process_local_overrides());
+}
+
+#[tokio::test]
+async fn injected_catalog_builds_static_models_manager() {
+    let config = test_config().await;
+    let auth_manager =
+        AuthManager::from_auth_for_testing(CodexAuth::create_dummy_chatgpt_auth_for_testing());
+    let expected = ModelsResponse {
+        models: vec![injected_model("provider/model")],
+    };
+    let options = ThreadManagerRuntimeOptions::default().with_model_catalog(expected.clone());
+
+    let manager = build_models_manager_with_runtime_options(&config, auth_manager, &options);
+    let actual = manager.raw_model_catalog(RefreshStrategy::Online).await;
+
+    assert_eq!(actual, expected);
+}
+*/
+
 fn user_msg(text: &str) -> ResponseItem {
     ResponseItem::Message {
         id: None,
