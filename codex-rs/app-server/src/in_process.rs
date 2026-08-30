@@ -578,9 +578,9 @@ async fn start_uninitialized(args: InProcessStartArgs) -> IoResult<InProcessClie
                                         IN_PROCESS_CONNECTION_ID,
                                         request,
                                         &in_process_transport,
-                                        crate::AppServerRpcContext {
-                                            transport: crate::AppServerRpcTransportContext::InProcess,
-                                        },
+                                        crate::AppServerRpcContext::new(
+                                            crate::AppServerRpcTransportContext::InProcess,
+                                        ),
                                         Arc::clone(&session),
                                     )
                                     .await;

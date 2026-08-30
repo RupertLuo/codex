@@ -49,8 +49,11 @@ use crate::request_processors::TurnRequestProcessor;
 use crate::request_processors::WindowsSandboxRequestProcessor;
 use crate::request_processors::read_server_diagnostics;
 use crate::request_serialization::QueuedInitializedRequest;
+use crate::request_serialization::RequestSerializationAccess;
 use crate::request_serialization::RequestSerializationQueueKey;
 use crate::request_serialization::RequestSerializationQueues;
+use crate::rpc_extension::AppServerNativeTurnFuture;
+use crate::rpc_extension::AppServerNativeTurnGateway;
 use crate::rpc_extension::AppServerRpcContext;
 use crate::rpc_extension::AppServerRpcRegistry;
 use crate::skills_watcher::SkillsWatcher;
@@ -71,6 +74,8 @@ use codex_app_server_protocol::JSONRPCErrorError;
 use codex_app_server_protocol::JSONRPCNotification;
 use codex_app_server_protocol::JSONRPCRequest;
 use codex_app_server_protocol::JSONRPCResponse;
+use codex_app_server_protocol::TurnStartParams;
+use codex_app_server_protocol::TurnStartResponse;
 use codex_app_server_protocol::experimental_required_message;
 use codex_arg0::Arg0DispatchPaths;
 use codex_code_mode::CodeModeSessionProvider;
@@ -95,6 +100,7 @@ use codex_thread_store::QueueStore;
 use tokio::sync::Mutex;
 use tokio::sync::Semaphore;
 use tokio::sync::broadcast;
+use tokio::sync::oneshot;
 use tokio::sync::watch;
 use tokio::time::Duration;
 use tokio::time::timeout;
@@ -166,6 +172,34 @@ pub(crate) struct MessageProcessor {
     windows_sandbox_processor: WindowsSandboxRequestProcessor,
     request_serialization_queues: RequestSerializationQueues,
     rpc_registry: Arc<AppServerRpcRegistry>,
+}
+
+struct MessageProcessorNativeTurnGateway {
+    connection_request_id: ConnectionRequestId,
+    processor: Arc<MessageProcessor>,
+    session: Arc<ConnectionSessionState>,
+}
+
+impl std::fmt::Debug for MessageProcessorNativeTurnGateway {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("MessageProcessorNativeTurnGateway")
+            .field("connection_request_id", &self.connection_request_id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl AppServerNativeTurnGateway for MessageProcessorNativeTurnGateway {
+    fn start_turn<'a>(&'a self, params: TurnStartParams) -> AppServerNativeTurnFuture<'a> {
+        let connection_request_id = self.connection_request_id.clone();
+        let processor = Arc::clone(&self.processor);
+        let session = Arc::clone(&self.session);
+        Box::pin(async move {
+            processor
+                .start_extension_native_turn(connection_request_id, session, params)
+                .await
+        })
+    }
 }
 
 #[derive(Debug)]
@@ -604,6 +638,52 @@ impl MessageProcessor {
         self.skills_watcher.shutdown();
     }
 
+    async fn start_extension_native_turn(
+        self: &Arc<Self>,
+        connection_request_id: ConnectionRequestId,
+        session: Arc<ConnectionSessionState>,
+        params: TurnStartParams,
+    ) -> Result<TurnStartResponse, JSONRPCErrorError> {
+        let thread_id = params.thread_id.clone();
+        let app_server_client_name = session.app_server_client_name().map(str::to_string);
+        let client_version = session.client_version().map(str::to_string);
+        let processor = Arc::clone(self);
+        let (result_tx, result_rx) = oneshot::channel();
+        let span = tracing::Span::current();
+        let request = QueuedInitializedRequest::new(
+            Arc::clone(&session.rpc_gate),
+            async move {
+                let result = processor
+                    .turn_processor
+                    .turn_start(
+                        connection_request_id,
+                        params,
+                        app_server_client_name,
+                        client_version,
+                    )
+                    .await
+                    .and_then(|response| match response {
+                        Some(ClientResponsePayload::TurnStart(response)) => Ok(response),
+                        _ => Err(internal_error(
+                            "native turn gateway received an invalid response",
+                        )),
+                    });
+                let _ = result_tx.send(result);
+            }
+            .instrument(span),
+        );
+        self.request_serialization_queues
+            .enqueue(
+                RequestSerializationQueueKey::Thread { thread_id },
+                RequestSerializationAccess::Exclusive,
+                request,
+            )
+            .await;
+        result_rx.await.map_err(|_| {
+            internal_error("native turn gateway was cancelled before the request completed")
+        })?
+    }
+
     pub(crate) async fn process_request(
         self: &Arc<Self>,
         connection_id: ConnectionId,
@@ -640,6 +720,13 @@ impl MessageProcessor {
                             .await;
                         return;
                     }
+                    let rpc_context = rpc_context.with_native_turn_gateway(Arc::new(
+                        MessageProcessorNativeTurnGateway {
+                            connection_request_id: request_id.clone(),
+                            processor: Arc::clone(self),
+                            session: Arc::clone(&session),
+                        },
+                    ));
                     match extension
                         .handle(rpc_context, request_method, request.params.clone())
                         .await
