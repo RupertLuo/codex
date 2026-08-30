@@ -136,3 +136,17 @@ and provider caches were not touched.
 - The existing non-prepared replacement wrapper intentionally keeps its legacy
   fire-and-forget behavior for unrelated callers.
 - Static validation passed; Rust tests remain blocked by disk capacity.
+
+## Audit notes — next deterministic tests
+
+- The remaining high-value coverage is orchestration-level: pause between the
+  prepared-window CAS and rollout append, inject an append failure, and verify
+  that live history/window state and completion events remain unchanged.
+- A second case should resume from the persisted rollout and verify the compact
+  boundary is contiguous after a simulated process restart. These require a
+  small commit-pause/test-hook seam; importing the much larger upstream runtime
+  options change is intentionally deferred until after the first compile pass.
+- Remote v2 audit also identified the same invariant for response completion and
+  trace ordering. The production paths now emit both only after a successful
+  prepared commit; budget accounting remains pre-commit because the provider
+  request has already consumed the shared budget.
