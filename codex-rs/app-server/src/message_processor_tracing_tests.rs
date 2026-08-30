@@ -259,6 +259,7 @@ async fn build_test_processor(
         config,
         config_manager,
         environment_manager: Arc::new(EnvironmentManager::default_for_tests()),
+        thread_manager_runtime_options: codex_core::ThreadManagerRuntimeOptions::default(),
         feedback: CodexFeedback::new(),
         log_db: None,
         state_db: None,

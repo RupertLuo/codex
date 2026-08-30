@@ -72,6 +72,7 @@ use codex_app_server_protocol::experimental_required_message;
 use codex_arg0::Arg0DispatchPaths;
 use codex_code_mode::CodeModeSessionProvider;
 use codex_core::ThreadManager;
+use codex_core::ThreadManagerRuntimeOptions;
 use codex_core::config::Config;
 use codex_core::config::ThreadStoreConfig;
 use codex_exec_server::EnvironmentManager;
@@ -248,6 +249,7 @@ pub(crate) struct MessageProcessorArgs {
     pub(crate) config: Arc<Config>,
     pub(crate) config_manager: ConfigManager,
     pub(crate) environment_manager: Arc<EnvironmentManager>,
+    pub(crate) thread_manager_runtime_options: ThreadManagerRuntimeOptions,
     pub(crate) feedback: CodexFeedback,
     pub(crate) log_db: Option<LogDbLayer>,
     pub(crate) state_db: Option<StateDbHandle>,
@@ -272,6 +274,7 @@ impl MessageProcessor {
             config,
             config_manager,
             environment_manager,
+            thread_manager_runtime_options,
             feedback,
             log_db,
             state_db,
@@ -356,7 +359,8 @@ impl MessageProcessor {
                     outgoing.clone(),
                     thread_state_manager.clone(),
                 )),
-            );
+            )
+            .with_runtime_options(thread_manager_runtime_options);
             match code_mode_session_provider {
                 Some(provider) => manager.with_code_mode_session_provider(provider),
                 None => manager,

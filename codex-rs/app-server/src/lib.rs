@@ -6,6 +6,7 @@ use codex_code_mode::CodeModeSessionProvider;
 use codex_code_mode::GrpcCodeModeSessionProvider;
 use codex_config::LoaderOverrides;
 use codex_config::NoopThreadConfigLoader;
+use codex_core::ThreadManagerRuntimeOptions;
 use codex_core::config::Config;
 use codex_core::config::UnsupportedUntrustedApprovalPolicyError;
 use codex_core::resolve_installation_id;
@@ -902,6 +903,7 @@ pub async fn run_main_with_transport_options(
             config: Arc::new(config),
             config_manager,
             environment_manager,
+            thread_manager_runtime_options: ThreadManagerRuntimeOptions::default(),
             feedback: feedback.clone(),
             log_db,
             state_db: state_db.clone(),
