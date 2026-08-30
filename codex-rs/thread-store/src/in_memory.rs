@@ -63,8 +63,41 @@ mod tests {
     use crate::StoredTurnItemsView;
     use crate::ThreadPersistenceMetadata;
     use crate::ThreadSortKey;
+    use codex_history::ResponseItemEnvelope;
     use codex_protocol::models::BaseInstructions;
+    use codex_protocol::models::ResponseItem;
     use codex_protocol::protocol::SessionSource;
+
+    #[tokio::test]
+    async fn fail_next_append_is_one_shot() {
+        let store = InMemoryThreadStore::default();
+        let thread_id = ThreadId::default();
+        store.fail_next_append("injected append failure");
+
+        let error = store
+            .append_items(AppendThreadItemsParams {
+                thread_id,
+                items: vec![RolloutItem::ResponseItem(ResponseItemEnvelope::new(
+                    ResponseItem::Other,
+                ))],
+            })
+            .await
+            .expect_err("the injected append must fail");
+        assert!(matches!(
+            error,
+            ThreadStoreError::InvalidRequest { message } if message == "injected append failure"
+        ));
+
+        store
+            .append_items(AppendThreadItemsParams {
+                thread_id,
+                items: vec![RolloutItem::ResponseItem(ResponseItemEnvelope::new(
+                    ResponseItem::Other,
+                ))],
+            })
+            .await
+            .expect("the failure injection must be consumed");
+    }
 
     #[tokio::test]
     async fn default_turn_pagination_methods_return_unsupported() {
@@ -497,6 +530,7 @@ pub struct InMemoryThreadStoreCalls {
 pub struct InMemoryThreadStore {
     state: tokio::sync::Mutex<InMemoryThreadStoreState>,
     omit_metadata_update_result: AtomicBool,
+    fail_next_append: Mutex<Option<String>>,
 }
 
 #[derive(Default)]
@@ -537,6 +571,14 @@ impl InMemoryThreadStore {
     pub fn omit_metadata_update_result_for_testing(&self) {
         self.omit_metadata_update_result
             .store(true, Ordering::Relaxed);
+    }
+
+    /// Causes the next non-empty append to fail with a deterministic test error.
+    pub fn fail_next_append(&self, message: impl Into<String>) {
+        *self
+            .fail_next_append
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(message.into());
     }
 
     async fn create_thread(&self, params: CreateThreadParams) -> ThreadStoreResult<()> {
@@ -599,6 +641,14 @@ impl InMemoryThreadStore {
     async fn append_items(&self, params: AppendThreadItemsParams) -> ThreadStoreResult<()> {
         if params.items.is_empty() {
             return Ok(());
+        }
+        if let Some(message) = self
+            .fail_next_append
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
+            return Err(ThreadStoreError::InvalidRequest { message });
         }
         let mut state = self.state.lock().await;
         let history_mode = history_mode_from_state(&state, params.thread_id);
