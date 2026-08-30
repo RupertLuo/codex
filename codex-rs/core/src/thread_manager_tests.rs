@@ -35,7 +35,9 @@ use codex_protocol::models::ReasoningItemReasoningSummary;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ModelsResponse;
 use codex_protocol::protocol::AgentMessageEvent;
+use codex_protocol::protocol::AgentStatus;
 use codex_protocol::protocol::EnvironmentConfigState;
+use codex_protocol::protocol::InitialHistory;
 use codex_protocol::protocol::InternalSessionSource;
 use codex_protocol::protocol::SessionMeta;
 
@@ -79,6 +81,8 @@ fn required_base_instructions_are_prefixed_once() {
         "product policy"
     );
 }
+use codex_protocol::protocol::AgentStatus;
+use codex_protocol::protocol::InitialHistory;
 use codex_protocol::protocol::SessionMetaLine;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
@@ -505,6 +509,119 @@ async fn native_agent_spawn_uses_parent_agent_control_and_submits_initial_operat
             ..
         }) if parent_thread_id == parent.thread_id && role == "research-analyst"
     ));
+}
+
+#[tokio::test]
+async fn native_agent_runtime_reports_missing_threads_as_not_found() {
+    let temp_dir = tempdir().expect("tempdir");
+    let mut config = test_config().await;
+    config.codex_home = temp_dir.path().join("codex-home").abs();
+    config.cwd = config.codex_home.abs();
+    std::fs::create_dir_all(&config.codex_home).expect("create codex home");
+    let manager = ThreadManager::with_models_provider_and_home_for_tests(
+        CodexAuth::from_api_key("dummy"),
+        config.model_provider.clone(),
+        config.codex_home.to_path_buf(),
+        Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+    );
+
+    assert_eq!(
+        manager.native_agent_status(ThreadId::new()).await,
+        AgentStatus::NotFound
+    );
+}
+
+#[tokio::test]
+async fn native_agent_runtime_interrupts_only_through_the_parent_agent_control() {
+    let temp_dir = tempdir().expect("tempdir");
+    let mut config = test_config().await;
+    config.codex_home = temp_dir.path().join("codex-home").abs();
+    config.cwd = config.codex_home.abs();
+    std::fs::create_dir_all(&config.codex_home).expect("create codex home");
+    let manager = ThreadManager::with_models_provider_and_home_for_tests(
+        CodexAuth::from_api_key("dummy"),
+        config.model_provider.clone(),
+        config.codex_home.to_path_buf(),
+        Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+    );
+    let parent = manager
+        .start_thread(config)
+        .await
+        .expect("start parent thread");
+
+    let missing_child = ThreadId::new();
+    let error = manager
+        .interrupt_native_agent(parent.thread_id, missing_child)
+        .await
+        .expect_err("an unrelated thread cannot be interrupted as a child");
+
+    assert!(error.to_string().contains(&missing_child.to_string()));
+}
+
+#[test]
+fn persisted_turn_status_rehydrates_native_agent_execution_status() {
+    assert_eq!(
+        stored_turn_status_to_agent_status(StoredTurnStatus::InProgress, None),
+        AgentStatus::Running
+    );
+    assert_eq!(
+        stored_turn_status_to_agent_status(StoredTurnStatus::Completed, None),
+        AgentStatus::Completed(None)
+    );
+    assert_eq!(
+        stored_turn_status_to_agent_status(StoredTurnStatus::Interrupted, None),
+        AgentStatus::Interrupted
+    );
+    assert_eq!(
+        stored_turn_status_to_agent_status(
+            StoredTurnStatus::Failed,
+            Some(&StoredTurnError {
+                message: "provider failed".to_string(),
+                additional_details: None,
+            }),
+        ),
+        AgentStatus::Errored("provider failed".to_string())
+    );
+}
+
+#[test]
+fn runtime_options_expose_required_base_instructions() {
+    let options = ThreadManagerRuntimeOptions::default()
+        .with_required_base_instructions("product policy".to_string());
+
+    assert_eq!(options.required_base_instructions(), Some("product policy"));
+    assert!(options.has_process_local_overrides());
+}
+
+/*
+#[test]
+fn runtime_options_retain_skill_provider_sources() {
+    let source = SkillProviderSource::new(
+        SkillSourceKind::Custom("private".to_string()),
+        "private",
+        Arc::new(ProbeSkillProvider),
+    );
+    let options = ThreadManagerRuntimeOptions::default().with_skill_provider(source);
+
+    assert_eq!(options.skill_provider_sources().len(), 1);
+    assert!(options.has_process_local_overrides());
+}
+*/
+
+#[test]
+fn required_base_instructions_are_prefixed_once() {
+    assert_eq!(
+        compose_required_base_instructions("product policy", None),
+        "product policy"
+    );
+    assert_eq!(
+        compose_required_base_instructions("product policy", Some("review task")),
+        "product policy\n\n# Additional task instructions\n\nreview task"
+    );
+    assert_eq!(
+        compose_required_base_instructions("product policy", Some("product policy")),
+        "product policy"
+    );
 }
 
 /*
