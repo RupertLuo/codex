@@ -1,3 +1,4 @@
+use std::fmt::Debug;
 use std::sync::Arc;
 
 use codex_protocol::protocol::ReviewDecision;
@@ -21,6 +22,16 @@ use crate::ToolLifecycleContributor;
 use crate::TurnInputContributor;
 use crate::TurnItemContributor;
 use crate::TurnLifecycleContributor;
+
+/// Installs trusted, process-local contributors into a thread extension registry.
+///
+/// Implementations should only register host-owned contributor handles and must
+/// not persist configuration or retain global mutable state. Hosts invoke
+/// [`RuntimeExtension::install`] once while constructing each runtime registry.
+pub trait RuntimeExtension<C: Sync>: Debug + Send + Sync {
+    /// Adds this extension's contributors to the mutable registry builder.
+    fn install(&self, builder: &mut ExtensionRegistryBuilder<C>);
+}
 
 /// Mutable registry used while hosts register typed runtime contributions.
 pub struct ExtensionRegistryBuilder<C: Sync> {
