@@ -394,7 +394,8 @@ async fn run_compact_task_inner_impl(
         // belongs to this compaction turn.
         summary_item.set_turn_id_if_missing(&turn_context.sub_id);
     }
-    let (window_number, window_ids) = sess.advance_auto_compact_window().await;
+    let prepared_window = sess.prepare_auto_compact_window().await;
+    let (window_number, window_ids) = prepared_window;
 
     let (initial_context, world_state_baseline) =
         build_compaction_initial_context(sess.as_ref(), &initial_context_injection).await;
@@ -408,7 +409,8 @@ async fn run_compact_task_inner_impl(
             Some(turn_context.to_turn_context_item())
         }
     };
-    sess.replace_compacted_history(
+    let committed = sess
+        .replace_compacted_history_with_prepared_window(
         new_history,
         reference_context_item,
         world_state_baseline,
@@ -417,8 +419,12 @@ async fn run_compact_task_inner_impl(
             window_number,
             window_ids,
         },
+        prepared_window,
     )
     .await;
+    if !committed {
+        return Err(CodexErr::Fatal("compaction window changed before commit".to_string()).into());
+    }
     sess.clear_http_incremental_baseline().await;
     if let Some(active_client_session) = active_client_session {
         active_client_session.clear_incremental_baseline();

@@ -3595,11 +3595,47 @@ impl Session {
 
     pub(crate) async fn replace_compacted_history(
         &self,
-        mut items: Vec<ResponseItemEnvelope>,
+        items: Vec<ResponseItemEnvelope>,
         reference_context_item: Option<TurnContextItem>,
         world_state_baseline: Option<Arc<WorldState>>,
         metadata: CompactedHistoryMetadata,
     ) {
+        self.replace_compacted_history_with_window(
+            items,
+            reference_context_item,
+            world_state_baseline,
+            metadata,
+            None,
+        )
+        .await;
+    }
+
+    pub(crate) async fn replace_compacted_history_with_prepared_window(
+        &self,
+        items: Vec<ResponseItemEnvelope>,
+        reference_context_item: Option<TurnContextItem>,
+        world_state_baseline: Option<Arc<WorldState>>,
+        metadata: CompactedHistoryMetadata,
+        prepared_window: (u64, AutoCompactWindowIds),
+    ) -> bool {
+        self.replace_compacted_history_with_window(
+            items,
+            reference_context_item,
+            world_state_baseline,
+            metadata,
+            Some(prepared_window),
+        )
+        .await
+    }
+
+    async fn replace_compacted_history_with_window(
+        &self,
+        mut items: Vec<ResponseItemEnvelope>,
+        reference_context_item: Option<TurnContextItem>,
+        world_state_baseline: Option<Arc<WorldState>>,
+        metadata: CompactedHistoryMetadata,
+        prepared_window: Option<(u64, AutoCompactWindowIds)>,
+    ) -> bool {
         for envelope in &mut items {
             Self::assign_missing_response_item_id(&mut envelope.item);
         }
@@ -3619,6 +3655,11 @@ impl Session {
         let mut world_state_item = None;
         {
             let mut state = self.state.lock().await;
+            if let Some((window_number, window_ids)) = prepared_window
+                && !state.commit_prepared_auto_compact_window_advance(window_number, window_ids)
+            {
+                return false;
+            }
             state.replace_annotated_history(items, reference_context_item.clone());
             if let Some(world_state) = world_state_baseline {
                 let snapshot = world_state.snapshot();
@@ -3642,6 +3683,7 @@ impl Session {
             let mut state = self.state.lock().await;
             state.queue_pending_session_start_source(codex_hooks::SessionStartSource::Compact);
         }
+        true
     }
 
     pub fn enabled(&self, feature: Feature) -> bool {
@@ -4000,6 +4042,11 @@ impl Session {
     pub(crate) async fn advance_auto_compact_window(&self) -> (u64, AutoCompactWindowIds) {
         let mut state = self.state.lock().await;
         state.advance_auto_compact_window()
+    }
+
+    pub(crate) async fn prepare_auto_compact_window(&self) -> (u64, AutoCompactWindowIds) {
+        let state = self.state.lock().await;
+        state.prepare_auto_compact_window_advance()
     }
 
     pub(crate) async fn request_new_context_window(&self) {
