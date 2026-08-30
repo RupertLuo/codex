@@ -423,7 +423,9 @@ async fn run_compact_task_inner_impl(
     )
     .await;
     if !committed {
-        return Err(CodexErr::Fatal("compaction window changed before commit".to_string()).into());
+        return Err(CodexErr::Fatal(
+            "compaction window changed before commit".to_string(),
+        ));
     }
     sess.clear_http_incremental_baseline().await;
     if let Some(active_client_session) = active_client_session {
