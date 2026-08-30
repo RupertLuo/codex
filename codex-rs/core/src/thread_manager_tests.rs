@@ -15,6 +15,11 @@ use crate::windows_sandbox::WindowsSandboxLevelExt;
 use codex_extension_api::empty_extension_registry;
 use codex_history::InitialHistory;
 use codex_history::ResumedHistory;
+use codex_http_client::HttpTransportHandle;
+use codex_http_client::Request;
+use codex_http_client::Response;
+use codex_http_client::StreamResponse;
+use codex_http_client::TransportError;
 use codex_models_manager::manager::RefreshStrategy;
 use codex_protocol::ResponseItemId;
 use codex_protocol::capabilities::CapabilityRootLocation;
@@ -33,6 +38,22 @@ use codex_protocol::protocol::AgentMessageEvent;
 use codex_protocol::protocol::EnvironmentConfigState;
 use codex_protocol::protocol::InternalSessionSource;
 use codex_protocol::protocol::SessionMeta;
+
+#[test]
+fn runtime_options_report_http_transport_override() {
+    let default_options = ThreadManagerRuntimeOptions::default();
+    assert!(!default_options.has_http_transport_override());
+
+    let configured_options = default_options.with_http_transport(HttpTransportHandle::new(
+        |_request: Request| async {
+            Err::<Response, TransportError>(TransportError::Build("unused".to_string()))
+        },
+        |_request: Request| async {
+            Err::<StreamResponse, TransportError>(TransportError::Build("unused".to_string()))
+        },
+    ));
+    assert!(configured_options.has_http_transport_override());
+}
 use codex_protocol::protocol::SessionMetaLine;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
