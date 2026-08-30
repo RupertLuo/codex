@@ -420,6 +420,7 @@ impl TurnContext {
             if !workspace_roots.contains(root) {
                 workspace_roots.push(root.clone());
             }
+        }
         workspace_roots
     }
 
