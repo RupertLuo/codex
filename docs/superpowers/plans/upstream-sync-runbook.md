@@ -214,3 +214,12 @@ git log --oneline <stable-tag>..HEAD
 3. 创建 `pre-sync-YYYYMMDD` 和同步分支；
 4. 从 patch 清单和测试基线开始，不跳过安全网；
 5. 按第 4 节顺序推进，并在每轮结束写 handoff。
+
+仓库还提供只读 preflight：
+
+```text
+bash scripts/upstream-sync-preflight.sh rust-v0.151.0
+```
+
+它检查工具链、stable ancestry、`cargo metadata --no-deps --locked --offline`、
+`git diff --check` 和残留过程文件；不会 fetch、安装工具、改写配置或清理全局缓存。
