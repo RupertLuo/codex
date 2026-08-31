@@ -50,5 +50,7 @@ where the stable 0.151.0 APIs required a semantic port rather than a cherry-pick
 `cargo check -p codex-state --lib` passes with one job and debuginfo disabled.
 The broader `codex-thread-store` test build and
 `cargo check -p codex-app-server-protocol --lib` are killed by the host's 2 GiB
-memory limit. Continue static ports and small checks here; run full targeted
-tests on a larger machine or CI worker.
+memory limit. A constrained `just test -p codex-core` was also allowed to
+compile until `codex-protocol` and was killed by SIGKILL during rustc, before
+tests started. Its temporary target was removed. Continue static ports and
+small checks here; run full targeted tests on a larger machine or CI worker.
