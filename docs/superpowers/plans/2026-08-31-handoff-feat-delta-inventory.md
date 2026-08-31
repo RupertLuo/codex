@@ -55,7 +55,7 @@ compile until `codex-protocol` and was killed by SIGKILL during rustc, before
 tests started. Its temporary target was removed. Continue static ports and
 small checks here; run full targeted tests on a larger machine or CI worker.
 
-## Current handoff (HEAD `d4c63c0105`)
+## Current handoff (HEAD `7c7a11394c`)
 
 - Skills/provider and TUI onboarding audits found no missing stable-target
   functionality; superseded Catalyst commits are explicitly excluded.
@@ -69,3 +69,6 @@ small checks here; run full targeted tests on a larger machine or CI worker.
 - Exact next action: validate compaction transaction tests and core/app-server
   suites on a larger runner, then perform final cleanup and update the reusable
   upstream sync runbook with the release result.
+- Latest preflight passes branch, stable ancestry, diff check, locked metadata,
+  and process-artifact checks. It reports only the known missing optional
+  `dotslash`/`uv` formatters; the root filesystem has 2.0 GiB free.
