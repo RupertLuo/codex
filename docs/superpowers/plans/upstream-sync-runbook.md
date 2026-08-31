@@ -200,6 +200,11 @@ git diff --check
 git log --oneline <stable-tag>..HEAD
 ```
 
+本机若使用可重建的数据盘，清理前先确认 `mountpoint -q /mnt/codex` 与
+`df -h /mnt/codex`；若挂载点不存在，先提醒维护者创建/挂载新盘，再进行任何构建。
+`AGENTS.override.md` 是本机私有且被 gitignore 的提醒文件，不得上传；卸载数据盘前，
+应恢复 `~/.cargo/{registry,git}` 与 `~/.cache/bazel*` 的原有路径或重新建立兼容链接。
+
 删除 `.rej`、临时 patch、冲突备份、未采用的 snapshot、调试日志和临时分支；保留
 `pre-sync-*`/`pre-round-*` 安全 tag（除非维护者要求删除）。不要把命令输出、凭证、网络
 代理或本机路径写入文档。最终 handoff 必须包含最终 HEAD、目标 SHA、每组处理方式、测试结果、
