@@ -10,7 +10,6 @@ use sqlx::Row;
 use sqlx::SqlSafeStr;
 use sqlx::migrate::Migration;
 use sqlx::migrate::Migrator;
-use std::borrow::Cow;
 
 use super::GOALS_MIGRATOR;
 use super::LOGS_MIGRATOR;
