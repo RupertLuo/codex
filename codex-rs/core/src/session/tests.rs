@@ -8258,11 +8258,45 @@ struct BlockingTurnCompletionContributor {
     messages: Arc<std::sync::Mutex<Vec<Option<String>>>>,
 }
 
+fn write_terminating_stop_hook_for_completion_test(home: &Path) {
+    let script_path = home.join("terminating_stop_hook.py");
+    let log_path = home.join("terminating_stop_hook_log.jsonl");
+    let script = format!(
+        r#"import json
+from pathlib import Path
+import sys
+
+payload = json.load(sys.stdin)
+with Path(r"{log_path}").open("a", encoding="utf-8") as handle:
+    handle.write(json.dumps(payload) + "\n")
+print(json.dumps({{"continue": False, "stopReason": "host requested stop"}}))
+"#,
+        log_path = log_path.display(),
+    );
+    let python = if cfg!(windows) { "python" } else { "python3" };
+    let hooks = serde_json::json!({
+        "hooks": {
+            "Stop": [{
+                "hooks": [{
+                    "type": "command",
+                    "command": format!("{python} \"{}\"", script_path.display()),
+                }]
+            }]
+        }
+    });
+
+    std::fs::write(&script_path, script).expect("write terminating stop hook script");
+    std::fs::write(home.join("hooks.json"), hooks.to_string()).expect("write hooks config");
+}
+
 impl codex_extension_api::TurnCompletionContributor for BlockingTurnCompletionContributor {
     fn contribute<'a>(
         &'a self,
         input: codex_extension_api::TurnCompletionInput<'a>,
-    ) -> codex_extension_api::ExtensionFuture<'a, Vec<codex_extension_api::PromptFragment>> {
+    ) -> codex_extension_api::ExtensionFuture<
+        'a,
+        Option<codex_extension_api::TurnCompletionContribution>,
+    > {
         Box::pin(async move {
             let call_index = {
                 let mut messages = self
@@ -8273,7 +8307,7 @@ impl codex_extension_api::TurnCompletionContributor for BlockingTurnCompletionCo
                 messages.len()
             };
             if call_index != 1 {
-                return Vec::new();
+                return None;
             }
 
             self.entered.add_permits(1);
@@ -8282,10 +8316,10 @@ impl codex_extension_api::TurnCompletionContributor for BlockingTurnCompletionCo
                 .await
                 .expect("completion release semaphore should remain open")
                 .forget();
-            vec![codex_extension_api::PromptFragment::new(
-                codex_extension_api::PromptSlot::ContextualUser,
-                "host batch complete",
-            )]
+            Some(
+                codex_extension_api::TurnCompletionContribution::new("host batch complete")
+                    .expect("test completion contribution should be bounded"),
+            )
         })
     }
 }
@@ -8359,7 +8393,7 @@ async fn turn_completion_contributor_can_wait_and_continue_the_same_turn() -> an
             .single_request()
             .message_input_texts("user")
             .iter()
-            .any(|text| text == "host batch complete")
+            .any(|text| { text == "<turn_completion>\nhost batch complete\n</turn_completion>" })
     );
     assert_eq!(
         messages
@@ -8368,6 +8402,227 @@ async fn turn_completion_contributor_can_wait_and_continue_the_same_turn() -> an
             .as_slice(),
         [Some("P01 done".to_string()), Some("all done".to_string())]
     );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn completion_barrier_runs_before_a_terminating_stop_hook() -> anyhow::Result<()> {
+    let server = start_mock_server().await;
+    let first_request = mount_sse_once(
+        &server,
+        sse(vec![
+            ev_response_created("resp-1"),
+            ev_assistant_message("msg-1", "draft done"),
+            ev_completed("resp-1"),
+        ]),
+    )
+    .await;
+    let second_request = mount_sse_once(
+        &server,
+        sse(vec![
+            ev_response_created("resp-2"),
+            ev_assistant_message("msg-2", "all done"),
+            ev_completed("resp-2"),
+        ]),
+    )
+    .await;
+    let entered = Arc::new(Semaphore::new(0));
+    let release = Arc::new(Semaphore::new(0));
+    let messages = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let contributor = Arc::new(BlockingTurnCompletionContributor {
+        entered: Arc::clone(&entered),
+        release: Arc::clone(&release),
+        messages,
+    });
+    let mut extensions = codex_extension_api::ExtensionRegistryBuilder::new();
+    extensions.turn_completion_contributor(contributor);
+    let test = test_codex()
+        .with_pre_build_hook(write_terminating_stop_hook_for_completion_test)
+        .with_config(core_test_support::hooks::trust_discovered_hooks)
+        .with_extensions(Arc::new(extensions.build()))
+        .build(&server)
+        .await?;
+
+    test.codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "make the deck".to_string(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: Default::default(),
+        })
+        .await?;
+
+    timeout(Duration::from_secs(2), entered.acquire())
+        .await
+        .expect("completion contributor should run before the stop hook")
+        .expect("completion barrier entry should remain open")
+        .forget();
+    assert_eq!(first_request.requests().len(), 1);
+    assert!(second_request.requests().is_empty());
+    let hook_log_path = test
+        .codex_home_path()
+        .join("terminating_stop_hook_log.jsonl");
+    assert!(!hook_log_path.exists());
+
+    release.add_permits(1);
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+
+    assert!(
+        second_request
+            .single_request()
+            .message_input_texts("user")
+            .iter()
+            .any(|text| text == "<turn_completion>\nhost batch complete\n</turn_completion>")
+    );
+    let hook_inputs = std::fs::read_to_string(hook_log_path)?
+        .lines()
+        .map(serde_json::from_str::<serde_json::Value>)
+        .collect::<Result<Vec<_>, _>>()?;
+    assert_eq!(hook_inputs.len(), 1);
+    assert_eq!(hook_inputs[0]["last_assistant_message"], "all done");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancelling_a_blocking_turn_completion_contributor_aborts_the_turn() -> anyhow::Result<()> {
+    let server = start_mock_server().await;
+    let first_request = mount_sse_once(
+        &server,
+        sse(vec![
+            ev_response_created("resp-1"),
+            ev_assistant_message("msg-1", "P01 done"),
+            ev_completed("resp-1"),
+        ]),
+    )
+    .await;
+    let second_request = mount_sse_once(
+        &server,
+        sse(vec![
+            ev_response_created("resp-2"),
+            ev_assistant_message("msg-2", "unexpected"),
+            ev_completed("resp-2"),
+        ]),
+    )
+    .await;
+
+    let entered = Arc::new(Semaphore::new(0));
+    let release = Arc::new(Semaphore::new(0));
+    let messages = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let contributor = Arc::new(BlockingTurnCompletionContributor {
+        entered: Arc::clone(&entered),
+        release: Arc::clone(&release),
+        messages,
+    });
+    let mut extensions = codex_extension_api::ExtensionRegistryBuilder::new();
+    extensions.turn_completion_contributor(contributor);
+    let test = test_codex()
+        .with_extensions(Arc::new(extensions.build()))
+        .build(&server)
+        .await?;
+
+    test.codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "make the deck".to_string(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: Default::default(),
+        })
+        .await?;
+    timeout(Duration::from_secs(2), entered.acquire())
+        .await
+        .expect("turn completion contributor should be entered")
+        .expect("completion entry semaphore should remain open")
+        .forget();
+
+    test.codex.submit(Op::Interrupt).await?;
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::TurnAborted(_))
+    })
+    .await;
+    release.add_permits(1);
+
+    assert_eq!(first_request.requests().len(), 1);
+    assert!(second_request.requests().is_empty());
+    Ok(())
+}
+
+struct OversizeTurnCompletionContributor {
+    constructor_rejected: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl codex_extension_api::TurnCompletionContributor for OversizeTurnCompletionContributor {
+    fn contribute<'a>(
+        &'a self,
+        _input: codex_extension_api::TurnCompletionInput<'a>,
+    ) -> codex_extension_api::ExtensionFuture<
+        'a,
+        Option<codex_extension_api::TurnCompletionContribution>,
+    > {
+        Box::pin(async move {
+            let result = codex_extension_api::TurnCompletionContribution::new(
+                "x".repeat(codex_extension_api::TURN_COMPLETION_CONTRIBUTION_MAX_BYTES + 1),
+            );
+            self.constructor_rejected
+                .store(result.is_err(), std::sync::atomic::Ordering::SeqCst);
+            result.ok()
+        })
+    }
+}
+
+#[tokio::test]
+async fn oversized_turn_completion_is_rejected_without_history_or_another_sample()
+-> anyhow::Result<()> {
+    let server = start_mock_server().await;
+    let first_request = mount_sse_once(
+        &server,
+        sse(vec![
+            ev_response_created("resp-1"),
+            ev_assistant_message("msg-1", "done"),
+            ev_completed("resp-1"),
+        ]),
+    )
+    .await;
+    let second_request = mount_sse_once(
+        &server,
+        sse(vec![
+            ev_response_created("resp-2"),
+            ev_assistant_message("msg-2", "unexpected"),
+            ev_completed("resp-2"),
+        ]),
+    )
+    .await;
+    let constructor_rejected = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut extensions = codex_extension_api::ExtensionRegistryBuilder::new();
+    extensions.turn_completion_contributor(Arc::new(OversizeTurnCompletionContributor {
+        constructor_rejected: Arc::clone(&constructor_rejected),
+    }));
+    let test = test_codex()
+        .with_extensions(Arc::new(extensions.build()))
+        .build(&server)
+        .await?;
+
+    test.submit_turn("make the deck").await?;
+
+    assert!(constructor_rejected.load(std::sync::atomic::Ordering::SeqCst));
+    assert_eq!(first_request.requests().len(), 1);
+    assert!(second_request.requests().is_empty());
+    let rollout = std::fs::read_to_string(
+        test.codex
+            .rollout_path()
+            .expect("test session should have a rollout path"),
+    )?;
+    assert!(!rollout.contains("<turn_completion>"));
     Ok(())
 }
 

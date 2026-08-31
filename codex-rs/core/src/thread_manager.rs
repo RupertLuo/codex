@@ -151,13 +151,19 @@ pub type NativeAgentFuture<'a, T> = Pin<Box<dyn Future<Output = CodexResult<T>> 
 ///
 /// Spawning, status reads, and interruption share one capability so an
 /// extension cannot accidentally mix native execution with a parallel status
-/// source.
+/// source. The capability also supports waiting for host-terminal child
+/// outcomes and closing directly owned children to release their capacity.
 pub trait NativeAgentRuntime:
     AgentSpawner<NativeAgentSpawnRequest, Spawned = NativeAgentSpawn, Error = CodexErr> + Send + Sync
 {
     fn agent_status<'a>(&'a self, thread_id: ThreadId) -> NativeAgentFuture<'a, AgentStatus>;
 
-    fn wait_agent<'a>(&'a self, thread_id: ThreadId) -> NativeAgentFuture<'a, AgentStatus>;
+    /// Waits until a child reaches a terminal state for one-shot host orchestration.
+    fn wait_agent<'a>(&'a self, _thread_id: ThreadId) -> NativeAgentFuture<'a, AgentStatus> {
+        Box::pin(std::future::ready(Err(CodexErr::UnsupportedOperation(
+            "native agent wait is unsupported".to_string(),
+        ))))
+    }
 
     fn interrupt_agent<'a>(
         &'a self,
@@ -165,15 +171,29 @@ pub trait NativeAgentRuntime:
         child_thread_id: ThreadId,
     ) -> NativeAgentFuture<'a, ()>;
 
+    /// Closes a directly owned child and releases its native-agent capacity.
     fn close_agent<'a>(
         &'a self,
-        parent_thread_id: ThreadId,
-        child_thread_id: ThreadId,
-    ) -> NativeAgentFuture<'a, ()>;
+        _parent_thread_id: ThreadId,
+        _child_thread_id: ThreadId,
+    ) -> NativeAgentFuture<'a, ()> {
+        Box::pin(std::future::ready(Err(CodexErr::UnsupportedOperation(
+            "native agent close is unsupported".to_string(),
+        ))))
+    }
 }
 
 /// Object-safe native agent runtime passed to runtime-extension factories.
 pub type NativeAgentSpawner = dyn NativeAgentRuntime;
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum NativeAgentNotificationPolicy {
+    /// Preserve the standard collaboration completion notification.
+    #[default]
+    NotifyParent,
+    /// The process-local host owns aggregation and parent notification.
+    HostOwned,
+}
 
 pub struct NativeAgentSpawnRequest {
     pub config: Config,
@@ -183,6 +203,7 @@ pub struct NativeAgentSpawnRequest {
     pub agent_role: Option<String>,
     pub agent_nickname: Option<String>,
     pub thread_extension_init: ExtensionDataInit,
+    pub notification_policy: NativeAgentNotificationPolicy,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1068,6 +1089,7 @@ impl ThreadManager {
             parent_thread_id: Some(parent_thread_id),
             environments: None,
             thread_extension_init: request.thread_extension_init,
+            notification_policy: request.notification_policy,
         };
         let session_source = SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
             parent_thread_id,
@@ -1132,7 +1154,7 @@ impl ThreadManager {
         };
         let mut status_rx = thread.subscribe_status();
         let mut status = status_rx.borrow().clone();
-        while !is_final(&status) {
+        while !is_final(&status) && status != AgentStatus::Interrupted {
             if status_rx.changed().await.is_err() {
                 return Ok(self.native_agent_status(thread_id).await);
             }
@@ -1155,6 +1177,13 @@ impl ThreadManager {
             .session
             .services
             .agent_control
+            .ensure_direct_child(parent_thread_id, child_thread_id)
+            .await?;
+        parent
+            .codex
+            .session
+            .services
+            .agent_control
             .interrupt_agent(child_thread_id)
             .await
             .map(|_| ())
@@ -1167,6 +1196,13 @@ impl ThreadManager {
         child_thread_id: ThreadId,
     ) -> CodexResult<()> {
         let parent = self.get_thread(parent_thread_id).await?;
+        parent
+            .codex
+            .session
+            .services
+            .agent_control
+            .ensure_direct_child(parent_thread_id, child_thread_id)
+            .await?;
         parent
             .codex
             .session

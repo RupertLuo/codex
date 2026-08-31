@@ -17,6 +17,7 @@ use crate::compact_remote::run_inline_remote_auto_compact_task;
 use crate::compact_remote_v2::run_inline_remote_auto_compact_task as run_inline_remote_auto_compact_task_v2;
 use crate::connectors;
 use crate::context::ContextualUserFragment;
+use crate::context::TurnCompletion;
 use crate::feedback_tags;
 use crate::hook_runtime::inspect_pending_input;
 use crate::hook_runtime::record_additional_contexts;
@@ -400,6 +401,22 @@ pub(crate) async fn run_turn(
 
                 if !needs_follow_up {
                     last_agent_message = sampling_request_last_agent_message;
+                    if let Some(completion_item) = build_turn_completion_item(
+                        sess.as_ref(),
+                        turn_context.as_ref(),
+                        turn_extension_data.as_ref(),
+                        last_agent_message.as_deref(),
+                        &cancellation_token,
+                    )
+                    .await?
+                    {
+                        sess.record_conversation_items(
+                            &turn_context,
+                            std::slice::from_ref(&completion_item),
+                        )
+                        .await;
+                        continue;
+                    }
                     let stop_outcome = run_turn_stop_hooks(
                         &sess,
                         &turn_context,
@@ -430,19 +447,6 @@ pub(crate) async fn run_turn(
                     }
                     if stop_outcome.should_stop {
                         break;
-                    }
-                    let completion_items = build_turn_completion_items(
-                        sess.as_ref(),
-                        turn_context.as_ref(),
-                        turn_extension_data.as_ref(),
-                        last_agent_message.as_deref(),
-                        &cancellation_token,
-                    )
-                    .await?;
-                    if !completion_items.is_empty() {
-                        sess.record_conversation_items(&turn_context, &completion_items)
-                            .await;
-                        continue;
                     }
                     if run_legacy_after_agent_hook(
                         &sess,
@@ -511,24 +515,20 @@ pub(crate) async fn run_turn(
     Ok(last_agent_message)
 }
 
-async fn build_turn_completion_items(
+async fn build_turn_completion_item(
     sess: &Session,
     turn_context: &TurnContext,
     turn_store: &codex_extension_api::ExtensionData,
     last_agent_message: Option<&str>,
     cancellation_token: &CancellationToken,
-) -> CodexResult<Vec<ResponseItem>> {
+) -> CodexResult<Option<ResponseItem>> {
     let contributors = sess
         .services
         .extensions
         .turn_completion_contributors()
         .to_vec();
-    let mut developer_sections = Vec::new();
-    let mut contextual_user_sections = Vec::new();
-    let mut separate_developer_sections = Vec::new();
-
     for contributor in contributors {
-        let fragments = contributor
+        let contribution = contributor
             .contribute(TurnCompletionInput {
                 turn_id: turn_context.sub_id.as_str(),
                 last_agent_message,
@@ -538,35 +538,13 @@ async fn build_turn_completion_items(
             })
             .or_cancel(cancellation_token)
             .await?;
-        for fragment in fragments {
-            super::push_prompt_fragment(
-                fragment,
-                &mut developer_sections,
-                &mut contextual_user_sections,
-                &mut separate_developer_sections,
-            );
-        }
-    }
-
-    let mut items = Vec::with_capacity(3);
-    if let Some(item) =
-        crate::context_manager::updates::build_developer_update_item(developer_sections)
-    {
-        items.push(item);
-    }
-    for section in separate_developer_sections {
-        if let Some(item) =
-            crate::context_manager::updates::build_developer_update_item(vec![section])
+        if let Some(contribution) = contribution
+            && let Some(fragment) = TurnCompletion::new(contribution)
         {
-            items.push(item);
+            return Ok(Some(ContextualUserFragment::into(fragment)));
         }
     }
-    if let Some(item) =
-        crate::context_manager::updates::build_contextual_user_message(contextual_user_sections)
-    {
-        items.push(item);
-    }
-    Ok(items)
+    Ok(None)
 }
 
 #[instrument(level = "trace", skip_all)]

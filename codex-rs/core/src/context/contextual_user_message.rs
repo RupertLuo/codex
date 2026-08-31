@@ -13,6 +13,7 @@ use super::RecommendedPluginsInstructions;
 use super::SkillInstructions;
 use super::SubagentNotification;
 use super::TurnAborted;
+use super::TurnCompletion;
 use super::UserInstructions;
 use super::UserShellCommand;
 use super::world_state::EnvironmentsState;
@@ -28,6 +29,8 @@ static SKILL_INSTRUCTIONS_REGISTRATION: FragmentRegistrationProxy<SkillInstructi
 static USER_SHELL_COMMAND_REGISTRATION: FragmentRegistrationProxy<UserShellCommand> =
     FragmentRegistrationProxy::new();
 static TURN_ABORTED_REGISTRATION: FragmentRegistrationProxy<TurnAborted> =
+    FragmentRegistrationProxy::new();
+static TURN_COMPLETION_REGISTRATION: FragmentRegistrationProxy<TurnCompletion> =
     FragmentRegistrationProxy::new();
 static SUBAGENT_NOTIFICATION_REGISTRATION: FragmentRegistrationProxy<SubagentNotification> =
     FragmentRegistrationProxy::new();
@@ -53,6 +56,7 @@ static CONTEXTUAL_USER_FRAGMENTS: &[&dyn FragmentRegistration] = &[
     &SKILL_INSTRUCTIONS_REGISTRATION,
     &USER_SHELL_COMMAND_REGISTRATION,
     &TURN_ABORTED_REGISTRATION,
+    &TURN_COMPLETION_REGISTRATION,
     &SUBAGENT_NOTIFICATION_REGISTRATION,
     &INTERNAL_MODEL_CONTEXT_REGISTRATION,
     &RECOMMENDED_PLUGINS_REGISTRATION,

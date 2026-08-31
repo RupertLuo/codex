@@ -19,6 +19,7 @@ use codex_extension_api::ToolCall;
 use codex_extension_api::ToolContributor;
 use codex_extension_api::ToolExecutor;
 use codex_extension_api::ToolLifecycleContributor;
+use codex_extension_api::TurnCompletionContribution;
 use codex_extension_api::TurnCompletionContributor;
 use codex_extension_api::TurnCompletionInput;
 use codex_extension_api::TurnContextContributionInput;
@@ -55,8 +56,8 @@ impl TurnCompletionContributor for AllContributors {
     fn contribute<'a>(
         &'a self,
         _input: TurnCompletionInput<'a>,
-    ) -> ExtensionFuture<'a, Vec<PromptFragment>> {
-        Box::pin(std::future::ready(Vec::new()))
+    ) -> ExtensionFuture<'a, Option<TurnCompletionContribution>> {
+        Box::pin(std::future::ready(None))
     }
 }
 

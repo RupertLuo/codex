@@ -360,7 +360,9 @@ impl AgentControl {
 
         self.send_input_after_capacity_check(new_thread.thread_id, &state, initial_operation)
             .await?;
-        if multi_agent_version != MultiAgentVersion::V2 {
+        if multi_agent_version != MultiAgentVersion::V2
+            && options.notification_policy == NativeAgentNotificationPolicy::NotifyParent
+        {
             let child_reference = agent_metadata
                 .agent_path
                 .as_ref()
