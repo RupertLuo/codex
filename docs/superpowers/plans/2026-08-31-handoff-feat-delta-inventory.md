@@ -72,3 +72,5 @@ small checks here; run full targeted tests on a larger machine or CI worker.
 - Latest preflight passes branch, stable ancestry, diff check, locked metadata,
   and process-artifact checks. It reports only the known missing optional
   `dotslash`/`uv` formatters; the root filesystem has 2.0 GiB free.
+- Removed 163 MiB of disposable `codex-state-runtime-test-*` SQLite artifacts
+  from `/mnt/codex/tmp`; the task temporary directory is now effectively empty.
