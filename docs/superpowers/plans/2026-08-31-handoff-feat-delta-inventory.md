@@ -88,3 +88,6 @@ small checks here; run full targeted tests on a larger machine or CI worker.
 - A live `git ls-remote --tags upstream 'rust-v0.*'` check found
   `rust-v0.151.0` to be the newest semver-stable Rust tag currently published;
   no newer stable target needs to replace this round's pin.
+- Cargo and Bazel lockfiles have no diff from the stable target. The five
+  changed JSON schema fixtures parse successfully with Python 3.11; their
+  changes are limited to the compact-model/auto-compact configuration surface.
