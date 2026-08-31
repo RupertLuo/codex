@@ -91,3 +91,14 @@ small checks here; run full targeted tests on a larger machine or CI worker.
 - Cargo and Bazel lockfiles have no diff from the stable target. The five
   changed JSON schema fixtures parse successfully with Python 3.11; their
   changes are limited to the compact-model/auto-compact configuration surface.
+
+## Completion matrix
+
+| Requirement | Evidence | Status |
+| --- | --- | --- |
+| Stable target pinned and current | `rust-v0.151.0` at `78c290807ce710180111df227df3b7a4fe845452`; live tag query finds no newer stable tag | pass |
+| Branch/cache safety and handoff | recovery tag, disposable-disk rules, ignored `AGENTS.override.md`, clean artifact audit | pass |
+| Core feature migration | staged commits and conflict decisions recorded in `AGENTS.md` | pass (static) |
+| Small-crate regression tests | state 187/187; HTTP client 96/96 | pass |
+| Core/thread-store/app-server suites | 2 GiB host SIGKILLs rustc before test binaries start | blocked by host capacity |
+| Final reusable runbook | `upstream-sync-runbook.md` with next-session and disk-detach procedure | pass |
