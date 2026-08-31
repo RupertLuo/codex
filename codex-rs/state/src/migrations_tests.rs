@@ -10,12 +10,14 @@ use sqlx::Row;
 use sqlx::SqlSafeStr;
 use sqlx::migrate::Migration;
 use sqlx::migrate::Migrator;
+use sqlx::sqlite::SqlitePoolOptions;
 
 use super::GOALS_MIGRATOR;
 use super::LOGS_MIGRATOR;
 use super::MEMORIES_MIGRATOR;
 use super::STATE_MIGRATOR;
 use super::THREAD_HISTORY_MIGRATOR;
+use super::repair_legacy_crlf_migration_checksums;
 use super::repair_legacy_recency_migration_version;
 use crate::PINNED_THREAD_SECTION_ID;
 use crate::PINNED_THREAD_SECTION_NAME;
@@ -97,6 +99,65 @@ fn migrator_through(version: i64) -> Migrator {
         create_schemas: STATE_MIGRATOR.create_schemas.clone(),
         no_tx: STATE_MIGRATOR.no_tx,
     }
+}
+
+fn migrator_with_crlf_line_endings_through(base: &Migrator, version: i64) -> Migrator {
+    Migrator {
+        migrations: Cow::Owned(
+            base.migrations
+                .iter()
+                .filter(|migration| migration.version <= version)
+                .map(|migration| {
+                    Migration::new(
+                        migration.version,
+                        migration.description.clone(),
+                        migration.migration_type,
+                        AssertSqlSafe(migration.sql.as_str().replace('\n', "\r\n")).into_sql_str(),
+                        migration.no_tx,
+                    )
+                })
+                .collect(),
+        ),
+        ignore_missing: base.ignore_missing,
+        locking: base.locking,
+        table_name: base.table_name.clone(),
+        create_schemas: base.create_schemas.clone(),
+        no_tx: base.no_tx,
+    }
+}
+
+#[tokio::test]
+async fn repairs_legacy_crlf_migration_checksums() {
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .expect("in-memory database should open");
+    migrator_with_crlf_line_endings_through(&STATE_MIGRATOR, /*version*/ 1)
+        .run(&pool)
+        .await
+        .expect("legacy CRLF migration should apply");
+
+    repair_legacy_crlf_migration_checksums(&pool, &STATE_MIGRATOR)
+        .await
+        .expect("legacy checksum should be repaired");
+    STATE_MIGRATOR
+        .run(&pool)
+        .await
+        .expect("current migration should validate after repair");
+
+    let applied = sqlx::query_as::<_, (i64, Vec<u8>)>(
+        "SELECT version, checksum FROM _sqlx_migrations ORDER BY version",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("migration checksums should load");
+    let expected = STATE_MIGRATOR
+        .migrations
+        .iter()
+        .map(|migration| (migration.version, migration.checksum.as_ref().to_vec()))
+        .collect::<Vec<_>>();
+    assert_eq!(applied, expected);
 }
 
 #[tokio::test]
