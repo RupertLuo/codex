@@ -83,3 +83,5 @@ small checks here; run full targeted tests on a larger machine or CI worker.
   leftovers. Repository `patches/` files are tracked build patches, not failed
   merge scratch data. `cargo metadata --no-deps --format-version 1 --locked`
   passes from `codex-rs`.
+- The recovery tag `pre-upstream-sync-20260830` remains present, and the pinned
+  stable commit resolves to `78c290807ce710180111df227df3b7a4fe845452`.
