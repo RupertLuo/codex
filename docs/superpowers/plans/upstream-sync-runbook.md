@@ -231,3 +231,16 @@ bash scripts/upstream-sync-preflight.sh rust-v0.151.0
 脚本还检查 `cargo-nextest`、`cargo-insta` 以及 Python 3.10+；可通过
 `SYNC_PYTHON_BIN=/path/to/python3.11` 指定任务级 Python。`dotslash`/`uv` 只作
 可选工具报告，不会被脚本悄悄安装。
+
+换到更大内存机器后的第一轮命令建议固定为：
+
+```text
+mountpoint -q /mnt/codex && df -h /mnt/codex
+SYNC_PYTHON_BIN=/usr/bin/python3.11 bash scripts/upstream-sync-preflight.sh rust-v0.151.0
+cd codex-rs
+CARGO_TARGET_DIR=/mnt/codex/target CARGO_BUILD_JOBS=2 just test -p codex-thread-store
+CARGO_TARGET_DIR=/mnt/codex/target CARGO_BUILD_JOBS=2 just test -p codex-core
+CARGO_TARGET_DIR=/mnt/codex/target CARGO_BUILD_JOBS=2 just test -p codex-app-server
+```
+
+若云盘未挂载，停止执行并先创建/挂载替代盘；不要让 Cargo 回退到根盘。
