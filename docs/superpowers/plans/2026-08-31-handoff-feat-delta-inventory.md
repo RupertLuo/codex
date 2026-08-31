@@ -91,6 +91,10 @@ small checks here; run full targeted tests on a larger machine or CI worker.
 - Cargo and Bazel lockfiles have no diff from the stable target. The five
   changed JSON schema fixtures parse successfully with Python 3.11; their
   changes are limited to the compact-model/auto-compact configuration surface.
+- Rustfmt `--check` parses all changed compaction/session/thread-manager files
+  successfully (exit 0; only the known nightly `imports_granularity` warnings
+  appear). This is syntax/format evidence only, not a substitute for linking
+  or runtime tests.
 
 ## Completion matrix
 
