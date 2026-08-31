@@ -102,6 +102,9 @@ small checks here; run full targeted tests on a larger machine or CI worker.
 - Post-cleanup preflight at HEAD `11936e16ec` passes stable ancestry, locked
   metadata, diff check, and process-artifact checks. Only optional `dotslash`
   and `uv` remain unavailable; no build output is left on the data disk.
+- Current tip is `8aebafd77c`; the sync delta is 211 commits touching 168
+  files relative to `rust-v0.151.0`. No task-owned `target*` directories remain
+  on `/mnt/codex` (only the small Bazel output root is present).
 
 ## Completion matrix
 
