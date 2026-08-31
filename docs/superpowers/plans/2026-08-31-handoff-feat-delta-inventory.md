@@ -54,3 +54,18 @@ memory limit. A constrained `just test -p codex-core` was also allowed to
 compile until `codex-protocol` and was killed by SIGKILL during rustc, before
 tests started. Its temporary target was removed. Continue static ports and
 small checks here; run full targeted tests on a larger machine or CI worker.
+
+## Current handoff (HEAD `d4c63c0105`)
+
+- Skills/provider and TUI onboarding audits found no missing stable-target
+  functionality; superseded Catalyst commits are explicitly excluded.
+- The native app-server client method registry is already present. The old
+  reusable-serve extraction remains deferred because its process layout does
+  not match this branch.
+- `just test -p codex-core` was attempted with one job and debuginfo disabled,
+  but the 2 GiB host killed rustc while compiling `codex-protocol`; no core
+  test binary started. Temporary outputs were removed and `Cargo.lock` was
+  restored.
+- Exact next action: validate compaction transaction tests and core/app-server
+  suites on a larger runner, then perform final cleanup and update the reusable
+  upstream sync runbook with the release result.
