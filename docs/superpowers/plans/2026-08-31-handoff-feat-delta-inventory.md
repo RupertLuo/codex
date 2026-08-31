@@ -18,9 +18,11 @@ where the stable 0.151.0 APIs required a semantic port rather than a cherry-pick
 
 ## Deferred or still requiring a coherent port
 
-- Thread-title generation (`d59b47d723`, `4d7ad8ce77`, `18ef0969c4`): the
-  prerequisite stable thread-store/title API is different; migrate the complete
-  group only after mapping that API.
+- Thread-store title generation (`d59b47d723`, `4d7ad8ce77`, `18ef0969c4`):
+  do not port this old 325-line store-level implementation. Stable 0.151.0
+  already contains the current TUI `app/thread_title.rs` flow, while the
+  thread-store title-generator API is absent; compare behavior and add only a
+  narrowly justified compatibility fix if a regression is demonstrated.
 - Skills provider handles and routing bounds (`5793b0dad6`, `eaf21f5a50`,
   `6b61d98fe2`, `dbbd0d59ec`, `d631fdd9fa`): stable already has newer
   `SkillProviderSource` and budgeted-tool structures; port authorization and
