@@ -79,3 +79,7 @@ small checks here; run full targeted tests on a larger machine or CI worker.
   `dotslash`/`uv` formatters; the root filesystem has 2.0 GiB free.
 - Removed 163 MiB of disposable `codex-state-runtime-test-*` SQLite artifacts
   from `/mnt/codex/tmp`; the task temporary directory is now effectively empty.
+- Final artifact audit found no `.rej`, `.orig`, `.snap.new`, or debug-log
+  leftovers. Repository `patches/` files are tracked build patches, not failed
+  merge scratch data. `cargo metadata --no-deps --format-version 1 --locked`
+  passes from `codex-rs`.
