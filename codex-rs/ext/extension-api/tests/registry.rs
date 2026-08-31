@@ -24,6 +24,9 @@ use codex_extension_api::ToolCall;
 use codex_extension_api::ToolContributor;
 use codex_extension_api::ToolExecutor;
 use codex_extension_api::ToolLifecycleContributor;
+use codex_extension_api::TurnCompletionContribution;
+use codex_extension_api::TurnCompletionContributor;
+use codex_extension_api::TurnCompletionInput;
 use codex_extension_api::TurnContextContributionInput;
 use codex_extension_api::TurnInputContext;
 use codex_extension_api::TurnInputContributor;
@@ -79,6 +82,15 @@ impl ContextContributor for AllContributors {
 impl ThreadLifecycleContributor<()> for AllContributors {}
 
 impl TurnLifecycleContributor for AllContributors {}
+
+impl TurnCompletionContributor for AllContributors {
+    fn contribute<'a>(
+        &'a self,
+        _input: TurnCompletionInput<'a>,
+    ) -> ExtensionFuture<'a, Option<TurnCompletionContribution>> {
+        Box::pin(std::future::ready(None))
+    }
+}
 
 impl ConfigContributor<()> for AllContributors {}
 
@@ -150,6 +162,7 @@ async fn build_round_trips_every_contributor_category() {
     let mut builder = ExtensionRegistryBuilder::<()>::new();
     builder.thread_lifecycle_contributor(contributor.clone());
     builder.turn_lifecycle_contributor(contributor.clone());
+    builder.turn_completion_contributor(contributor.clone());
     builder.config_contributor(contributor.clone());
     builder.token_usage_contributor(contributor.clone());
     builder.skill_invocation_contributor(contributor.clone());
@@ -163,6 +176,7 @@ async fn build_round_trips_every_contributor_category() {
 
     assert_eq!(registry.thread_lifecycle_contributors().len(), 1);
     assert_eq!(registry.turn_lifecycle_contributors().len(), 1);
+    assert_eq!(registry.turn_completion_contributors().len(), 1);
     assert_eq!(registry.config_contributors().len(), 1);
     assert_eq!(registry.token_usage_contributors().len(), 1);
     assert_eq!(registry.skill_invocation_contributors().len(), 1);

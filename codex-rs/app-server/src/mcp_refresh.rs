@@ -341,6 +341,7 @@ enabled = false
                         http_client_factory: good_config.http_client_factory(),
                         queue_service: None,
                         runtime_extensions: Vec::new(),
+                        agent_spawner_runtime_extension_factories: Vec::new(),
                         skill_provider_sources: Vec::new(),
                     },
                 ),

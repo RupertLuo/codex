@@ -15,6 +15,7 @@ use crate::ThreadLifecycleContributor;
 use crate::TokenUsageContributor;
 use crate::ToolContributor;
 use crate::ToolLifecycleContributor;
+use crate::TurnCompletionContributor;
 use crate::TurnInputContributor;
 use crate::TurnItemContributor;
 use crate::TurnLifecycleContributor;
@@ -39,6 +40,7 @@ impl<C: Sync> Default for ExtensionRegistryBuilder<C> {
                 event_sink: Arc::new(NoopExtensionEventSink),
                 thread_lifecycle_contributors: Vec::new(),
                 turn_lifecycle_contributors: Vec::new(),
+                turn_completion_contributors: Vec::new(),
                 config_contributors: Vec::new(),
                 token_usage_contributors: Vec::new(),
                 skill_invocation_contributors: Vec::new(),
@@ -90,6 +92,11 @@ impl<C: Sync> ExtensionRegistryBuilder<C> {
     /// Registers one turn-lifecycle contributor.
     pub fn turn_lifecycle_contributor(&mut self, contributor: Arc<dyn TurnLifecycleContributor>) {
         self.registry.turn_lifecycle_contributors.push(contributor);
+    }
+
+    /// Registers one turn-completion contributor.
+    pub fn turn_completion_contributor(&mut self, contributor: Arc<dyn TurnCompletionContributor>) {
+        self.registry.turn_completion_contributors.push(contributor);
     }
 
     /// Registers one config contributor.
@@ -153,6 +160,7 @@ pub struct ExtensionRegistry<C: Sync> {
     event_sink: Arc<dyn ExtensionEventSink>,
     thread_lifecycle_contributors: Vec<Arc<dyn ThreadLifecycleContributor<C>>>,
     turn_lifecycle_contributors: Vec<Arc<dyn TurnLifecycleContributor>>,
+    turn_completion_contributors: Vec<Arc<dyn TurnCompletionContributor>>,
     config_contributors: Vec<Arc<dyn ConfigContributor<C>>>,
     token_usage_contributors: Vec<Arc<dyn TokenUsageContributor>>,
     skill_invocation_contributors: Vec<Arc<dyn SkillInvocationContributor>>,
@@ -179,6 +187,11 @@ impl<C: Sync> ExtensionRegistry<C> {
     /// Returns the registered turn-lifecycle contributors.
     pub fn turn_lifecycle_contributors(&self) -> &[Arc<dyn TurnLifecycleContributor>] {
         &self.turn_lifecycle_contributors
+    }
+
+    /// Returns the registered turn-completion contributors.
+    pub fn turn_completion_contributors(&self) -> &[Arc<dyn TurnCompletionContributor>] {
+        &self.turn_completion_contributors
     }
 
     /// Returns the registered config contributors.

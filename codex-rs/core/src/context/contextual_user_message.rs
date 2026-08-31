@@ -11,6 +11,7 @@ use super::LegacyUnifiedExecProcessLimitWarning;
 use super::RecommendedPluginsInstructions;
 use super::SubagentNotification;
 use super::TurnAborted;
+use super::TurnCompletion;
 use super::UserInstructions;
 use super::UserShellCommand;
 use super::world_state::EnvironmentsState;
@@ -22,6 +23,7 @@ const CONTEXTUAL_USER_FRAGMENT_MATCHERS: &[fn(&str) -> bool] = &[
     codex_skills_extension::is_skill_prompt_fragment,
     UserShellCommand::matches_text,
     TurnAborted::matches_text,
+    TurnCompletion::matches_text,
     SubagentNotification::matches_text,
     InternalModelContextFragment::matches_text,
     RecommendedPluginsInstructions::matches_text,
