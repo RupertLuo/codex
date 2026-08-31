@@ -200,10 +200,9 @@ git diff --check
 git log --oneline <stable-tag>..HEAD
 ```
 
-本机若使用可重建的数据盘，清理前先确认 `mountpoint -q /mnt/codex` 与
-`df -h /mnt/codex`；若挂载点不存在，先提醒维护者创建/挂载新盘，再进行任何构建。
-`AGENTS.override.md` 是本机私有且被 gitignore 的提醒文件，不得上传；卸载数据盘前，
-应恢复 `~/.cargo/{registry,git}` 与 `~/.cache/bazel*` 的原有路径或重新建立兼容链接。
+若使用可重建的任务专用存储，清理前先确认挂载点和剩余空间；若存储不可用，先提醒维护者
+准备替代环境，再进行任何构建。机器专属路径、缓存链接和配置只应记录在本地忽略文件中，
+不得上传。卸载任务存储前，应恢复工具默认路径或重新建立兼容链接。
 
 删除 `.rej`、临时 patch、冲突备份、未采用的 snapshot、调试日志和临时分支；保留
 `pre-sync-*`/`pre-round-*` 安全 tag（除非维护者要求删除）。不要把命令输出、凭证、网络
@@ -232,15 +231,15 @@ bash scripts/upstream-sync-preflight.sh rust-v0.151.0
 `SYNC_PYTHON_BIN=/path/to/python3.11` 指定任务级 Python。`dotslash`/`uv` 只作
 可选工具报告，不会被脚本悄悄安装。
 
-换到更大内存机器后的第一轮命令建议固定为：
+在具备足够资源的执行环境中的第一轮命令建议为（将 `<cache-root>` 替换为该环境的任务缓存根目录）：
 
 ```text
-mountpoint -q /mnt/codex && df -h /mnt/codex
+df -h <cache-root>
 SYNC_PYTHON_BIN=/usr/bin/python3.11 bash scripts/upstream-sync-preflight.sh rust-v0.151.0
 cd codex-rs
-CARGO_TARGET_DIR=/mnt/codex/target CARGO_BUILD_JOBS=2 just test -p codex-thread-store
-CARGO_TARGET_DIR=/mnt/codex/target CARGO_BUILD_JOBS=2 just test -p codex-core
-CARGO_TARGET_DIR=/mnt/codex/target CARGO_BUILD_JOBS=2 just test -p codex-app-server
+CARGO_TARGET_DIR=<cache-root>/target CARGO_BUILD_JOBS=2 just test -p codex-thread-store
+CARGO_TARGET_DIR=<cache-root>/target CARGO_BUILD_JOBS=2 just test -p codex-core
+CARGO_TARGET_DIR=<cache-root>/target CARGO_BUILD_JOBS=2 just test -p codex-app-server
 ```
 
-若云盘未挂载，停止执行并先创建/挂载替代盘；不要让 Cargo 回退到根盘。
+若任务缓存存储未准备好，停止执行并先创建/挂载替代存储；不要让 Cargo 回退到系统盘。
