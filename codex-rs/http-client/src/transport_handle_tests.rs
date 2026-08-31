@@ -21,7 +21,7 @@ fn handle_is_cloneable() {
         },
     );
 
-    let _clone = handle.clone();
+    let _clone = handle;
 }
 
 #[tokio::test]
