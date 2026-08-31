@@ -132,6 +132,8 @@ fn has_retryable_tls_error(error: &(dyn Error + 'static)) -> bool {
         let is_macos_protocol_version_error = message.contains("bad protocol version");
         // Linux OpenSSL reports the peer's "tlsv1 alert protocol version".
         let is_linux_protocol_version_error = message.contains("tlsv1 alert protocol version");
+        // Some Linux TLS wrappers expose rustls' enum-style `ProtocolVersion` without spaces.
+        let is_enum_protocol_version_error = message.contains("protocolversion");
         // Windows Schannel may expose the protocol alert as a raw or formatted OS error.
         let is_schannel_protocol_version_error = error
             .downcast_ref::<std::io::Error>()
@@ -141,6 +143,7 @@ fn has_retryable_tls_error(error: &(dyn Error + 'static)) -> bool {
             || message.contains("0x80090302");
         if is_macos_protocol_version_error
             || is_linux_protocol_version_error
+            || is_enum_protocol_version_error
             || is_schannel_protocol_version_error
         {
             recognized_negotiation_failure = true;

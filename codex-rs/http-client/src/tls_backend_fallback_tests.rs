@@ -18,6 +18,8 @@ fn recognizes_platform_specific_tls_protocol_negotiation_failures() {
             "error:0A00042E:SSL routines:ssl3_read_bytes:tlsv1 alert protocol version",
             true,
         ),
+        ("received fatal alert: ProtocolVersion", true),
+        ("InvalidCertificate(UnknownIssuer)", false),
         ("TLSV1 ALERT PROTOCOL VERSION", true),
         (
             "The function requested is not supported. (os error -2146893054)",

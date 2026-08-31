@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::error::Error;
 use std::fmt;
 use std::future::Future;
 use std::io;
@@ -117,14 +118,22 @@ impl RouteAwareRequestError {
             return Some(RouteFailureClass::TlsError);
         }
 
-        let mut source: Option<&(dyn std::error::Error + 'static)> = Some(self);
+        let mut source: Option<&(dyn std::error::Error + 'static)> = match self {
+            // Start below reqwest's outer error so URL text cannot affect TLS classification.
+            Self::Request(error) => error.source(),
+            _ => Some(self),
+        };
         while let Some(error) = source {
             if error.downcast_ref::<rustls::Error>().is_some()
                 || error.downcast_ref::<native_tls::Error>().is_some()
             {
                 return Some(RouteFailureClass::TlsError);
             }
-            if error.to_string() == "tunnel error: proxy authorization required" {
+            let message = error.to_string().to_ascii_lowercase();
+            if message.contains("invalidcertificate") || message.contains("unknownissuer") {
+                return Some(RouteFailureClass::TlsError);
+            }
+            if message == "tunnel error: proxy authorization required" {
                 return Some(RouteFailureClass::ProxyAuthenticationRequired);
             }
             source = error.source();
