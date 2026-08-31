@@ -99,6 +99,9 @@ small checks here; run full targeted tests on a larger machine or CI worker.
   `/mnt/codex/target` and `/mnt/codex/target-state-crlf` were removed. Cargo
   (2.0 GiB), Bazel (250 MiB), and the tiny temp directory were retained for a
   future larger runner; the data disk now has about 91 GiB free.
+- Post-cleanup preflight at HEAD `11936e16ec` passes stable ancestry, locked
+  metadata, diff check, and process-artifact checks. Only optional `dotslash`
+  and `uv` remain unavailable; no build output is left on the data disk.
 
 ## Completion matrix
 
