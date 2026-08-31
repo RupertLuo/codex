@@ -10,7 +10,6 @@ use sqlx::Row;
 use sqlx::SqlSafeStr;
 use sqlx::migrate::Migration;
 use sqlx::migrate::Migrator;
-use sqlx::sqlite::SqlitePoolOptions;
 
 use super::GOALS_MIGRATOR;
 use super::LOGS_MIGRATOR;
@@ -128,11 +127,18 @@ fn migrator_with_crlf_line_endings_through(base: &Migrator, version: i64) -> Mig
 
 #[tokio::test]
 async fn repairs_legacy_crlf_migration_checksums() {
-    let pool = SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect("sqlite::memory:")
+    let sqlite_home = crate::runtime::test_support::unique_temp_dir();
+    tokio::fs::create_dir_all(&sqlite_home)
         .await
-        .expect("in-memory database should open");
+        .expect("sqlite home should be created");
+    let _cleanup = scopeguard::guard(sqlite_home.clone(), |sqlite_home| {
+        let _ = std::fs::remove_dir_all(sqlite_home);
+    });
+    let sqlite = crate::SqliteConfig::new_for_testing(sqlite_home.as_path().abs());
+    let pool = sqlite
+        .open_read_write_pool(&sqlite.state_db_path())
+        .await
+        .expect("sqlite database should open");
     migrator_with_crlf_line_endings_through(&STATE_MIGRATOR, /*version*/ 1)
         .run(&pool)
         .await

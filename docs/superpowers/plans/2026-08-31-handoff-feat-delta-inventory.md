@@ -105,7 +105,7 @@ small checks here; run full targeted tests on a larger machine or CI worker.
 
 The CRLF compatibility repair was implemented in the state database migration
 open path and covered by `repairs_legacy_crlf_migration_checksums`; the state
-suite now passes **188/188**. `just fix -p codex-state` was attempted, but the
-recipe used the default root-disk target and stopped with `ENOSPC`; its partial
-target was removed and the lockfile restored. Re-run fix with an explicit
-`CARGO_TARGET_DIR=/mnt/codex/...` on a host with sufficient root scratch space.
+suite passes **188/188**. `just fix -p codex-state` passes when pointed at the
+cloud-disk target (`CARGO_TARGET_DIR=/mnt/codex/target-state-crlf`); the
+SQLite-shim warning was eliminated. An earlier root-disk `ENOSPC` attempt was
+cleaned up and its lockfile rewrite restored.
