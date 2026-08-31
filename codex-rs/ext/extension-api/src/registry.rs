@@ -13,6 +13,7 @@ use crate::ThreadLifecycleContributor;
 use crate::TokenUsageContributor;
 use crate::ToolContributor;
 use crate::ToolLifecycleContributor;
+use crate::TurnCompletionContributor;
 use crate::TurnInputContributor;
 use crate::TurnItemContributor;
 use crate::TurnLifecycleContributor;
@@ -30,6 +31,7 @@ pub struct ExtensionRegistryBuilder<C: Sync> {
     event_sink: Arc<dyn ExtensionEventSink>,
     thread_lifecycle_contributors: Vec<Arc<dyn ThreadLifecycleContributor<C>>>,
     turn_lifecycle_contributors: Vec<Arc<dyn TurnLifecycleContributor>>,
+    turn_completion_contributors: Vec<Arc<dyn TurnCompletionContributor>>,
     config_contributors: Vec<Arc<dyn ConfigContributor<C>>>,
     token_usage_contributors: Vec<Arc<dyn TokenUsageContributor>>,
     context_contributors: Vec<Arc<dyn ContextContributor>>,
@@ -47,6 +49,7 @@ impl<C: Sync> Default for ExtensionRegistryBuilder<C> {
             event_sink: Arc::new(NoopExtensionEventSink),
             thread_lifecycle_contributors: Vec::new(),
             turn_lifecycle_contributors: Vec::new(),
+            turn_completion_contributors: Vec::new(),
             config_contributors: Vec::new(),
             token_usage_contributors: Vec::new(),
             approval_review_contributors: Vec::new(),
@@ -97,6 +100,11 @@ impl<C: Sync> ExtensionRegistryBuilder<C> {
         self.turn_lifecycle_contributors.push(contributor);
     }
 
+    /// Registers one turn-completion contributor.
+    pub fn turn_completion_contributor(&mut self, contributor: Arc<dyn TurnCompletionContributor>) {
+        self.turn_completion_contributors.push(contributor);
+    }
+
     /// Registers one config contributor.
     pub fn config_contributor(&mut self, contributor: Arc<dyn ConfigContributor<C>>) {
         self.config_contributors.push(contributor);
@@ -143,6 +151,7 @@ impl<C: Sync> ExtensionRegistryBuilder<C> {
             event_sink: self.event_sink,
             thread_lifecycle_contributors: self.thread_lifecycle_contributors,
             turn_lifecycle_contributors: self.turn_lifecycle_contributors,
+            turn_completion_contributors: self.turn_completion_contributors,
             config_contributors: self.config_contributors,
             token_usage_contributors: self.token_usage_contributors,
             approval_review_contributors: self.approval_review_contributors,
@@ -161,6 +170,7 @@ pub struct ExtensionRegistry<C: Sync> {
     event_sink: Arc<dyn ExtensionEventSink>,
     thread_lifecycle_contributors: Vec<Arc<dyn ThreadLifecycleContributor<C>>>,
     turn_lifecycle_contributors: Vec<Arc<dyn TurnLifecycleContributor>>,
+    turn_completion_contributors: Vec<Arc<dyn TurnCompletionContributor>>,
     config_contributors: Vec<Arc<dyn ConfigContributor<C>>>,
     token_usage_contributors: Vec<Arc<dyn TokenUsageContributor>>,
     context_contributors: Vec<Arc<dyn ContextContributor>>,
@@ -186,6 +196,11 @@ impl<C: Sync> ExtensionRegistry<C> {
     /// Returns the registered turn-lifecycle contributors.
     pub fn turn_lifecycle_contributors(&self) -> &[Arc<dyn TurnLifecycleContributor>] {
         &self.turn_lifecycle_contributors
+    }
+
+    /// Returns the registered turn-completion contributors.
+    pub fn turn_completion_contributors(&self) -> &[Arc<dyn TurnCompletionContributor>] {
+        &self.turn_completion_contributors
     }
 
     /// Returns the registered config contributors.

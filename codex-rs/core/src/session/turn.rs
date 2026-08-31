@@ -77,6 +77,7 @@ use codex_analytics::build_track_events_context;
 use codex_async_utils::OrCancelExt;
 use codex_core_plugins::RecommendedPluginCandidatesInput;
 use codex_core_skills::injection::InjectedHostSkillPrompts;
+use codex_extension_api::TurnCompletionInput;
 use codex_extension_api::TurnInputContext;
 use codex_extension_api::TurnInputEnvironment;
 use codex_features::Feature;
@@ -430,6 +431,19 @@ pub(crate) async fn run_turn(
                     if stop_outcome.should_stop {
                         break;
                     }
+                    let completion_items = build_turn_completion_items(
+                        sess.as_ref(),
+                        turn_context.as_ref(),
+                        turn_extension_data.as_ref(),
+                        last_agent_message.as_deref(),
+                        &cancellation_token,
+                    )
+                    .await?;
+                    if !completion_items.is_empty() {
+                        sess.record_conversation_items(&turn_context, &completion_items)
+                            .await;
+                        continue;
+                    }
                     if run_legacy_after_agent_hook(
                         &sess,
                         &turn_context,
@@ -495,6 +509,64 @@ pub(crate) async fn run_turn(
     }
 
     Ok(last_agent_message)
+}
+
+async fn build_turn_completion_items(
+    sess: &Session,
+    turn_context: &TurnContext,
+    turn_store: &codex_extension_api::ExtensionData,
+    last_agent_message: Option<&str>,
+    cancellation_token: &CancellationToken,
+) -> CodexResult<Vec<ResponseItem>> {
+    let contributors = sess
+        .services
+        .extensions
+        .turn_completion_contributors()
+        .to_vec();
+    let mut developer_sections = Vec::new();
+    let mut contextual_user_sections = Vec::new();
+    let mut separate_developer_sections = Vec::new();
+
+    for contributor in contributors {
+        let fragments = contributor
+            .contribute(TurnCompletionInput {
+                turn_id: turn_context.sub_id.as_str(),
+                last_agent_message,
+                session_store: &sess.services.session_extension_data,
+                thread_store: &sess.services.thread_extension_data,
+                turn_store,
+            })
+            .or_cancel(cancellation_token)
+            .await?;
+        for fragment in fragments {
+            super::push_prompt_fragment(
+                fragment,
+                &mut developer_sections,
+                &mut contextual_user_sections,
+                &mut separate_developer_sections,
+            );
+        }
+    }
+
+    let mut items = Vec::with_capacity(3);
+    if let Some(item) =
+        crate::context_manager::updates::build_developer_update_item(developer_sections)
+    {
+        items.push(item);
+    }
+    for section in separate_developer_sections {
+        if let Some(item) =
+            crate::context_manager::updates::build_developer_update_item(vec![section])
+        {
+            items.push(item);
+        }
+    }
+    if let Some(item) =
+        crate::context_manager::updates::build_contextual_user_message(contextual_user_sections)
+    {
+        items.push(item);
+    }
+    Ok(items)
 }
 
 #[instrument(level = "trace", skip_all)]

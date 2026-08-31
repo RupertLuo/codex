@@ -153,6 +153,7 @@ use core_test_support::PathExt;
 use core_test_support::context_snapshot;
 use core_test_support::context_snapshot::ContextSnapshotOptions;
 use core_test_support::context_snapshot::ContextSnapshotRenderMode;
+use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
 use core_test_support::responses::ev_response_created;
 use core_test_support::responses::mount_sse_once;
@@ -8249,6 +8250,125 @@ struct PromptExtensionTestState;
 struct TurnContextExtensionTestContributor;
 struct TurnContextExtensionTestState {
     expected_model_context_window: Option<i64>,
+}
+
+struct BlockingTurnCompletionContributor {
+    entered: Arc<Semaphore>,
+    release: Arc<Semaphore>,
+    messages: Arc<std::sync::Mutex<Vec<Option<String>>>>,
+}
+
+impl codex_extension_api::TurnCompletionContributor for BlockingTurnCompletionContributor {
+    fn contribute<'a>(
+        &'a self,
+        input: codex_extension_api::TurnCompletionInput<'a>,
+    ) -> codex_extension_api::ExtensionFuture<'a, Vec<codex_extension_api::PromptFragment>> {
+        Box::pin(async move {
+            let call_index = {
+                let mut messages = self
+                    .messages
+                    .lock()
+                    .expect("completion messages lock should not be poisoned");
+                messages.push(input.last_agent_message.map(str::to_string));
+                messages.len()
+            };
+            if call_index != 1 {
+                return Vec::new();
+            }
+
+            self.entered.add_permits(1);
+            self.release
+                .acquire()
+                .await
+                .expect("completion release semaphore should remain open")
+                .forget();
+            vec![codex_extension_api::PromptFragment::new(
+                codex_extension_api::PromptSlot::ContextualUser,
+                "host batch complete",
+            )]
+        })
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn turn_completion_contributor_can_wait_and_continue_the_same_turn() -> anyhow::Result<()> {
+    let server = start_mock_server().await;
+    let first_request = mount_sse_once(
+        &server,
+        sse(vec![
+            ev_response_created("resp-1"),
+            ev_assistant_message("msg-1", "P01 done"),
+            ev_completed("resp-1"),
+        ]),
+    )
+    .await;
+    let second_request = mount_sse_once(
+        &server,
+        sse(vec![
+            ev_response_created("resp-2"),
+            ev_assistant_message("msg-2", "all done"),
+            ev_completed("resp-2"),
+        ]),
+    )
+    .await;
+
+    let entered = Arc::new(Semaphore::new(0));
+    let release = Arc::new(Semaphore::new(0));
+    let messages = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let contributor = Arc::new(BlockingTurnCompletionContributor {
+        entered: Arc::clone(&entered),
+        release: Arc::clone(&release),
+        messages: Arc::clone(&messages),
+    });
+    let mut extensions = codex_extension_api::ExtensionRegistryBuilder::new();
+    extensions.turn_completion_contributor(contributor);
+    let test = test_codex()
+        .with_extensions(Arc::new(extensions.build()))
+        .build(&server)
+        .await?;
+
+    test.codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "make the deck".to_string(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: Default::default(),
+        })
+        .await?;
+
+    timeout(Duration::from_secs(2), entered.acquire())
+        .await
+        .expect("turn completion contributor should be entered")
+        .expect("completion entry semaphore should remain open")
+        .forget();
+    assert_eq!(first_request.requests().len(), 1);
+    assert!(second_request.requests().is_empty());
+
+    release.add_permits(1);
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+
+    assert!(
+        second_request
+            .single_request()
+            .message_input_texts("user")
+            .iter()
+            .any(|text| text == "host batch complete")
+    );
+    assert_eq!(
+        messages
+            .lock()
+            .expect("completion messages lock should not be poisoned")
+            .as_slice(),
+        [Some("P01 done".to_string()), Some("all done".to_string())]
+    );
+    Ok(())
 }
 
 impl codex_extension_api::ContextContributor for PromptExtensionTestContributor {

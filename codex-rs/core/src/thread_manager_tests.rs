@@ -21,6 +21,8 @@ use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ModelsResponse;
 use codex_protocol::protocol::AgentMessageEvent;
 use codex_protocol::protocol::AgentStatus;
+use codex_protocol::protocol::Event;
+use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::InitialHistory;
 use codex_protocol::protocol::InternalSessionSource;
 use codex_protocol::protocol::ResumedHistory;
@@ -28,6 +30,7 @@ use codex_protocol::protocol::SessionMeta;
 use codex_protocol::protocol::SessionMetaLine;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::ThreadSource;
+use codex_protocol::protocol::TurnCompleteEvent;
 use codex_protocol::protocol::TurnStartedEvent;
 use codex_protocol::protocol::UserMessageEvent;
 use codex_skills_extension::SkillProvider;
@@ -290,6 +293,116 @@ async fn native_agent_runtime_interrupts_only_through_the_parent_agent_control()
         .expect_err("an unrelated thread cannot be interrupted as a child");
 
     assert!(error.to_string().contains(&missing_child.to_string()));
+}
+
+#[tokio::test]
+async fn native_agent_runtime_waits_for_a_terminal_status() {
+    let temp_dir = tempdir().expect("tempdir");
+    let mut config = test_config().await;
+    config.codex_home = temp_dir.path().join("codex-home").abs();
+    config.cwd = config.codex_home.abs();
+    std::fs::create_dir_all(&config.codex_home).expect("create codex home");
+    let manager = ThreadManager::with_models_provider_and_home_for_tests(
+        CodexAuth::from_api_key("dummy"),
+        config.model_provider.clone(),
+        config.codex_home.to_path_buf(),
+        Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+    );
+    let parent = manager
+        .start_thread(config.clone())
+        .await
+        .expect("start parent thread");
+    let spawned = spawn_native_test_child(&manager, parent.thread_id, config).await;
+    let child = manager
+        .get_thread(spawned.thread_id)
+        .await
+        .expect("spawned child");
+
+    child
+        .codex
+        .session
+        .send_event_raw(Event {
+            id: "child-turn".to_string(),
+            msg: EventMsg::TurnComplete(TurnCompleteEvent {
+                turn_id: "child-turn".to_string(),
+                last_agent_message: Some("done".to_string()),
+                completed_at: None,
+                duration_ms: None,
+                time_to_first_token_ms: None,
+            }),
+        })
+        .await;
+
+    assert_eq!(
+        manager
+            .wait_native_agent(spawned.thread_id)
+            .await
+            .expect("wait for native child"),
+        AgentStatus::Completed(Some("done".to_string()))
+    );
+}
+
+#[tokio::test]
+async fn native_agent_runtime_close_uses_parent_ownership_and_releases_capacity() {
+    let temp_dir = tempdir().expect("tempdir");
+    let mut config = test_config().await;
+    config.codex_home = temp_dir.path().join("codex-home").abs();
+    config.cwd = config.codex_home.abs();
+    config.agent_max_threads = Some(1);
+    std::fs::create_dir_all(&config.codex_home).expect("create codex home");
+    let manager = ThreadManager::with_models_provider_and_home_for_tests(
+        CodexAuth::from_api_key("dummy"),
+        config.model_provider.clone(),
+        config.codex_home.to_path_buf(),
+        Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+    );
+    let parent = manager
+        .start_thread(config.clone())
+        .await
+        .expect("start parent thread");
+    let first = spawn_native_test_child(&manager, parent.thread_id, config.clone()).await;
+
+    manager
+        .close_native_agent(parent.thread_id, first.thread_id)
+        .await
+        .expect("close native child");
+
+    assert_eq!(
+        manager.native_agent_status(first.thread_id).await,
+        AgentStatus::NotFound
+    );
+    spawn_native_test_child(&manager, parent.thread_id, config).await;
+}
+
+async fn spawn_native_test_child(
+    manager: &ThreadManager,
+    parent_thread_id: ThreadId,
+    config: Config,
+) -> NativeAgentSpawn {
+    manager
+        .spawn_native_agent(
+            parent_thread_id,
+            NativeAgentSpawnRequest {
+                config,
+                initial_operation: Op::UserInput {
+                    items: vec![codex_protocol::user_input::UserInput::Text {
+                        text: "delegated test task".to_string(),
+                        text_elements: Vec::new(),
+                    }],
+                    final_output_json_schema: None,
+                    responsesapi_client_metadata: None,
+                    additional_context: Default::default(),
+                    thread_settings: Default::default(),
+                },
+                parent_spawn_call_id: "native-test-call".to_string(),
+                fork_turns: 0,
+                agent_role: Some("test-worker".to_string()),
+                agent_nickname: Some("Test Worker".to_string()),
+                thread_extension_init: codex_extension_api::ExtensionDataInit::default(),
+            },
+        )
+        .await
+        .expect("spawn native test child")
 }
 
 #[test]

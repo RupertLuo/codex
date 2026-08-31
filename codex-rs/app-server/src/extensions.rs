@@ -250,6 +250,17 @@ impl NativeAgentRuntime for AppServerNativeAgentRuntime {
         })
     }
 
+    fn wait_agent<'a>(
+        &'a self,
+        thread_id: ThreadId,
+    ) -> NativeAgentFuture<'a, codex_protocol::protocol::AgentStatus> {
+        let thread_manager = self.thread_manager.clone();
+        Box::pin(async move {
+            let thread_manager = upgrade_thread_manager(thread_manager)?;
+            thread_manager.wait_native_agent(thread_id).await
+        })
+    }
+
     fn interrupt_agent<'a>(
         &'a self,
         parent_thread_id: ThreadId,
@@ -260,6 +271,20 @@ impl NativeAgentRuntime for AppServerNativeAgentRuntime {
             let thread_manager = upgrade_thread_manager(thread_manager)?;
             thread_manager
                 .interrupt_native_agent(parent_thread_id, child_thread_id)
+                .await
+        })
+    }
+
+    fn close_agent<'a>(
+        &'a self,
+        parent_thread_id: ThreadId,
+        child_thread_id: ThreadId,
+    ) -> NativeAgentFuture<'a, ()> {
+        let thread_manager = self.thread_manager.clone();
+        Box::pin(async move {
+            let thread_manager = upgrade_thread_manager(thread_manager)?;
+            thread_manager
+                .close_native_agent(parent_thread_id, child_thread_id)
                 .await
         })
     }
@@ -330,7 +355,30 @@ mod tests {
             })
         }
 
+        fn wait_agent<'a>(
+            &'a self,
+            _thread_id: ThreadId,
+        ) -> NativeAgentFuture<'a, codex_protocol::protocol::AgentStatus> {
+            Box::pin(async {
+                Err(CodexErr::UnsupportedOperation(
+                    "test native agent runtime".to_string(),
+                ))
+            })
+        }
+
         fn interrupt_agent<'a>(
+            &'a self,
+            _parent_thread_id: ThreadId,
+            _child_thread_id: ThreadId,
+        ) -> NativeAgentFuture<'a, ()> {
+            Box::pin(async {
+                Err(CodexErr::UnsupportedOperation(
+                    "test native agent runtime".to_string(),
+                ))
+            })
+        }
+
+        fn close_agent<'a>(
             &'a self,
             _parent_thread_id: ThreadId,
             _child_thread_id: ThreadId,
@@ -392,7 +440,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn native_agent_runtime_exposes_status_and_interrupt_capabilities() {
+    async fn native_agent_runtime_exposes_lifecycle_capabilities() {
         let runtime = native_agent_spawner(Weak::<ThreadManager>::new());
         let thread_id = ThreadId::new();
 
@@ -400,13 +448,23 @@ mod tests {
             .agent_status(thread_id)
             .await
             .expect_err("a dropped manager cannot report native agent status");
+        let wait_error = runtime
+            .wait_agent(thread_id)
+            .await
+            .expect_err("a dropped manager cannot wait for a native agent");
         let interrupt_error = runtime
             .interrupt_agent(thread_id, ThreadId::new())
             .await
             .expect_err("a dropped manager cannot interrupt a native agent");
+        let close_error = runtime
+            .close_agent(thread_id, ThreadId::new())
+            .await
+            .expect_err("a dropped manager cannot close a native agent");
 
         assert!(matches!(status_error, CodexErr::UnsupportedOperation(_)));
+        assert!(matches!(wait_error, CodexErr::UnsupportedOperation(_)));
         assert!(matches!(interrupt_error, CodexErr::UnsupportedOperation(_)));
+        assert!(matches!(close_error, CodexErr::UnsupportedOperation(_)));
     }
 
     #[tokio::test]

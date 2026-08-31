@@ -3,6 +3,7 @@ use crate::agent::AgentControl;
 use crate::agent::AgentStatus;
 use crate::agent::control::SpawnAgentForkMode;
 use crate::agent::control::SpawnAgentOptions;
+use crate::agent::status::is_final;
 use crate::attestation::AttestationProvider;
 use crate::codex_thread::CodexThread;
 use crate::config::Config;
@@ -156,7 +157,15 @@ pub trait NativeAgentRuntime:
 {
     fn agent_status<'a>(&'a self, thread_id: ThreadId) -> NativeAgentFuture<'a, AgentStatus>;
 
+    fn wait_agent<'a>(&'a self, thread_id: ThreadId) -> NativeAgentFuture<'a, AgentStatus>;
+
     fn interrupt_agent<'a>(
+        &'a self,
+        parent_thread_id: ThreadId,
+        child_thread_id: ThreadId,
+    ) -> NativeAgentFuture<'a, ()>;
+
+    fn close_agent<'a>(
         &'a self,
         parent_thread_id: ThreadId,
         child_thread_id: ThreadId,
@@ -1112,6 +1121,26 @@ impl ThreadManager {
         }
     }
 
+    /// Waits for the native agent graph to report a terminal child status.
+    pub async fn wait_native_agent(&self, thread_id: ThreadId) -> CodexResult<AgentStatus> {
+        let thread = match self.get_thread(thread_id).await {
+            Ok(thread) => thread,
+            Err(CodexErr::ThreadNotFound(_)) => {
+                return Ok(self.native_agent_status(thread_id).await);
+            }
+            Err(error) => return Err(error),
+        };
+        let mut status_rx = thread.subscribe_status();
+        let mut status = status_rx.borrow().clone();
+        while !is_final(&status) {
+            if status_rx.changed().await.is_err() {
+                return Ok(self.native_agent_status(thread_id).await);
+            }
+            status = status_rx.borrow().clone();
+        }
+        Ok(status)
+    }
+
     /// Interrupts one native child through the parent thread's shared
     /// [`AgentControl`], preserving the same graph ownership checks used by
     /// Codex collaboration tools.
@@ -1127,6 +1156,23 @@ impl ThreadManager {
             .services
             .agent_control
             .interrupt_agent(child_thread_id)
+            .await
+            .map(|_| ())
+    }
+
+    /// Closes one native child through its parent's shared [`AgentControl`].
+    pub async fn close_native_agent(
+        &self,
+        parent_thread_id: ThreadId,
+        child_thread_id: ThreadId,
+    ) -> CodexResult<()> {
+        let parent = self.get_thread(parent_thread_id).await?;
+        parent
+            .codex
+            .session
+            .services
+            .agent_control
+            .close_agent(child_thread_id)
             .await
             .map(|_| ())
     }
