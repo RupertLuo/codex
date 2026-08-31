@@ -108,6 +108,10 @@ small checks here; run full targeted tests on a larger machine or CI worker.
 - Final cache-link audit confirms Cargo registry/git and all four Bazel cache
   roots under the home directory resolve into `/mnt/codex`; no build cache path
   falls back to the root filesystem.
+- Host cleanup removed 511 disposable state-test directories from `/tmp`
+  (~1.2 GiB) and cleared the rebuildable npm download cache (~2.2 GiB).
+  Node runtimes, Rustup, Git history, and unrelated provider caches were kept;
+  root free space is now about 4.2 GiB.
 
 ## Completion matrix
 
