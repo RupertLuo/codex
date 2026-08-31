@@ -417,9 +417,6 @@ impl MessageProcessor {
                         runtime_extensions: thread_manager_runtime_options
                             .runtime_extensions()
                             .to_vec(),
-                        agent_spawner_runtime_extension_factories: thread_manager_runtime_options
-                            .agent_spawner_runtime_extension_factories()
-                            .to_vec(),
                         skill_provider_sources: thread_manager_runtime_options
                             .skill_provider_sources()
                             .to_vec(),

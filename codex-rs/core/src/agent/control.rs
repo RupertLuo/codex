@@ -19,13 +19,11 @@ use crate::session::multi_agents::ResolvedMultiAgentV2UsageHints;
 use crate::session_prefix::format_inter_agent_completion_message;
 use crate::session_prefix::format_subagent_context_line;
 use crate::session_prefix::format_subagent_notification_message;
-use crate::thread_manager::NativeAgentNotificationPolicy;
 use crate::thread_manager::ResumeThreadWithHistoryOptions;
 use crate::thread_manager::ThreadIdGenerator;
 use crate::thread_manager::ThreadManagerState;
 use crate::thread_manager::default_thread_id_generator;
 use crate::thread_rollout_truncation::truncate_rollout_to_last_n_fork_turns;
-use codex_extension_api::ExtensionDataInit;
 use codex_history::InitialHistory;
 use codex_history::ResumedHistory;
 use codex_history::RolloutItem;
@@ -82,8 +80,6 @@ pub(crate) struct SpawnAgentOptions {
     pub(crate) parent_turn_id: Option<String>,
     pub(crate) root_turn_id: Option<String>,
     pub(crate) environments: Option<Vec<TurnEnvironmentSelection>>,
-    pub(crate) thread_extension_init: ExtensionDataInit,
-    pub(crate) notification_policy: NativeAgentNotificationPolicy,
     pub(crate) multi_agent_v2_usage_hints: Option<ResolvedMultiAgentV2UsageHints>,
 }
 
@@ -361,28 +357,6 @@ impl AgentControl {
         self.state
             .agent_metadata_for_thread(agent_id)
             .ok_or_else(|| CodexErr::ThreadNotFound(agent_id))
-    }
-
-    pub(crate) async fn ensure_direct_child(
-        &self,
-        parent_thread_id: ThreadId,
-        child_thread_id: ThreadId,
-    ) -> CodexResult<()> {
-        let state = self.upgrade()?;
-        let child = state.get_thread(child_thread_id).await?;
-        let child_snapshot = child.config_snapshot().await;
-        if matches!(
-            child_snapshot.session_source,
-            SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
-                parent_thread_id: direct_parent_thread_id,
-                ..
-            }) if direct_parent_thread_id == parent_thread_id
-        ) {
-            return Ok(());
-        }
-        Err(CodexErr::UnsupportedOperation(format!(
-            "thread {child_thread_id} is not a direct child of {parent_thread_id}"
-        )))
     }
 
     pub(crate) async fn list_live_agent_subtree_thread_ids(

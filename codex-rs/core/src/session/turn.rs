@@ -12,7 +12,6 @@ use crate::compact_remote::run_inline_remote_auto_compact_task;
 use crate::compact_remote_v2::run_inline_remote_auto_compact_task as run_inline_remote_auto_compact_task_v2;
 use crate::connectors;
 use crate::context::ContextualUserFragment;
-use crate::context::TurnCompletion;
 use crate::environment_selection::TurnEnvironmentSnapshot;
 use crate::feedback_tags;
 use crate::hook_runtime::drain_async_hook_results;
@@ -70,7 +69,6 @@ use codex_async_utils::OrCancelExt;
 use codex_connectors::AppToolPolicyEvaluator;
 use codex_core_plugins::RecommendedPluginCandidatesInput;
 use codex_extension_api::ExtensionData;
-use codex_extension_api::TurnCompletionInput;
 use codex_extension_api::TurnInputContext;
 use codex_extension_api::TurnInputEnvironment;
 use codex_features::Feature;
@@ -503,22 +501,6 @@ pub(crate) async fn run_turn(
 
                 if !needs_follow_up {
                     last_agent_message = sampling_request_last_agent_message;
-                    if let Some(completion_item) = build_turn_completion_item(
-                        sess.as_ref(),
-                        turn_context.as_ref(),
-                        turn_context.extension_data.as_ref(),
-                        last_agent_message.as_deref(),
-                        &cancellation_token,
-                    )
-                    .await?
-                    {
-                        sess.record_conversation_items(
-                            &turn_context,
-                            std::slice::from_ref(&completion_item),
-                        )
-                        .await;
-                        continue;
-                    }
                     let stop_outcome = run_turn_stop_hooks(
                         &sess,
                         &turn_context,
@@ -606,38 +588,6 @@ pub(crate) async fn run_turn(
     }
 
     Ok(last_agent_message)
-}
-
-async fn build_turn_completion_item(
-    sess: &Session,
-    turn_context: &TurnContext,
-    turn_store: &codex_extension_api::ExtensionData,
-    last_agent_message: Option<&str>,
-    cancellation_token: &CancellationToken,
-) -> CodexResult<Option<ResponseItem>> {
-    let contributors = sess
-        .services
-        .extensions
-        .turn_completion_contributors()
-        .to_vec();
-    for contributor in contributors {
-        let contribution = contributor
-            .contribute(TurnCompletionInput {
-                turn_id: turn_context.sub_id.as_str(),
-                last_agent_message,
-                session_store: &sess.services.session_extension_data,
-                thread_store: &sess.services.thread_extension_data,
-                turn_store,
-            })
-            .or_cancel(cancellation_token)
-            .await?;
-        if let Some(contribution) = contribution
-            && let Some(fragment) = TurnCompletion::new(contribution)
-        {
-            return Ok(Some(ContextualUserFragment::into(fragment)));
-        }
-    }
-    Ok(None)
 }
 
 #[instrument(level = "trace", skip_all)]

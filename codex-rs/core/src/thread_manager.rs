@@ -1,9 +1,5 @@
 use crate::CodexAppsToolsCache;
 use crate::agent::AgentControl;
-use crate::agent::AgentStatus;
-use crate::agent::control::SpawnAgentForkMode;
-use crate::agent::control::SpawnAgentOptions;
-use crate::agent::status::is_final;
 use crate::attestation::AttestationProvider;
 use crate::codex_thread::CodexThread;
 use crate::config::Config;
@@ -33,7 +29,6 @@ use codex_code_mode::DisabledCodeModeSessionProvider;
 use codex_code_mode::ProcessOwnedCodeModeSessionProvider;
 use codex_core_plugins::PluginsManager;
 use codex_exec_server::EnvironmentManager;
-use codex_extension_api::AgentSpawner;
 use codex_extension_api::ExtensionDataInit;
 use codex_extension_api::ExtensionRegistry;
 use codex_extension_api::LoadedUserInstructions;
@@ -57,7 +52,6 @@ use codex_models_manager::manager::StaticModelsManager;
 use codex_protocol::ThreadId;
 use codex_protocol::config_types::CollaborationModeMask;
 use codex_protocol::error::CodexErr;
-use codex_protocol::error::CodexErrorDetails;
 use codex_protocol::error::Result as CodexResult;
 use codex_protocol::mcp::ClientMcpExtensions;
 use codex_protocol::mcp::OPENAI_STANDARD_FORM_INPUT_EXTENSION_ID;
@@ -76,7 +70,6 @@ use codex_protocol::protocol::TurnAbortReason;
 use codex_protocol::protocol::TurnAbortedEvent;
 use codex_protocol::protocol::TurnEnvironmentSelection;
 use codex_protocol::protocol::W3cTraceContext;
-use codex_protocol::user_input::UserInput;
 use codex_rollout::state_db::StateDbHandle;
 use codex_skills_extension::HostSkillsService;
 use codex_thread_store::InMemoryThreadStore;
@@ -98,9 +91,7 @@ use futures::StreamExt;
 use futures::stream::FuturesUnordered;
 use std::collections::HashMap;
 use std::collections::HashSet;
-use std::future::Future;
 use std::path::PathBuf;
-use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
@@ -168,80 +159,6 @@ pub struct NewThread {
     pub session_configured: SessionConfiguredEvent,
 }
 
-/// Boxed operation exposed by the native agent runtime capability.
-pub type NativeAgentFuture<'a, T> = Pin<Box<dyn Future<Output = CodexResult<T>> + Send + 'a>>;
-
-/// Native child-agent capability exposed to process-local runtime extensions
-/// without coupling them to [`ThreadManager`].
-///
-/// Spawning, status reads, and interruption share one capability so an
-/// extension cannot accidentally mix native execution with a parallel status
-/// source. The capability also supports waiting for host-terminal child
-/// outcomes and closing directly owned children to release their capacity.
-pub trait NativeAgentRuntime:
-    AgentSpawner<NativeAgentSpawnRequest, Spawned = NativeAgentSpawn, Error = CodexErr> + Send + Sync
-{
-    fn agent_status<'a>(&'a self, thread_id: ThreadId) -> NativeAgentFuture<'a, AgentStatus>;
-
-    /// Waits until a child reaches a terminal state for one-shot host orchestration.
-    fn wait_agent<'a>(&'a self, _thread_id: ThreadId) -> NativeAgentFuture<'a, AgentStatus> {
-        Box::pin(std::future::ready(Err(CodexErr::UnsupportedOperation(
-            "native agent wait is unsupported".to_string(),
-        ))))
-    }
-
-    fn interrupt_agent<'a>(
-        &'a self,
-        parent_thread_id: ThreadId,
-        child_thread_id: ThreadId,
-    ) -> NativeAgentFuture<'a, ()>;
-
-    /// Closes a directly owned child and releases its native-agent capacity.
-    fn close_agent<'a>(
-        &'a self,
-        _parent_thread_id: ThreadId,
-        _child_thread_id: ThreadId,
-    ) -> NativeAgentFuture<'a, ()> {
-        Box::pin(std::future::ready(Err(CodexErr::UnsupportedOperation(
-            "native agent close is unsupported".to_string(),
-        ))))
-    }
-}
-
-/// Object-safe native agent runtime passed to runtime-extension factories.
-pub type NativeAgentSpawner = dyn NativeAgentRuntime;
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub enum NativeAgentNotificationPolicy {
-    /// Preserve the standard collaboration completion notification.
-    #[default]
-    NotifyParent,
-    /// The process-local host owns aggregation and parent notification.
-    HostOwned,
-}
-
-pub struct NativeAgentSpawnRequest {
-    pub config: Config,
-    pub initial_input: Vec<UserInput>,
-    pub parent_spawn_call_id: String,
-    pub fork_turns: usize,
-    pub agent_role: Option<String>,
-    pub agent_nickname: Option<String>,
-    pub thread_extension_init: ExtensionDataInit,
-    pub notification_policy: NativeAgentNotificationPolicy,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct NativeAgentSpawn {
-    pub thread_id: ThreadId,
-}
-
-/// Creates a runtime extension after the app-server has a native subagent
-/// spawner available. This keeps native thread ownership inside the app-server
-/// while allowing process-local extensions to contribute orchestration tools.
-pub trait AgentSpawnerRuntimeExtensionFactory: std::fmt::Debug + Send + Sync {
-    fn create(&self, spawner: Arc<NativeAgentSpawner>) -> Arc<dyn RuntimeExtension<Config>>;
-}
 // TODO(ccunningham): Add an explicit non-interrupting live-turn snapshot once
 // core can represent sampling boundaries directly instead of relying on
 // whichever items happened to be persisted mid-turn.
@@ -314,7 +231,6 @@ pub struct ThreadManagerRuntimeOptions {
     model_catalog: Option<ModelsResponse>,
     required_base_instructions: Option<String>,
     runtime_extensions: Vec<Arc<dyn RuntimeExtension<Config>>>,
-    agent_spawner_runtime_extension_factories: Vec<Arc<dyn AgentSpawnerRuntimeExtensionFactory>>,
     skill_provider_sources: Vec<codex_skills_extension::SkillProviderSource>,
     title_generator: Option<Arc<dyn codex_thread_store::ThreadTitleGenerator>>,
     model_runtime_policies: HashMap<String, crate::client::ModelRuntimePolicy>,
@@ -338,14 +254,6 @@ impl ThreadManagerRuntimeOptions {
 
     pub fn with_runtime_extension(mut self, value: Arc<dyn RuntimeExtension<Config>>) -> Self {
         self.runtime_extensions.push(value);
-        self
-    }
-
-    pub fn with_agent_spawner_runtime_extension_factory(
-        mut self,
-        factory: Arc<dyn AgentSpawnerRuntimeExtensionFactory>,
-    ) -> Self {
-        self.agent_spawner_runtime_extension_factories.push(factory);
         self
     }
 
@@ -387,7 +295,6 @@ impl ThreadManagerRuntimeOptions {
             || self.model_catalog.is_some()
             || self.required_base_instructions.is_some()
             || !self.runtime_extensions.is_empty()
-            || !self.agent_spawner_runtime_extension_factories.is_empty()
             || !self.skill_provider_sources.is_empty()
             || self.title_generator.is_some()
             || !self.model_runtime_policies.is_empty()
@@ -399,12 +306,6 @@ impl ThreadManagerRuntimeOptions {
 
     pub fn runtime_extensions(&self) -> &[Arc<dyn RuntimeExtension<Config>>] {
         &self.runtime_extensions
-    }
-
-    pub fn agent_spawner_runtime_extension_factories(
-        &self,
-    ) -> &[Arc<dyn AgentSpawnerRuntimeExtensionFactory>] {
-        &self.agent_spawner_runtime_extension_factories
     }
 
     pub fn skill_provider_sources(&self) -> &[codex_skills_extension::SkillProviderSource] {
@@ -1246,129 +1147,6 @@ impl ThreadManager {
             .await
     }
 
-    pub async fn spawn_native_agent(
-        &self,
-        parent_thread_id: ThreadId,
-        request: NativeAgentSpawnRequest,
-    ) -> CodexResult<NativeAgentSpawn> {
-        let parent = self.get_thread(parent_thread_id).await?;
-        let parent_snapshot = parent.config_snapshot().await;
-        let depth = match parent_snapshot.session_source {
-            SessionSource::SubAgent(SubAgentSource::ThreadSpawn { depth, .. }) => depth + 1,
-            _ => 1,
-        };
-        let fork_mode =
-            (request.fork_turns > 0).then_some(SpawnAgentForkMode::LastNTurns(request.fork_turns));
-        let options = SpawnAgentOptions {
-            fork_parent_spawn_call_id: fork_mode.as_ref().map(|_| request.parent_spawn_call_id),
-            fork_mode,
-            parent_thread_id: Some(parent_thread_id),
-            parent_turn_id: None,
-            root_turn_id: None,
-            environments: None,
-            thread_extension_init: request.thread_extension_init,
-            notification_policy: request.notification_policy,
-            multi_agent_v2_usage_hints: None,
-        };
-        let session_source = SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
-            parent_thread_id,
-            depth,
-            agent_path: None,
-            agent_nickname: request.agent_nickname,
-            agent_role: request.agent_role,
-        });
-        let spawned = parent
-            .session
-            .services
-            .agent_control
-            .spawn_agent_with_metadata(
-                request.config,
-                request.initial_input,
-                Some(session_source),
-                options,
-            )
-            .await?;
-        Ok(NativeAgentSpawn {
-            thread_id: spawned.thread_id,
-        })
-    }
-
-    /// Returns the live status tracked by the native agent graph.
-    ///
-    /// Runtime extensions use this instead of maintaining a second execution
-    /// status for child agents they spawned through [`Self::spawn_native_agent`].
-    pub async fn native_agent_status(&self, thread_id: ThreadId) -> AgentStatus {
-        match self.get_thread(thread_id).await {
-            Ok(thread) => thread.agent_status().await,
-            Err(_) => AgentStatus::NotFound,
-        }
-    }
-
-    /// Waits for the native agent graph to report a terminal child status.
-    pub async fn wait_native_agent(&self, thread_id: ThreadId) -> CodexResult<AgentStatus> {
-        let thread = match self.get_thread(thread_id).await {
-            Ok(thread) => thread,
-            Err(error) if matches!(error.details(), CodexErrorDetails::ThreadNotFound(_)) => {
-                return Ok(self.native_agent_status(thread_id).await);
-            }
-            Err(error) => return Err(error),
-        };
-        let mut status_rx = thread.subscribe_status();
-        let mut status = status_rx.borrow().clone();
-        while !is_final(&status) && status != AgentStatus::Interrupted {
-            if status_rx.changed().await.is_err() {
-                return Ok(self.native_agent_status(thread_id).await);
-            }
-            status = status_rx.borrow().clone();
-        }
-        Ok(status)
-    }
-
-    /// Interrupts one native child through the parent thread's shared
-    /// [`AgentControl`], preserving the same graph ownership checks used by
-    /// Codex collaboration tools.
-    pub async fn interrupt_native_agent(
-        &self,
-        parent_thread_id: ThreadId,
-        child_thread_id: ThreadId,
-    ) -> CodexResult<()> {
-        let parent = self.get_thread(parent_thread_id).await?;
-        parent
-            .session
-            .services
-            .agent_control
-            .ensure_direct_child(parent_thread_id, child_thread_id)
-            .await?;
-        parent
-            .session
-            .services
-            .agent_control
-            .interrupt_agent(child_thread_id)
-            .await
-            .map(|_| ())
-    }
-
-    /// Closes one native child through its parent's shared [`AgentControl`].
-    pub async fn close_native_agent(
-        &self,
-        parent_thread_id: ThreadId,
-        child_thread_id: ThreadId,
-    ) -> CodexResult<()> {
-        let parent = self.get_thread(parent_thread_id).await?;
-        parent
-            .session
-            .services
-            .agent_control
-            .ensure_direct_child(parent_thread_id, child_thread_id)
-            .await?;
-        parent
-            .session
-            .services
-            .agent_control
-            .close_agent(child_thread_id)
-            .await
-            .map(|_| ())
-    }
     pub async fn resume_thread_from_rollout(
         &self,
         config: Config,
@@ -2033,7 +1811,6 @@ impl ThreadManagerState {
             /*inherited_environments*/ None,
             /*inherited_exec_policy*/ None,
             /*environments*/ None,
-            ExtensionDataInit::default(),
         ))
         .await
     }
@@ -2052,7 +1829,6 @@ impl ThreadManagerState {
         inherited_environments: Option<TurnEnvironmentSnapshot>,
         inherited_exec_policy: Option<Arc<crate::exec_policy::ExecPolicyManager>>,
         environments: Option<Vec<TurnEnvironmentSelection>>,
-        thread_extension_init: ExtensionDataInit,
     ) -> CodexResult<NewThread> {
         let client_mcp_extensions = self.client_mcp_extensions_for_child(parent_thread_id).await;
         let options = StartThreadOptions {
@@ -2061,7 +1837,6 @@ impl ThreadManagerState {
             thread_source,
             metrics_service_name,
             environments,
-            thread_extension_init,
             client_mcp_extensions,
             ..StartThreadOptions::new(config)
         };

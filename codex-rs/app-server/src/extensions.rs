@@ -8,12 +8,6 @@ use codex_app_server_protocol::ThreadGoal;
 use codex_app_server_protocol::ThreadGoalUpdatedNotification;
 use codex_app_server_protocol::ThreadQueueChangedNotification;
 use codex_app_server_protocol::WarningNotification;
-use codex_core::AgentSpawnerRuntimeExtensionFactory;
-use codex_core::NativeAgentFuture;
-use codex_core::NativeAgentRuntime;
-use codex_core::NativeAgentSpawn;
-use codex_core::NativeAgentSpawnRequest;
-use codex_core::NativeAgentSpawner;
 use codex_core::NewThread;
 use codex_core::StartThreadOptions;
 use codex_core::ThreadManager;
@@ -56,8 +50,6 @@ pub(crate) struct ThreadExtensionDependencies {
     /// Process-scoped queue shared by idle dispatch and app-server requests.
     pub(crate) queue_service: Option<Arc<QueuedItemService>>,
     pub(crate) runtime_extensions: Vec<Arc<dyn RuntimeExtension<Config>>>,
-    pub(crate) agent_spawner_runtime_extension_factories:
-        Vec<Arc<dyn AgentSpawnerRuntimeExtensionFactory>>,
     pub(crate) skill_provider_sources: Vec<codex_skills_extension::SkillProviderSource>,
 }
 
@@ -81,11 +73,8 @@ where
         http_client_factory,
         queue_service,
         runtime_extensions,
-        agent_spawner_runtime_extension_factories,
         skill_provider_sources,
     } = dependencies;
-    let native_agent_spawner: Arc<NativeAgentSpawner> =
-        Arc::new(native_agent_spawner(thread_manager.clone()));
     let mut builder = ExtensionRegistryBuilder::<Config>::with_event_sink(Arc::clone(&event_sink));
     if let Some(queue_service) = queue_service {
         codex_queue_extension::install(&mut builder, queue_service);
@@ -146,32 +135,10 @@ where
                 .enabled(codex_features::Feature::SkillSearch),
         },
     );
-    install_runtime_extensions(&mut builder, &runtime_extensions);
-    install_agent_spawner_runtime_extensions(
-        &mut builder,
-        &agent_spawner_runtime_extension_factories,
-        native_agent_spawner,
-    );
-    Arc::new(builder.build())
-}
-
-fn install_runtime_extensions(
-    builder: &mut ExtensionRegistryBuilder<Config>,
-    runtime_extensions: &[Arc<dyn RuntimeExtension<Config>>],
-) {
     for extension in runtime_extensions {
-        extension.install(builder);
+        extension.install(&mut builder);
     }
-}
-
-fn install_agent_spawner_runtime_extensions(
-    builder: &mut ExtensionRegistryBuilder<Config>,
-    factories: &[Arc<dyn AgentSpawnerRuntimeExtensionFactory>],
-    spawner: Arc<NativeAgentSpawner>,
-) {
-    for factory in factories {
-        factory.create(Arc::clone(&spawner)).install(builder);
-    }
+    Arc::new(builder.build())
 }
 
 pub(crate) fn app_server_extension_event_sink(
@@ -364,98 +331,8 @@ pub(crate) fn guardian_agent_spawner(
     }
 }
 
-pub(crate) fn native_agent_spawner(thread_manager: Weak<ThreadManager>) -> impl NativeAgentRuntime {
-    AppServerNativeAgentRuntime { thread_manager }
-}
-
-struct AppServerNativeAgentRuntime {
-    thread_manager: Weak<ThreadManager>,
-}
-
-impl AgentSpawner<NativeAgentSpawnRequest> for AppServerNativeAgentRuntime {
-    type Spawned = NativeAgentSpawn;
-    type Error = CodexErr;
-
-    fn spawn_subagent<'a>(
-        &'a self,
-        forked_from_thread_id: ThreadId,
-        request: NativeAgentSpawnRequest,
-    ) -> AgentSpawnFuture<'a, NativeAgentSpawn, CodexErr> {
-        let thread_manager = self.thread_manager.clone();
-        Box::pin(async move {
-            let thread_manager = upgrade_thread_manager(thread_manager)?;
-            thread_manager
-                .spawn_native_agent(forked_from_thread_id, request)
-                .await
-        })
-    }
-}
-
-impl NativeAgentRuntime for AppServerNativeAgentRuntime {
-    fn agent_status<'a>(
-        &'a self,
-        thread_id: ThreadId,
-    ) -> NativeAgentFuture<'a, codex_protocol::protocol::AgentStatus> {
-        let thread_manager = self.thread_manager.clone();
-        Box::pin(async move {
-            let thread_manager = upgrade_thread_manager(thread_manager)?;
-            Ok(thread_manager.native_agent_status(thread_id).await)
-        })
-    }
-
-    fn wait_agent<'a>(
-        &'a self,
-        thread_id: ThreadId,
-    ) -> NativeAgentFuture<'a, codex_protocol::protocol::AgentStatus> {
-        let thread_manager = self.thread_manager.clone();
-        Box::pin(async move {
-            let thread_manager = upgrade_thread_manager(thread_manager)?;
-            thread_manager.wait_native_agent(thread_id).await
-        })
-    }
-
-    fn interrupt_agent<'a>(
-        &'a self,
-        parent_thread_id: ThreadId,
-        child_thread_id: ThreadId,
-    ) -> NativeAgentFuture<'a, ()> {
-        let thread_manager = self.thread_manager.clone();
-        Box::pin(async move {
-            let thread_manager = upgrade_thread_manager(thread_manager)?;
-            thread_manager
-                .interrupt_native_agent(parent_thread_id, child_thread_id)
-                .await
-        })
-    }
-
-    fn close_agent<'a>(
-        &'a self,
-        parent_thread_id: ThreadId,
-        child_thread_id: ThreadId,
-    ) -> NativeAgentFuture<'a, ()> {
-        let thread_manager = self.thread_manager.clone();
-        Box::pin(async move {
-            let thread_manager = upgrade_thread_manager(thread_manager)?;
-            thread_manager
-                .close_native_agent(parent_thread_id, child_thread_id)
-                .await
-        })
-    }
-}
-
-fn upgrade_thread_manager(
-    thread_manager: Weak<ThreadManager>,
-) -> Result<Arc<ThreadManager>, CodexErr> {
-    thread_manager
-        .upgrade()
-        .ok_or_else(|| CodexErr::UnsupportedOperation("thread manager dropped".to_string()))
-}
 #[cfg(test)]
 mod tests {
-    use codex_extension_api::ExtensionData;
-    use codex_extension_api::ToolCall;
-    use codex_extension_api::ToolContributor;
-    use codex_extension_api::ToolExecutor;
     use codex_protocol::protocol::ThreadGoal as CoreThreadGoal;
     use codex_protocol::protocol::ThreadGoalStatus;
     use codex_protocol::protocol::ThreadGoalUpdatedEvent;
@@ -469,159 +346,6 @@ mod tests {
     use crate::thread_state::ConnectionCapabilities;
 
     use super::*;
-
-    #[derive(Debug)]
-    struct ProbeRuntimeExtension;
-
-    struct ProbeToolContributor;
-
-    #[derive(Debug)]
-    struct ProbeAgentSpawnerExtensionFactory;
-
-    struct RejectingNativeAgentRuntime;
-
-    impl AgentSpawner<NativeAgentSpawnRequest> for RejectingNativeAgentRuntime {
-        type Spawned = NativeAgentSpawn;
-        type Error = CodexErr;
-
-        fn spawn_subagent<'a>(
-            &'a self,
-            _thread_id: ThreadId,
-            _request: NativeAgentSpawnRequest,
-        ) -> AgentSpawnFuture<'a, NativeAgentSpawn, CodexErr> {
-            Box::pin(async {
-                Err(CodexErr::UnsupportedOperation(
-                    "test native agent runtime".to_string(),
-                ))
-            })
-        }
-    }
-
-    impl NativeAgentRuntime for RejectingNativeAgentRuntime {
-        fn agent_status<'a>(
-            &'a self,
-            _thread_id: ThreadId,
-        ) -> NativeAgentFuture<'a, codex_protocol::protocol::AgentStatus> {
-            Box::pin(async {
-                Err(CodexErr::UnsupportedOperation(
-                    "test native agent runtime".to_string(),
-                ))
-            })
-        }
-
-        fn wait_agent<'a>(
-            &'a self,
-            _thread_id: ThreadId,
-        ) -> NativeAgentFuture<'a, codex_protocol::protocol::AgentStatus> {
-            Box::pin(async {
-                Err(CodexErr::UnsupportedOperation(
-                    "test native agent runtime".to_string(),
-                ))
-            })
-        }
-
-        fn interrupt_agent<'a>(
-            &'a self,
-            _parent_thread_id: ThreadId,
-            _child_thread_id: ThreadId,
-        ) -> NativeAgentFuture<'a, ()> {
-            Box::pin(async {
-                Err(CodexErr::UnsupportedOperation(
-                    "test native agent runtime".to_string(),
-                ))
-            })
-        }
-
-        fn close_agent<'a>(
-            &'a self,
-            _parent_thread_id: ThreadId,
-            _child_thread_id: ThreadId,
-        ) -> NativeAgentFuture<'a, ()> {
-            Box::pin(async {
-                Err(CodexErr::UnsupportedOperation(
-                    "test native agent runtime".to_string(),
-                ))
-            })
-        }
-    }
-
-    impl AgentSpawnerRuntimeExtensionFactory for ProbeAgentSpawnerExtensionFactory {
-        fn create(&self, _spawner: Arc<NativeAgentSpawner>) -> Arc<dyn RuntimeExtension<Config>> {
-            Arc::new(ProbeRuntimeExtension)
-        }
-    }
-
-    impl ToolContributor for ProbeToolContributor {
-        fn tools(
-            &self,
-            _session_store: &ExtensionData,
-            _thread_store: &ExtensionData,
-        ) -> Vec<Arc<dyn ToolExecutor<ToolCall>>> {
-            Vec::new()
-        }
-    }
-
-    impl RuntimeExtension<Config> for ProbeRuntimeExtension {
-        fn install(&self, builder: &mut ExtensionRegistryBuilder<Config>) {
-            builder.tool_contributor(Arc::new(ProbeToolContributor));
-        }
-    }
-
-    #[test]
-    fn runtime_extensions_install_tool_contributors() {
-        let mut empty_builder = ExtensionRegistryBuilder::<Config>::new();
-        install_runtime_extensions(&mut empty_builder, &[]);
-        assert!(empty_builder.build().tool_contributors().is_empty());
-
-        let mut builder = ExtensionRegistryBuilder::<Config>::new();
-        let extensions: Vec<Arc<dyn RuntimeExtension<Config>>> =
-            vec![Arc::new(ProbeRuntimeExtension)];
-        install_runtime_extensions(&mut builder, &extensions);
-
-        assert_eq!(builder.build().tool_contributors().len(), 1);
-    }
-
-    #[test]
-    fn agent_spawner_factories_install_runtime_extensions() {
-        let factory: Arc<dyn AgentSpawnerRuntimeExtensionFactory> =
-            Arc::new(ProbeAgentSpawnerExtensionFactory);
-        let spawner: Arc<NativeAgentSpawner> = Arc::new(RejectingNativeAgentRuntime);
-        let mut builder = ExtensionRegistryBuilder::<Config>::new();
-
-        install_agent_spawner_runtime_extensions(&mut builder, &[factory], spawner);
-
-        assert_eq!(builder.build().tool_contributors().len(), 1);
-    }
-
-    #[tokio::test]
-    async fn native_agent_runtime_exposes_lifecycle_capabilities() {
-        let runtime = native_agent_spawner(Weak::<ThreadManager>::new());
-        let thread_id = ThreadId::new();
-
-        let status_error = runtime
-            .agent_status(thread_id)
-            .await
-            .expect_err("a dropped manager cannot report native agent status");
-        let wait_error = runtime
-            .wait_agent(thread_id)
-            .await
-            .expect_err("a dropped manager cannot wait for a native agent");
-        let interrupt_error = runtime
-            .interrupt_agent(thread_id, ThreadId::new())
-            .await
-            .expect_err("a dropped manager cannot interrupt a native agent");
-        let close_error = runtime
-            .close_agent(thread_id, ThreadId::new())
-            .await
-            .expect_err("a dropped manager cannot close a native agent");
-
-        for error in [status_error, wait_error, interrupt_error, close_error] {
-            assert!(matches!(
-                error.details(),
-                codex_protocol::error::CodexErrorDetails::UnsupportedOperation(_)
-            ));
-        }
-    }
 
     #[tokio::test]
     async fn app_server_event_sink_uses_listener_fifo_for_goal_updates_warnings_and_clears() {

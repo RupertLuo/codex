@@ -7,6 +7,7 @@ use crate::context::CurrentTimeReminder;
 use crate::context::MultiAgentModeInstructions;
 use crate::context::MultiAgentRoleInstructions;
 use crate::session::multi_agents::resolve_usage_hints;
+use codex_extension_api::ExtensionDataInit;
 
 const AGENT_NAMES: &str = include_str!("../agent_names.txt");
 
@@ -502,7 +503,6 @@ impl AgentControl {
                     inheritance.environments,
                     inheritance.exec_policy,
                     options.environments.clone(),
-                    options.thread_extension_init.clone(),
                 ))
                 .await?
             }
@@ -581,9 +581,7 @@ impl AgentControl {
                 .await?;
             }
         }
-        if multi_agent_version != MultiAgentVersion::V2
-            && options.notification_policy == NativeAgentNotificationPolicy::NotifyParent
-        {
+        if multi_agent_version != MultiAgentVersion::V2 {
             let child_reference = agent_metadata
                 .agent_path
                 .as_ref()
@@ -849,7 +847,7 @@ impl AgentControl {
                 subagent_usage_hint_message.into(),
             ));
         }
-        let mut thread_extension_init = options.thread_extension_init.clone();
+        let mut thread_extension_init = ExtensionDataInit::new();
         thread_extension_init.insert(selected_capability_roots);
 
         state

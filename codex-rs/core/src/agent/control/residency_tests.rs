@@ -153,7 +153,6 @@ async fn spawn_v2_subagent(
             /*inherited_environments*/ None,
             /*inherited_exec_policy*/ None,
             /*environments*/ None,
-            codex_extension_api::ExtensionDataInit::default(),
         )
         .await
         .expect("spawn v2 subagent")
