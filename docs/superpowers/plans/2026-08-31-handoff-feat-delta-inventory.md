@@ -55,7 +55,7 @@ compile until `codex-protocol` and was killed by SIGKILL during rustc, before
 tests started. Its temporary target was removed. Continue static ports and
 small checks here; run full targeted tests on a larger machine or CI worker.
 
-## Current handoff (HEAD `7c7a11394c`)
+## Current handoff (base HEAD `2e3b93e952`; verify final tip with `git log -1`)
 
 - Branch topology is intentional: `feat/yanjiang` is not an ancestor of the
   sync branch, and the sync branch is not an ancestor of `feat/yanjiang`.
