@@ -95,6 +95,10 @@ small checks here; run full targeted tests on a larger machine or CI worker.
   successfully (exit 0; only the known nightly `imports_granularity` warnings
   appear). This is syntax/format evidence only, not a substitute for linking
   or runtime tests.
+- After the final local validation pass, task-owned build outputs
+  `/mnt/codex/target` and `/mnt/codex/target-state-crlf` were removed. Cargo
+  (2.0 GiB), Bazel (250 MiB), and the tiny temp directory were retained for a
+  future larger runner; the data disk now has about 91 GiB free.
 
 ## Completion matrix
 
