@@ -23,10 +23,13 @@ where the stable 0.151.0 APIs required a semantic port rather than a cherry-pick
   already contains the current TUI `app/thread_title.rs` flow, while the
   thread-store title-generator API is absent; compare behavior and add only a
   narrowly justified compatibility fix if a regression is demonstrated.
-- Skills provider handles and routing bounds (`5793b0dad6`, `eaf21f5a50`,
-  `6b61d98fe2`, `dbbd0d59ec`, `d631fdd9fa`): stable already has newer
-  `SkillProviderSource` and budgeted-tool structures; port authorization and
-  cache-generation semantics together.
+- Skills/provider commits (`5793b0dad6`, `eaf21f5a50`, `6b61d98fe2`,
+  `dbbd0d59ec`, `d631fdd9fa`) require no additional port at this target:
+  `git diff rust-v0.151.0..HEAD -- codex-rs/ext/skills codex-rs/codex-mcp`
+  is empty, and the stable tree already contains the newer
+  `SkillProviderSource`, budgeted-tool, authorization, and generation-binding
+  implementation. Do not cherry-pick the older commits; only revisit if a
+  concrete regression appears.
 - Legacy CRLF checksum repair (`e85f2c1dbe`): revisit with the state migration
   group, not as an isolated checksum edit.
 - App-server reusable serve/client surfaces (`a2f8befc6d`, `b0b17bf811`):
