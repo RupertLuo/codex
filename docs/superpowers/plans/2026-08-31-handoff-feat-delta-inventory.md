@@ -105,6 +105,9 @@ small checks here; run full targeted tests on a larger machine or CI worker.
 - Current tip is `8aebafd77c`; the sync delta is 211 commits touching 168
   files relative to `rust-v0.151.0`. No task-owned `target*` directories remain
   on `/mnt/codex` (only the small Bazel output root is present).
+- Final cache-link audit confirms Cargo registry/git and all four Bazel cache
+  roots under the home directory resolve into `/mnt/codex`; no build cache path
+  falls back to the root filesystem.
 
 ## Completion matrix
 
