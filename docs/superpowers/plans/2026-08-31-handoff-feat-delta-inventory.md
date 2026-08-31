@@ -57,6 +57,11 @@ small checks here; run full targeted tests on a larger machine or CI worker.
 
 ## Current handoff (HEAD `7c7a11394c`)
 
+- Branch topology is intentional: `feat/yanjiang` is not an ancestor of the
+  sync branch, and the sync branch is not an ancestor of `feat/yanjiang`.
+  Their common ancestor is `ccdfb4f342a2e659be7ab878309cc5d81683d737`;
+  synchronization is therefore a reviewed behavior migration, not a full
+  branch merge.
 - Skills/provider and TUI onboarding audits found no missing stable-target
   functionality; superseded Catalyst commits are explicitly excluded.
 - The native app-server client method registry is already present. The old
