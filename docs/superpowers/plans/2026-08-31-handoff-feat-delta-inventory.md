@@ -32,8 +32,11 @@ where the stable 0.151.0 APIs required a semantic port rather than a cherry-pick
   concrete regression appears.
 - Legacy CRLF checksum repair (`e85f2c1dbe`): revisit with the state migration
   group, not as an isolated checksum edit.
-- App-server reusable serve/client surfaces (`a2f8befc6d`, `b0b17bf811`):
-  map the current v2 transport and public API before exposing another seam.
+- App-server reusable serve CLI (`a2f8befc6d`) remains deferred: its old
+  `cli.rs` extraction targets a different process/transport layout and should
+  be re-designed against the current binary before porting. The native client
+  method list from `b0b17bf811` is already present in
+  `app-server-protocol/src/protocol/common.rs`; do not replay it.
 - TUI model/credential onboarding commits: compare against the stable TUI
   runtime first; preserve stable provider abstractions and add snapshots only
   for behavior that is actually retained.
