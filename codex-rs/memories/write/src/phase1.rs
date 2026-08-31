@@ -13,10 +13,9 @@ use codex_protocol::error::CodexErr;
 use codex_protocol::models::BaseInstructions;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
-use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::TokenUsage;
-use codex_protocol::protocol::flatten_rollout_items;
 use codex_rollout::INTERACTIVE_SESSION_SOURCES;
+use codex_rollout::RolloutItem;
 use codex_rollout::should_persist_response_item_for_memories;
 use codex_secrets::redact_secrets;
 use futures::StreamExt;
@@ -308,6 +307,7 @@ mod job {
         }];
         prompt.base_instructions = BaseInstructions {
             text: crate::stage_one::PROMPT.to_string(),
+            provenance: None,
         };
         prompt.output_schema = Some(output_schema());
         prompt.output_schema_strict = true;
@@ -405,16 +405,10 @@ mod job {
     pub(super) fn serialize_filtered_rollout_response_items(
         items: &[RolloutItem],
     ) -> codex_protocol::error::Result<String> {
-        let logical_items = flatten_rollout_items(items).map_err(|err| {
-            CodexErr::InvalidRequest(format!(
-                "failed to traverse rollout memory transaction: {err}"
-            ))
-        })?;
-        let filtered = logical_items
-            .into_items()
-            .into_iter()
+        let filtered = items
+            .iter()
             .filter_map(|item| match item {
-                RolloutItem::ResponseItem(item) => sanitize_response_item_for_memories(item),
+                RolloutItem::ResponseItem(item) => sanitize_response_item_for_memories(&item.item),
                 RolloutItem::InterAgentCommunication(communication) => {
                     Some(communication.to_model_input_item())
                 }
@@ -423,7 +417,7 @@ mod job {
                 | RolloutItem::Compacted(_)
                 | RolloutItem::TurnContext(_)
                 | RolloutItem::WorldState(_)
-                | RolloutItem::Transaction(_)
+                | RolloutItem::SecurityRiskScore(_)
                 | RolloutItem::EventMsg(_) => None,
             })
             .collect::<Vec<_>>();
@@ -658,6 +652,11 @@ fn emit_metrics(context: &StageOneRequestContext, counts: &Stats) {
         );
         context.histogram(
             MEMORY_PHASE_ONE_TOKEN_USAGE,
+            token_usage.cache_write_input_tokens.max(0),
+            &[("token_type", "cache_write_input")],
+        );
+        context.histogram(
+            MEMORY_PHASE_ONE_TOKEN_USAGE,
             token_usage.output_tokens.max(0),
             &[("token_type", "output")],
         );
@@ -674,44 +673,9 @@ mod tests {
     use super::*;
     use codex_protocol::AgentPath;
     use codex_protocol::protocol::InterAgentCommunication;
-    use codex_protocol::protocol::RolloutTransaction;
+    use codex_protocol::security_risk::SecurityRiskScore;
     use pretty_assertions::assert_eq;
-
-    #[test]
-    fn serializes_nested_rollout_transactions_once_by_stable_id() {
-        let assistant_message = |text: &str| ResponseItem::Message {
-            id: None,
-            role: "assistant".to_string(),
-            content: vec![ContentItem::OutputText {
-                text: text.to_string(),
-            }],
-            phase: None,
-            internal_chat_message_metadata_passthrough: None,
-        };
-        let first = assistant_message("first");
-        let nested = assistant_message("nested");
-
-        let serialized = job::serialize_filtered_rollout_response_items(&[
-            RolloutItem::Transaction(RolloutTransaction {
-                transaction_id: "outer".to_string(),
-                items: vec![
-                    RolloutItem::ResponseItem(first.clone()),
-                    RolloutItem::Transaction(RolloutTransaction {
-                        transaction_id: "inner".to_string(),
-                        items: vec![RolloutItem::ResponseItem(nested.clone())],
-                    }),
-                ],
-            }),
-            RolloutItem::Transaction(RolloutTransaction {
-                transaction_id: "outer".to_string(),
-                items: vec![RolloutItem::ResponseItem(assistant_message("duplicate"))],
-            }),
-        ])
-        .expect("serialize nested rollout transaction");
-        let parsed: Vec<ResponseItem> = serde_json::from_str(&serialized).expect("parse");
-
-        assert_eq!(parsed, vec![first, nested]);
-    }
+    use std::collections::BTreeMap;
 
     #[test]
     fn serializes_memory_rollout_with_agents_removed_but_environment_kept() {
@@ -759,9 +723,13 @@ mod tests {
         };
 
         let serialized = job::serialize_filtered_rollout_response_items(&[
-            RolloutItem::ResponseItem(mixed_contextual_message),
-            RolloutItem::ResponseItem(skill_message),
-            RolloutItem::ResponseItem(subagent_message.clone()),
+            RolloutItem::ResponseItem(mixed_contextual_message.into()),
+            RolloutItem::ResponseItem(skill_message.into()),
+            RolloutItem::SecurityRiskScore(SecurityRiskScore {
+                scores: BTreeMap::from([("action_risk".to_string(), 0.92)]),
+                sampled_at: None,
+            }),
+            RolloutItem::ResponseItem(subagent_message.clone().into()),
         ])
         .expect("serialize");
         let parsed: Vec<ResponseItem> = serde_json::from_str(&serialized).expect("parse");
@@ -798,7 +766,8 @@ mod tests {
                         success: Some(true),
                     },
                     internal_chat_message_metadata_passthrough: None,
-                },
+                }
+                .into(),
             )])
             .expect("serialize");
 
@@ -850,7 +819,7 @@ mod tests {
 
         let serialized = job::serialize_filtered_rollout_response_items(&[
             RolloutItem::InterAgentCommunicationMetadata { trigger_turn: true },
-            RolloutItem::ResponseItem(response_item.clone()),
+            RolloutItem::ResponseItem(response_item.clone().into()),
         ])
         .expect("serialize");
         let parsed: Vec<ResponseItem> = serde_json::from_str(&serialized).expect("parse");
@@ -866,9 +835,11 @@ mod tests {
                 token_usage: Some(TokenUsage {
                     input_tokens: 10,
                     cached_input_tokens: 2,
+                    cache_write_input_tokens: 0,
                     output_tokens: 3,
                     reasoning_output_tokens: 1,
                     total_tokens: 13,
+                    codex_rollout_budget_units: None,
                 }),
             },
             JobResult {
@@ -876,9 +847,11 @@ mod tests {
                 token_usage: Some(TokenUsage {
                     input_tokens: 7,
                     cached_input_tokens: 1,
+                    cache_write_input_tokens: 0,
                     output_tokens: 2,
                     reasoning_output_tokens: 0,
                     total_tokens: 9,
+                    codex_rollout_budget_units: None,
                 }),
             },
             JobResult {
@@ -896,9 +869,11 @@ mod tests {
             Some(TokenUsage {
                 input_tokens: 17,
                 cached_input_tokens: 3,
+                cache_write_input_tokens: 0,
                 output_tokens: 5,
                 reasoning_output_tokens: 1,
                 total_tokens: 22,
+                codex_rollout_budget_units: None,
             })
         );
     }

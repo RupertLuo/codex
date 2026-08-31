@@ -1,3 +1,6 @@
+use std::fmt;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -10,11 +13,13 @@ use codex_api::auth_header_telemetry;
 use codex_api::map_api_error;
 use codex_feedback::FeedbackRequestTags;
 use codex_feedback::emit_feedback_request_tags_with_auth_env;
+use codex_http_client::ClientRouteClass;
+use codex_http_client::HttpClientFactory;
 use codex_login::AuthEnvTelemetry;
 use codex_login::AuthManager;
 use codex_login::CodexAuth;
 use codex_login::collect_auth_env_telemetry;
-use codex_login::default_client::build_reqwest_client;
+use codex_login::default_client::create_client_for_route_async;
 use codex_model_provider_info::ModelProviderInfo;
 use codex_models_manager::manager::ModelsEndpointClient;
 use codex_models_manager::manager::ModelsEndpointFuture;
@@ -29,6 +34,7 @@ use tokio::time::timeout;
 
 use crate::auth::agent_identity_telemetry;
 use crate::auth::resolve_provider_auth;
+use crate::provider::enforce_managed_residency;
 
 const MODELS_REFRESH_TIMEOUT: Duration = Duration::from_secs(5);
 const MODELS_ENDPOINT: &str = "/models";
@@ -38,6 +44,7 @@ const MODELS_ENDPOINT: &str = "/models";
 pub(crate) struct OpenAiModelsEndpoint {
     provider_info: ModelProviderInfo,
     auth_manager: Option<Arc<AuthManager>>,
+    transport_builder: Arc<dyn ModelsTransportBuilder>,
 }
 
 impl OpenAiModelsEndpoint {
@@ -48,6 +55,7 @@ impl OpenAiModelsEndpoint {
         Self {
             provider_info,
             auth_manager,
+            transport_builder: Arc::new(RouteAwareModelsTransportBuilder),
         }
     }
 
@@ -68,14 +76,17 @@ impl OpenAiModelsEndpoint {
     async fn list_models(
         &self,
         client_version: &str,
+        http_client_factory: HttpClientFactory,
     ) -> CoreResult<(Vec<ModelInfo>, Option<String>)> {
         let _timer =
             codex_otel::start_global_timer("codex.remote_models.fetch_update.duration_ms", &[]);
         let auth = self.auth().await;
         let auth_mode = auth.as_ref().map(CodexAuth::auth_mode);
-        let api_provider = self.provider_info.to_api_provider(auth_mode)?;
+        let mut api_provider = self.provider_info.to_api_provider(auth_mode)?;
+        enforce_managed_residency(&mut api_provider);
         let api_auth = resolve_provider_auth(auth.as_ref(), &self.provider_info)?;
-        let transport = ReqwestTransport::new(build_reqwest_client());
+        let request_url =
+            ModelsClient::<ReqwestTransport>::request_url(&api_provider, client_version);
         let auth_telemetry = auth_header_telemetry(api_auth.as_ref());
         let agent_identity_telemetry = if let Some(CodexAuth::AgentIdentity(auth)) = auth.as_ref() {
             Some(agent_identity_telemetry(auth))
@@ -89,16 +100,20 @@ impl OpenAiModelsEndpoint {
             agent_identity_telemetry,
             auth_env: self.auth_env(),
         });
-        let client = ModelsClient::new(transport, api_provider, api_auth)
-            .with_telemetry(Some(request_telemetry));
-
-        timeout(
-            MODELS_REFRESH_TIMEOUT,
-            client.list_models(client_version, HeaderMap::new()),
-        )
+        timeout(MODELS_REFRESH_TIMEOUT, async {
+            let transport = self
+                .transport_builder
+                .build(http_client_factory, request_url.clone())
+                .await?;
+            let client = ModelsClient::new(transport, api_provider, api_auth)
+                .with_telemetry(Some(request_telemetry));
+            client
+                .list_models(request_url, HeaderMap::new())
+                .await
+                .map_err(map_api_error)
+        })
         .await
         .map_err(|_| CodexErr::Timeout)?
-        .map_err(map_api_error)
     }
 
     fn auth_env(&self) -> AuthEnvTelemetry {
@@ -122,8 +137,44 @@ impl ModelsEndpointClient for OpenAiModelsEndpoint {
     fn list_models<'a>(
         &'a self,
         client_version: &'a str,
+        http_client_factory: HttpClientFactory,
     ) -> ModelsEndpointFuture<'a, CoreResult<(Vec<ModelInfo>, Option<String>)>> {
-        Box::pin(OpenAiModelsEndpoint::list_models(self, client_version))
+        Box::pin(OpenAiModelsEndpoint::list_models(
+            self,
+            client_version,
+            http_client_factory,
+        ))
+    }
+}
+
+type ModelsTransportFuture<'a> =
+    Pin<Box<dyn Future<Output = std::io::Result<ReqwestTransport>> + Send + 'a>>;
+
+/// Builds the concrete transport selected for one models request.
+///
+/// Implementations must honor the supplied request-time client factory and exact request URL.
+trait ModelsTransportBuilder: fmt::Debug + Send + Sync {
+    fn build(
+        &self,
+        http_client_factory: HttpClientFactory,
+        request_url: String,
+    ) -> ModelsTransportFuture<'_>;
+}
+
+#[derive(Debug)]
+struct RouteAwareModelsTransportBuilder;
+
+impl ModelsTransportBuilder for RouteAwareModelsTransportBuilder {
+    fn build(
+        &self,
+        http_client_factory: HttpClientFactory,
+        request_url: String,
+    ) -> ModelsTransportFuture<'_> {
+        Box::pin(async move {
+            create_client_for_route_async(http_client_factory, request_url, ClientRouteClass::Api)
+                .await
+                .map(ReqwestTransport::from_http_client)
+        })
     }
 }
 
@@ -227,9 +278,46 @@ impl RequestTelemetry for ModelsRequestTelemetry {
 #[cfg(test)]
 mod tests {
     use std::num::NonZeroU64;
+    use std::sync::Mutex;
 
     use super::*;
+    use codex_http_client::OutboundProxyPolicy;
+    use codex_login::default_client::RESIDENCY_HEADER_NAME;
+    use codex_login::default_client::ResidencyRequirement;
+    use codex_login::default_client::create_client;
+    use codex_login::default_client::set_default_client_residency_requirement;
     use codex_protocol::config_types::ModelProviderAuthInfo;
+    use codex_protocol::openai_models::ModelsResponse;
+    use pretty_assertions::assert_eq;
+    use wiremock::Mock;
+    use wiremock::MockServer;
+    use wiremock::ResponseTemplate;
+    use wiremock::matchers::header;
+    use wiremock::matchers::method;
+    use wiremock::matchers::path;
+    use wiremock::matchers::query_param;
+
+    #[derive(Debug)]
+    struct RecordingTransportBuilder {
+        observed_request: Arc<Mutex<Option<(OutboundProxyPolicy, String)>>>,
+    }
+
+    impl ModelsTransportBuilder for RecordingTransportBuilder {
+        fn build(
+            &self,
+            http_client_factory: HttpClientFactory,
+            request_url: String,
+        ) -> ModelsTransportFuture<'_> {
+            let observed_request = Arc::clone(&self.observed_request);
+            Box::pin(async move {
+                *observed_request
+                    .lock()
+                    .expect("observed request lock should not be poisoned") =
+                    Some((http_client_factory.outbound_proxy_policy(), request_url));
+                Ok(ReqwestTransport::from_http_client(create_client()))
+            })
+        }
+    }
 
     fn provider_info_with_command_auth() -> ModelProviderInfo {
         ModelProviderInfo {
@@ -266,5 +354,93 @@ mod tests {
         );
 
         assert!(!endpoint.has_command_auth());
+    }
+
+    #[tokio::test]
+    async fn model_request_uses_request_time_proxy_policy_and_exact_url() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .and(query_param("client_version", "0.0.0"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(ModelsResponse { models: Vec::new() }),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let observed_request = Arc::new(Mutex::new(None));
+        let endpoint = OpenAiModelsEndpoint {
+            provider_info: ModelProviderInfo::create_openai_provider(Some(server.uri())),
+            auth_manager: None,
+            transport_builder: Arc::new(RecordingTransportBuilder {
+                observed_request: Arc::clone(&observed_request),
+            }),
+        };
+
+        endpoint
+            .list_models(
+                "0.0.0",
+                HttpClientFactory::new(OutboundProxyPolicy::RespectSystemProxy),
+            )
+            .await
+            .expect("models request should succeed");
+
+        assert_eq!(
+            *observed_request
+                .lock()
+                .expect("observed request lock should not be poisoned"),
+            Some((
+                OutboundProxyPolicy::RespectSystemProxy,
+                format!("{}/models?client_version=0.0.0", server.uri()),
+            ))
+        );
+    }
+
+    #[tokio::test]
+    async fn model_discovery_enforces_managed_residency_over_provider_headers() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .and(header(RESIDENCY_HEADER_NAME, "us"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(ModelsResponse { models: Vec::new() }),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut provider_info = ModelProviderInfo::create_openai_provider(Some(server.uri()));
+        provider_info.http_headers = Some(std::collections::HashMap::from([(
+            RESIDENCY_HEADER_NAME.to_string(),
+            "eu".to_string(),
+        )]));
+        let endpoint = OpenAiModelsEndpoint {
+            provider_info,
+            auth_manager: None,
+            transport_builder: Arc::new(RecordingTransportBuilder {
+                observed_request: Arc::new(Mutex::new(None)),
+            }),
+        };
+
+        set_default_client_residency_requirement(Some(ResidencyRequirement::Us));
+        endpoint
+            .list_models(
+                "0.0.0",
+                HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
+            )
+            .await
+            .expect("managed residency model discovery should succeed");
+        set_default_client_residency_requirement(/*enforce_residency*/ None);
+
+        assert_eq!(
+            endpoint
+                .provider_info
+                .http_headers
+                .as_ref()
+                .and_then(|headers| headers.get(RESIDENCY_HEADER_NAME))
+                .map(String::as_str),
+            Some("eu")
+        );
     }
 }

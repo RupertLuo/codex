@@ -1,15 +1,14 @@
 use std::borrow::Cow;
 
-use sqlx::AssertSqlSafe;
-use sqlx::SqlSafeStr;
 use sqlx::SqlitePool;
-use sqlx::migrate::Migration;
 use sqlx::migrate::Migrator;
 
 pub(crate) static STATE_MIGRATOR: Migrator = sqlx::migrate!("./migrations");
 pub(crate) static LOGS_MIGRATOR: Migrator = sqlx::migrate!("./logs_migrations");
 pub(crate) static GOALS_MIGRATOR: Migrator = sqlx::migrate!("./goals_migrations");
 pub(crate) static MEMORIES_MIGRATOR: Migrator = sqlx::migrate!("./memory_migrations");
+pub(crate) static QUEUE_MIGRATOR: Migrator = sqlx::migrate!("./queue_migrations");
+pub(crate) static THREAD_HISTORY_MIGRATOR: Migrator = sqlx::migrate!("./thread_history_migrations");
 
 /// Allow an older Codex binary to open a database that has already been
 /// migrated by a newer binary running in parallel.
@@ -44,72 +43,14 @@ pub(crate) fn runtime_memories_migrator() -> Migrator {
     runtime_migrator(&MEMORIES_MIGRATOR)
 }
 
-fn migration_with_crlf_line_endings(migration: &Migration) -> Migration {
-    Migration::new(
-        migration.version,
-        migration.description.clone(),
-        migration.migration_type,
-        AssertSqlSafe(migration.sql.as_str().replace('\n', "\r\n")).into_sql_str(),
-        migration.no_tx,
-    )
+pub(crate) fn runtime_queue_migrator() -> Migrator {
+    runtime_migrator(&QUEUE_MIGRATOR)
 }
 
-pub(crate) async fn repair_legacy_crlf_migration_checksums(
-    pool: &SqlitePool,
-    migrator: &Migrator,
-) -> anyhow::Result<()> {
-    let migrations_table_exists = sqlx::query_scalar::<_, i64>(
-        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = '_sqlx_migrations'",
-    )
-    .fetch_optional(pool)
-    .await?
-    .is_some();
-    if !migrations_table_exists {
-        return Ok(());
-    }
-
-    let applied_migrations = sqlx::query_as::<_, (i64, Vec<u8>)>(
-        "SELECT version, checksum FROM _sqlx_migrations WHERE success = TRUE ORDER BY version",
-    )
-    .fetch_all(pool)
-    .await?;
-    let mut repairs = Vec::new();
-    for (version, applied_checksum) in applied_migrations {
-        let Some(migration) = migrator
-            .migrations
-            .iter()
-            .find(|migration| migration.version == version)
-        else {
-            continue;
-        };
-        if applied_checksum.as_slice() == migration.checksum.as_ref() {
-            continue;
-        }
-
-        let legacy_migration = migration_with_crlf_line_endings(migration);
-        if applied_checksum.as_slice() == legacy_migration.checksum.as_ref() {
-            repairs.push((
-                version,
-                applied_checksum,
-                migration.checksum.as_ref().to_vec(),
-            ));
-        }
-    }
-    if repairs.is_empty() {
-        return Ok(());
-    }
-
-    let mut transaction = pool.begin().await?;
-    for (version, legacy_checksum, current_checksum) in repairs {
-        sqlx::query("UPDATE _sqlx_migrations SET checksum = ? WHERE version = ? AND checksum = ?")
-            .bind(current_checksum)
-            .bind(version)
-            .bind(legacy_checksum)
-            .execute(&mut *transaction)
-            .await?;
-    }
-    transaction.commit().await?;
-    Ok(())
+// The paginated history projector will call this when it takes ownership of opening the database.
+#[allow(dead_code)]
+pub(crate) fn runtime_thread_history_migrator() -> Migrator {
+    runtime_migrator(&THREAD_HISTORY_MIGRATOR)
 }
 
 pub(crate) async fn repair_legacy_recency_migration_version(
@@ -130,6 +71,27 @@ pub(crate) async fn repair_legacy_recency_migration_version(
     .await?
     .is_some();
     if !migrations_table_exists {
+        return Ok(());
+    }
+
+    let legacy_recency_needs_repair = sqlx::query_scalar::<_, i64>(
+        r#"
+SELECT 1
+FROM _sqlx_migrations
+WHERE version = ?
+  AND checksum = ?
+  AND NOT EXISTS (
+      SELECT 1 FROM _sqlx_migrations WHERE version = ?
+  )
+        "#,
+    )
+    .bind(38_i64)
+    .bind(recency_migration.checksum.as_ref())
+    .bind(recency_migration.version)
+    .fetch_optional(pool)
+    .await?
+    .is_some();
+    if !legacy_recency_needs_repair {
         return Ok(());
     }
 

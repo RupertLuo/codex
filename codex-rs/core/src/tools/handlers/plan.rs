@@ -81,7 +81,7 @@ impl PlanHandler {
             }
         };
 
-        if turn.collaboration_mode.mode == ModeKind::Plan {
+        if turn.mode == ModeKind::Plan {
             return Err(FunctionCallError::RespondToModel(
                 "update_plan is a TODO/checklist tool and is not allowed in Plan mode".to_string(),
             ));
@@ -96,7 +96,11 @@ impl PlanHandler {
     }
 }
 
-impl CoreToolRuntime for PlanHandler {}
+impl CoreToolRuntime for PlanHandler {
+    fn is_builtin_control_tool(&self) -> bool {
+        true
+    }
+}
 
 fn parse_update_plan_arguments(arguments: &str) -> Result<UpdatePlanArgs, FunctionCallError> {
     serde_json::from_str::<UpdatePlanArgs>(arguments).map_err(|e| {

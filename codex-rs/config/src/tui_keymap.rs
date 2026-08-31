@@ -26,20 +26,21 @@ use std::collections::BTreeMap;
 /// Highest function key supported by portable TUI keymap configuration.
 pub const MAX_FUNCTION_KEY: u8 = 24;
 
-/// Normalized string representation of a single key event (for example `ctrl-a`).
+/// Maximum number of key events in one configurable TUI binding.
+const MAX_KEY_CHORD_STROKES: usize = 2;
+
+/// Normalized representation of one key event or a two-stroke key chord.
 ///
 /// The parser accepts a small alias set (for example `escape` -> `esc`,
-/// `pageup` -> `page-up`) and stores the canonical form.
-///
-/// This deliberately represents one terminal key event, not a sequence of
-/// events. A value like `ctrl-x ctrl-s` is not a chord in this schema; adding
-/// multi-step chords would require a separate runtime state machine.
+/// `pageup` -> `page-up`) and stores each stroke in its canonical form. Chord
+/// strokes are separated by one space, for example `ctrl-x ctrl-s`. Arrays of
+/// bindings remain alternatives; their entries do not form a chord together.
 #[derive(Serialize, Debug, Clone, PartialEq, Eq, JsonSchema)]
 #[serde(transparent)]
 pub struct KeybindingSpec(#[schemars(with = "String")] pub String);
 
 impl KeybindingSpec {
-    /// Returns the canonical key-spec string (for example `ctrl-a`).
+    /// Returns the canonical key-spec string (for example `ctrl-x ctrl-s`).
     pub fn as_str(&self) -> &str {
         self.0.as_str()
     }
@@ -60,8 +61,8 @@ impl<'de> Deserialize<'de> for KeybindingSpec {
 ///
 /// This accepts either:
 ///
-/// 1. A single key spec string (`"ctrl-a"`).
-/// 2. A list of key spec strings (`["ctrl-a", "alt-a"]`).
+/// 1. A single key or chord string (`"ctrl-a"` or `"ctrl-x ctrl-s"`).
+/// 2. A list of alternative bindings (`["ctrl-a", "ctrl-x ctrl-s"]`).
 ///
 /// An empty list explicitly unbinds the action in that scope. Because an
 /// explicit empty list is still a configured value, runtime resolution must not
@@ -91,6 +92,8 @@ impl KeybindingsSpec {
 #[serde(deny_unknown_fields)]
 #[schemars(deny_unknown_fields)]
 pub struct TuiGlobalKeymap {
+    /// Open the shared agent-session overview.
+    pub open_agents: Option<KeybindingsSpec>,
     /// Open the transcript overlay.
     pub open_transcript: Option<KeybindingsSpec>,
     /// Open the external editor for the current draft.
@@ -111,6 +114,8 @@ pub struct TuiGlobalKeymap {
     pub toggle_fast_mode: Option<KeybindingsSpec>,
     /// Toggle raw scrollback mode for copy-friendly transcript selection.
     pub toggle_raw_output: Option<KeybindingsSpec>,
+    /// Switch between a side conversation and its parent without closing either.
+    pub toggle_side_conversation: Option<KeybindingsSpec>,
 }
 
 /// Chat context keybindings.
@@ -226,6 +231,8 @@ pub struct TuiVimNormalKeymap {
     pub move_line_end: Option<KeybindingsSpec>,
     /// Delete character under cursor (`x`).
     pub delete_char: Option<KeybindingsSpec>,
+    /// Replace the character under the cursor (`r`).
+    pub replace_char: Option<KeybindingsSpec>,
     /// Delete character under cursor and enter insert mode (`s`).
     pub substitute_char: Option<KeybindingsSpec>,
     /// Delete from cursor to end of line (`D`).
@@ -364,6 +371,23 @@ pub struct TuiListKeymap {
     pub cancel: Option<KeybindingsSpec>,
 }
 
+/// Shortcuts specific to the shared agents overview.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
+pub struct TuiAgentsKeymap {
+    /// Search the available agent tasks.
+    pub search: Option<KeybindingsSpec>,
+    /// Start composing a new agent task.
+    pub new_task: Option<KeybindingsSpec>,
+    /// Rename the selected task.
+    pub rename: Option<KeybindingsSpec>,
+    /// Stop the selected running task.
+    pub stop: Option<KeybindingsSpec>,
+    /// Toggle grouping tasks by status or project.
+    pub toggle_grouping: Option<KeybindingsSpec>,
+}
+
 /// Approval overlay keybindings.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -420,6 +444,8 @@ pub struct TuiKeymap {
     #[serde(default)]
     pub list: TuiListKeymap,
     #[serde(default)]
+    pub agents: TuiAgentsKeymap,
+    #[serde(default)]
     pub approval: TuiApprovalKeymap,
 }
 
@@ -434,6 +460,26 @@ pub struct TuiKeymap {
 /// this function when accepting user-authored key specs, or otherwise equivalent
 /// keys can fail to compare equal in tests, UI hints, and duplicate detection.
 fn normalize_keybinding_spec(raw: &str) -> Result<String, String> {
+    let strokes = raw.split_whitespace().collect::<Vec<_>>();
+    if strokes.is_empty() {
+        return normalize_keybinding_stroke(raw);
+    }
+    if strokes.len() > MAX_KEY_CHORD_STROKES {
+        return Err(format!(
+            "invalid keybinding `{raw}`: key chords may contain at most \
+{MAX_KEY_CHORD_STROKES} strokes (for example `ctrl-x ctrl-s`)."
+        ));
+    }
+
+    strokes
+        .into_iter()
+        .map(normalize_keybinding_stroke)
+        .collect::<Result<Vec<_>, _>>()
+        .map(|normalized| normalized.join(" "))
+}
+
+/// Normalize the key and modifiers for one stroke in a key binding.
+fn normalize_keybinding_stroke(raw: &str) -> Result<String, String> {
     let lower = raw.trim().to_ascii_lowercase();
     if lower.is_empty() {
         return Err(
@@ -685,3 +731,7 @@ mod tests {
         assert!(normalize_keybinding_spec("f25").is_err());
     }
 }
+
+#[cfg(test)]
+#[path = "tui_keymap_chord_tests.rs"]
+mod chord_tests;

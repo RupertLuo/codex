@@ -1,14 +1,20 @@
 use anyhow::Result;
 use anyhow::anyhow;
+use codex_core::TurnInputRequest;
 use codex_core::compact::SUMMARIZATION_PROMPT;
 use codex_core::compact::SUMMARY_PREFIX;
 use codex_core::config::Config;
 use codex_features::Feature;
+use codex_history::RolloutItem;
+use codex_history::RolloutLine;
 use codex_login::CodexAuth;
 use codex_model_provider_info::ModelProviderInfo;
 use codex_model_provider_info::built_in_model_providers;
 use codex_models_manager::bundled_models_response;
 use codex_protocol::config_types::AutoCompactTokenLimitScope;
+use codex_protocol::config_types::CollaborationMode;
+use codex_protocol::config_types::ModeKind;
+use codex_protocol::config_types::Settings;
 use codex_protocol::items::TurnItem;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::openai_models::ModelInfo;
@@ -20,8 +26,7 @@ use codex_protocol::protocol::HookRunStatus;
 use codex_protocol::protocol::ItemCompletedEvent;
 use codex_protocol::protocol::ItemStartedEvent;
 use codex_protocol::protocol::Op;
-use codex_protocol::protocol::RolloutItem;
-use codex_protocol::protocol::RolloutLine;
+use codex_protocol::protocol::ThreadSettingsOverrides;
 use codex_protocol::protocol::WarningEvent;
 use codex_protocol::user_input::UserInput;
 use codex_utils_absolute_path::AbsolutePathBuf;
@@ -34,6 +39,7 @@ use core_test_support::hooks::trust_discovered_hooks;
 use core_test_support::responses;
 use core_test_support::responses::ev_reasoning_item;
 use core_test_support::responses::mount_models_once;
+use core_test_support::responses::strip_response_item_ids_from_json;
 use core_test_support::skip_if_no_network;
 use core_test_support::test_codex::local_selections;
 use core_test_support::test_codex::test_codex;
@@ -48,6 +54,7 @@ use core_test_support::responses::ev_completed;
 use core_test_support::responses::ev_completed_with_tokens;
 use core_test_support::responses::ev_function_call;
 use core_test_support::responses::mount_compact_json_once;
+use core_test_support::responses::mount_compact_response_sequence;
 use core_test_support::responses::mount_response_sequence;
 use core_test_support::responses::mount_sse_once;
 use core_test_support::responses::mount_sse_once_match;
@@ -89,8 +96,6 @@ const GLOBAL_AGENTS_OVERRIDE_FILENAME: &str = "AGENTS.override.md";
 const NEW_GLOBAL_INSTRUCTIONS: &str = "new global instructions";
 const OLD_GLOBAL_INSTRUCTIONS: &str = "old global instructions";
 const REMOTE_V2_SUMMARY: &str = "global-instructions-remote-v2-summary";
-const ACTIVE_MODEL: &str = "gpt-5.4";
-const COMPACT_MODEL: &str = "deepseek/deepseek-v4-flash";
 
 pub(super) const COMPACT_WARNING_MESSAGE: &str = "Heads up: Long threads and multiple compactions can cause the model to be less accurate. Start a new thread when possible to keep threads small and targeted.";
 
@@ -102,33 +107,32 @@ fn ev_shell_command_call(call_id: &str, command: &str) -> serde_json::Value {
     )
 }
 
-fn disabled_permission_user_turn(text: impl Into<String>, cwd: PathBuf, model: String) -> Op {
+fn disabled_permission_user_turn(
+    text: impl Into<String>,
+    cwd: PathBuf,
+    model: String,
+) -> TurnInputRequest {
     let (sandbox_policy, permission_profile) =
         turn_permission_fields(PermissionProfile::Disabled, cwd.as_path());
-    Op::UserInput {
-        items: vec![UserInput::Text {
-            text: text.into(),
-            text_elements: Vec::new(),
-        }],
-        final_output_json_schema: None,
-        responsesapi_client_metadata: None,
-        additional_context: Default::default(),
-        thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
-            environments: Some(local_selections(cwd.abs())),
-            approval_policy: Some(AskForApproval::Never),
-            sandbox_policy: Some(sandbox_policy),
-            permission_profile,
-            collaboration_mode: Some(codex_protocol::config_types::CollaborationMode {
-                mode: codex_protocol::config_types::ModeKind::Default,
-                settings: codex_protocol::config_types::Settings {
-                    model,
-                    reasoning_effort: None,
-                    developer_instructions: None,
-                },
-            }),
-            ..Default::default()
-        },
-    }
+    TurnInputRequest::user_input(vec![UserInput::Text {
+        text: text.into(),
+        text_elements: Vec::new(),
+    }])
+    .with_thread_settings(ThreadSettingsOverrides {
+        environments: Some(local_selections(cwd.abs())),
+        approval_policy: Some(AskForApproval::Never),
+        sandbox_policy: Some(sandbox_policy),
+        permission_profile,
+        collaboration_mode: Some(CollaborationMode {
+            mode: ModeKind::Default,
+            settings: Settings {
+                model,
+                reasoning_effort: None,
+                developer_instructions: None,
+            },
+        }),
+        ..Default::default()
+    })
 }
 
 fn auto_summary(summary: &str) -> String {
@@ -276,6 +280,31 @@ fn non_openai_model_provider(server: &MockServer) -> ModelProviderInfo {
     provider
 }
 
+fn openai_model_provider(server: &MockServer) -> ModelProviderInfo {
+    let mut provider =
+        built_in_model_providers(/* openai_base_url */ /*openai_base_url*/ None)["openai"].clone();
+    provider.base_url = Some(format!("{}/v1", server.uri()));
+    provider.supports_websockets = false;
+    provider
+}
+
+fn invalid_request_response(message: impl Into<String>) -> wiremock::ResponseTemplate {
+    wiremock::ResponseTemplate::new(/*status*/ 400).set_body_json(json!({
+        "detail": message.into(),
+    }))
+}
+
+fn model_not_found_response(model: &str) -> wiremock::ResponseTemplate {
+    wiremock::ResponseTemplate::new(/*status*/ 404).set_body_json(json!({
+        "error": {
+            "message": format!("Model not found {model}"),
+            "type": "invalid_request_error",
+            "param": "model",
+            "code": null,
+        }
+    }))
+}
+
 fn write_global_file(
     home: &TempDir,
     filename: &str,
@@ -332,7 +361,7 @@ fn replacement_history_from_rollout(path: &Path) -> Result<Vec<Value>> {
             replacement_history = Some(
                 items
                     .into_iter()
-                    .map(serde_json::to_value)
+                    .map(|envelope| serde_json::to_value(envelope.item))
                     .collect::<std::result::Result<Vec<_>, _>>()?,
             );
         }
@@ -423,6 +452,7 @@ async fn assert_compaction_uses_turn_lifecycle_id(codex: &std::sync::Arc<codex_c
                 item: TurnItem::ContextCompaction(_),
                 ..
             }) => compact_completed_id = Some(event.id.clone()),
+            EventMsg::Error(error) => panic!("unexpected compaction error: {error:?}"),
             EventMsg::TurnComplete(_) => turn_completed_id = Some(event.id.clone()),
             _ => {}
         }
@@ -502,16 +532,10 @@ async fn summarize_context_three_requests_and_instructions() {
 
     // 1) Normal user input – should hit server once.
     codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
-                text: "hello world".into(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: Default::default(),
-        })
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "hello world".into(),
+            text_elements: Vec::new(),
+        }]))
         .await
         .unwrap();
     wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
@@ -527,16 +551,10 @@ async fn summarize_context_three_requests_and_instructions() {
 
     // 3) Next user input – third hit; history should include only the summary.
     codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
-                text: THIRD_USER_MSG.into(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: Default::default(),
-        })
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: THIRD_USER_MSG.into(),
+            text_elements: Vec::new(),
+        }]))
         .await
         .unwrap();
     wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
@@ -697,16 +715,10 @@ async fn manual_pre_compact_block_decision_does_not_block_compaction() {
     let codex = test.codex.clone();
 
     codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
-                text: "hello before blocked compact".to_string(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: Default::default(),
-        })
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "hello before blocked compact".to_string(),
+            text_elements: Vec::new(),
+        }]))
         .await
         .expect("submit first user turn");
     wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
@@ -770,16 +782,10 @@ async fn compact_hooks_respect_matchers_and_post_runs_after_compaction() {
     let codex = test.codex.clone();
 
     codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
-                text: "hello before matched compact".to_string(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: Default::default(),
-        })
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "hello before matched compact".to_string(),
+            text_elements: Vec::new(),
+        }]))
         .await
         .expect("submit first user turn");
     wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
@@ -840,16 +846,10 @@ async fn manual_compact_uses_custom_prompt() {
         .codex;
 
     codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
-                text: "USER_ONE".to_string(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: Default::default(),
-        })
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "USER_ONE".to_string(),
+            text_elements: Vec::new(),
+        }]))
         .await
         .expect("submit first user turn");
     wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
@@ -987,16 +987,10 @@ async fn manual_compact_emits_context_compaction_items() {
     let codex = builder.build(&server).await.unwrap().codex;
 
     codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
-                text: "manual compact".into(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: Default::default(),
-        })
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "manual compact".into(),
+            text_elements: Vec::new(),
+        }]))
         .await
         .unwrap();
     wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
@@ -1047,14 +1041,13 @@ async fn multiple_auto_compact_per_task_runs_after_token_limit_hit() {
     let server = start_mock_server().await;
 
     let non_openai_provider_name = non_openai_model_provider(&server).name;
-    let codex = test_codex()
+    let test = test_codex()
         .with_config(move |config| {
             config.model_provider.name = non_openai_provider_name;
         })
         .build(&server)
         .await
-        .expect("build codex")
-        .codex;
+        .expect("build codex");
 
     // user message
     let user_message = "create an app";
@@ -1152,20 +1145,15 @@ async fn multiple_auto_compact_per_task_runs_after_token_limit_hit() {
     let request_log = mount_sse_sequence(&server, bodies).await;
 
     // Start the conversation with the user message
-    codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
-                text: user_message.into(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: Default::default(),
-        })
+    test.codex
+        .start_or_steer_turn(disabled_permission_user_turn(
+            user_message,
+            test.cwd.path().to_path_buf(),
+            test.session_configured.model.clone(),
+        ))
         .await
         .expect("submit user input");
-    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+    wait_for_event(&test.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
     // collect the requests payloads from the model
     let requests_payloads = request_log.requests();
@@ -1200,6 +1188,7 @@ async fn multiple_auto_compact_per_task_runs_after_token_limit_hit() {
         values
             .iter()
             .filter_map(|value| {
+                let value = strip_response_item_ids_from_json(value.clone());
                 if value
                     .get("type")
                     .and_then(|ty| ty.as_str())
@@ -1208,25 +1197,27 @@ async fn multiple_auto_compact_per_task_runs_after_token_limit_hit() {
                     return None;
                 }
 
-                let text = value
+                let texts = value
                     .get("content")
                     .and_then(|content| content.as_array())
-                    .and_then(|content| content.first())
-                    .and_then(|item| item.get("text"))
-                    .and_then(|text| text.as_str());
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|item| item.get("text").and_then(|text| text.as_str()));
 
                 // Ignore cached prefix messages (project docs + permissions) since they are not
                 // relevant to compaction behavior and can change as bundled prompts evolve.
                 let role = value.get("role").and_then(|role| role.as_str());
                 if role == Some("developer")
-                    && text.is_some_and(|text| text.contains("`sandbox_mode`"))
+                    && texts
+                        .into_iter()
+                        .any(|text| text.contains("`sandbox_mode`"))
                 {
                     return None;
                 }
                 if role == Some("user") {
-                    return strip_agents_parts_from_user_message(value);
+                    return strip_agents_parts_from_user_message(&value);
                 }
-                Some(value.clone())
+                Some(value)
             })
             .collect()
     }
@@ -1625,48 +1616,30 @@ async fn auto_compact_runs_after_token_limit_hit() {
     let codex = builder.build(&server).await.unwrap().codex;
 
     codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
-                text: FIRST_AUTO_MSG.into(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: Default::default(),
-        })
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: FIRST_AUTO_MSG.into(),
+            text_elements: Vec::new(),
+        }]))
         .await
         .unwrap();
 
     wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
     codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
-                text: SECOND_AUTO_MSG.into(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: Default::default(),
-        })
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: SECOND_AUTO_MSG.into(),
+            text_elements: Vec::new(),
+        }]))
         .await
         .unwrap();
 
     wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
     codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
-                text: POST_AUTO_USER_MSG.into(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: Default::default(),
-        })
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: POST_AUTO_USER_MSG.into(),
+            text_elements: Vec::new(),
+        }]))
         .await
         .unwrap();
 
@@ -1828,16 +1801,10 @@ async fn auto_compact_emits_context_compaction_items() {
 
     for user in [FIRST_AUTO_MSG, SECOND_AUTO_MSG, POST_AUTO_USER_MSG] {
         codex
-            .submit(Op::UserInput {
-                items: vec![UserInput::Text {
-                    text: user.into(),
-                    text_elements: Vec::new(),
-                }],
-                final_output_json_schema: None,
-                responsesapi_client_metadata: None,
-                additional_context: Default::default(),
-                thread_settings: Default::default(),
-            })
+            .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+                text: user.into(),
+                text_elements: Vec::new(),
+            }]))
             .await
             .unwrap();
 
@@ -1909,46 +1876,28 @@ async fn auto_compact_starts_after_turn_started() {
     let codex = builder.build(&server).await.unwrap().codex;
 
     codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
-                text: FIRST_AUTO_MSG.into(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: Default::default(),
-        })
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: FIRST_AUTO_MSG.into(),
+            text_elements: Vec::new(),
+        }]))
         .await
         .unwrap();
     wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
     codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
-                text: SECOND_AUTO_MSG.into(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: Default::default(),
-        })
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: SECOND_AUTO_MSG.into(),
+            text_elements: Vec::new(),
+        }]))
         .await
         .unwrap();
     wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
     codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
-                text: POST_AUTO_USER_MSG.into(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: Default::default(),
-        })
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: POST_AUTO_USER_MSG.into(),
+            text_elements: Vec::new(),
+        }]))
         .await
         .unwrap();
 
@@ -2012,12 +1961,6 @@ async fn auto_compact_runs_after_resume_when_token_usage_is_over_limit() {
         let _ = config.features.disable(Feature::RemoteCompactionV2);
     });
     let initial = builder.build(&server).await.unwrap();
-    let home = initial.home.clone();
-    let rollout_path = initial
-        .session_configured
-        .rollout_path
-        .clone()
-        .expect("rollout path");
 
     // A single over-limit completion should not auto-compact until the next user message.
     mount_sse_once(
@@ -2040,10 +1983,7 @@ async fn auto_compact_runs_after_resume_when_token_usage_is_over_limit() {
         config.model_auto_compact_token_limit = Some(limit);
         let _ = config.features.disable(Feature::RemoteCompactionV2);
     });
-    let resumed = resume_builder
-        .resume(&server, home, rollout_path)
-        .await
-        .unwrap();
+    let resumed = resume_builder.restart(&server, &initial).await.unwrap();
 
     let follow_up_user = "AFTER_RESUME_USER";
     let sse_follow_up = sse(vec![
@@ -2059,7 +1999,7 @@ async fn auto_compact_runs_after_resume_when_token_usage_is_over_limit() {
 
     resumed
         .codex
-        .submit(disabled_permission_user_turn(
+        .start_or_steer_turn(disabled_permission_user_turn(
             follow_up_user,
             resumed.cwd.path().to_path_buf(),
             resumed.session_configured.model.clone(),
@@ -2094,7 +2034,7 @@ async fn pre_sampling_compact_runs_on_switch_to_smaller_context_model() {
     skip_if_no_network!();
 
     let server = MockServer::start().await;
-    let previous_model = "gpt-5.3-codex";
+    let previous_model = "gpt-5.4";
     let next_model = "gpt-5.2";
 
     let models_mock = mount_models_once(
@@ -2138,7 +2078,7 @@ async fn pre_sampling_compact_runs_on_switch_to_smaller_context_model() {
     let test = builder.build(&server).await.expect("build test codex");
 
     test.codex
-        .submit(disabled_permission_user_turn(
+        .start_or_steer_turn(disabled_permission_user_turn(
             "before switch",
             test.cwd.path().to_path_buf(),
             previous_model.to_string(),
@@ -2151,7 +2091,7 @@ async fn pre_sampling_compact_runs_on_switch_to_smaller_context_model() {
     .await;
 
     test.codex
-        .submit(disabled_permission_user_turn(
+        .start_or_steer_turn(disabled_permission_user_turn(
             "after switch",
             test.cwd.path().to_path_buf(),
             next_model.to_string(),
@@ -2196,7 +2136,7 @@ async fn pre_sampling_compact_runs_when_comp_hash_changes() {
     skip_if_no_network!();
 
     let server = MockServer::start().await;
-    let previous_model = "gpt-5.3-codex";
+    let previous_model = "gpt-5.4";
     let next_model = "gpt-5.2";
 
     let models_mock = mount_models_once(
@@ -2240,7 +2180,7 @@ async fn pre_sampling_compact_runs_when_comp_hash_changes() {
     let test = builder.build(&server).await.expect("build test codex");
 
     test.codex
-        .submit(disabled_permission_user_turn(
+        .start_or_steer_turn(disabled_permission_user_turn(
             "before switch",
             test.cwd.path().to_path_buf(),
             previous_model.to_string(),
@@ -2253,7 +2193,7 @@ async fn pre_sampling_compact_runs_when_comp_hash_changes() {
     .await;
 
     test.codex
-        .submit(disabled_permission_user_turn(
+        .start_or_steer_turn(disabled_permission_user_turn(
             "after switch",
             test.cwd.path().to_path_buf(),
             next_model.to_string(),
@@ -2279,12 +2219,585 @@ async fn pre_sampling_compact_runs_when_comp_hash_changes() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pre_sampling_compact_falls_back_from_retired_previous_model_after_rename() {
+    skip_if_no_network!();
+
+    let server = MockServer::start().await;
+    let retired_model = "gpt-5.5";
+    let previous_model_family = "gpt-5.5";
+    let renamed_model = "gpt-5.6";
+    let mut previous_model_info = model_info_with_optional_comp_hash("gpt-5.4", Some("hash-a"));
+    previous_model_info.slug = previous_model_family.to_string();
+    let mut renamed_model_info = model_info_with_optional_comp_hash("gpt-5.4", Some("hash-b"));
+    renamed_model_info.slug = renamed_model.to_string();
+
+    let models_mock = mount_models_once(
+        &server,
+        ModelsResponse {
+            models: vec![previous_model_info, renamed_model_info],
+        },
+    )
+    .await;
+
+    let request_log = mount_response_sequence(
+        &server,
+        vec![
+            sse_response(sse(vec![
+                ev_assistant_message("m1", "before switch"),
+                ev_completed_with_tokens("r1", /*total_tokens*/ 100),
+            ])),
+            invalid_request_response(format!(
+                "The '{retired_model}' model is not supported when using Codex with a ChatGPT account."
+            )),
+            sse_response(sse(vec![
+                json!({
+                    "type": "response.output_item.done",
+                    "item": {
+                        "type": "compaction",
+                        "encrypted_content": "RETIRED_MODEL_SUMMARY",
+                    }
+                }),
+                ev_completed_with_tokens("r2", /*total_tokens*/ 10),
+            ])),
+            sse_response(sse(vec![
+                ev_assistant_message("m3", "after switch"),
+                ev_completed_with_tokens("r3", /*total_tokens*/ 100),
+            ])),
+        ],
+    )
+    .await;
+
+    let model_provider = openai_model_provider(&server);
+    let mut initial_builder = test_codex()
+        .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
+        .with_model(retired_model)
+        .with_config(move |config| {
+            config.model_provider = model_provider;
+            set_test_compact_prompt(config);
+        });
+    let initial = initial_builder
+        .build(&server)
+        .await
+        .expect("build initial test codex");
+    let home = initial.home.clone();
+    let rollout_path = initial
+        .session_configured
+        .rollout_path
+        .clone()
+        .expect("rollout path");
+
+    initial
+        .codex
+        .start_or_steer_turn(disabled_permission_user_turn(
+            "before switch",
+            initial.cwd.path().to_path_buf(),
+            retired_model.to_string(),
+        ))
+        .await
+        .expect("submit first user turn");
+    wait_for_event(&initial.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+
+    initial
+        .codex
+        .submit(Op::Shutdown)
+        .await
+        .expect("shutdown initial session");
+    wait_for_event(&initial.codex, |event| {
+        matches!(event, EventMsg::ShutdownComplete)
+    })
+    .await;
+
+    let model_provider = openai_model_provider(&server);
+    let mut resumed_builder = test_codex()
+        .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
+        .with_model(retired_model)
+        .with_config(move |config| {
+            config.model_provider = model_provider;
+            set_test_compact_prompt(config);
+        });
+    let resumed = resumed_builder
+        .resume(&server, home, rollout_path)
+        .await
+        .expect("resume codex");
+
+    resumed
+        .codex
+        .start_or_steer_turn(disabled_permission_user_turn(
+            "after switch",
+            resumed.cwd.path().to_path_buf(),
+            renamed_model.to_string(),
+        ))
+        .await
+        .expect("submit renamed-model turn");
+    assert_compaction_uses_turn_lifecycle_id(&resumed.codex).await;
+
+    let requests = request_log.requests();
+    assert_eq!(models_mock.requests().len(), 1);
+    assert_eq!(
+        requests.len(),
+        4,
+        "the renamed-model turn should retry compaction and then sample"
+    );
+    assert_eq!(
+        requests[0].body_json()["model"].as_str(),
+        Some(retired_model)
+    );
+    assert_eq!(
+        requests[1].body_json()["model"].as_str(),
+        Some(retired_model)
+    );
+    assert_eq!(
+        requests[2].body_json()["model"].as_str(),
+        Some(renamed_model)
+    );
+    assert_eq!(
+        requests[3].body_json()["model"].as_str(),
+        Some(renamed_model)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pre_sampling_compact_falls_back_when_previous_model_is_not_found() {
+    skip_if_no_network!();
+
+    let server = MockServer::start().await;
+    let retired_model = "gpt-5.5";
+    let previous_model_family = "gpt-5.5";
+    let renamed_model = "gpt-5.6";
+    let mut previous_model_info = model_info_with_optional_comp_hash("gpt-5.4", Some("hash-a"));
+    previous_model_info.slug = previous_model_family.to_string();
+    let mut renamed_model_info = model_info_with_optional_comp_hash("gpt-5.4", Some("hash-b"));
+    renamed_model_info.slug = renamed_model.to_string();
+
+    let models_mock = mount_models_once(
+        &server,
+        ModelsResponse {
+            models: vec![previous_model_info, renamed_model_info],
+        },
+    )
+    .await;
+
+    let request_log = mount_response_sequence(
+        &server,
+        vec![
+            sse_response(sse(vec![
+                ev_assistant_message("m1", "before switch"),
+                ev_completed_with_tokens("r1", /*total_tokens*/ 100),
+            ])),
+            model_not_found_response(retired_model),
+            sse_response(sse(vec![
+                json!({
+                    "type": "response.output_item.done",
+                    "item": {
+                        "type": "compaction",
+                        "encrypted_content": "RETIRED_MODEL_SUMMARY",
+                    }
+                }),
+                ev_completed_with_tokens("r2", /*total_tokens*/ 10),
+            ])),
+            sse_response(sse(vec![
+                ev_assistant_message("m3", "after switch"),
+                ev_completed_with_tokens("r3", /*total_tokens*/ 100),
+            ])),
+        ],
+    )
+    .await;
+
+    let model_provider = openai_model_provider(&server);
+    let mut initial_builder = test_codex()
+        .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
+        .with_model(retired_model)
+        .with_config(move |config| {
+            config.model_provider = model_provider;
+            set_test_compact_prompt(config);
+        });
+    let initial = initial_builder
+        .build(&server)
+        .await
+        .expect("build initial test codex");
+    let home = initial.home.clone();
+    let rollout_path = initial
+        .session_configured
+        .rollout_path
+        .clone()
+        .expect("rollout path");
+
+    initial
+        .codex
+        .start_or_steer_turn(disabled_permission_user_turn(
+            "before switch",
+            initial.cwd.path().to_path_buf(),
+            retired_model.to_string(),
+        ))
+        .await
+        .expect("submit first user turn");
+    wait_for_event(&initial.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+
+    initial
+        .codex
+        .submit(Op::Shutdown)
+        .await
+        .expect("shutdown initial session");
+    wait_for_event(&initial.codex, |event| {
+        matches!(event, EventMsg::ShutdownComplete)
+    })
+    .await;
+
+    let mut model_provider = openai_model_provider(&server);
+    model_provider.stream_max_retries = Some(0);
+    let mut resumed_builder = test_codex()
+        .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
+        .with_model(retired_model)
+        .with_config(move |config| {
+            config.model_provider = model_provider;
+            set_test_compact_prompt(config);
+        });
+    let resumed = resumed_builder
+        .resume(&server, home, rollout_path)
+        .await
+        .expect("resume codex");
+
+    resumed
+        .codex
+        .start_or_steer_turn(disabled_permission_user_turn(
+            "after switch",
+            resumed.cwd.path().to_path_buf(),
+            renamed_model.to_string(),
+        ))
+        .await
+        .expect("submit renamed-model turn");
+    assert_compaction_uses_turn_lifecycle_id(&resumed.codex).await;
+
+    let requests = request_log.requests();
+    assert_eq!(models_mock.requests().len(), 1);
+    assert_eq!(
+        requests.len(),
+        4,
+        "the renamed-model turn should retry compaction and then sample"
+    );
+    assert_eq!(
+        requests[0].body_json()["model"].as_str(),
+        Some(retired_model)
+    );
+    assert_eq!(
+        requests[1].body_json()["model"].as_str(),
+        Some(retired_model)
+    );
+    assert_eq!(
+        requests[2].body_json()["model"].as_str(),
+        Some(renamed_model)
+    );
+    assert_eq!(
+        requests[3].body_json()["model"].as_str(),
+        Some(renamed_model)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pre_sampling_compact_falls_back_after_previous_model_invalid_request_on_downshift() {
+    skip_if_no_network!();
+
+    let server = MockServer::start().await;
+    let retired_model = "gpt-5.6";
+    let previous_model_family = "gpt-5.6";
+    let next_model = "gpt-5.5";
+    let mut previous_model_info =
+        model_info_with_context_window("gpt-5.4", /*context_window*/ 273_000);
+    previous_model_info.slug = previous_model_family.to_string();
+    let mut next_model_info =
+        model_info_with_context_window("gpt-5.4", /*context_window*/ 125_000);
+    next_model_info.slug = next_model.to_string();
+
+    let models_mock = mount_models_once(
+        &server,
+        ModelsResponse {
+            models: vec![previous_model_info, next_model_info],
+        },
+    )
+    .await;
+
+    let request_log = mount_response_sequence(
+        &server,
+        vec![
+            sse_response(sse(vec![
+                ev_assistant_message("m1", "before switch"),
+                ev_completed_with_tokens("r1", /*total_tokens*/ 120_000),
+            ])),
+            invalid_request_response("previous-model compaction was rejected"),
+            sse_response(sse(vec![
+                json!({
+                    "type": "response.output_item.done",
+                    "item": {
+                        "type": "compaction",
+                        "encrypted_content": "DOWNSHIFT_SUMMARY",
+                    }
+                }),
+                ev_completed_with_tokens("r2", /*total_tokens*/ 10),
+            ])),
+            sse_response(sse(vec![
+                ev_assistant_message("m3", "after switch"),
+                ev_completed_with_tokens("r3", /*total_tokens*/ 100),
+            ])),
+        ],
+    )
+    .await;
+
+    let model_provider = openai_model_provider(&server);
+    let mut builder = test_codex()
+        .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
+        .with_model(retired_model)
+        .with_config(move |config| {
+            config.model_provider = model_provider;
+            set_test_compact_prompt(config);
+            let _ = config.features.enable(Feature::RemoteCompactionV2);
+        });
+    let test = builder.build(&server).await.expect("build test codex");
+
+    test.codex
+        .start_or_steer_turn(disabled_permission_user_turn(
+            "before switch",
+            test.cwd.path().to_path_buf(),
+            retired_model.to_string(),
+        ))
+        .await
+        .expect("submit first user turn");
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+
+    test.codex
+        .start_or_steer_turn(disabled_permission_user_turn(
+            "after switch",
+            test.cwd.path().to_path_buf(),
+            next_model.to_string(),
+        ))
+        .await
+        .expect("submit smaller-model turn");
+    assert_compaction_uses_turn_lifecycle_id(&test.codex).await;
+
+    let requests = request_log.requests();
+    assert_eq!(models_mock.requests().len(), 1);
+    assert_eq!(
+        requests.len(),
+        4,
+        "the smaller-model turn should retry compaction and then sample"
+    );
+    assert_eq!(
+        requests[0].body_json()["model"].as_str(),
+        Some(retired_model)
+    );
+    assert_eq!(
+        requests[1].body_json()["model"].as_str(),
+        Some(retired_model)
+    );
+    assert_eq!(requests[2].body_json()["model"].as_str(), Some(next_model));
+    assert_eq!(requests[3].body_json()["model"].as_str(), Some(next_model));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pre_sampling_legacy_remote_compact_falls_back_after_previous_model_invalid_request() {
+    skip_if_no_network!();
+
+    let server = MockServer::start().await;
+    let retired_model = "gpt-5.6";
+    let previous_model_family = "gpt-5.6";
+    let next_model = "gpt-5.5";
+    let mut previous_model_info =
+        model_info_with_context_window("gpt-5.4", /*context_window*/ 273_000);
+    previous_model_info.slug = previous_model_family.to_string();
+    let mut next_model_info =
+        model_info_with_context_window("gpt-5.4", /*context_window*/ 125_000);
+    next_model_info.slug = next_model.to_string();
+
+    let models_mock = mount_models_once(
+        &server,
+        ModelsResponse {
+            models: vec![previous_model_info, next_model_info],
+        },
+    )
+    .await;
+    let request_log = mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![
+                ev_assistant_message("m1", "before switch"),
+                ev_completed_with_tokens("r1", /*total_tokens*/ 120_000),
+            ]),
+            sse(vec![
+                ev_assistant_message("m3", "after switch"),
+                ev_completed_with_tokens("r3", /*total_tokens*/ 100),
+            ]),
+        ],
+    )
+    .await;
+    let compact_request_log = mount_compact_response_sequence(
+        &server,
+        vec![
+            invalid_request_response("previous-model compaction was rejected"),
+            wiremock::ResponseTemplate::new(/*status*/ 200)
+                .insert_header("content-type", "application/json")
+                .set_body_json(json!({
+                    "output": [{
+                        "type": "compaction",
+                        "encrypted_content": "DOWNSHIFT_SUMMARY",
+                    }],
+                })),
+        ],
+    )
+    .await;
+
+    let model_provider = openai_model_provider(&server);
+    let mut builder = test_codex()
+        .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
+        .with_model(retired_model)
+        .with_config(move |config| {
+            config.model_provider = model_provider;
+            set_test_compact_prompt(config);
+            let _ = config.features.disable(Feature::RemoteCompactionV2);
+        });
+    let test = builder.build(&server).await.expect("build test codex");
+
+    test.codex
+        .start_or_steer_turn(disabled_permission_user_turn(
+            "before switch",
+            test.cwd.path().to_path_buf(),
+            retired_model.to_string(),
+        ))
+        .await
+        .expect("submit first user turn");
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+
+    test.codex
+        .start_or_steer_turn(disabled_permission_user_turn(
+            "after switch",
+            test.cwd.path().to_path_buf(),
+            next_model.to_string(),
+        ))
+        .await
+        .expect("submit smaller-model turn");
+    assert_compaction_uses_turn_lifecycle_id(&test.codex).await;
+
+    let requests = request_log.requests();
+    let compact_requests = compact_request_log.requests();
+    assert_eq!(models_mock.requests().len(), 1);
+    assert_eq!(requests.len(), 2);
+    assert_eq!(compact_requests.len(), 2);
+    assert_eq!(
+        requests[0].body_json()["model"].as_str(),
+        Some(retired_model)
+    );
+    assert_eq!(
+        compact_requests[0].body_json()["model"].as_str(),
+        Some(retired_model)
+    );
+    assert_eq!(
+        compact_requests[1].body_json()["model"].as_str(),
+        Some(next_model)
+    );
+    assert_eq!(requests[1].body_json()["model"].as_str(), Some(next_model));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pre_sampling_compact_keeps_unknown_previous_model_for_api_key_auth_and_custom_provider() {
+    skip_if_no_network!();
+
+    let server = MockServer::start().await;
+    let previous_model = "custom/gpt-5.5";
+    let previous_model_family = "gpt-5.5";
+    let next_model = "gpt-5.6";
+    let mut previous_model_info = model_info_with_optional_comp_hash("gpt-5.4", Some("hash-a"));
+    previous_model_info.slug = previous_model_family.to_string();
+    let mut next_model_info = model_info_with_optional_comp_hash("gpt-5.4", Some("hash-b"));
+    next_model_info.slug = next_model.to_string();
+
+    let model_catalog = ModelsResponse {
+        models: vec![previous_model_info, next_model_info],
+    };
+
+    let request_log = mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![
+                ev_assistant_message("m1", "before switch"),
+                ev_completed_with_tokens("r1", /*total_tokens*/ 100),
+            ]),
+            sse(vec![
+                ev_assistant_message("m2", "CUSTOM_MODEL_SUMMARY"),
+                ev_completed_with_tokens("r2", /*total_tokens*/ 10),
+            ]),
+            sse(vec![
+                ev_assistant_message("m3", "after switch"),
+                ev_completed_with_tokens("r3", /*total_tokens*/ 100),
+            ]),
+        ],
+    )
+    .await;
+
+    let model_provider = non_openai_model_provider(&server);
+    let mut builder = test_codex()
+        .with_auth(CodexAuth::from_api_key("Test API Key"))
+        .with_model(previous_model)
+        .with_config(move |config| {
+            config.model_provider = model_provider;
+            config.model_catalog = Some(model_catalog);
+            set_test_compact_prompt(config);
+        });
+    let test = builder.build(&server).await.expect("build test codex");
+
+    test.codex
+        .start_or_steer_turn(disabled_permission_user_turn(
+            "before switch",
+            test.cwd.path().to_path_buf(),
+            previous_model.to_string(),
+        ))
+        .await
+        .expect("submit first user turn");
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+
+    test.codex
+        .start_or_steer_turn(disabled_permission_user_turn(
+            "after switch",
+            test.cwd.path().to_path_buf(),
+            next_model.to_string(),
+        ))
+        .await
+        .expect("submit next-model turn");
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+
+    let requests = request_log.requests();
+    assert_eq!(requests.len(), 3);
+    assert_pre_sampling_switch_compaction_requests(
+        &requests[0].body_json(),
+        &requests[1].body_json(),
+        &requests[2].body_json(),
+        previous_model,
+        next_model,
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pre_sampling_compact_skips_when_either_comp_hash_is_missing() {
     skip_if_no_network!();
 
     let server = MockServer::start().await;
     let model_without_hash = "gpt-5.4";
-    let model_with_hash = "gpt-5.3-codex";
+    let model_with_hash = "gpt-5.5";
     let next_model_without_hash = "gpt-5.2";
 
     let models_mock = mount_models_once(
@@ -2332,7 +2845,7 @@ async fn pre_sampling_compact_skips_when_either_comp_hash_is_missing() {
     let test = builder.build(&server).await.expect("build test codex");
 
     test.codex
-        .submit(disabled_permission_user_turn(
+        .start_or_steer_turn(disabled_permission_user_turn(
             "before hash",
             test.cwd.path().to_path_buf(),
             model_without_hash.to_string(),
@@ -2345,7 +2858,7 @@ async fn pre_sampling_compact_skips_when_either_comp_hash_is_missing() {
     .await;
 
     test.codex
-        .submit(disabled_permission_user_turn(
+        .start_or_steer_turn(disabled_permission_user_turn(
             "hash introduced",
             test.cwd.path().to_path_buf(),
             model_with_hash.to_string(),
@@ -2358,7 +2871,7 @@ async fn pre_sampling_compact_skips_when_either_comp_hash_is_missing() {
     .await;
 
     test.codex
-        .submit(disabled_permission_user_turn(
+        .start_or_steer_turn(disabled_permission_user_turn(
             "hash removed",
             test.cwd.path().to_path_buf(),
             next_model_without_hash.to_string(),
@@ -2393,7 +2906,7 @@ async fn body_after_prefix_model_switch_budget_compacts_with_next_model() {
     skip_if_no_network!();
 
     let server = MockServer::start().await;
-    let previous_model = "gpt-5.3-codex";
+    let previous_model = "gpt-5.4";
     let next_model = "gpt-5.2";
 
     let models_mock = mount_models_once(
@@ -2441,7 +2954,7 @@ async fn body_after_prefix_model_switch_budget_compacts_with_next_model() {
     let test = builder.build(&server).await.expect("build test codex");
 
     test.codex
-        .submit(disabled_permission_user_turn(
+        .start_or_steer_turn(disabled_permission_user_turn(
             "before switch",
             test.cwd.path().to_path_buf(),
             previous_model.to_string(),
@@ -2454,7 +2967,7 @@ async fn body_after_prefix_model_switch_budget_compacts_with_next_model() {
     .await;
 
     test.codex
-        .submit(disabled_permission_user_turn(
+        .start_or_steer_turn(disabled_permission_user_turn(
             "after switch",
             test.cwd.path().to_path_buf(),
             next_model.to_string(),
@@ -2487,7 +3000,7 @@ async fn pre_sampling_compact_runs_after_resume_and_switch_to_smaller_model() {
     skip_if_no_network!();
 
     let server = MockServer::start().await;
-    let previous_model = "gpt-5.3-codex";
+    let previous_model = "gpt-5.4";
     let next_model = "gpt-5.2";
 
     let models_mock = mount_models_once(
@@ -2541,7 +3054,7 @@ async fn pre_sampling_compact_runs_after_resume_and_switch_to_smaller_model() {
 
     initial
         .codex
-        .submit(disabled_permission_user_turn(
+        .start_or_steer_turn(disabled_permission_user_turn(
             "before resume",
             initial.cwd.path().to_path_buf(),
             previous_model.to_string(),
@@ -2578,7 +3091,7 @@ async fn pre_sampling_compact_runs_after_resume_and_switch_to_smaller_model() {
 
     resumed
         .codex
-        .submit(disabled_permission_user_turn(
+        .start_or_steer_turn(disabled_permission_user_turn(
             "after resume",
             resumed.cwd.path().to_path_buf(),
             next_model.to_string(),
@@ -2608,7 +3121,7 @@ async fn pre_sampling_compact_recovers_comp_hash_after_resume() {
     skip_if_no_network!();
 
     let server = MockServer::start().await;
-    let previous_model = "gpt-5.3-codex";
+    let previous_model = "gpt-5.4";
     let next_model = "gpt-5.2";
 
     let models_mock = mount_models_once(
@@ -2662,7 +3175,7 @@ async fn pre_sampling_compact_recovers_comp_hash_after_resume() {
 
     initial
         .codex
-        .submit(disabled_permission_user_turn(
+        .start_or_steer_turn(disabled_permission_user_turn(
             "before resume",
             initial.cwd.path().to_path_buf(),
             previous_model.to_string(),
@@ -2709,7 +3222,7 @@ async fn pre_sampling_compact_recovers_comp_hash_after_resume() {
 
     resumed
         .codex
-        .submit(disabled_permission_user_turn(
+        .start_or_steer_turn(disabled_permission_user_turn(
             "after resume",
             resumed.cwd.path().to_path_buf(),
             next_model.to_string(),
@@ -2739,7 +3252,7 @@ async fn pre_sampling_compact_skips_missing_comp_hash_after_resume() {
     skip_if_no_network!();
 
     let server = MockServer::start().await;
-    let previous_model = "gpt-5.3-codex";
+    let previous_model = "gpt-5.4";
     let next_model = "gpt-5.2";
 
     let models_mock = mount_models_once(
@@ -2789,7 +3302,7 @@ async fn pre_sampling_compact_skips_missing_comp_hash_after_resume() {
 
     initial
         .codex
-        .submit(disabled_permission_user_turn(
+        .start_or_steer_turn(disabled_permission_user_turn(
             "before resume",
             initial.cwd.path().to_path_buf(),
             previous_model.to_string(),
@@ -2834,7 +3347,7 @@ async fn pre_sampling_compact_skips_missing_comp_hash_after_resume() {
 
     resumed
         .codex
-        .submit(disabled_permission_user_turn(
+        .start_or_steer_turn(disabled_permission_user_turn(
             "after resume",
             resumed.cwd.path().to_path_buf(),
             next_model.to_string(),
@@ -2929,46 +3442,28 @@ async fn auto_compact_persists_rollout_entries() {
     let session_configured = test.session_configured;
 
     codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
-                text: FIRST_AUTO_MSG.into(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: Default::default(),
-        })
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: FIRST_AUTO_MSG.into(),
+            text_elements: Vec::new(),
+        }]))
         .await
         .unwrap();
     wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
     codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
-                text: SECOND_AUTO_MSG.into(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: Default::default(),
-        })
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: SECOND_AUTO_MSG.into(),
+            text_elements: Vec::new(),
+        }]))
         .await
         .unwrap();
     wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
     codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
-                text: POST_AUTO_USER_MSG.into(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: Default::default(),
-        })
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: POST_AUTO_USER_MSG.into(),
+            text_elements: Vec::new(),
+        }]))
         .await
         .unwrap();
     wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
@@ -3043,16 +3538,10 @@ async fn manual_compact_retries_after_context_window_error() {
     let codex = builder.build(&server).await.unwrap().codex;
 
     codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
-                text: "first turn".into(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: Default::default(),
-        })
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "first turn".into(),
+            text_elements: Vec::new(),
+        }]))
         .await
         .unwrap();
     wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
@@ -3147,16 +3636,10 @@ async fn manual_compact_non_context_failure_retries_then_emits_task_error() {
         .codex;
 
     codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
-                text: "first turn".into(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: Default::default(),
-        })
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "first turn".into(),
+            text_elements: Vec::new(),
+        }]))
         .await
         .expect("submit user input");
     wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
@@ -3242,16 +3725,10 @@ async fn manual_compact_twice_preserves_latest_user_messages() {
     let codex = builder.build(&server).await.unwrap().codex;
 
     codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
-                text: first_user_message.into(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: Default::default(),
-        })
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: first_user_message.into(),
+            text_elements: Vec::new(),
+        }]))
         .await
         .unwrap();
     wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
@@ -3260,16 +3737,10 @@ async fn manual_compact_twice_preserves_latest_user_messages() {
     wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
     codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
-                text: second_user_message.into(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: Default::default(),
-        })
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: second_user_message.into(),
+            text_elements: Vec::new(),
+        }]))
         .await
         .unwrap();
     wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
@@ -3278,16 +3749,10 @@ async fn manual_compact_twice_preserves_latest_user_messages() {
     wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
     codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
-                text: final_user_message.into(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: Default::default(),
-        })
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: final_user_message.into(),
+            text_elements: Vec::new(),
+        }]))
         .await
         .unwrap();
     wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
@@ -3478,23 +3943,18 @@ async fn auto_compact_allows_multiple_attempts_when_interleaved_with_other_turn_
     let mut builder = test_codex().with_config(move |config| {
         config.model_provider = model_provider;
         set_test_compact_prompt(config);
-        config.model_auto_compact_token_limit = Some(200);
+        // Leave enough headroom for per-item request metadata before the second compaction.
+        config.model_auto_compact_token_limit = Some(300);
     });
     let codex = builder.build(&server).await.unwrap().codex;
 
     let mut auto_compact_lifecycle_events = Vec::new();
     for user in [MULTI_AUTO_MSG, follow_up_user, final_user] {
         codex
-            .submit(Op::UserInput {
-                items: vec![UserInput::Text {
-                    text: user.into(),
-                    text_elements: Vec::new(),
-                }],
-                final_output_json_schema: None,
-                responsesapi_client_metadata: None,
-                additional_context: Default::default(),
-                thread_settings: Default::default(),
-            })
+            .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+                text: user.into(),
+                text_elements: Vec::new(),
+            }]))
             .await
             .unwrap();
 
@@ -3581,28 +4041,19 @@ async fn snapshot_request_shape_mid_turn_continuation_compaction() {
 
     let model_provider = non_openai_model_provider(&server);
 
-    let mut builder = test_codex()
-        .with_model(ACTIVE_MODEL)
-        .with_config(move |config| {
-            config.model_provider = model_provider;
-            set_test_compact_prompt(config);
-            config.compact_model = Some(COMPACT_MODEL.to_string());
-            config.model_context_window = Some(context_window);
-            config.model_auto_compact_token_limit = Some(limit);
-        });
+    let mut builder = test_codex().with_config(move |config| {
+        config.model_provider = model_provider;
+        set_test_compact_prompt(config);
+        config.model_context_window = Some(context_window);
+        config.model_auto_compact_token_limit = Some(limit);
+    });
     let codex = builder.build(&server).await.unwrap().codex;
 
     codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
-                text: FUNCTION_CALL_LIMIT_MSG.into(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: Default::default(),
-        })
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: FUNCTION_CALL_LIMIT_MSG.into(),
+            text_elements: Vec::new(),
+        }]))
         .await
         .unwrap();
 
@@ -3636,43 +4087,10 @@ async fn snapshot_request_shape_mid_turn_continuation_compaction() {
         "function call output should be sent before auto compact"
     );
 
-    let auto_compact_body = auto_compact_mock.single_request().body_json();
-    assert_eq!(auto_compact_body["model"], COMPACT_MODEL);
-    assert!(auto_compact_body.get("previous_response_id").is_none());
-    assert_eq!(auto_compact_body["tools"], json!([]));
-    assert!(auto_compact_body.get("text").is_none());
+    let auto_compact_body = auto_compact_mock.single_request().body_json().to_string();
     assert!(
-        body_contains_text(&auto_compact_body.to_string(), SUMMARIZATION_PROMPT),
+        body_contains_text(&auto_compact_body, SUMMARIZATION_PROMPT),
         "mid-turn auto compact request should include the summarization prompt after exceeding 95% (limit {limit})"
-    );
-
-    let post_auto_compact_body = post_auto_compact_mock.single_request().body_json();
-    assert_eq!(post_auto_compact_body["model"], ACTIVE_MODEL);
-    let post_auto_compact_body_text = post_auto_compact_body.to_string();
-    assert!(!post_auto_compact_body_text.contains("<model_switch>"));
-    assert!(!post_auto_compact_body_text.contains(COMPACT_MODEL));
-
-    let post_auto_compact_input = post_auto_compact_body["input"]
-        .as_array()
-        .expect("post-compact continuation should contain an input array");
-    let canonical_context_index = post_auto_compact_input
-        .iter()
-        .position(|item| item.to_string().contains("<environment_context>"))
-        .expect("post-compact continuation should contain canonical environment context");
-    let last_real_user_index = post_auto_compact_input
-        .iter()
-        .position(|item| item.to_string().contains(FUNCTION_CALL_LIMIT_MSG))
-        .expect("post-compact continuation should contain the last real user message");
-    let summary_index = post_auto_compact_input
-        .iter()
-        .position(|item| {
-            let item = item.to_string();
-            item.contains(SUMMARY_PREFIX) && item.contains(AUTO_SUMMARY_TEXT)
-        })
-        .expect("post-compact continuation should contain the compaction summary");
-    assert!(
-        canonical_context_index < last_real_user_index && last_real_user_index < summary_index,
-        "canonical context, last real user message, and summary must remain in order: {canonical_context_index} < {last_real_user_index} < {summary_index}"
     );
 
     insta::assert_snapshot!(
@@ -4061,16 +4479,10 @@ async fn auto_compact_counts_encrypted_reasoning_before_last_user() {
         .enumerate()
     {
         codex
-            .submit(Op::UserInput {
-                items: vec![UserInput::Text {
-                    text: user.into(),
-                    text_elements: Vec::new(),
-                }],
-                final_output_json_schema: None,
-                responsesapi_client_metadata: None,
-                additional_context: Default::default(),
-                thread_settings: Default::default(),
-            })
+            .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+                text: user.into(),
+                text_elements: Vec::new(),
+            }]))
             .await
             .unwrap();
         wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
@@ -4184,16 +4596,10 @@ async fn auto_compact_runs_when_reasoning_header_clears_between_turns() {
 
     for user in [first_user, second_user, third_user] {
         codex
-            .submit(Op::UserInput {
-                items: vec![UserInput::Text {
-                    text: user.into(),
-                    text_elements: Vec::new(),
-                }],
-                final_output_json_schema: None,
-                responsesapi_client_metadata: None,
-                additional_context: Default::default(),
-                thread_settings: Default::default(),
-            })
+            .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+                text: user.into(),
+                text_elements: Vec::new(),
+            }]))
             .await
             .unwrap();
         wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
@@ -4246,23 +4652,17 @@ async fn snapshot_request_shape_pre_turn_compaction_including_incoming_user_mess
 
     for user in ["USER_ONE", "USER_TWO"] {
         codex
-            .submit(Op::UserInput {
-                items: vec![UserInput::Text {
-                    text: user.to_string(),
-                    text_elements: Vec::new(),
-                }],
-                final_output_json_schema: None,
-                responsesapi_client_metadata: None,
-                additional_context: Default::default(),
-                thread_settings: Default::default(),
-            })
+            .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+                text: user.to_string(),
+                text_elements: Vec::new(),
+            }]))
             .await
             .expect("submit user input");
         wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
     }
     core_test_support::submit_thread_settings(
         &codex,
-        codex_protocol::protocol::ThreadSettingsOverrides {
+        ThreadSettingsOverrides {
             environments: Some(local_selections(
                 test_path_buf(PRETURN_CONTEXT_DIFF_CWD).abs(),
             )),
@@ -4274,22 +4674,16 @@ async fn snapshot_request_shape_pre_turn_compaction_including_incoming_user_mess
     let image_url = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg=="
         .to_string();
     codex
-        .submit(Op::UserInput {
-            items: vec![
-                UserInput::Image {
-                    image_url: image_url.clone(),
-                    detail: None,
-                },
-                UserInput::Text {
-                    text: "USER_THREE".to_string(),
-                    text_elements: Vec::new(),
-                },
-            ],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: Default::default(),
-        })
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![
+            UserInput::Image {
+                image_url: image_url.clone(),
+                detail: None,
+            },
+            UserInput::Text {
+                text: "USER_THREE".to_string(),
+                text_elements: Vec::new(),
+            },
+        ]))
         .await
         .expect("submit user input");
     wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
@@ -4336,7 +4730,7 @@ async fn snapshot_request_shape_pre_turn_compaction_strips_incoming_model_switch
 
     let server = start_mock_server().await;
     let previous_model = "gpt-5.4";
-    let next_model = "gpt-5.3-codex";
+    let next_model = "gpt-5.2";
 
     let request_log = mount_sse_sequence(
         &server,
@@ -4372,7 +4766,7 @@ async fn snapshot_request_shape_pre_turn_compaction_strips_incoming_model_switch
         .expect("build codex");
 
     test.codex
-        .submit(disabled_permission_user_turn(
+        .start_or_steer_turn(disabled_permission_user_turn(
             "BEFORE_SWITCH_USER",
             test.cwd.path().to_path_buf(),
             previous_model.to_string(),
@@ -4385,7 +4779,7 @@ async fn snapshot_request_shape_pre_turn_compaction_strips_incoming_model_switch
     .await;
 
     test.codex
-        .submit(disabled_permission_user_turn(
+        .start_or_steer_turn(disabled_permission_user_turn(
             "AFTER_SWITCH_USER",
             test.cwd.path().to_path_buf(),
             next_model.to_string(),
@@ -4469,31 +4863,19 @@ async fn snapshot_request_shape_pre_turn_compaction_context_window_exceeded() {
         .codex;
 
     codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
-                text: "USER_ONE".to_string(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: Default::default(),
-        })
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "USER_ONE".to_string(),
+            text_elements: Vec::new(),
+        }]))
         .await
         .expect("submit first user");
     wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
     codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
-                text: "USER_TWO".to_string(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: Default::default(),
-        })
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "USER_TWO".to_string(),
+            text_elements: Vec::new(),
+        }]))
         .await
         .expect("submit second user");
     let error_message = wait_for_event_match(&codex, |event| match event {
@@ -4557,16 +4939,10 @@ async fn snapshot_request_shape_manual_compact_without_previous_user_messages() 
     wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
     codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
-                text: "AFTER_MANUAL_EMPTY_COMPACT".to_string(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: Default::default(),
-        })
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "AFTER_MANUAL_EMPTY_COMPACT".to_string(),
+            text_elements: Vec::new(),
+        }]))
         .await
         .expect("submit follow-up user input");
     wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;

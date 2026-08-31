@@ -12,6 +12,7 @@ use serde::Serialize;
 use serde::ser::Serializer;
 use ts_rs::TS;
 
+use crate::local_media::audio_mime_for_path;
 use crate::permissions::FileSystemAccessMode;
 use crate::permissions::FileSystemPath;
 use crate::permissions::FileSystemSandboxEntry;
@@ -19,14 +20,28 @@ use crate::permissions::FileSystemSandboxKind;
 use crate::permissions::FileSystemSandboxPolicy;
 use crate::permissions::FileSystemSpecialPath;
 use crate::permissions::NetworkSandboxPolicy;
+use crate::permissions::RawFileSystemSandboxEntry;
 use crate::protocol::SandboxPolicy;
 use crate::user_input::UserInput;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_image::ImageProcessingError;
-use codex_utils_path_uri::PathUri;
 use schemars::JsonSchema;
 
+use crate::ResponseItemId;
 use crate::mcp::CallToolResult;
+use codex_utils_path_uri::PathUri;
+
+mod executed_tool_calls;
+
+pub use crate::local_media::MAX_PROMPT_AUDIO_INPUT_BYTES;
+pub use crate::local_media::snapshot_local_user_input;
+pub use crate::permission_profile_snapshot::PermissionProfileSnapshot;
+pub use executed_tool_calls::ExecutedToolCall;
+pub use executed_tool_calls::ExecutedToolCallArguments;
+pub use executed_tool_calls::ExecutedToolCallTruncation;
+pub use executed_tool_calls::bound_executed_tool_calls_for_prompt;
+pub use executed_tool_calls::bound_executed_tool_calls_for_prompt_prioritizing_recent;
+pub use executed_tool_calls::executed_tool_call_metadata_bytes;
 
 /// Controls the per-command sandbox override requested by a shell-like tool call.
 #[derive(
@@ -63,72 +78,60 @@ impl SandboxPermissions {
     }
 }
 
-#[derive(Debug, Clone, Eq, Hash, PartialEq, JsonSchema, TS)]
-pub struct FileSystemPermissions<PathType = AbsolutePathBuf> {
-    pub entries: Vec<FileSystemSandboxEntry<PathType>>,
+#[derive(Debug, Clone, Default, Eq, Hash, PartialEq, JsonSchema, TS)]
+pub struct FileSystemPermissions {
+    #[schemars(with = "Vec<RawFileSystemSandboxEntry>")]
+    #[ts(as = "Vec<RawFileSystemSandboxEntry>")]
+    pub entries: Vec<FileSystemSandboxEntry>,
     pub glob_scan_max_depth: Option<NonZeroUsize>,
 }
 
-impl From<FileSystemPermissions<AbsolutePathBuf>> for FileSystemPermissions<PathUri> {
-    fn from(value: FileSystemPermissions<AbsolutePathBuf>) -> Self {
-        FileSystemPermissions {
-            entries: value
-                .entries
-                .into_iter()
-                .map(FileSystemSandboxEntry::<PathUri>::from)
-                .collect(),
-            glob_scan_max_depth: value.glob_scan_max_depth,
-        }
-    }
+#[derive(Debug, Clone, Default, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LegacyReadWriteRoots {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read: Option<Vec<AbsolutePathBuf>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub write: Option<Vec<AbsolutePathBuf>>,
 }
 
-impl TryFrom<FileSystemPermissions<PathUri>> for FileSystemPermissions<AbsolutePathBuf> {
-    type Error = io::Error;
-
-    fn try_from(value: FileSystemPermissions<PathUri>) -> Result<Self, Self::Error> {
-        Ok(FileSystemPermissions {
-            entries: value
-                .entries
-                .into_iter()
-                .map(FileSystemSandboxEntry::<AbsolutePathBuf>::try_from)
-                .collect::<io::Result<_>>()?,
-            glob_scan_max_depth: value.glob_scan_max_depth,
-        })
-    }
-}
-
-impl<PathType> Default for FileSystemPermissions<PathType> {
-    fn default() -> Self {
-        Self {
-            entries: Vec::new(),
-            glob_scan_max_depth: None,
-        }
-    }
-}
-
-pub type LegacyReadWriteRoots<PathType = AbsolutePathBuf> =
-    (Option<Vec<PathType>>, Option<Vec<PathType>>);
-impl<PathType> FileSystemPermissions<PathType> {
+impl FileSystemPermissions {
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
 
     pub fn from_read_write_roots(
-        read: Option<Vec<PathType>>,
-        write: Option<Vec<PathType>>,
+        read: Option<Vec<AbsolutePathBuf>>,
+        write: Option<Vec<AbsolutePathBuf>>,
     ) -> Self {
+        Self::from_paths(read, write)
+    }
+
+    pub fn from_read_write_path_uris(
+        read: Option<Vec<PathUri>>,
+        write: Option<Vec<PathUri>>,
+    ) -> Self {
+        Self::from_paths(read, write)
+    }
+
+    fn from_paths<P>(read: Option<Vec<P>>, write: Option<Vec<P>>) -> Self
+    where
+        P: Into<FileSystemPath>,
+    {
         let mut entries = Vec::new();
         if let Some(read) = read {
-            entries.extend(read.into_iter().map(|path| FileSystemSandboxEntry {
-                path: FileSystemPath::Path { path },
-                access: FileSystemAccessMode::Read,
-            }));
+            entries.extend(
+                read.into_iter().map(|path| {
+                    FileSystemSandboxEntry::new(path.into(), FileSystemAccessMode::Read)
+                }),
+            );
         }
         if let Some(write) = write {
-            entries.extend(write.into_iter().map(|path| FileSystemSandboxEntry {
-                path: FileSystemPath::Path { path },
-                access: FileSystemAccessMode::Write,
-            }));
+            entries.extend(
+                write.into_iter().map(|path| {
+                    FileSystemSandboxEntry::new(path.into(), FileSystemAccessMode::Write)
+                }),
+            );
         }
         Self {
             entries,
@@ -136,25 +139,11 @@ impl<PathType> FileSystemPermissions<PathType> {
         }
     }
 
-    pub fn explicit_path_entries(&self) -> impl Iterator<Item = (&PathType, FileSystemAccessMode)> {
-        self.entries.iter().filter_map(|entry| match &entry.path {
-            FileSystemPath::Path { path } => Some((path, entry.access)),
-            FileSystemPath::GlobPattern { .. } | FileSystemPath::Special { .. } => None,
-        })
-    }
-
-    pub fn legacy_read_write_roots(&self) -> Option<LegacyReadWriteRoots<PathType>>
-    where
-        PathType: Clone,
-    {
+    pub fn legacy_read_write_roots(&self) -> Option<LegacyReadWriteRoots> {
         self.as_legacy_permissions()
-            .map(|legacy| (legacy.read, legacy.write))
     }
 
-    fn as_legacy_permissions(&self) -> Option<LegacyFileSystemPermissions<PathType>>
-    where
-        PathType: Clone,
-    {
+    fn as_legacy_permissions(&self) -> Option<LegacyReadWriteRoots> {
         if self.glob_scan_max_depth.is_some() {
             return None;
         }
@@ -166,14 +155,15 @@ impl<PathType> FileSystemPermissions<PathType> {
             let FileSystemPath::Path { path } = &entry.path else {
                 return None;
             };
+            let path = path.to_abs_path().ok()?;
             match entry.access {
-                FileSystemAccessMode::Read => read.push(path.clone()),
-                FileSystemAccessMode::Write => write.push(path.clone()),
+                FileSystemAccessMode::Read => read.push(path),
+                FileSystemAccessMode::Write => write.push(path),
                 FileSystemAccessMode::Deny => return None,
             }
         }
 
-        Some(LegacyFileSystemPermissions {
+        Some(LegacyReadWriteRoots {
             read: (!read.is_empty()).then_some(read),
             write: (!write.is_empty()).then_some(write),
         })
@@ -182,35 +172,21 @@ impl<PathType> FileSystemPermissions<PathType> {
 
 #[derive(Debug, Clone, Default, Eq, Hash, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-#[serde(bound(deserialize = "PathType: Deserialize<'de>"))]
-struct LegacyFileSystemPermissions<PathType = AbsolutePathBuf> {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    read: Option<Vec<PathType>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    write: Option<Vec<PathType>>,
-}
-
-#[derive(Debug, Clone, Default, Eq, Hash, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-#[serde(bound(deserialize = "PathType: Deserialize<'de>"))]
-struct CanonicalFileSystemPermissions<PathType = AbsolutePathBuf> {
+struct CanonicalFileSystemPermissions {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    entries: Vec<FileSystemSandboxEntry<PathType>>,
+    entries: Vec<RawFileSystemSandboxEntry>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     glob_scan_max_depth: Option<NonZeroUsize>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(untagged)]
-enum FileSystemPermissionsDe<PathType = AbsolutePathBuf> {
-    Canonical(CanonicalFileSystemPermissions<PathType>),
-    Legacy(LegacyFileSystemPermissions<PathType>),
+enum FileSystemPermissionsDe {
+    Canonical(CanonicalFileSystemPermissions),
+    Legacy(LegacyReadWriteRoots),
 }
 
-impl<PathType> Serialize for FileSystemPermissions<PathType>
-where
-    PathType: Clone + Serialize,
-{
+impl Serialize for FileSystemPermissions {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
@@ -219,7 +195,13 @@ where
             legacy.serialize(serializer)
         } else {
             CanonicalFileSystemPermissions {
-                entries: self.entries.clone(),
+                entries: self
+                    .entries
+                    .clone()
+                    .into_iter()
+                    .map(TryInto::try_into)
+                    .collect::<Result<_, _>>()
+                    .map_err(serde::ser::Error::custom)?,
                 glob_scan_max_depth: self.glob_scan_max_depth,
             }
             .serialize(serializer)
@@ -227,10 +209,7 @@ where
     }
 }
 
-impl<'de, PathType> Deserialize<'de> for FileSystemPermissions<PathType>
-where
-    PathType: Deserialize<'de>,
-{
+impl<'de> Deserialize<'de> for FileSystemPermissions {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
@@ -240,10 +219,14 @@ where
                 entries,
                 glob_scan_max_depth,
             }) => Ok(Self {
-                entries,
+                entries: entries
+                    .into_iter()
+                    .map(TryInto::try_into)
+                    .collect::<Result<_, _>>()
+                    .map_err(serde::de::Error::custom)?,
                 glob_scan_max_depth,
             }),
-            FileSystemPermissionsDe::Legacy(LegacyFileSystemPermissions { read, write }) => {
+            FileSystemPermissionsDe::Legacy(LegacyReadWriteRoots { read, write }) => {
                 Ok(Self::from_read_write_roots(read, write))
             }
         }
@@ -300,15 +283,17 @@ impl SandboxEnforcement {
 }
 
 /// Filesystem permissions for profiles where Codex owns sandbox construction.
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+#[derive(Debug, Clone, Eq, PartialEq, JsonSchema, TS)]
 #[serde(tag = "type", rename_all = "snake_case")]
 #[ts(tag = "type")]
-pub enum ManagedFileSystemPermissions<PathType = AbsolutePathBuf> {
+pub enum ManagedFileSystemPermissions {
     /// Apply a managed filesystem sandbox from the listed entries.
     #[serde(rename_all = "snake_case")]
     #[ts(rename_all = "snake_case")]
     Restricted {
-        entries: Vec<FileSystemSandboxEntry<PathType>>,
+        #[schemars(with = "Vec<RawFileSystemSandboxEntry>")]
+        #[ts(as = "Vec<RawFileSystemSandboxEntry>")]
+        entries: Vec<FileSystemSandboxEntry>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[ts(optional)]
         glob_scan_max_depth: Option<NonZeroUsize>,
@@ -317,47 +302,65 @@ pub enum ManagedFileSystemPermissions<PathType = AbsolutePathBuf> {
     Unrestricted,
 }
 
-impl From<ManagedFileSystemPermissions<AbsolutePathBuf>> for ManagedFileSystemPermissions<PathUri> {
-    fn from(value: ManagedFileSystemPermissions<AbsolutePathBuf>) -> Self {
-        match value {
-            ManagedFileSystemPermissions::Restricted {
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum SerializedManagedFileSystemPermissions {
+    #[serde(rename_all = "snake_case")]
+    Restricted {
+        entries: Vec<RawFileSystemSandboxEntry>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        glob_scan_max_depth: Option<NonZeroUsize>,
+    },
+    Unrestricted,
+}
+
+impl Serialize for ManagedFileSystemPermissions {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            Self::Restricted {
                 entries,
                 glob_scan_max_depth,
-            } => ManagedFileSystemPermissions::Restricted {
+            } => SerializedManagedFileSystemPermissions::Restricted {
                 entries: entries
+                    .clone()
                     .into_iter()
-                    .map(FileSystemSandboxEntry::<PathUri>::from)
-                    .collect(),
-                glob_scan_max_depth,
-            },
-            ManagedFileSystemPermissions::Unrestricted => {
-                ManagedFileSystemPermissions::Unrestricted
+                    .map(TryInto::try_into)
+                    .collect::<Result<_, _>>()
+                    .map_err(serde::ser::Error::custom)?,
+                glob_scan_max_depth: *glob_scan_max_depth,
+            }
+            .serialize(serializer),
+            Self::Unrestricted => {
+                SerializedManagedFileSystemPermissions::Unrestricted.serialize(serializer)
             }
         }
     }
 }
 
-impl TryFrom<ManagedFileSystemPermissions<PathUri>>
-    for ManagedFileSystemPermissions<AbsolutePathBuf>
-{
-    type Error = io::Error;
-
-    fn try_from(value: ManagedFileSystemPermissions<PathUri>) -> Result<Self, Self::Error> {
-        Ok(match value {
-            ManagedFileSystemPermissions::Restricted {
-                entries,
-                glob_scan_max_depth,
-            } => ManagedFileSystemPermissions::Restricted {
-                entries: entries
-                    .into_iter()
-                    .map(FileSystemSandboxEntry::<AbsolutePathBuf>::try_from)
-                    .collect::<io::Result<_>>()?,
-                glob_scan_max_depth,
+impl<'de> Deserialize<'de> for ManagedFileSystemPermissions {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Ok(
+            match SerializedManagedFileSystemPermissions::deserialize(deserializer)? {
+                SerializedManagedFileSystemPermissions::Restricted {
+                    entries,
+                    glob_scan_max_depth,
+                } => Self::Restricted {
+                    entries: entries
+                        .into_iter()
+                        .map(TryInto::try_into)
+                        .collect::<Result<_, _>>()
+                        .map_err(serde::de::Error::custom)?,
+                    glob_scan_max_depth,
+                },
+                SerializedManagedFileSystemPermissions::Unrestricted => Self::Unrestricted,
             },
-            ManagedFileSystemPermissions::Unrestricted => {
-                ManagedFileSystemPermissions::Unrestricted
-            }
-        })
+        )
     }
 }
 
@@ -405,12 +408,12 @@ pub const BUILT_IN_PERMISSION_PROFILE_DANGER_FULL_ACCESS: &str = ":danger-full-a
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, JsonSchema, TS)]
 #[serde(tag = "type", rename_all = "snake_case")]
 #[ts(tag = "type")]
-pub enum PermissionProfile<PathType = AbsolutePathBuf> {
+pub enum PermissionProfile {
     /// Codex owns sandbox construction for this profile.
     #[serde(rename_all = "snake_case")]
     #[ts(rename_all = "snake_case")]
     Managed {
-        file_system: ManagedFileSystemPermissions<PathType>,
+        file_system: ManagedFileSystemPermissions,
         network: NetworkSandboxPolicy,
     },
     /// Do not apply an outer sandbox.
@@ -419,40 +422,6 @@ pub enum PermissionProfile<PathType = AbsolutePathBuf> {
     #[serde(rename_all = "snake_case")]
     #[ts(rename_all = "snake_case")]
     External { network: NetworkSandboxPolicy },
-}
-
-impl From<PermissionProfile<AbsolutePathBuf>> for PermissionProfile<PathUri> {
-    fn from(value: PermissionProfile<AbsolutePathBuf>) -> Self {
-        match value {
-            PermissionProfile::Managed {
-                file_system,
-                network,
-            } => PermissionProfile::Managed {
-                file_system: file_system.into(),
-                network,
-            },
-            PermissionProfile::Disabled => PermissionProfile::Disabled,
-            PermissionProfile::External { network } => PermissionProfile::External { network },
-        }
-    }
-}
-
-impl TryFrom<PermissionProfile<PathUri>> for PermissionProfile<AbsolutePathBuf> {
-    type Error = io::Error;
-
-    fn try_from(value: PermissionProfile<PathUri>) -> Result<Self, Self::Error> {
-        Ok(match value {
-            PermissionProfile::Managed {
-                file_system,
-                network,
-            } => PermissionProfile::Managed {
-                file_system: file_system.try_into()?,
-                network,
-            },
-            PermissionProfile::Disabled => PermissionProfile::Disabled,
-            PermissionProfile::External { network } => PermissionProfile::External { network },
-        })
-    }
 }
 
 /// Metadata for the named or implicit built-in permissions profile that
@@ -488,7 +457,7 @@ impl ActivePermissionProfile {
     }
 }
 
-impl<PathType> Default for PermissionProfile<PathType> {
+impl Default for PermissionProfile {
     fn default() -> Self {
         Self::Managed {
             file_system: ManagedFileSystemPermissions::Restricted {
@@ -508,6 +477,33 @@ impl PermissionProfile {
             file_system: ManagedFileSystemPermissions::from_sandbox_policy(&file_system),
             network: NetworkSandboxPolicy::Restricted,
         }
+    }
+
+    /// Intersects managed filesystem permissions with read-only access and restricts network.
+    ///
+    /// Returns `None` when filesystem enforcement belongs to an external caller.
+    pub fn intersect_with_read_only(&self) -> Option<Self> {
+        let mut file_system = self.file_system_sandbox_policy();
+        match file_system.kind {
+            FileSystemSandboxKind::Restricted => {
+                for entry in &mut file_system.entries {
+                    entry.access = match entry.access {
+                        FileSystemAccessMode::Read | FileSystemAccessMode::Write => {
+                            FileSystemAccessMode::Read
+                        }
+                        FileSystemAccessMode::Deny => FileSystemAccessMode::Deny,
+                    };
+                }
+            }
+            FileSystemSandboxKind::Unrestricted => {
+                file_system = FileSystemSandboxPolicy::read_only();
+            }
+            FileSystemSandboxKind::ExternalSandbox => return None,
+        }
+        Some(Self::from_runtime_permissions(
+            &file_system,
+            NetworkSandboxPolicy::Restricted,
+        ))
     }
 
     /// Managed workspace-write filesystem access with restricted network
@@ -676,10 +672,10 @@ impl PermissionProfile {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-enum TaggedPermissionProfile<PathType = AbsolutePathBuf> {
+enum TaggedPermissionProfile {
     #[serde(rename_all = "snake_case")]
     Managed {
-        file_system: ManagedFileSystemPermissions<PathType>,
+        file_system: ManagedFileSystemPermissions,
         network: NetworkSandboxPolicy,
     },
     Disabled,
@@ -689,8 +685,8 @@ enum TaggedPermissionProfile<PathType = AbsolutePathBuf> {
     },
 }
 
-impl<PathType> From<TaggedPermissionProfile<PathType>> for PermissionProfile<PathType> {
-    fn from(value: TaggedPermissionProfile<PathType>) -> Self {
+impl From<TaggedPermissionProfile> for PermissionProfile {
+    fn from(value: TaggedPermissionProfile) -> Self {
         match value {
             TaggedPermissionProfile::Managed {
                 file_system,
@@ -709,13 +705,13 @@ impl<PathType> From<TaggedPermissionProfile<PathType>> for PermissionProfile<Pat
 /// represented enforcement explicitly.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct LegacyPermissionProfile<PathType = AbsolutePathBuf> {
+struct LegacyPermissionProfile {
     network: Option<NetworkPermissions>,
-    file_system: Option<FileSystemPermissions<PathType>>,
+    file_system: Option<FileSystemPermissions>,
 }
 
-impl<PathType> From<LegacyPermissionProfile<PathType>> for PermissionProfile<PathType> {
-    fn from(value: LegacyPermissionProfile<PathType>) -> Self {
+impl From<LegacyPermissionProfile> for PermissionProfile {
+    fn from(value: LegacyPermissionProfile) -> Self {
         let file_system = value.file_system.map_or_else(
             || ManagedFileSystemPermissions::Restricted {
                 entries: Vec::new(),
@@ -745,15 +741,12 @@ impl<PathType> From<LegacyPermissionProfile<PathType>> for PermissionProfile<Pat
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(untagged)]
-enum PermissionProfileDe<PathType = AbsolutePathBuf> {
-    Tagged(TaggedPermissionProfile<PathType>),
-    Legacy(LegacyPermissionProfile<PathType>),
+enum PermissionProfileDe {
+    Tagged(TaggedPermissionProfile),
+    Legacy(LegacyPermissionProfile),
 }
 
-impl<'de, PathType> Deserialize<'de> for PermissionProfile<PathType>
-where
-    PathType: Deserialize<'de>,
-{
+impl<'de> Deserialize<'de> for PermissionProfile {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
@@ -778,12 +771,12 @@ impl From<&FileSystemSandboxPolicy> for FileSystemPermissions {
         let entries = match value.kind {
             FileSystemSandboxKind::Restricted => value.entries.clone(),
             FileSystemSandboxKind::Unrestricted | FileSystemSandboxKind::ExternalSandbox => {
-                vec![FileSystemSandboxEntry {
-                    path: FileSystemPath::Special {
+                vec![FileSystemSandboxEntry::new(
+                    FileSystemPath::Special {
                         value: FileSystemSpecialPath::Root,
                     },
-                    access: FileSystemAccessMode::Write,
-                }]
+                    FileSystemAccessMode::Write,
+                )]
             }
         };
         Self {
@@ -851,6 +844,9 @@ pub enum ContentItem {
         #[ts(optional)]
         detail: Option<ImageDetail>,
     },
+    InputAudio {
+        audio_url: String,
+    },
     OutputText {
         text: String,
     },
@@ -913,6 +909,16 @@ pub struct InternalChatMessageMetadataPassthrough {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub turn_id: Option<String>,
+    /// Message creation time in fractional Unix seconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(skip)]
+    #[ts(skip)]
+    pub create_time: Option<serde_json::Number>,
+    /// Warehouse-only Responses metadata, not part of the public app-server protocol.
+    #[serde(default, skip_deserializing, skip_serializing_if = "Option::is_none")]
+    #[schemars(skip)]
+    #[ts(skip)]
+    pub executed_tool_calls: Option<Vec<ExecutedToolCall>>,
 }
 
 impl InternalChatMessageMetadataPassthrough {
@@ -936,14 +942,14 @@ pub enum ResponseItem {
     #[ts(skip)]
     AdditionalTools {
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        id: Option<String>,
+        id: Option<ResponseItemId>,
         role: String,
         tools: Vec<serde_json::Value>,
     },
     Message {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[ts(optional)]
-        id: Option<String>,
+        id: Option<ResponseItemId>,
         role: String,
         content: Vec<ContentItem>,
         // Optional output-message phase (for example: "commentary", "final_answer").
@@ -959,7 +965,7 @@ pub enum ResponseItem {
     AgentMessage {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[ts(optional)]
-        id: Option<String>,
+        id: Option<ResponseItemId>,
         author: String,
         recipient: String,
         content: Vec<AgentMessageInputContent>,
@@ -970,7 +976,7 @@ pub enum ResponseItem {
     Reasoning {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[ts(optional)]
-        id: Option<String>,
+        id: Option<ResponseItemId>,
         summary: Vec<ReasoningItemReasoningSummary>,
         #[serde(default, skip_serializing_if = "should_serialize_reasoning_content")]
         #[ts(optional)]
@@ -984,7 +990,7 @@ pub enum ResponseItem {
         /// Legacy id field retained for compatibility with older payloads.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[ts(optional)]
-        id: Option<String>,
+        id: Option<ResponseItemId>,
         /// Set when using the Responses API.
         call_id: Option<String>,
         status: LocalShellStatus,
@@ -996,7 +1002,7 @@ pub enum ResponseItem {
     FunctionCall {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[ts(optional)]
-        id: Option<String>,
+        id: Option<ResponseItemId>,
         name: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[ts(optional)]
@@ -1005,6 +1011,9 @@ pub enum ResponseItem {
         // JSON, not as an already‑parsed object. We keep it as a raw string here and let
         // Session::handle_function_call parse it into a Value.
         arguments: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        encrypted_function_args: Option<Vec<String>>,
         call_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[ts(optional)]
@@ -1013,7 +1022,7 @@ pub enum ResponseItem {
     ToolSearchCall {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[ts(optional)]
-        id: Option<String>,
+        id: Option<ResponseItemId>,
         call_id: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[ts(optional)]
@@ -1033,7 +1042,7 @@ pub enum ResponseItem {
     FunctionCallOutput {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[ts(optional)]
-        id: Option<String>,
+        id: Option<ResponseItemId>,
         call_id: String,
         #[ts(as = "FunctionCallOutputBody")]
         #[schemars(with = "FunctionCallOutputBody")]
@@ -1045,7 +1054,7 @@ pub enum ResponseItem {
     CustomToolCall {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[ts(optional)]
-        id: Option<String>,
+        id: Option<ResponseItemId>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[ts(optional)]
         status: Option<String>,
@@ -1066,7 +1075,7 @@ pub enum ResponseItem {
     CustomToolCallOutput {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[ts(optional)]
-        id: Option<String>,
+        id: Option<ResponseItemId>,
         call_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[ts(optional)]
@@ -1081,7 +1090,7 @@ pub enum ResponseItem {
     ToolSearchOutput {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[ts(optional)]
-        id: Option<String>,
+        id: Option<ResponseItemId>,
         call_id: Option<String>,
         status: String,
         execution: String,
@@ -1102,7 +1111,7 @@ pub enum ResponseItem {
     WebSearchCall {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[ts(optional)]
-        id: Option<String>,
+        id: Option<ResponseItemId>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[ts(optional)]
         status: Option<String>,
@@ -1125,7 +1134,7 @@ pub enum ResponseItem {
     ImageGenerationCall {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[ts(optional)]
-        id: Option<String>,
+        id: Option<ResponseItemId>,
         status: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[ts(optional)]
@@ -1139,7 +1148,7 @@ pub enum ResponseItem {
     Compaction {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[ts(optional)]
-        id: Option<String>,
+        id: Option<ResponseItemId>,
         encrypted_content: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[ts(optional)]
@@ -1150,7 +1159,7 @@ pub enum ResponseItem {
     ContextCompaction {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[ts(optional)]
-        id: Option<String>,
+        id: Option<ResponseItemId>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[ts(optional)]
         encrypted_content: Option<String>,
@@ -1168,8 +1177,8 @@ impl ResponseItem {
         matches!(self, Self::Message { role, .. } if role == "user")
     }
 
-    /// Returns the non-empty Responses API item ID, if present.
-    pub fn id(&self) -> Option<&str> {
+    /// Returns the Responses API item ID, if present.
+    pub fn id(&self) -> Option<&ResponseItemId> {
         match self {
             Self::AdditionalTools { id, .. }
             | Self::Message { id, .. }
@@ -1185,13 +1194,13 @@ impl ResponseItem {
             | Self::Reasoning { id, .. }
             | Self::ImageGenerationCall { id, .. }
             | Self::Compaction { id, .. }
-            | Self::ContextCompaction { id, .. } => id.as_deref().filter(|id| !id.is_empty()),
+            | Self::ContextCompaction { id, .. } => id.as_ref(),
             Self::CompactionTrigger { .. } | Self::Other => None,
         }
     }
 
     /// Sets or clears the Responses API item ID for variants that carry one.
-    pub fn set_id(&mut self, new_id: Option<String>) {
+    pub fn set_id(&mut self, new_id: Option<ResponseItemId>) {
         match self {
             Self::AdditionalTools { id, .. }
             | Self::Message { id, .. }
@@ -1212,6 +1221,27 @@ impl ResponseItem {
         }
     }
 
+    /// Returns the Responses API item ID prefix for variants that carry an ID.
+    pub fn id_prefix(&self) -> Option<&'static str> {
+        match self {
+            Self::AdditionalTools { .. } => Some("at"),
+            Self::Message { .. } => Some("msg"),
+            Self::AgentMessage { .. } => Some("amsg"),
+            Self::Reasoning { .. } => Some("rs"),
+            Self::LocalShellCall { .. } => Some("lsh"),
+            Self::FunctionCall { .. } => Some("fc"),
+            Self::ToolSearchCall { .. } => Some("tsc"),
+            Self::FunctionCallOutput { .. } => Some("fco"),
+            Self::CustomToolCall { .. } => Some("ctc"),
+            Self::CustomToolCallOutput { .. } => Some("ctco"),
+            Self::ToolSearchOutput { .. } => Some("tso"),
+            Self::WebSearchCall { .. } => Some("ws"),
+            Self::ImageGenerationCall { .. } => Some("ig"),
+            Self::Compaction { .. } | Self::ContextCompaction { .. } => Some("cmp"),
+            Self::CompactionTrigger { .. } | Self::Other => None,
+        }
+    }
+
     /// Returns the non-empty turn ID stamped onto this item, if present.
     pub fn turn_id(&self) -> Option<&str> {
         self.internal_chat_message_metadata_passthrough()
@@ -1225,6 +1255,39 @@ impl ResponseItem {
             return;
         };
         InternalChatMessageMetadataPassthrough::set_turn_id_if_missing(metadata, turn_id);
+    }
+
+    /// Stamps a harness-authored durable item without replacing its creation time.
+    pub fn set_create_time_if_missing(&mut self, create_time: serde_json::Number) {
+        let metadata = match self {
+            Self::Message {
+                role,
+                internal_chat_message_metadata_passthrough: metadata,
+                ..
+            } if matches!(role.as_str(), "user" | "developer") => metadata,
+            Self::AgentMessage {
+                internal_chat_message_metadata_passthrough: metadata,
+                ..
+            }
+            | Self::FunctionCallOutput {
+                internal_chat_message_metadata_passthrough: metadata,
+                ..
+            }
+            | Self::CustomToolCallOutput {
+                internal_chat_message_metadata_passthrough: metadata,
+                ..
+            }
+            | Self::ToolSearchOutput {
+                internal_chat_message_metadata_passthrough: metadata,
+                ..
+            } => metadata,
+            _ => return,
+        };
+
+        metadata
+            .get_or_insert_default()
+            .create_time
+            .get_or_insert(create_time);
     }
 
     /// Removes internal chat message metadata passthrough before sending to a provider that does
@@ -1366,17 +1429,33 @@ impl ResponseItem {
 
 pub const BASE_INSTRUCTIONS_DEFAULT: &str = include_str!("prompts/base_instructions/default.md");
 
+/// Describes whether persisted base instructions were supplied by the user or generated for a model.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema, TS)]
+#[serde(tag = "type", rename_all = "snake_case")]
+#[ts(tag = "type")]
+pub enum BaseInstructionsProvenance {
+    /// The instructions were explicitly configured and must survive model changes unchanged.
+    Custom,
+    /// The instructions were generated from this model's instruction template.
+    Model { model: String },
+}
+
 /// Base instructions for the model in a thread. Corresponds to the `instructions` field in the ResponsesAPI.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, JsonSchema, TS)]
 #[serde(rename = "base_instructions", rename_all = "snake_case")]
 pub struct BaseInstructions {
     pub text: String,
+    /// Missing on rollouts written before base-instruction provenance was persisted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub provenance: Option<BaseInstructionsProvenance>,
 }
 
 impl Default for BaseInstructions {
     fn default() -> Self {
         Self {
             text: BASE_INSTRUCTIONS_DEFAULT.to_string(),
+            provenance: None,
         }
     }
 }
@@ -1446,16 +1525,30 @@ fn should_serialize_reasoning_content(content: &Option<Vec<ReasoningItemContent>
     }
 }
 
-fn local_image_error_placeholder(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LocalMediaKind {
+    Audio,
+    Image,
+}
+
+impl LocalMediaKind {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Audio => "audio",
+            Self::Image => "image",
+        }
+    }
+}
+
+fn local_media_error_placeholder(
     path: &std::path::Path,
     error: impl std::fmt::Display,
+    media_kind: LocalMediaKind,
 ) -> ContentItem {
+    let media_name = media_kind.name();
+    let path = path.display();
     ContentItem::InputText {
-        text: format!(
-            "Codex could not read the local image at `{}`: {}",
-            path.display(),
-            error
-        ),
+        text: format!("Codex could not read the local {media_name} at `{path}`: {error}"),
     }
 }
 
@@ -1466,6 +1559,11 @@ const IMAGE_CLOSE_TAG: &str = "</image>";
 const LOCAL_IMAGE_OPEN_TAG_PREFIX: &str = "<image name=";
 const LOCAL_IMAGE_OPEN_TAG_SUFFIX: &str = ">";
 const LOCAL_IMAGE_CLOSE_TAG: &str = IMAGE_CLOSE_TAG;
+const AUDIO_OPEN_TAG: &str = "<audio>";
+const AUDIO_CLOSE_TAG: &str = "</audio>";
+const LOCAL_AUDIO_OPEN_TAG_PREFIX: &str = "<audio name=";
+const LOCAL_AUDIO_OPEN_TAG_SUFFIX: &str = ">";
+const LOCAL_AUDIO_CLOSE_TAG: &str = AUDIO_CLOSE_TAG;
 
 pub fn image_open_tag_text() -> String {
     IMAGE_OPEN_TAG.to_string()
@@ -1500,6 +1598,41 @@ pub fn is_image_open_tag_text(text: &str) -> bool {
 
 pub fn is_image_close_tag_text(text: &str) -> bool {
     text == IMAGE_CLOSE_TAG
+}
+
+pub fn audio_open_tag_text() -> String {
+    AUDIO_OPEN_TAG.to_string()
+}
+
+pub fn audio_close_tag_text() -> String {
+    AUDIO_CLOSE_TAG.to_string()
+}
+
+pub fn local_audio_label_text(label_number: usize) -> String {
+    format!("[Audio #{label_number}]")
+}
+
+pub fn local_audio_open_tag_text_with_path(label_number: usize, path: &std::path::Path) -> String {
+    let label = local_audio_label_text(label_number);
+    let path = path.display();
+    format!("{LOCAL_AUDIO_OPEN_TAG_PREFIX}{label} path=\"{path}\"{LOCAL_AUDIO_OPEN_TAG_SUFFIX}")
+}
+
+pub fn is_local_audio_open_tag_text(text: &str) -> bool {
+    text.strip_prefix(LOCAL_AUDIO_OPEN_TAG_PREFIX)
+        .is_some_and(|rest| rest.ends_with(LOCAL_AUDIO_OPEN_TAG_SUFFIX))
+}
+
+pub fn is_local_audio_close_tag_text(text: &str) -> bool {
+    is_audio_close_tag_text(text)
+}
+
+pub fn is_audio_open_tag_text(text: &str) -> bool {
+    text == AUDIO_OPEN_TAG
+}
+
+pub fn is_audio_close_tag_text(text: &str) -> bool {
+    text == AUDIO_CLOSE_TAG
 }
 
 fn invalid_image_error_placeholder(
@@ -1543,13 +1676,21 @@ pub fn local_image_content_items_with_label_number(
             | ImageProcessingError::Encode { .. }
             | ImageProcessingError::InvalidDataUrl { .. }
             | ImageProcessingError::ImageTooLarge { .. } => {
-                vec![local_image_error_placeholder(path, &err)]
+                vec![local_media_error_placeholder(
+                    path,
+                    &err,
+                    LocalMediaKind::Image,
+                )]
             }
             ImageProcessingError::Decode { .. } if err.is_invalid_image() => {
                 vec![invalid_image_error_placeholder(path, &err)]
             }
             ImageProcessingError::Decode { .. } => {
-                vec![local_image_error_placeholder(path, &err)]
+                vec![local_media_error_placeholder(
+                    path,
+                    &err,
+                    LocalMediaKind::Image,
+                )]
             }
             ImageProcessingError::UnsupportedImageFormat { mime } => {
                 vec![unsupported_image_error_placeholder(path, mime)]
@@ -1562,6 +1703,37 @@ pub fn local_image_content_items_with_label_number(
 pub enum LocalImagePreparation {
     Process,
     Defer,
+}
+
+fn unsupported_audio_error_placeholder(path: &std::path::Path) -> ContentItem {
+    ContentItem::InputText {
+        text: format!(
+            "Codex cannot attach audio at `{}`: unsupported audio format; use wav, mp3, m4a, webm, or ogg.",
+            path.display()
+        ),
+    }
+}
+
+fn local_audio_content_items(
+    path: &std::path::Path,
+    file_bytes: &[u8],
+    label_number: usize,
+) -> Vec<ContentItem> {
+    let Some(mime) = audio_mime_for_path(path) else {
+        return vec![unsupported_audio_error_placeholder(path)];
+    };
+
+    vec![
+        ContentItem::InputText {
+            text: local_audio_open_tag_text_with_path(label_number, path),
+        },
+        ContentItem::InputAudio {
+            audio_url: data_url_from_bytes(mime, file_bytes),
+        },
+        ContentItem::InputText {
+            text: LOCAL_AUDIO_CLOSE_TAG.to_string(),
+        },
+    ]
 }
 
 fn local_image_content_items(
@@ -1723,6 +1895,7 @@ impl ResponseInputItem {
         local_image_preparation: LocalImagePreparation,
     ) -> Self {
         let mut image_index = 0;
+        let mut audio_index = 0;
         Self::Message {
             role: "user".to_string(),
             content: items
@@ -1759,7 +1932,28 @@ impl ResponseInputItem {
                                     detail,
                                 ),
                             },
-                            Err(err) => vec![local_image_error_placeholder(&path, err)],
+                            Err(err) => vec![local_media_error_placeholder(
+                                &path,
+                                err,
+                                LocalMediaKind::Image,
+                            )],
+                        }
+                    }
+                    UserInput::Audio { audio_url } => {
+                        audio_index += 1;
+                        vec![ContentItem::InputAudio { audio_url }]
+                    }
+                    UserInput::LocalAudio { path } => {
+                        audio_index += 1;
+                        match std::fs::read(&path) {
+                            Ok(file_bytes) => {
+                                local_audio_content_items(&path, &file_bytes, audio_index)
+                            }
+                            Err(err) => vec![local_media_error_placeholder(
+                                &path,
+                                err,
+                                LocalMediaKind::Audio,
+                            )],
                         }
                     }
                     UserInput::Skill { .. } | UserInput::Mention { .. } => Vec::new(), // Tool bodies are injected later in core
@@ -1819,6 +2013,10 @@ pub enum FunctionCallOutputContentItem {
         #[ts(optional)]
         detail: Option<ImageDetail>,
     },
+    // Do not rename, these are serialized and used directly in the responses API.
+    InputAudio {
+        audio_url: String,
+    },
     EncryptedContent {
         encrypted_content: String,
     },
@@ -1829,7 +2027,7 @@ pub enum FunctionCallOutputContentItem {
 ///
 /// This conversion is intentionally lossy:
 /// - only `input_text` items are included
-/// - image items are ignored
+/// - image and audio items are ignored
 ///
 /// We use this helper where callers still need a string representation (for
 /// example telemetry previews or legacy string-only output paths) while keeping
@@ -1846,6 +2044,7 @@ pub fn function_call_output_content_items_to_text(
             }
             FunctionCallOutputContentItem::InputText { .. }
             | FunctionCallOutputContentItem::InputImage { .. }
+            | FunctionCallOutputContentItem::InputAudio { .. }
             | FunctionCallOutputContentItem::EncryptedContent { .. } => None,
         })
         .collect::<Vec<_>>();
@@ -1870,6 +2069,9 @@ impl From<crate::dynamic_tools::DynamicToolCallOutputContentItem>
                     image_url,
                     detail: Some(DEFAULT_IMAGE_DETAIL),
                 }
+            }
+            crate::dynamic_tools::DynamicToolCallOutputContentItem::InputAudio { audio_url } => {
+                Self::InputAudio { audio_url }
             }
         }
     }
@@ -1930,13 +2132,6 @@ impl FunctionCallOutputPayload {
 
     pub fn text_content(&self) -> Option<&str> {
         match &self.body {
-            FunctionCallOutputBody::Text(content) => Some(content),
-            FunctionCallOutputBody::ContentItems(_) => None,
-        }
-    }
-
-    pub fn text_content_mut(&mut self) -> Option<&mut String> {
-        match &mut self.body {
             FunctionCallOutputBody::Text(content) => Some(content),
             FunctionCallOutputBody::ContentItems(_) => None,
         }
@@ -2010,6 +2205,18 @@ impl CallToolResult {
     }
 
     pub fn as_function_call_output_payload(&self) -> FunctionCallOutputPayload {
+        let content_items = convert_mcp_content_to_items(&self.content);
+        if content_items.as_ref().is_some_and(|items| {
+            items
+                .iter()
+                .any(|item| matches!(item, FunctionCallOutputContentItem::EncryptedContent { .. }))
+        }) {
+            return FunctionCallOutputPayload {
+                body: FunctionCallOutputBody::ContentItems(content_items.unwrap_or_default()),
+                success: Some(self.success()),
+            };
+        }
+
         if let Some(structured_content) = &self.structured_content
             && !structured_content.is_null()
         {
@@ -2039,8 +2246,6 @@ impl CallToolResult {
             }
         };
 
-        let content_items = convert_mcp_content_to_items(&self.content);
-
         let body = match content_items {
             Some(content_items) => FunctionCallOutputBody::ContentItems(content_items),
             None => FunctionCallOutputBody::Text(serialized_content),
@@ -2060,13 +2265,18 @@ impl CallToolResult {
 fn convert_mcp_content_to_items(
     contents: &[serde_json::Value],
 ) -> Option<Vec<FunctionCallOutputContentItem>> {
+    const CODEX_ENCRYPTED_CONTENT_META_KEY: &str = "codex/encryptedContent";
     const CODEX_IMAGE_DETAIL_META_KEY: &str = "codex/imageDetail";
 
     #[derive(serde::Deserialize)]
     #[serde(tag = "type")]
     enum McpContent {
         #[serde(rename = "text")]
-        Text { text: String },
+        Text {
+            text: String,
+            #[serde(rename = "_meta", default)]
+            meta: Option<serde_json::Value>,
+        },
         #[serde(rename = "image")]
         Image {
             data: String,
@@ -2075,22 +2285,44 @@ fn convert_mcp_content_to_items(
             #[serde(rename = "_meta", default)]
             meta: Option<serde_json::Value>,
         },
+        #[serde(rename = "audio")]
+        Audio {
+            data: String,
+            #[serde(rename = "mimeType", alias = "mime_type")]
+            mime_type: Option<String>,
+            #[serde(rename = "_meta", default)]
+            _meta: Option<serde_json::Value>,
+        },
         #[serde(other)]
         Unknown,
     }
 
-    let mut saw_image = false;
+    let mut saw_content_item = false;
     let mut items = Vec::with_capacity(contents.len());
 
     for content in contents {
         let item = match serde_json::from_value::<McpContent>(content.clone()) {
-            Ok(McpContent::Text { text }) => FunctionCallOutputContentItem::InputText { text },
+            Ok(McpContent::Text { text, meta }) => {
+                if meta
+                    .as_ref()
+                    .and_then(|meta| meta.get(CODEX_ENCRYPTED_CONTENT_META_KEY))
+                    .and_then(serde_json::Value::as_bool)
+                    == Some(true)
+                {
+                    saw_content_item = true;
+                    FunctionCallOutputContentItem::EncryptedContent {
+                        encrypted_content: text,
+                    }
+                } else {
+                    FunctionCallOutputContentItem::InputText { text }
+                }
+            }
             Ok(McpContent::Image {
                 data,
                 mime_type,
                 meta,
             }) => {
-                saw_image = true;
+                saw_content_item = true;
                 let image_url = if data.starts_with("data:") {
                     data
                 } else {
@@ -2114,6 +2346,18 @@ fn convert_mcp_content_to_items(
                         .or(Some(DEFAULT_IMAGE_DETAIL)),
                 }
             }
+            Ok(McpContent::Audio {
+                data, mime_type, ..
+            }) => {
+                saw_content_item = true;
+                let audio_url = if data.starts_with("data:") {
+                    data
+                } else {
+                    let mime_type = mime_type.unwrap_or_else(|| "application/octet-stream".into());
+                    format!("data:{mime_type};base64,{data}")
+                };
+                FunctionCallOutputContentItem::InputAudio { audio_url }
+            }
             Ok(McpContent::Unknown) | Err(_) => FunctionCallOutputContentItem::InputText {
                 text: serde_json::to_string(content).unwrap_or_else(|_| "<content>".to_string()),
             },
@@ -2121,7 +2365,7 @@ fn convert_mcp_content_to_items(
         items.push(item);
     }
 
-    if saw_image { Some(items) } else { None }
+    if saw_content_item { Some(items) } else { None }
 }
 
 // Implement Display so callers can treat the payload like a plain string when logging or doing
@@ -2158,6 +2402,31 @@ mod tests {
         0, 0, 0, 31, 21, 196, 137, 0, 0, 0, 11, 73, 68, 65, 84, 120, 156, 99, 96, 0, 2, 0, 0, 5, 0,
         1, 122, 94, 171, 63, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130,
     ];
+
+    #[test]
+    fn base_instructions_preserve_provenance_and_accept_legacy_rollouts() -> Result<()> {
+        let legacy: BaseInstructions =
+            serde_json::from_value(serde_json::json!({ "text": "legacy instructions" }))?;
+        assert_eq!(legacy.provenance, None);
+
+        for provenance in [
+            BaseInstructionsProvenance::Custom,
+            BaseInstructionsProvenance::Model {
+                model: "gpt-5.2".to_string(),
+            },
+        ] {
+            let instructions = BaseInstructions {
+                text: "persisted instructions".to_string(),
+                provenance: Some(provenance),
+            };
+            assert_eq!(
+                serde_json::from_value::<BaseInstructions>(serde_json::to_value(&instructions)?)?,
+                instructions
+            );
+        }
+
+        Ok(())
+    }
 
     #[test]
     fn plaintext_agent_message_content_rejects_mixed_encrypted_content() {
@@ -2215,6 +2484,25 @@ mod tests {
         }))?;
         assert_eq!(unknown_metadata, item);
 
+        item.append_executed_tool_calls(vec![ExecutedToolCall::new(
+            "test_tool".to_string(),
+            serde_json::json!({"value": 1}),
+        )]);
+        let serialized = serde_json::to_value(&item)?;
+        assert_eq!(
+            serialized["internal_chat_message_metadata_passthrough"]["executed_tool_calls"],
+            serde_json::json!([{"name": "test_tool", "arguments": {"value": 1}}]),
+        );
+        let deserialized = serde_json::from_value::<ResponseItem>(serialized)?;
+        assert_eq!(deserialized.turn_id(), Some("turn-1"));
+        assert!(
+            deserialized
+                .executed_tool_call_metadata()
+                .and_then(|metadata| metadata.executed_tool_calls.as_ref())
+                .is_none(),
+            "provider and rollout input cannot forge local attempted-tool metadata",
+        );
+        item.clear_executed_tool_calls();
         item.set_turn_id_if_missing("turn-2");
         assert_eq!(item.turn_id(), Some("turn-1"));
 
@@ -2226,9 +2514,19 @@ mod tests {
         let mut missing_turn_id = response_item_with_passthrough_metadata(
             /*internal_chat_message_metadata_passthrough*/ None,
         );
+        let create_time = serde_json::Number::from(123);
+        missing_turn_id.set_create_time_if_missing(create_time.clone());
         missing_turn_id.set_turn_id_if_missing("");
         missing_turn_id.set_turn_id_if_missing("turn-1");
-        assert_eq!(missing_turn_id.turn_id(), Some("turn-1"));
+        missing_turn_id.set_create_time_if_missing(serde_json::Number::from(456));
+        assert_eq!(
+            missing_turn_id.executed_tool_call_metadata(),
+            Some(&InternalChatMessageMetadataPassthrough {
+                turn_id: Some("turn-1".to_string()),
+                create_time: Some(create_time),
+                ..Default::default()
+            })
+        );
 
         let mut other = ResponseItem::Other;
         other.set_turn_id_if_missing("turn-1");
@@ -2243,9 +2541,9 @@ mod tests {
         );
         assert_eq!(item.id(), None);
 
-        item.set_id(Some("msg_test".to_string()));
+        item.set_id(Some(ResponseItemId::with_suffix("msg", "test")));
 
-        assert_eq!(item.id(), Some("msg_test"));
+        assert_eq!(item.id().map(ResponseItemId::as_str), Some("msg_test"));
 
         item.set_id(/*new_id*/ None);
 
@@ -2256,8 +2554,11 @@ mod tests {
             role: "developer".to_string(),
             tools: Vec::new(),
         };
-        additional_tools.set_id(Some("at_test".to_string()));
-        assert_eq!(additional_tools.id(), Some("at_test"));
+        additional_tools.set_id(Some(ResponseItemId::with_suffix("at", "test")));
+        assert_eq!(
+            additional_tools.id().map(ResponseItemId::as_str),
+            Some("at_test")
+        );
     }
 
     fn response_item_with_passthrough_metadata(
@@ -2277,6 +2578,7 @@ mod tests {
     fn passthrough_metadata(turn_id: &str) -> InternalChatMessageMetadataPassthrough {
         InternalChatMessageMetadataPassthrough {
             turn_id: Some(turn_id.to_string()),
+            ..Default::default()
         }
     }
 
@@ -2377,7 +2679,7 @@ mod tests {
         assert_eq!(
             item,
             ResponseItem::ImageGenerationCall {
-                id: Some("ig_123".to_string()),
+                id: Some(ResponseItemId::with_suffix("ig", "123")),
                 status: "completed".to_string(),
                 revised_prompt: Some("A small blue square".to_string()),
                 result: "Zm9v".to_string(),
@@ -2399,7 +2701,7 @@ mod tests {
         assert_eq!(
             item,
             ResponseItem::ImageGenerationCall {
-                id: Some("ig_123".to_string()),
+                id: Some(ResponseItemId::with_suffix("ig", "123")),
                 status: "completed".to_string(),
                 revised_prompt: None,
                 result: "Zm9v".to_string(),
@@ -2430,6 +2732,7 @@ mod tests {
                     pattern: "**/*.env".to_string(),
                 },
                 access: FileSystemAccessMode::Deny,
+                missing_path_behavior: None,
             }]);
         file_system_sandbox_policy.glob_scan_max_depth = Some(2);
 
@@ -2442,6 +2745,33 @@ mod tests {
             permission_profile.file_system_sandbox_policy(),
             file_system_sandbox_policy
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn permission_profile_round_trip_preserves_ambiguous_native_denies() -> Result<()> {
+        let denied_path = AbsolutePathBuf::try_from(PathBuf::from("/C:/secret"))?;
+        let file_system_sandbox_policy = FileSystemSandboxPolicy::restricted(vec![
+            FileSystemSandboxEntry::new(
+                FileSystemPath::Special {
+                    value: FileSystemSpecialPath::Root,
+                },
+                FileSystemAccessMode::Read,
+            ),
+            FileSystemSandboxEntry::new(denied_path.into(), FileSystemAccessMode::Deny),
+        ]);
+        let permission_profile = PermissionProfile::from_runtime_permissions(
+            &file_system_sandbox_policy,
+            NetworkSandboxPolicy::Restricted,
+        );
+
+        assert_eq!(
+            serde_json::from_value::<PermissionProfile>(serde_json::to_value(
+                &permission_profile
+            )?)?,
+            permission_profile
+        );
+        Ok(())
     }
 
     #[test]
@@ -2475,6 +2805,7 @@ mod tests {
                             value: FileSystemSpecialPath::Root,
                         },
                         access: FileSystemAccessMode::Write,
+                        missing_path_behavior: None,
                     }],
                     glob_scan_max_depth: NonZeroUsize::new(2),
                 },
@@ -2616,8 +2947,9 @@ mod tests {
         .expect("absolute path");
         let file_system_permissions = FileSystemPermissions {
             entries: vec![FileSystemSandboxEntry {
-                path: FileSystemPath::Path { path },
+                path: path.into(),
                 access: FileSystemAccessMode::Read,
+                missing_path_behavior: None,
             }],
             glob_scan_max_depth: NonZeroUsize::new(2),
         };
@@ -2666,7 +2998,36 @@ mod tests {
     }
 
     #[test]
-    fn convert_mcp_content_to_items_returns_none_without_images() {
+    fn convert_mcp_audio_content_builds_data_urls_and_preserves_existing_data_urls() {
+        let contents = vec![
+            serde_json::json!({
+                "type": "audio",
+                "data": "Zm9v",
+                "mimeType": "audio/wav",
+                "_meta": {"source": "microphone"},
+            }),
+            serde_json::json!({
+                "type": "audio",
+                "data": "data:audio/ogg;base64,YmFy",
+                "mimeType": "audio/ogg",
+            }),
+        ];
+
+        assert_eq!(
+            convert_mcp_content_to_items(&contents),
+            Some(vec![
+                FunctionCallOutputContentItem::InputAudio {
+                    audio_url: "data:audio/wav;base64,Zm9v".to_string(),
+                },
+                FunctionCallOutputContentItem::InputAudio {
+                    audio_url: "data:audio/ogg;base64,YmFy".to_string(),
+                },
+            ])
+        );
+    }
+
+    #[test]
+    fn convert_mcp_content_to_items_returns_none_without_media() {
         let contents = vec![serde_json::json!({
             "type": "text",
             "text": "hello",
@@ -2695,7 +3056,7 @@ mod tests {
     }
 
     #[test]
-    fn function_call_output_content_items_to_text_ignores_blank_text_and_images() {
+    fn function_call_output_content_items_to_text_ignores_blank_text_and_media() {
         let content_items = vec![
             FunctionCallOutputContentItem::InputText {
                 text: "   ".to_string(),
@@ -2703,6 +3064,9 @@ mod tests {
             FunctionCallOutputContentItem::InputImage {
                 image_url: "data:image/png;base64,AAA".to_string(),
                 detail: Some(DEFAULT_IMAGE_DETAIL),
+            },
+            FunctionCallOutputContentItem::InputAudio {
+                audio_url: "data:audio/wav;base64,AAA".to_string(),
             },
             FunctionCallOutputContentItem::EncryptedContent {
                 encrypted_content: "enc_opaque".to_string(),
@@ -2754,10 +3118,27 @@ mod tests {
                 name: "mcp__codex_apps__gmail_get_recent_emails".to_string(),
                 namespace: Some("mcp__codex_apps__gmail".to_string()),
                 arguments: "{\"top_k\":5}".to_string(),
+                encrypted_function_args: None,
                 call_id: "call-1".to_string(),
                 internal_chat_message_metadata_passthrough: None,
             }
         );
+    }
+
+    #[test]
+    fn function_call_preserves_empty_encrypted_function_args() {
+        let value = serde_json::json!({
+            "type": "function_call",
+            "name": "spawn_agent",
+            "namespace": "collaboration",
+            "arguments": "{\"message\":\"hello\",\"task_name\":\"worker\"}",
+            "encrypted_function_args": [],
+            "call_id": "call-1",
+        });
+        let item: ResponseItem =
+            serde_json::from_value(value.clone()).expect("function_call should deserialize");
+
+        assert_eq!(serde_json::to_value(item).expect("serialize item"), value);
     }
 
     #[test]
@@ -2889,6 +3270,54 @@ mod tests {
 
         let output = v.get("output").expect("output field");
         assert!(output.is_array(), "expected array output");
+
+        Ok(())
+    }
+
+    #[test]
+    fn serializes_audio_outputs_as_array() -> Result<()> {
+        let call_tool_result = CallToolResult {
+            content: vec![
+                serde_json::json!({"type":"text","text":"caption"}),
+                serde_json::json!({"type":"audio","data":"BASE64","mimeType":"audio/wav"}),
+            ],
+            structured_content: None,
+            is_error: Some(false),
+            meta: None,
+        };
+
+        let payload = call_tool_result.into_function_call_output_payload();
+        assert_eq!(
+            payload,
+            FunctionCallOutputPayload {
+                body: FunctionCallOutputBody::ContentItems(vec![
+                    FunctionCallOutputContentItem::InputText {
+                        text: "caption".into(),
+                    },
+                    FunctionCallOutputContentItem::InputAudio {
+                        audio_url: "data:audio/wav;base64,BASE64".into(),
+                    },
+                ]),
+                success: Some(true),
+            }
+        );
+
+        let item = ResponseInputItem::FunctionCallOutput {
+            call_id: "call1".into(),
+            output: payload,
+        };
+
+        assert_eq!(
+            serde_json::to_value(item)?,
+            serde_json::json!({
+                "type": "function_call_output",
+                "call_id": "call1",
+                "output": [
+                    {"type": "input_text", "text": "caption"},
+                    {"type": "input_audio", "audio_url": "data:audio/wav;base64,BASE64"},
+                ],
+            })
+        );
 
         Ok(())
     }
@@ -3225,7 +3654,7 @@ mod tests {
                     "status": "in_progress",
                     "id": "ws_partial"
                 }"#,
-                Some("ws_partial".into()),
+                Some(ResponseItemId::with_suffix("ws", "partial")),
                 None,
                 Some("in_progress".into()),
             ),
@@ -3270,6 +3699,127 @@ mod tests {
         }
 
         Ok(())
+    }
+
+    #[test]
+    fn serializes_audio_user_input_without_tags() -> Result<()> {
+        let audio_url = "data:audio/wav;base64,abc".to_string();
+
+        let item = ResponseInputItem::from(vec![UserInput::Audio {
+            audio_url: audio_url.clone(),
+        }]);
+
+        assert_eq!(
+            item,
+            ResponseInputItem::Message {
+                role: "user".to_string(),
+                content: vec![ContentItem::InputAudio { audio_url }],
+                phase: None,
+            }
+        );
+        assert_eq!(
+            serde_json::to_value(item)?,
+            serde_json::json!({
+                "type": "message",
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_audio",
+                        "audio_url": "data:audio/wav;base64,abc",
+                    },
+                ],
+            })
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn serializes_local_audio_user_input_with_label_and_data_url() -> Result<()> {
+        let temp_dir = tempdir()?;
+        for (extension, mime) in [
+            ("wav", "audio/wav"),
+            ("mp3", "audio/mpeg"),
+            ("m4a", "audio/mp4"),
+            ("webm", "audio/webm"),
+            ("ogg", "audio/ogg"),
+        ] {
+            let audio_path = temp_dir.path().join(format!("sample.{extension}"));
+            std::fs::write(&audio_path, b"audio")?;
+
+            let item = ResponseInputItem::from(vec![UserInput::LocalAudio {
+                path: audio_path.clone(),
+            }]);
+
+            assert_eq!(
+                item,
+                ResponseInputItem::Message {
+                    role: "user".to_string(),
+                    content: vec![
+                        ContentItem::InputText {
+                            text: local_audio_open_tag_text_with_path(
+                                /*label_number*/ 1,
+                                &audio_path,
+                            ),
+                        },
+                        ContentItem::InputAudio {
+                            audio_url: format!("data:{mime};base64,YXVkaW8="),
+                        },
+                        ContentItem::InputText {
+                            text: audio_close_tag_text(),
+                        },
+                    ],
+                    phase: None,
+                }
+            );
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn replaces_unsupported_local_audio_format_with_placeholder() -> Result<()> {
+        let temp_dir = tempdir()?;
+        let audio_path = temp_dir.path().join("sample.flac");
+        std::fs::write(&audio_path, b"audio")?;
+
+        let item = ResponseInputItem::from(vec![UserInput::LocalAudio {
+            path: audio_path.clone(),
+        }]);
+
+        assert_eq!(
+            item,
+            ResponseInputItem::Message {
+                role: "user".to_string(),
+                content: vec![ContentItem::InputText {
+                    text: format!(
+                        "Codex cannot attach audio at `{}`: unsupported audio format; use wav, mp3, m4a, webm, or ogg.",
+                        audio_path.display()
+                    ),
+                }],
+                phase: None,
+            }
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn replaces_unreadable_local_audio_with_placeholder() {
+        let audio_path = PathBuf::from("missing.wav");
+
+        let item = ResponseInputItem::from(vec![UserInput::LocalAudio { path: audio_path }]);
+
+        let ResponseInputItem::Message { content, .. } = item else {
+            panic!("expected message response");
+        };
+        let [ContentItem::InputText { text }] = content.as_slice() else {
+            panic!("expected local audio error placeholder");
+        };
+        assert!(
+            text.starts_with("Codex could not read the local audio at `missing.wav`: "),
+            "unexpected placeholder: {text}"
+        );
     }
 
     #[test]
@@ -3515,6 +4065,48 @@ mod tests {
             }
             other => panic!("expected message response but got {other:?}"),
         }
+
+        Ok(())
+    }
+
+    #[test]
+    fn mixed_remote_and_local_audio_share_label_sequence() -> Result<()> {
+        let audio_url = "data:audio/wav;base64,abc".to_string();
+        let dir = tempdir()?;
+        let local_path = dir.path().join("local.mp3");
+        std::fs::write(&local_path, b"audio")?;
+
+        let item = ResponseInputItem::from(vec![
+            UserInput::Audio {
+                audio_url: audio_url.clone(),
+            },
+            UserInput::LocalAudio {
+                path: local_path.clone(),
+            },
+        ]);
+
+        assert_eq!(
+            item,
+            ResponseInputItem::Message {
+                role: "user".to_string(),
+                content: vec![
+                    ContentItem::InputAudio { audio_url },
+                    ContentItem::InputText {
+                        text: local_audio_open_tag_text_with_path(
+                            /*label_number*/ 2,
+                            &local_path,
+                        ),
+                    },
+                    ContentItem::InputAudio {
+                        audio_url: "data:audio/mpeg;base64,YXVkaW8=".to_string(),
+                    },
+                    ContentItem::InputText {
+                        text: audio_close_tag_text(),
+                    },
+                ],
+                phase: None,
+            }
+        );
 
         Ok(())
     }

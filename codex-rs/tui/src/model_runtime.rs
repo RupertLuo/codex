@@ -2,6 +2,7 @@ use std::error::Error;
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
+
 use zeroize::Zeroize;
 
 pub type ModelRuntimeFuture<T> = Pin<Box<dyn Future<Output = T> + Send + 'static>>;
@@ -159,38 +160,5 @@ mod tests {
 
         assert_eq!(format!("{input:?}"), "SensitiveInput([REDACTED])");
         assert_eq!(input.expose_secret(), "provider-secret");
-    }
-
-    #[test]
-    fn runtime_error_display_uses_the_user_facing_message() {
-        let error = ModelRuntimeError::new(
-            "credential_missing",
-            "A credential is required for this model.",
-            Some("Open /credentials to add one.".to_string()),
-        );
-
-        assert_eq!(
-            error.to_string(),
-            "A credential is required for this model. Open /credentials to add one."
-        );
-    }
-
-    #[test]
-    fn onboarding_provider_contract_keeps_credential_and_model_ids_together() {
-        let provider = OnboardingProvider {
-            id: "example".to_string(),
-            display_name: "Example Provider".to_string(),
-            credential: CredentialEntry {
-                id: "example".to_string(),
-                display_name: "Example Provider".to_string(),
-                environment_variable: "EXAMPLE_PROVIDER_API_KEY".to_string(),
-                status: CredentialStatus::Missing,
-                group: CredentialGroup::ModelProviders,
-            },
-            model_ids: vec!["example/model-pro".to_string()],
-        };
-
-        assert_eq!(provider.credential.id, provider.id);
-        assert_eq!(provider.model_ids, ["example/model-pro"]);
     }
 }

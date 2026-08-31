@@ -3,6 +3,7 @@ use crate::AppServerRpcTransportContext;
 use codex_app_server_protocol::ConfigWarningNotification;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::ServerNotification;
+use codex_app_server_protocol::ServerNotificationEnvelope;
 use codex_app_server_protocol::ThreadRealtimeStartedNotification;
 use codex_app_server_transport::auth::AppServerWebsocketAuthConfig;
 use codex_app_server_transport::auth::AppServerWebsocketAuthSettings;
@@ -82,6 +83,13 @@ fn thread_realtime_started_notification() -> ServerNotification {
     })
 }
 
+fn app_server_notification(notification: ServerNotification) -> OutgoingMessage {
+    OutgoingMessage::AppServerNotification(ServerNotificationEnvelope {
+        notification,
+        emitted_at_ms: Some(1_234),
+    })
+}
+
 #[tokio::test]
 async fn to_connection_notification_respects_opt_out_filters() {
     let connection_id = ConnectionId(7);
@@ -106,7 +114,7 @@ async fn to_connection_notification_respects_opt_out_filters() {
         &mut connections,
         OutgoingEnvelope::ToConnection {
             connection_id,
-            message: OutgoingMessage::AppServerNotification(ServerNotification::ConfigWarning(
+            message: app_server_notification(ServerNotification::ConfigWarning(
                 ConfigWarningNotification {
                     summary: "task_started".to_string(),
                     details: None,
@@ -146,7 +154,7 @@ async fn to_connection_notifications_are_dropped_for_opted_out_clients() {
         &mut connections,
         OutgoingEnvelope::ToConnection {
             connection_id,
-            message: OutgoingMessage::AppServerNotification(ServerNotification::ConfigWarning(
+            message: app_server_notification(ServerNotification::ConfigWarning(
                 ConfigWarningNotification {
                     summary: "task_started".to_string(),
                     details: None,
@@ -186,7 +194,7 @@ async fn to_connection_notifications_are_preserved_for_non_opted_out_clients() {
         &mut connections,
         OutgoingEnvelope::ToConnection {
             connection_id,
-            message: OutgoingMessage::AppServerNotification(ServerNotification::ConfigWarning(
+            message: app_server_notification(ServerNotification::ConfigWarning(
                 ConfigWarningNotification {
                     summary: "task_started".to_string(),
                     details: None,
@@ -205,9 +213,10 @@ async fn to_connection_notifications_are_preserved_for_non_opted_out_clients() {
         .expect("notification should reach non-opted-out clients");
     assert!(matches!(
         message.message,
-        OutgoingMessage::AppServerNotification(ServerNotification::ConfigWarning(
-            ConfigWarningNotification { summary, .. }
-        )) if summary == "task_started"
+        OutgoingMessage::AppServerNotification(ServerNotificationEnvelope {
+            notification: ServerNotification::ConfigWarning(ConfigWarningNotification { summary, .. }),
+            ..
+        }) if summary == "task_started"
     ));
 }
 
@@ -232,7 +241,7 @@ async fn experimental_notifications_are_dropped_without_capability() {
         &mut connections,
         OutgoingEnvelope::ToConnection {
             connection_id,
-            message: OutgoingMessage::AppServerNotification(thread_realtime_started_notification()),
+            message: app_server_notification(thread_realtime_started_notification()),
             write_complete_tx: None,
         },
     )
@@ -265,7 +274,7 @@ async fn experimental_notifications_are_preserved_with_capability() {
         &mut connections,
         OutgoingEnvelope::ToConnection {
             connection_id,
-            message: OutgoingMessage::AppServerNotification(thread_realtime_started_notification()),
+            message: app_server_notification(thread_realtime_started_notification()),
             write_complete_tx: None,
         },
     )
@@ -277,7 +286,10 @@ async fn experimental_notifications_are_preserved_with_capability() {
         .expect("experimental notification should reach opted-in client");
     assert!(matches!(
         message.message,
-        OutgoingMessage::AppServerNotification(ServerNotification::ThreadRealtimeStarted(_))
+        OutgoingMessage::AppServerNotification(ServerNotificationEnvelope {
+            notification: ServerNotification::ThreadRealtimeStarted(_),
+            ..
+        })
     ));
 }
 
@@ -455,7 +467,7 @@ async fn broadcast_does_not_block_on_slow_connection() {
         ),
     );
 
-    let queued_message = OutgoingMessage::AppServerNotification(ServerNotification::ConfigWarning(
+    let queued_message = app_server_notification(ServerNotification::ConfigWarning(
         ConfigWarningNotification {
             summary: "already-buffered".to_string(),
             details: None,
@@ -467,14 +479,14 @@ async fn broadcast_does_not_block_on_slow_connection() {
         .try_send(QueuedOutgoingMessage::new(queued_message))
         .expect("channel should have room");
 
-    let broadcast_message = OutgoingMessage::AppServerNotification(
-        ServerNotification::ConfigWarning(ConfigWarningNotification {
+    let broadcast_message = app_server_notification(ServerNotification::ConfigWarning(
+        ConfigWarningNotification {
             summary: "test".to_string(),
             details: None,
             path: None,
             range: None,
-        }),
-    );
+        },
+    ));
     timeout(
         Duration::from_millis(100),
         route_outgoing_envelope(
@@ -494,9 +506,10 @@ async fn broadcast_does_not_block_on_slow_connection() {
         .expect("fast connection should receive the broadcast notification");
     assert!(matches!(
         fast_message.message,
-        OutgoingMessage::AppServerNotification(ServerNotification::ConfigWarning(
-            ConfigWarningNotification { summary, .. }
-        )) if summary == "test"
+        OutgoingMessage::AppServerNotification(ServerNotificationEnvelope {
+            notification: ServerNotification::ConfigWarning(ConfigWarningNotification { summary, .. }),
+            ..
+        }) if summary == "test"
     ));
 
     let slow_message = slow_writer_rx
@@ -504,9 +517,10 @@ async fn broadcast_does_not_block_on_slow_connection() {
         .expect("slow connection should retain its original buffered message");
     assert!(matches!(
         slow_message.message,
-        OutgoingMessage::AppServerNotification(ServerNotification::ConfigWarning(
-            ConfigWarningNotification { summary, .. }
-        )) if summary == "already-buffered"
+        OutgoingMessage::AppServerNotification(ServerNotificationEnvelope {
+            notification: ServerNotification::ConfigWarning(ConfigWarningNotification { summary, .. }),
+            ..
+        }) if summary == "already-buffered"
     ));
 }
 
@@ -515,16 +529,14 @@ async fn to_connection_stdio_waits_instead_of_disconnecting_when_writer_queue_is
     let connection_id = ConnectionId(3);
     let (writer_tx, mut writer_rx) = mpsc::channel(1);
     writer_tx
-        .send(QueuedOutgoingMessage::new(
-            OutgoingMessage::AppServerNotification(ServerNotification::ConfigWarning(
-                ConfigWarningNotification {
-                    summary: "queued".to_string(),
-                    details: None,
-                    path: None,
-                    range: None,
-                },
-            )),
-        ))
+        .send(QueuedOutgoingMessage::new(app_server_notification(
+            ServerNotification::ConfigWarning(ConfigWarningNotification {
+                summary: "queued".to_string(),
+                details: None,
+                path: None,
+                range: None,
+            }),
+        )))
         .await
         .expect("channel should accept the first queued message");
 
@@ -545,7 +557,7 @@ async fn to_connection_stdio_waits_instead_of_disconnecting_when_writer_queue_is
             &mut connections,
             OutgoingEnvelope::ToConnection {
                 connection_id,
-                message: OutgoingMessage::AppServerNotification(ServerNotification::ConfigWarning(
+                message: app_server_notification(ServerNotification::ConfigWarning(
                     ConfigWarningNotification {
                         summary: "second".to_string(),
                         details: None,
@@ -570,17 +582,19 @@ async fn to_connection_stdio_waits_instead_of_disconnecting_when_writer_queue_is
 
     assert!(matches!(
         first.message,
-        OutgoingMessage::AppServerNotification(ServerNotification::ConfigWarning(
-            ConfigWarningNotification { summary, .. }
-        )) if summary == "queued"
+        OutgoingMessage::AppServerNotification(ServerNotificationEnvelope {
+            notification: ServerNotification::ConfigWarning(ConfigWarningNotification { summary, .. }),
+            ..
+        }) if summary == "queued"
     ));
     let second = writer_rx
         .try_recv()
         .expect("second notification should be delivered once the queue has room");
     assert!(matches!(
         second.message,
-        OutgoingMessage::AppServerNotification(ServerNotification::ConfigWarning(
-            ConfigWarningNotification { summary, .. }
-        )) if summary == "second"
+        OutgoingMessage::AppServerNotification(ServerNotificationEnvelope {
+            notification: ServerNotification::ConfigWarning(ConfigWarningNotification { summary, .. }),
+            ..
+        }) if summary == "second"
     ));
 }

@@ -2,7 +2,6 @@ use super::*;
 use crate::session::InputQueueActivity;
 use crate::tools::handlers::multi_agents_spec::WaitAgentTimeoutOptions;
 use crate::tools::handlers::multi_agents_spec::create_wait_agent_tool_v2;
-use crate::turn_timing::now_unix_timestamp_ms;
 use codex_tools::ToolSpec;
 use std::collections::HashMap;
 use std::time::Duration;
@@ -51,18 +50,14 @@ impl Handler {
         let min_timeout_ms = turn.config.multi_agent_v2.min_wait_timeout_ms;
         let max_timeout_ms = turn.config.multi_agent_v2.max_wait_timeout_ms;
         let default_timeout_ms = turn.config.multi_agent_v2.default_wait_timeout_ms;
-        let timeout_ms = match args.timeout_ms {
-            Some(ms) if ms < min_timeout_ms => {
-                return Err(FunctionCallError::RespondToModel(format!(
-                    "timeout_ms must be at least {min_timeout_ms}"
-                )));
-            }
+        let requested_timeout_ms = args.timeout_ms;
+        let timeout_ms = match requested_timeout_ms {
             Some(ms) if ms > max_timeout_ms => {
                 return Err(FunctionCallError::RespondToModel(format!(
                     "timeout_ms must be at most {max_timeout_ms}"
                 )));
             }
-            Some(ms) => ms,
+            Some(ms) => ms.max(min_timeout_ms),
             None => default_timeout_ms,
         };
 
@@ -76,34 +71,42 @@ impl Handler {
             .await;
 
         session
-            .send_event(
+            .emit_turn_item_started(
                 &turn,
-                CollabWaitingBeginEvent {
-                    started_at_ms: now_unix_timestamp_ms(),
+                &TurnItem::CollabAgentToolCall(CollabAgentToolCallItem {
+                    id: call_id.clone(),
+                    tool: CollabAgentTool::Wait,
+                    status: CollabAgentToolCallStatus::InProgress,
                     sender_thread_id: session.thread_id,
                     receiver_thread_ids: Vec::new(),
                     receiver_agents: Vec::new(),
-                    call_id: call_id.clone(),
-                }
-                .into(),
+                    prompt: None,
+                    model: None,
+                    reasoning_effort: None,
+                    agents_states: Default::default(),
+                }),
             )
             .await;
 
         let deadline = Instant::now() + Duration::from_millis(timeout_ms as u64);
         let outcome = wait_for_activity(&mut activity_rx, pending_activity, deadline).await;
-        let result = WaitAgentResult::from_outcome(outcome);
+        let result = WaitAgentResult::from_outcome(outcome, requested_timeout_ms, timeout_ms);
 
         session
-            .send_event(
+            .emit_turn_item_completed(
                 &turn,
-                CollabWaitingEndEvent {
+                TurnItem::CollabAgentToolCall(CollabAgentToolCallItem {
+                    id: call_id,
+                    tool: CollabAgentTool::Wait,
+                    status: CollabAgentToolCallStatus::Completed,
                     sender_thread_id: session.thread_id,
-                    call_id,
-                    completed_at_ms: now_unix_timestamp_ms(),
-                    agent_statuses: Vec::new(),
-                    statuses: HashMap::new(),
-                }
-                .into(),
+                    receiver_thread_ids: Vec::new(),
+                    receiver_agents: Vec::new(),
+                    prompt: None,
+                    model: None,
+                    reasoning_effort: None,
+                    agents_states: HashMap::new(),
+                }),
             )
             .await;
 
@@ -130,14 +133,24 @@ pub(crate) struct WaitAgentResult {
 }
 
 impl WaitAgentResult {
-    fn from_outcome(outcome: WaitOutcome) -> Self {
+    fn from_outcome(
+        outcome: WaitOutcome,
+        requested_timeout_ms: Option<i64>,
+        timeout_ms: i64,
+    ) -> Self {
         let message = match outcome {
             WaitOutcome::MailboxActivity => "Wait completed.",
             WaitOutcome::Steered => "Wait interrupted by new input.",
             WaitOutcome::TimedOut => "Wait timed out.",
         };
+        let message = match requested_timeout_ms {
+            Some(requested_timeout_ms) if requested_timeout_ms < timeout_ms => format!(
+                "{message}\n\nRequested timeout of {requested_timeout_ms}ms was clamped to the minimum of {timeout_ms}ms."
+            ),
+            Some(_) | None => message.to_string(),
+        };
         Self {
-            message: message.to_string(),
+            message,
             timed_out: outcome == WaitOutcome::TimedOut,
         }
     }

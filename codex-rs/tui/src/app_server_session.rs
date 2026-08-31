@@ -4,10 +4,16 @@
 //! request/response plumbing out of `App` and `ChatWidget`.
 
 mod fs;
+mod history;
+mod rollout_history;
+
+pub(crate) use history::HISTORY_ITEM_PAGE_LIMIT;
+pub(crate) use history::HISTORY_ITEM_SCAN_LIMIT;
+pub(crate) use history::HistoryHydrationScope;
+pub(crate) use history::thread_items_page_params;
 
 use crate::bottom_pane::FeedbackAudience;
 use crate::legacy_core::config::Config;
-use crate::permission_compat::legacy_compatible_permission_profile;
 use crate::service_tier_resolution;
 use crate::session_state::MessageHistoryMetadata;
 use crate::session_state::ThreadSessionState;
@@ -47,6 +53,7 @@ use codex_app_server_protocol::ReviewDelivery;
 use codex_app_server_protocol::ReviewStartParams;
 use codex_app_server_protocol::ReviewStartResponse;
 use codex_app_server_protocol::ReviewTarget;
+use codex_app_server_protocol::SessionSource;
 use codex_app_server_protocol::SkillsListParams;
 use codex_app_server_protocol::SkillsListResponse;
 use codex_app_server_protocol::Thread;
@@ -69,6 +76,7 @@ use codex_app_server_protocol::ThreadGoalGetResponse;
 use codex_app_server_protocol::ThreadGoalSetParams;
 use codex_app_server_protocol::ThreadGoalSetResponse;
 use codex_app_server_protocol::ThreadGoalStatus;
+use codex_app_server_protocol::ThreadHistoryMode;
 use codex_app_server_protocol::ThreadInjectItemsParams;
 use codex_app_server_protocol::ThreadInjectItemsResponse;
 use codex_app_server_protocol::ThreadListParams;
@@ -85,8 +93,6 @@ use codex_app_server_protocol::ThreadReadParams;
 use codex_app_server_protocol::ThreadReadResponse;
 use codex_app_server_protocol::ThreadResumeParams;
 use codex_app_server_protocol::ThreadResumeResponse;
-use codex_app_server_protocol::ThreadRollbackParams;
-use codex_app_server_protocol::ThreadRollbackResponse;
 use codex_app_server_protocol::ThreadSetNameParams;
 use codex_app_server_protocol::ThreadSetNameResponse;
 use codex_app_server_protocol::ThreadSettingsUpdateParams;
@@ -114,6 +120,7 @@ use codex_protocol::ThreadId;
 use codex_protocol::approvals::GuardianAssessmentEvent;
 use codex_protocol::config_types::SERVICE_TIER_DEFAULT_REQUEST_VALUE;
 use codex_protocol::models::ActivePermissionProfile;
+use codex_protocol::models::BaseInstructionsProvenance;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ModelAvailabilityNux;
@@ -121,6 +128,7 @@ use codex_protocol::openai_models::ModelPreset;
 use codex_protocol::openai_models::ModelServiceTier;
 use codex_protocol::openai_models::ModelUpgrade;
 use codex_protocol::openai_models::ReasoningEffortPreset;
+use codex_protocol::protocol::SubAgentSource;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::PathUri;
 use color_eyre::eyre::ContextCompat;
@@ -136,12 +144,91 @@ use uuid::Uuid;
 
 const JSONRPC_INVALID_REQUEST: i64 = -32600;
 const JSONRPC_METHOD_NOT_FOUND: i64 = -32601;
-pub(crate) const EXTERNAL_AGENT_CONFIG_IMPORT_IN_PROGRESS_MESSAGE: &str =
-    "A previous Claude Code import is still running. Wait for it to finish before importing again.";
+const JSONRPC_INVALID_PARAMS: i64 = -32602;
+pub(crate) const EXTERNAL_AGENT_CONFIG_IMPORT_IN_PROGRESS_MESSAGE: &str = "A previous external agent import is still running. Wait for it to finish before importing again.";
 const THREAD_SETTINGS_UPDATE_METHOD: &str = "thread/settings/update";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ForkGoalContinuation {
+    StartIfIdle,
+    DeferUntilNextTurn,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ForkPresentation {
+    Regular,
+    SideConversation,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ThreadHistorySupport {
+    Paginated,
+    LegacyOnly,
+}
 
 fn bootstrap_request_error(context: &'static str, err: TypedRequestError) -> color_eyre::Report {
     color_eyre::eyre::eyre!("{context}: {err}")
+}
+
+pub(crate) fn is_history_pagination_unsupported(source: &JSONRPCErrorError) -> bool {
+    if source.code == JSONRPC_METHOD_NOT_FOUND {
+        return true;
+    }
+
+    if !matches!(
+        source.code,
+        JSONRPC_INVALID_REQUEST | JSONRPC_INVALID_PARAMS
+    ) {
+        return false;
+    }
+
+    let message = source.message.to_ascii_lowercase();
+    [
+        "historymode",
+        "history mode",
+        "excludeturns",
+        "exclude turns",
+        "thread/turns/list",
+        "thread/items/list",
+    ]
+    .into_iter()
+    .any(|field| message.contains(field))
+        || (message.contains("paginated")
+            && ["unknown variant", "unsupported variant", "invalid enum"]
+                .into_iter()
+                .any(|error| message.contains(error)))
+}
+
+async fn request_thread_start_with_history_fallback(
+    request_handle: &AppServerRequestHandle,
+    request_id: RequestId,
+    mut params: ThreadStartParams,
+) -> std::result::Result<(ThreadStartResponse, ThreadHistorySupport), TypedRequestError> {
+    match request_handle
+        .request_typed(ClientRequest::ThreadStart {
+            request_id,
+            params: params.clone(),
+        })
+        .await
+    {
+        Ok(response) => Ok((response, ThreadHistorySupport::Paginated)),
+        Err(TypedRequestError::Server { source, .. })
+            if params.history_mode.is_some() && is_history_pagination_unsupported(&source) =>
+        {
+            params.history_mode = None;
+            let response = request_handle
+                .request_typed(ClientRequest::ThreadStart {
+                    request_id: RequestId::String(format!(
+                        "legacy-thread-start-{}",
+                        Uuid::new_v4()
+                    )),
+                    params,
+                })
+                .await?;
+            Ok((response, ThreadHistorySupport::LegacyOnly))
+        }
+        Err(err) => Err(err),
+    }
 }
 
 fn is_thread_settings_update_unsupported(source: &JSONRPCErrorError) -> bool {
@@ -175,8 +262,11 @@ pub(crate) struct AppServerBootstrap {
 pub(crate) struct AppServerSession {
     client: AppServerClient,
     next_request_id: i64,
+    history_pagination: HashMap<ThreadId, history::ThreadHistoryPagination>,
     remote_cwd_override: Option<PathBuf>,
     thread_params_mode: ThreadParamsMode,
+    background_rollout_migration_enabled: bool,
+    history_support: ThreadHistorySupport,
     thread_settings_update_supported: bool,
     default_model: Option<String>,
     available_models: Vec<ModelPreset>,
@@ -188,6 +278,17 @@ pub(crate) struct AppServerSession {
 pub(crate) enum ThreadParamsMode {
     Embedded,
     Remote,
+}
+
+/// Determines where model settings come from when resuming a thread.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ResumeModelSettings {
+    /// Sends the current config's model, provider, and reasoning effort as explicit overrides.
+    OverrideFromCurrentConfig,
+    /// Omits those overrides so app-server restores the settings saved with the thread.
+    RestoreFromThread,
+    /// Rejoins a loaded thread without changing any of its existing settings.
+    PreserveExistingThread,
 }
 
 impl ThreadParamsMode {
@@ -203,6 +304,24 @@ impl ThreadParamsMode {
 pub(crate) struct AppServerStartedThread {
     pub(crate) session: ThreadSessionState,
     pub(crate) turns: Vec<Turn>,
+    pub(crate) blocks_direct_input: bool,
+}
+
+pub(crate) fn source_agent_path(source: &SessionSource) -> Option<String> {
+    match source {
+        SessionSource::SubAgent(SubAgentSource::ThreadSpawn { agent_path, .. }) => {
+            agent_path.clone().map(String::from)
+        }
+        _ => None,
+    }
+}
+
+/// Uses the server capability when available and preserves compatibility with older servers.
+pub(crate) fn thread_blocks_direct_input(thread: &Thread) -> bool {
+    thread
+        .can_accept_direct_input
+        .map(|can_accept| !can_accept)
+        .unwrap_or_else(|| source_agent_path(&thread.source).is_some())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -215,13 +334,22 @@ pub(crate) enum TurnPermissionsOverride {
     LegacySandbox(PermissionProfile),
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "the selected permission profile cannot be safely represented by the legacy app-server sandbox policy; select a named or legacy-compatible permission profile"
+)]
+pub(crate) struct UnsupportedLegacyPermissionProfile;
+
 impl AppServerSession {
     pub(crate) fn new(client: AppServerClient, thread_params_mode: ThreadParamsMode) -> Self {
         Self {
             client,
             next_request_id: 1,
+            history_pagination: HashMap::new(),
             remote_cwd_override: None,
             thread_params_mode,
+            background_rollout_migration_enabled: true,
+            history_support: ThreadHistorySupport::Paginated,
             thread_settings_update_supported: true,
             default_model: None,
             available_models: Vec::new(),
@@ -264,36 +392,61 @@ impl AppServerSession {
     pub(crate) async fn bootstrap(&mut self, config: &Config) -> Result<AppServerBootstrap> {
         let started_at = Instant::now();
         let account = self.read_account().await?;
+        let mut bootstrap = self.bootstrap_with_account(config, account).await?;
+        bootstrap.duration = started_at.elapsed();
+        Ok(bootstrap)
+    }
+
+    /// Bootstraps using a previously read account.
+    ///
+    /// Callers must discard a prefetched account after authentication, server, or provider changes.
+    pub(crate) async fn bootstrap_with_account(
+        &mut self,
+        config: &Config,
+        account: GetAccountResponse,
+    ) -> Result<AppServerBootstrap> {
+        let started_at = Instant::now();
+        // `hooks/list` holds the global config queue during startup. Submit models and config
+        // requirements together so an uncached model fetch can overlap both config requests.
+        let model_request_id = self.next_request_id();
         let requirements_request_id = self.next_request_id();
-        let requirements: ConfigRequirementsReadResponse = self
-            .client
-            .request_typed(ClientRequest::ConfigRequirementsRead {
-                request_id: requirements_request_id,
-                params: None,
-            })
-            .await
-            .map_err(|err| {
-                bootstrap_request_error("configRequirements/read failed during TUI bootstrap", err)
-            })?;
+        let (models, requirements) = tokio::try_join!(
+            async {
+                self.client
+                    .request_typed::<ModelListResponse>(ClientRequest::ModelList {
+                        request_id: model_request_id,
+                        params: ModelListParams {
+                            cursor: None,
+                            limit: None,
+                            include_hidden: Some(true),
+                        },
+                    })
+                    .await
+                    .map_err(|err| {
+                        bootstrap_request_error("model/list failed during TUI bootstrap", err)
+                    })
+            },
+            async {
+                self.client
+                    .request_typed::<ConfigRequirementsReadResponse>(
+                        ClientRequest::ConfigRequirementsRead {
+                            request_id: requirements_request_id,
+                            params: None,
+                        },
+                    )
+                    .await
+                    .map_err(|err| {
+                        bootstrap_request_error(
+                            "configRequirements/read failed during TUI bootstrap",
+                            err,
+                        )
+                    })
+            },
+        )?;
         self.managed_new_thread_defaults = requirements
             .requirements
             .and_then(|requirements| requirements.models)
             .and_then(|models| models.new_thread);
-        let model_request_id = self.next_request_id();
-        let models: ModelListResponse = self
-            .client
-            .request_typed(ClientRequest::ModelList {
-                request_id: model_request_id,
-                params: ModelListParams {
-                    cursor: None,
-                    limit: None,
-                    include_hidden: Some(true),
-                },
-            })
-            .await
-            .map_err(|err| {
-                bootstrap_request_error("model/list failed during TUI bootstrap", err)
-            })?;
         let available_models = models
             .data
             .into_iter()
@@ -398,12 +551,13 @@ impl AppServerSession {
         self.client
             .request_typed(ClientRequest::ExternalAgentConfigDetect { request_id, params })
             .await
-            .wrap_err("externalAgentConfig/detect failed during Claude Code import")
+            .wrap_err("externalAgentConfig/detect failed during external agent import")
     }
 
     pub(crate) async fn external_agent_config_import(
         &mut self,
         migration_items: Vec<ExternalAgentConfigMigrationItem>,
+        migration_source: String,
     ) -> Result<()> {
         // Mark the import active before sending the request so a fast completion notification
         // cannot arrive before the TUI records it.
@@ -420,11 +574,13 @@ impl AppServerSession {
                 request_id,
                 params: ExternalAgentConfigImportParams {
                     migration_items,
-                    source: None,
+                    source: Some("cli".to_string()),
+                    provider_id: Some(migration_source.clone()),
+                    migration_source: Some(migration_source),
                 },
             })
             .await
-            .wrap_err("externalAgentConfig/import failed during Claude Code import");
+            .wrap_err("externalAgentConfig/import failed during external agent import");
         match response {
             Ok(_) => Ok(()),
             Err(err) => {
@@ -451,65 +607,40 @@ impl AppServerSession {
 
     #[cfg(test)]
     pub(crate) async fn start_thread(&mut self, config: &Config) -> Result<AppServerStartedThread> {
-        self.start_thread_with_session_start_source(config, /*session_start_source*/ None)
-            .await
+        self.start_thread_with_session_start_source(
+            config, /*session_start_source*/ None, /*remote_cwd_override*/ None,
+        )
+        .await
     }
 
     pub(crate) async fn start_thread_with_session_start_source(
         &mut self,
         config: &Config,
         session_start_source: Option<ThreadStartSource>,
+        remote_cwd_override: Option<&std::path::Path>,
     ) -> Result<AppServerStartedThread> {
         let request_id = self.next_request_id();
         let session_config = self.session_config_with_effective_service_tier(config);
-        let response: ThreadStartResponse = self
-            .client
-            .request_typed(ClientRequest::ThreadStart {
-                request_id,
-                params: thread_start_params_from_config(
-                    &session_config,
-                    self.thread_params_mode(),
-                    self.remote_cwd_override.as_deref(),
-                    session_start_source,
-                ),
-            })
-            .await
-            .map_err(|err| {
-                bootstrap_request_error("thread/start failed during TUI bootstrap", err)
-            })?;
+        let mut params = thread_start_params_from_config(
+            &session_config,
+            self.thread_params_mode(),
+            remote_cwd_override.or(self.remote_cwd_override.as_deref()),
+            session_start_source,
+        );
+        if self.history_support == ThreadHistorySupport::LegacyOnly {
+            params.history_mode = None;
+        }
+        let request_handle = self.request_handle();
+        let (response, history_support) =
+            request_thread_start_with_history_fallback(&request_handle, request_id, params)
+                .await
+                .map_err(|err| {
+                    bootstrap_request_error("thread/start failed during TUI bootstrap", err)
+                })?;
+        if history_support == ThreadHistorySupport::LegacyOnly {
+            self.history_support = ThreadHistorySupport::LegacyOnly;
+        }
         started_thread_from_start_response(response, config, self.thread_params_mode()).await
-    }
-
-    pub(crate) async fn resume_thread(
-        &mut self,
-        config: Config,
-        thread_id: ThreadId,
-    ) -> Result<AppServerStartedThread> {
-        let request_id = self.next_request_id();
-        let session_config = self.session_config_with_effective_service_tier(&config);
-        let response: ThreadResumeResponse = self
-            .client
-            .request_typed(ClientRequest::ThreadResume {
-                request_id,
-                params: thread_resume_params_from_config(
-                    session_config,
-                    thread_id,
-                    self.thread_params_mode(),
-                    self.remote_cwd_override.as_deref(),
-                ),
-            })
-            .await
-            .map_err(|err| {
-                bootstrap_request_error("thread/resume failed during TUI bootstrap", err)
-            })?;
-        let fork_parent_title = self
-            .fork_parent_title_from_app_server(response.thread.forked_from_id.as_deref())
-            .await;
-        let mut started =
-            started_thread_from_resume_response(response, &config, self.thread_params_mode())
-                .await?;
-        started.session.fork_parent_title = fork_parent_title;
-        Ok(started)
     }
 
     pub(crate) async fn fork_thread(
@@ -517,29 +648,137 @@ impl AppServerSession {
         config: Config,
         thread_id: ThreadId,
     ) -> Result<AppServerStartedThread> {
+        self.fork_thread_at(
+            config,
+            thread_id,
+            /*last_turn_id*/ None,
+            /*before_turn_id*/ None,
+            ForkGoalContinuation::StartIfIdle,
+        )
+        .await
+    }
+
+    pub(crate) async fn fork_thread_at(
+        &mut self,
+        config: Config,
+        thread_id: ThreadId,
+        last_turn_id: Option<String>,
+        before_turn_id: Option<String>,
+        goal_continuation: ForkGoalContinuation,
+    ) -> Result<AppServerStartedThread> {
+        self.fork_thread_at_with_presentation(
+            config,
+            thread_id,
+            last_turn_id,
+            before_turn_id,
+            goal_continuation,
+            ForkPresentation::Regular,
+        )
+        .await
+    }
+
+    pub(crate) async fn fork_side_thread(
+        &mut self,
+        config: Config,
+        thread_id: ThreadId,
+    ) -> Result<AppServerStartedThread> {
+        self.fork_thread_at_with_presentation(
+            config,
+            thread_id,
+            /*last_turn_id*/ None,
+            /*before_turn_id*/ None,
+            ForkGoalContinuation::StartIfIdle,
+            ForkPresentation::SideConversation,
+        )
+        .await
+    }
+
+    async fn fork_thread_at_with_presentation(
+        &mut self,
+        config: Config,
+        thread_id: ThreadId,
+        last_turn_id: Option<String>,
+        before_turn_id: Option<String>,
+        goal_continuation: ForkGoalContinuation,
+        presentation: ForkPresentation,
+    ) -> Result<AppServerStartedThread> {
+        let fork_parent = match presentation {
+            ForkPresentation::Regular => self
+                .thread_read(thread_id, /*include_turns*/ false)
+                .await
+                .ok(),
+            ForkPresentation::SideConversation => None,
+        };
+        let exclude_turns = self.history_support == ThreadHistorySupport::Paginated
+            && (fork_parent
+                .as_ref()
+                .is_some_and(|thread| thread.history_mode == ThreadHistoryMode::Paginated)
+                || presentation == ForkPresentation::SideConversation);
         let request_id = self.next_request_id();
         let session_config = self.session_config_with_effective_service_tier(&config);
-        let response: ThreadForkResponse = self
+        let mut params = ThreadForkParams {
+            last_turn_id,
+            before_turn_id,
+            defer_goal_continuation: goal_continuation == ForkGoalContinuation::DeferUntilNextTurn,
+            exclude_turns,
+            ..thread_fork_params_from_config(
+                session_config,
+                thread_id,
+                self.thread_params_mode(),
+                self.remote_cwd_override.as_deref(),
+            )
+        };
+        let response: ThreadForkResponse = match self
             .client
             .request_typed(ClientRequest::ThreadFork {
                 request_id,
-                params: thread_fork_params_from_config(
-                    session_config,
-                    thread_id,
-                    self.thread_params_mode(),
-                    self.remote_cwd_override.as_deref(),
-                ),
+                params: params.clone(),
             })
             .await
-            .map_err(|err| {
-                bootstrap_request_error("thread/fork failed during TUI bootstrap", err)
-            })?;
-        let fork_parent_title = self
-            .fork_parent_title_from_app_server(response.thread.forked_from_id.as_deref())
-            .await;
+        {
+            Ok(response) => response,
+            Err(TypedRequestError::Server { source, .. })
+                if params.exclude_turns && is_history_pagination_unsupported(&source) =>
+            {
+                self.history_support = ThreadHistorySupport::LegacyOnly;
+                params.exclude_turns = false;
+                let request_id = self.next_request_id();
+                self.client
+                    .request_typed(ClientRequest::ThreadFork { request_id, params })
+                    .await
+                    .map_err(|err| {
+                        bootstrap_request_error("thread/fork failed during TUI bootstrap", err)
+                    })?
+            }
+            Err(err) => {
+                return Err(bootstrap_request_error(
+                    "thread/fork failed during TUI bootstrap",
+                    err,
+                ));
+            }
+        };
+        let mut response = response;
+        if presentation == ForkPresentation::Regular
+            && !response.thread.ephemeral
+            && let Err(error) = self
+                .hydrate_initial_thread_history(
+                    &mut response.thread,
+                    /*turn_cursor*/ None,
+                    /*item_cursor*/ None,
+                    Some(&config),
+                    HistoryHydrationScope::Initial,
+                )
+                .await
+        {
+            tracing::warn!(
+                thread_id = %response.thread.id,
+                error = %error,
+                "preserving the created fork after bounded history hydration failed"
+            );
+        }
         let mut started =
             started_thread_from_fork_response(response, &config, self.thread_params_mode()).await?;
-        started.session.fork_parent_title = fork_parent_title;
+        started.session.fork_parent_title = fork_parent.and_then(|thread| thread.name);
         Ok(started)
     }
 
@@ -631,17 +870,45 @@ impl AppServerSession {
         include_turns: bool,
     ) -> Result<Thread> {
         let request_id = self.next_request_id();
-        let response: ThreadReadResponse = self
+        let response = self
             .client
-            .request_typed(ClientRequest::ThreadRead {
+            .request_typed::<ThreadReadResponse>(ClientRequest::ThreadRead {
                 request_id,
                 params: ThreadReadParams {
                     thread_id: thread_id.to_string(),
                     include_turns,
                 },
             })
-            .await
-            .wrap_err("thread/read failed during TUI session lookup")?;
+            .await;
+        let mut response: ThreadReadResponse = match response {
+            Ok(response) => return Ok(response.thread),
+            Err(TypedRequestError::Server { source, .. })
+                if include_turns
+                    && source.message
+                        == "paginated threads do not support thread/read(includeTurns=true)" =>
+            {
+                let request_id = self.next_request_id();
+                self.client
+                    .request_typed(ClientRequest::ThreadRead {
+                        request_id,
+                        params: ThreadReadParams {
+                            thread_id: thread_id.to_string(),
+                            include_turns: false,
+                        },
+                    })
+                    .await
+                    .wrap_err("thread/read failed during TUI session lookup")?
+            }
+            Err(err) => return Err(err).wrap_err("thread/read failed during TUI session lookup"),
+        };
+        self.hydrate_initial_thread_history(
+            &mut response.thread,
+            /*turn_cursor*/ None,
+            /*item_cursor*/ None,
+            /*config*/ None,
+            HistoryHydrationScope::Initial,
+        )
+        .await?;
         Ok(response.thread)
     }
 
@@ -701,6 +968,7 @@ impl AppServerSession {
                 request_id,
                 params: ThreadMetadataUpdateParams {
                     thread_id: thread_id.to_string(),
+                    project_id: None,
                     git_info: Some(ThreadMetadataGitInfoUpdateParams {
                         sha: None,
                         branch: Some(Some(branch)),
@@ -715,9 +983,9 @@ impl AppServerSession {
     pub(crate) async fn thread_settings_update(
         &mut self,
         params: ThreadSettingsUpdateParams,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         if !self.thread_settings_update_supported {
-            return Ok(());
+            return Ok(false);
         }
         let request_id = self.next_request_id();
         match self
@@ -728,7 +996,7 @@ impl AppServerSession {
             })
             .await
         {
-            Ok(_) => Ok(()),
+            Ok(_) => Ok(true),
             Err(TypedRequestError::Server { source, .. })
                 if is_thread_settings_update_unsupported(&source) =>
             {
@@ -739,7 +1007,7 @@ impl AppServerSession {
                 // of showing an error every time the user changes model, effort,
                 // personality, or mode.
                 self.thread_settings_update_supported = false;
-                Ok(())
+                Ok(false)
             }
             Err(err) => Err(err).wrap_err("thread/settings/update failed in TUI"),
         }
@@ -788,7 +1056,7 @@ impl AppServerSession {
     ) -> Result<TurnStartResponse> {
         let request_id = self.next_request_id();
         let (sandbox_policy, permissions) =
-            turn_permissions_overrides(permissions_override, cwd.as_path());
+            turn_permissions_overrides(permissions_override, cwd.as_path())?;
         self.client
             .request_typed(ClientRequest::TurnStart {
                 request_id,
@@ -1076,24 +1344,6 @@ impl AppServerSession {
         Ok(())
     }
 
-    pub(crate) async fn thread_rollback(
-        &mut self,
-        thread_id: ThreadId,
-        num_turns: u32,
-    ) -> Result<ThreadRollbackResponse> {
-        let request_id = self.next_request_id();
-        self.client
-            .request_typed(ClientRequest::ThreadRollback {
-                request_id,
-                params: ThreadRollbackParams {
-                    thread_id: thread_id.to_string(),
-                    num_turns,
-                },
-            })
-            .await
-            .wrap_err("thread/rollback failed in TUI")
-    }
-
     pub(crate) async fn review_start(
         &mut self,
         thread_id: ThreadId,
@@ -1166,7 +1416,7 @@ impl AppServerSession {
         self.client.request_handle()
     }
 
-    fn next_request_id(&mut self) -> RequestId {
+    pub(crate) fn next_request_id(&mut self) -> RequestId {
         let request_id = self.next_request_id;
         self.next_request_id += 1;
         RequestId::Integer(request_id)
@@ -1179,18 +1429,19 @@ pub(crate) async fn start_thread_with_request_handle(
     thread_params_mode: ThreadParamsMode,
     remote_cwd_override: Option<PathBuf>,
 ) -> Result<AppServerStartedThread> {
-    let response: ThreadStartResponse = request_handle
-        .request_typed(ClientRequest::ThreadStart {
-            request_id: RequestId::String(format!("startup-thread-start-{}", Uuid::new_v4())),
-            params: thread_start_params_from_config(
-                &config,
-                thread_params_mode,
-                remote_cwd_override.as_deref(),
-                /*session_start_source*/ None,
-            ),
-        })
-        .await
-        .map_err(|err| bootstrap_request_error("thread/start failed during TUI bootstrap", err))?;
+    let request_id = RequestId::String(format!("startup-thread-start-{}", Uuid::new_v4()));
+    let params = thread_start_params_from_config(
+        &config,
+        thread_params_mode,
+        remote_cwd_override.as_deref(),
+        /*session_start_source*/ None,
+    );
+    let (response, _history_support) =
+        request_thread_start_with_history_fallback(&request_handle, request_id, params)
+            .await
+            .map_err(|err| {
+                bootstrap_request_error("thread/start failed during TUI bootstrap", err)
+            })?;
     started_thread_from_start_response(response, &config, thread_params_mode).await
 }
 
@@ -1207,7 +1458,7 @@ pub(crate) fn status_account_display_from_auth_mode(
             email: None,
             plan: plan_type.map(plan_type_display_name),
         }),
-        Some(AuthMode::BedrockApiKey) => None,
+        Some(AuthMode::Headers) | Some(AuthMode::BedrockApiKey) => None,
         None => None,
     }
 }
@@ -1225,6 +1476,13 @@ fn model_preset_from_api_model(model: ApiModel) -> ModelPreset {
                 .as_ref()
                 .and_then(|info| info.upgrade_copy.clone()),
             migration_markdown: upgrade_info.and_then(|info| info.migration_markdown),
+            retirement_at: model
+                .upgrade_info
+                .as_ref()
+                .and_then(|info| info.retirement_at)
+                .and_then(|retirement_at| {
+                    chrono::DateTime::<chrono::Utc>::from_timestamp(retirement_at, 0)
+                }),
         }
     });
 
@@ -1233,6 +1491,7 @@ fn model_preset_from_api_model(model: ApiModel) -> ModelPreset {
         model: model.model,
         display_name: model.display_name,
         description: model.description,
+        model_specialty: model.model_specialty,
         default_reasoning_effort: model.default_reasoning_effort,
         supported_reasoning_efforts: model
             .supported_reasoning_efforts
@@ -1257,6 +1516,7 @@ fn model_preset_from_api_model(model: ApiModel) -> ModelPreset {
         is_default: model.is_default,
         upgrade,
         show_in_picker: !model.hidden,
+        multi_agent_version: None,
         availability_nux: model.availability_nux.map(|nux| ModelAvailabilityNux {
             message: nux.message,
         }),
@@ -1352,14 +1612,14 @@ fn permission_profile_id_from_active_profile(active: ActivePermissionProfile) ->
     active.id
 }
 
-fn turn_permissions_overrides(
+pub(crate) fn turn_permissions_overrides(
     permissions_override: TurnPermissionsOverride,
     cwd: &std::path::Path,
-) -> (
+) -> Result<(
     Option<codex_app_server_protocol::SandboxPolicy>,
     Option<String>,
-) {
-    match permissions_override {
+)> {
+    Ok(match permissions_override {
         TurnPermissionsOverride::Preserve => (None, None),
         TurnPermissionsOverride::ActiveProfile(active_permission_profile) => (
             None,
@@ -1368,17 +1628,20 @@ fn turn_permissions_overrides(
             )),
         ),
         TurnPermissionsOverride::LegacySandbox(permission_profile) => {
-            let legacy_profile = legacy_compatible_permission_profile(&permission_profile, cwd);
-            let policy = legacy_profile
+            let policy = permission_profile
                 .to_legacy_sandbox_policy(cwd)
-                .unwrap_or_else(|err| {
-                    unreachable!(
-                        "legacy-compatible permissions must project to legacy policy: {err}"
-                    )
-                });
+                .map_err(|_| UnsupportedLegacyPermissionProfile)?;
+            let projected_profile =
+                PermissionProfile::from_legacy_sandbox_policy_for_cwd(&policy, cwd);
+            if !permission_profile
+                .file_system_sandbox_policy()
+                .is_semantically_equivalent_to(&projected_profile.file_system_sandbox_policy(), cwd)
+            {
+                return Err(UnsupportedLegacyPermissionProfile.into());
+            }
             (Some(policy.into()), None)
         }
-    }
+    })
 }
 
 fn permissions_selection_from_config(
@@ -1423,6 +1686,7 @@ fn thread_start_params_from_config(
         permissions,
         config: config_request_overrides_from_config(config),
         ephemeral: Some(config.ephemeral),
+        history_mode: (!config.ephemeral).then_some(ThreadHistoryMode::Paginated),
         session_start_source,
         thread_source: Some(ThreadSource::User),
         developer_instructions: with_terminal_visualization_instructions(
@@ -1437,7 +1701,14 @@ fn thread_resume_params_from_config(
     thread_id: ThreadId,
     thread_params_mode: ThreadParamsMode,
     remote_cwd_override: Option<&std::path::Path>,
+    model_settings: ResumeModelSettings,
 ) -> ThreadResumeParams {
+    if model_settings == ResumeModelSettings::PreserveExistingThread {
+        return ThreadResumeParams {
+            thread_id: thread_id.to_string(),
+            ..ThreadResumeParams::default()
+        };
+    }
     let permissions = permissions_selection_from_config(&config, thread_params_mode);
     let sandbox = permissions
         .is_none()
@@ -1448,10 +1719,28 @@ fn thread_resume_params_from_config(
             )
         })
         .flatten();
+    let mut config_overrides = config_request_overrides_from_config(&config);
+    if model_settings == ResumeModelSettings::RestoreFromThread
+        && let Some(overrides) = config_overrides.as_mut()
+    {
+        overrides.remove("model_reasoning_effort");
+        if overrides.is_empty() {
+            config_overrides = None;
+        }
+    }
+    let (model, model_provider) = match model_settings {
+        ResumeModelSettings::OverrideFromCurrentConfig => (
+            config.model.clone(),
+            thread_params_mode.model_provider_from_config(&config),
+        ),
+        ResumeModelSettings::RestoreFromThread | ResumeModelSettings::PreserveExistingThread => {
+            (None, None)
+        }
+    };
     ThreadResumeParams {
         thread_id: thread_id.to_string(),
-        model: config.model.clone(),
-        model_provider: thread_params_mode.model_provider_from_config(&config),
+        model,
+        model_provider,
         service_tier: service_tier_override_from_config(&config),
         cwd: thread_cwd_from_config(&config, thread_params_mode, remote_cwd_override),
         runtime_workspace_roots: Some(config.workspace_roots.clone()),
@@ -1459,7 +1748,7 @@ fn thread_resume_params_from_config(
         approvals_reviewer: approvals_reviewer_override_from_config(&config),
         sandbox,
         permissions,
-        config: config_request_overrides_from_config(&config),
+        config: config_overrides,
         developer_instructions: with_terminal_visualization_instructions(
             &config, /*control_instructions*/ None,
         ),
@@ -1495,7 +1784,12 @@ fn thread_fork_params_from_config(
         sandbox,
         permissions,
         config: config_request_overrides_from_config(&config),
-        base_instructions: config.base_instructions.clone(),
+        base_instructions: config.base_instructions.clone().filter(|_| {
+            !matches!(
+                config.base_instructions_provenance,
+                Some(BaseInstructionsProvenance::Model { .. })
+            )
+        }),
         developer_instructions: with_terminal_visualization_instructions(
             &config,
             config.developer_instructions.clone(),
@@ -1524,6 +1818,7 @@ async fn started_thread_from_start_response(
     config: &Config,
     thread_params_mode: ThreadParamsMode,
 ) -> Result<AppServerStartedThread> {
+    let blocks_direct_input = thread_blocks_direct_input(&response.thread);
     let session =
         thread_session_state_from_thread_start_response(&response, config, thread_params_mode)
             .await
@@ -1531,6 +1826,7 @@ async fn started_thread_from_start_response(
     Ok(AppServerStartedThread {
         session,
         turns: response.thread.turns,
+        blocks_direct_input,
     })
 }
 
@@ -1539,6 +1835,7 @@ async fn started_thread_from_resume_response(
     config: &Config,
     thread_params_mode: ThreadParamsMode,
 ) -> Result<AppServerStartedThread> {
+    let blocks_direct_input = thread_blocks_direct_input(&response.thread);
     let session =
         thread_session_state_from_thread_resume_response(&response, config, thread_params_mode)
             .await
@@ -1546,6 +1843,7 @@ async fn started_thread_from_resume_response(
     Ok(AppServerStartedThread {
         session,
         turns: response.thread.turns,
+        blocks_direct_input,
     })
 }
 
@@ -1554,6 +1852,7 @@ async fn started_thread_from_fork_response(
     config: &Config,
     thread_params_mode: ThreadParamsMode,
 ) -> Result<AppServerStartedThread> {
+    let blocks_direct_input = thread_blocks_direct_input(&response.thread);
     let session =
         thread_session_state_from_thread_fork_response(&response, config, thread_params_mode)
             .await
@@ -1561,6 +1860,7 @@ async fn started_thread_from_fork_response(
     Ok(AppServerStartedThread {
         session,
         turns: response.thread.turns,
+        blocks_direct_input,
     })
 }
 
@@ -1676,6 +1976,17 @@ fn display_permission_profile_from_thread_response(
     thread_params_mode: ThreadParamsMode,
 ) -> PermissionProfile {
     match thread_params_mode {
+        ThreadParamsMode::Embedded
+            if matches!(
+                config.permissions.effective_permission_profile(),
+                PermissionProfile::Disabled
+            ) && !matches!(
+                sandbox,
+                codex_app_server_protocol::SandboxPolicy::DangerFullAccess
+            ) =>
+        {
+            PermissionProfile::from_legacy_sandbox_policy_for_cwd(&sandbox.to_core(), cwd)
+        }
         ThreadParamsMode::Embedded => config.permissions.effective_permission_profile(),
         ThreadParamsMode::Remote => {
             PermissionProfile::from_legacy_sandbox_policy_for_cwd(&sandbox.to_core(), cwd)
@@ -1767,6 +2078,8 @@ mod tests {
     use super::*;
     use crate::legacy_core::config::ConfigBuilder;
     use crate::legacy_core::config::ConfigOverrides;
+    use app_test_support::create_fake_paginated_rollout;
+    use app_test_support::create_fake_rollout;
     use codex_app_server_protocol::ThreadStatus;
     use codex_app_server_protocol::Turn;
     use codex_app_server_protocol::TurnStatus;
@@ -1779,6 +2092,7 @@ mod tests {
     use codex_protocol::models::BUILT_IN_PERMISSION_PROFILE_READ_ONLY;
     use codex_protocol::models::BUILT_IN_PERMISSION_PROFILE_WORKSPACE;
     use codex_protocol::models::ManagedFileSystemPermissions;
+    use codex_protocol::openai_models::ModelServiceTier;
     use codex_protocol::openai_models::ReasoningEffort;
     use codex_protocol::permissions::FileSystemAccessMode;
     use codex_protocol::permissions::FileSystemPath;
@@ -1799,6 +2113,58 @@ mod tests {
             .expect("config should build")
     }
 
+    #[tokio::test]
+    async fn bootstrap_reuses_prefetched_account_without_another_account_read() -> Result<()> {
+        let codex_home = tempfile::tempdir()?;
+        let config = build_config(&codex_home).await;
+        let mut app_server = crate::start_embedded_app_server_for_picker(&config).await?;
+        let next_request_id = app_server.next_request_id;
+        let account = GetAccountResponse {
+            account: Some(Account::Chatgpt {
+                email: Some("teammate@openai.com".to_string()),
+                plan_type: codex_protocol::account::PlanType::Plus,
+            }),
+            requires_openai_auth: true,
+        };
+
+        let bootstrap = app_server.bootstrap_with_account(&config, account).await?;
+
+        assert_eq!(app_server.next_request_id, next_request_id + 2);
+        assert_eq!(
+            (
+                bootstrap.account_email.as_deref(),
+                bootstrap.auth_mode,
+                bootstrap.plan_type,
+                bootstrap.feedback_audience,
+                bootstrap.has_chatgpt_account,
+            ),
+            (
+                Some("teammate@openai.com"),
+                Some(TelemetryAuthMode::Chatgpt),
+                Some(codex_protocol::account::PlanType::Plus),
+                FeedbackAudience::OpenAiEmployee,
+                true,
+            )
+        );
+
+        app_server.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bootstrap_reads_account_when_no_prefetched_account_is_available() -> Result<()> {
+        let codex_home = tempfile::tempdir()?;
+        let config = build_config(&codex_home).await;
+        let mut app_server = crate::start_embedded_app_server_for_picker(&config).await?;
+        let next_request_id = app_server.next_request_id;
+
+        app_server.bootstrap(&config).await?;
+
+        assert_eq!(app_server.next_request_id, next_request_id + 3);
+        app_server.shutdown().await?;
+        Ok(())
+    }
+
     fn rate_limit_snapshot(limit_id: &str) -> RateLimitSnapshot {
         RateLimitSnapshot {
             limit_id: Some(limit_id.to_string()),
@@ -1811,9 +2177,76 @@ mod tests {
             secondary: None,
             credits: None,
             individual_limit: None,
+            spend_control_reached: None,
             plan_type: None,
             rate_limit_reached_type: None,
         }
+    }
+
+    fn api_model_with_upgrade_retirement_at(retirement_at: Option<i64>) -> ApiModel {
+        ApiModel {
+            id: "model-id".to_string(),
+            model: "current-model".to_string(),
+            upgrade: Some("replacement-model".to_string()),
+            upgrade_info: Some(codex_app_server_protocol::ModelUpgradeInfo {
+                model: "replacement-model".to_string(),
+                upgrade_copy: None,
+                model_link: None,
+                migration_markdown: None,
+                retirement_at,
+            }),
+            availability_nux: None,
+            display_name: "Current model".to_string(),
+            description: "A test model".to_string(),
+            model_specialty: None,
+            hidden: false,
+            supported_reasoning_efforts: Vec::new(),
+            default_reasoning_effort: ReasoningEffort::Medium,
+            input_modalities: Vec::new(),
+            supports_personality: false,
+            multi_agent_version: None,
+            additional_speed_tiers: Vec::new(),
+            service_tiers: Vec::new(),
+            default_service_tier: None,
+            is_default: false,
+        }
+    }
+
+    #[test]
+    fn model_preset_from_api_model_preserves_upgrade_retirement_at() {
+        let retirement_at = chrono::DateTime::parse_from_rfc3339("2030-01-01T00:00:00Z")
+            .expect("valid RFC 3339 timestamp")
+            .with_timezone(&chrono::Utc);
+        let expected_upgrade = |retirement_at| {
+            Some(ModelUpgrade {
+                id: "replacement-model".to_string(),
+                migration_config_key: "current-model".to_string(),
+                model_link: None,
+                upgrade_copy: None,
+                migration_markdown: None,
+                retirement_at,
+            })
+        };
+
+        assert_eq!(
+            vec![
+                model_preset_from_api_model(api_model_with_upgrade_retirement_at(Some(
+                    retirement_at.timestamp(),
+                )))
+                .upgrade,
+                model_preset_from_api_model(api_model_with_upgrade_retirement_at(
+                    /*retirement_at*/ None,
+                ))
+                .upgrade,
+                model_preset_from_api_model(api_model_with_upgrade_retirement_at(Some(i64::MAX)))
+                    .upgrade,
+            ],
+            vec![
+                expected_upgrade(Some(retirement_at)),
+                expected_upgrade(None),
+                expected_upgrade(None),
+            ]
+        );
     }
 
     #[test]
@@ -1867,6 +2300,75 @@ mod tests {
                 "{message}"
             );
         }
+    }
+
+    #[test]
+    fn history_pagination_compat_detects_unsupported_server_fields() {
+        let cases = [
+            (JSONRPC_INVALID_PARAMS, "unknown field `historyMode`", true),
+            (
+                JSONRPC_INVALID_REQUEST,
+                "thread/resume.excludeTurns requires experimentalApi capability",
+                true,
+            ),
+            (
+                JSONRPC_INVALID_REQUEST,
+                "thread/fork.excludeTurns requires experimentalApi capability",
+                true,
+            ),
+            (
+                JSONRPC_METHOD_NOT_FOUND,
+                "unknown method thread/turns/list",
+                true,
+            ),
+            (JSONRPC_METHOD_NOT_FOUND, "method not found", true),
+            (
+                JSONRPC_INVALID_PARAMS,
+                "unknown variant \"paginated\", expected \"legacy\"",
+                true,
+            ),
+            (
+                JSONRPC_INVALID_PARAMS,
+                "invalid enum value `paginated`",
+                true,
+            ),
+            (
+                JSONRPC_INVALID_PARAMS,
+                "paginated thread was not found",
+                false,
+            ),
+            (JSONRPC_INVALID_PARAMS, "invalid thread id", false),
+        ];
+
+        for (code, message, expected) in cases {
+            let source = JSONRPCErrorError {
+                code,
+                data: None,
+                message: message.to_string(),
+            };
+            assert_eq!(
+                is_history_pagination_unsupported(&source),
+                expected,
+                "{message}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn ephemeral_thread_start_does_not_request_paginated_history() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let mut config = build_config(&temp_dir).await;
+        config.ephemeral = true;
+
+        let params = thread_start_params_from_config(
+            &config,
+            ThreadParamsMode::Embedded,
+            /*remote_cwd_override*/ None,
+            /*session_start_source*/ None,
+        );
+
+        assert_eq!(params.ephemeral, Some(true));
+        assert_eq!(params.history_mode, None);
     }
 
     #[tokio::test]
@@ -1932,7 +2434,8 @@ mod tests {
         let (sandbox_policy, permissions) = turn_permissions_overrides(
             TurnPermissionsOverride::ActiveProfile(active_permission_profile),
             cwd.as_path(),
-        );
+        )
+        .expect("active permission profile should be supported");
 
         assert_eq!(sandbox_policy, None);
         assert_eq!(permissions, Some(expected_permissions));
@@ -1947,7 +2450,8 @@ mod tests {
         let (sandbox_policy, permissions) = turn_permissions_overrides(
             TurnPermissionsOverride::ActiveProfile(active_permission_profile),
             cwd.as_path(),
-        );
+        )
+        .expect("active permission profile should be supported");
 
         assert_eq!(sandbox_policy, None);
         assert_eq!(
@@ -1961,7 +2465,8 @@ mod tests {
         let cwd = test_path_buf("/workspace/project").abs();
 
         let (sandbox_policy, permissions) =
-            turn_permissions_overrides(TurnPermissionsOverride::Preserve, cwd.as_path());
+            turn_permissions_overrides(TurnPermissionsOverride::Preserve, cwd.as_path())
+                .expect("preserving permissions should be supported");
 
         assert_eq!(sandbox_policy, None);
         assert_eq!(permissions, None);
@@ -1974,7 +2479,8 @@ mod tests {
         let (sandbox_policy, permissions) = turn_permissions_overrides(
             TurnPermissionsOverride::LegacySandbox(PermissionProfile::read_only()),
             cwd.as_path(),
-        );
+        )
+        .expect("read-only permission profile should be supported");
 
         assert_eq!(
             sandbox_policy,
@@ -1983,6 +2489,118 @@ mod tests {
             })
         );
         assert_eq!(permissions, None);
+    }
+
+    #[test]
+    fn legacy_turn_permissions_preserve_workspace_write() {
+        let cwd = test_path_buf("/workspace/project").abs();
+
+        let (sandbox_policy, permissions) = turn_permissions_overrides(
+            TurnPermissionsOverride::LegacySandbox(PermissionProfile::workspace_write()),
+            cwd.as_path(),
+        )
+        .expect("workspace-write permission profile should be supported");
+
+        assert_eq!(
+            sandbox_policy,
+            Some(codex_app_server_protocol::SandboxPolicy::WorkspaceWrite {
+                writable_roots: Vec::new(),
+                network_access: false,
+                exclude_tmpdir_env_var: false,
+                exclude_slash_tmp: false,
+            })
+        );
+        assert_eq!(permissions, None);
+    }
+
+    #[test]
+    fn legacy_turn_permissions_reject_non_cwd_write_roots() {
+        let cwd = test_path_buf("/workspace/project").abs();
+        let extra_root = test_path_buf("/workspace/extra").abs();
+        let permission_profile = PermissionProfile::Managed {
+            network: NetworkSandboxPolicy::Restricted,
+            file_system: ManagedFileSystemPermissions::Restricted {
+                entries: vec![
+                    FileSystemSandboxEntry {
+                        path: FileSystemPath::Special {
+                            value: FileSystemSpecialPath::Root,
+                        },
+                        access: FileSystemAccessMode::Read,
+                        missing_path_behavior: None,
+                    },
+                    FileSystemSandboxEntry {
+                        path: FileSystemPath::Path {
+                            path: extra_root.into(),
+                        },
+                        access: FileSystemAccessMode::Write,
+                        missing_path_behavior: None,
+                    },
+                ],
+                glob_scan_max_depth: None,
+            },
+        };
+
+        let error = turn_permissions_overrides(
+            TurnPermissionsOverride::LegacySandbox(permission_profile),
+            cwd.as_path(),
+        )
+        .expect_err("non-cwd write roots must not grant cwd write access");
+
+        assert_eq!(
+            error.to_string(),
+            "the selected permission profile cannot be safely represented by the legacy app-server sandbox policy; select a named or legacy-compatible permission profile"
+        );
+    }
+
+    #[test]
+    fn legacy_turn_permissions_reject_restrictions_lost_by_projection() {
+        let cwd = test_path_buf("/workspace/project").abs();
+        let docs = test_path_buf("/workspace/project/docs").abs();
+
+        for (path, access) in [
+            (
+                FileSystemPath::Path {
+                    path: docs.clone().into(),
+                },
+                FileSystemAccessMode::Read,
+            ),
+            (
+                FileSystemPath::Path { path: docs.into() },
+                FileSystemAccessMode::Deny,
+            ),
+            (
+                FileSystemPath::GlobPattern {
+                    pattern: "**/*.secret".to_string(),
+                },
+                FileSystemAccessMode::Deny,
+            ),
+        ] {
+            let mut permission_profile = PermissionProfile::workspace_write();
+            let PermissionProfile::Managed {
+                file_system: ManagedFileSystemPermissions::Restricted { entries, .. },
+                ..
+            } = &mut permission_profile
+            else {
+                unreachable!("workspace-write profiles use restricted managed permissions");
+            };
+            entries.push(FileSystemSandboxEntry {
+                path,
+                access,
+                missing_path_behavior: None,
+            });
+
+            let error = turn_permissions_overrides(
+                TurnPermissionsOverride::LegacySandbox(permission_profile),
+                cwd.as_path(),
+            )
+            .expect_err("legacy projection must not discard filesystem restrictions");
+
+            assert!(
+                error
+                    .downcast_ref::<UnsupportedLegacyPermissionProfile>()
+                    .is_some()
+            );
+        }
     }
 
     #[test]
@@ -1995,7 +2613,8 @@ mod tests {
         let (sandbox_policy, permissions) = turn_permissions_overrides(
             TurnPermissionsOverride::ActiveProfile(active_permission_profile),
             cwd.as_path(),
-        );
+        )
+        .expect("active permission profile should be supported");
 
         assert_eq!(sandbox_policy, None);
         assert_eq!(permissions, Some(expected_permissions));
@@ -2023,6 +2642,7 @@ mod tests {
             thread_id,
             ThreadParamsMode::Remote,
             /*remote_cwd_override*/ None,
+            ResumeModelSettings::OverrideFromCurrentConfig,
         );
         let fork = thread_fork_params_from_config(
             config,
@@ -2059,6 +2679,32 @@ mod tests {
         assert_eq!(fork.thread_source, Some(ThreadSource::User));
     }
 
+    #[tokio::test]
+    async fn remote_resume_params_keep_local_roots_with_cross_platform_cwd_override() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let config = build_config(&temp_dir).await;
+        let expected_workspace_roots = config.workspace_roots.clone();
+        let remote_cwd = if cfg!(windows) {
+            std::path::PathBuf::from("/srv/remote/project")
+        } else {
+            std::path::PathBuf::from(r"C:\remote\project")
+        };
+
+        let resume = thread_resume_params_from_config(
+            config,
+            ThreadId::new(),
+            ThreadParamsMode::Remote,
+            Some(remote_cwd.as_path()),
+            ResumeModelSettings::RestoreFromThread,
+        );
+
+        assert_eq!(resume.cwd, Some(remote_cwd.to_string_lossy().to_string()));
+        assert_eq!(
+            resume.runtime_workspace_roots,
+            Some(expected_workspace_roots)
+        );
+    }
+
     #[test]
     fn sandbox_mode_does_not_project_non_cwd_write_roots_for_remote_sessions() {
         let cwd = test_path_buf("/workspace/project").abs();
@@ -2072,10 +2718,12 @@ mod tests {
                             value: FileSystemSpecialPath::Root,
                         },
                         access: FileSystemAccessMode::Read,
+                        missing_path_behavior: None,
                     },
                     FileSystemSandboxEntry {
-                        path: FileSystemPath::Path { path: extra_root },
+                        path: extra_root.into(),
                         access: FileSystemAccessMode::Write,
+                        missing_path_behavior: None,
                     },
                 ],
                 glob_scan_max_depth: None,
@@ -2100,12 +2748,14 @@ mod tests {
                             value: FileSystemSpecialPath::Root,
                         },
                         access: FileSystemAccessMode::Read,
+                        missing_path_behavior: None,
                     },
                     FileSystemSandboxEntry {
                         path: FileSystemPath::Special {
                             value: FileSystemSpecialPath::ProjectRoots { subpath: None },
                         },
                         access: FileSystemAccessMode::Write,
+                        missing_path_behavior: None,
                     },
                 ],
                 glob_scan_max_depth: None,
@@ -2140,6 +2790,7 @@ mod tests {
             thread_id,
             ThreadParamsMode::Remote,
             Some(remote_cwd.as_path()),
+            ResumeModelSettings::OverrideFromCurrentConfig,
         );
         let fork = thread_fork_params_from_config(
             config,
@@ -2191,6 +2842,7 @@ mod tests {
             thread_id,
             ThreadParamsMode::Embedded,
             /*remote_cwd_override*/ None,
+            ResumeModelSettings::OverrideFromCurrentConfig,
         );
         let fork = thread_fork_params_from_config(
             config,
@@ -2215,6 +2867,279 @@ mod tests {
         assert_eq!(start.config, Some(expected_config.clone()));
         assert_eq!(resume.config, Some(expected_config.clone()));
         assert_eq!(fork.config, Some(expected_config));
+    }
+
+    #[tokio::test]
+    async fn thread_resume_params_can_restore_persisted_model_settings() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let mut config = build_config(&temp_dir).await;
+        config.model = Some("configured-model".to_string());
+        config.model_provider_id = "configured-provider".to_string();
+        config.model_reasoning_effort = Some(ReasoningEffort::Ultra);
+        config.model_reasoning_summary = Some(ReasoningSummary::Detailed);
+
+        let params = thread_resume_params_from_config(
+            config,
+            ThreadId::new(),
+            ThreadParamsMode::Embedded,
+            /*remote_cwd_override*/ None,
+            ResumeModelSettings::RestoreFromThread,
+        );
+
+        assert_eq!(params.model, None);
+        assert_eq!(params.model_provider, None);
+        assert_eq!(
+            params.config,
+            Some(HashMap::from([
+                (
+                    "model_reasoning_summary".to_string(),
+                    serde_json::Value::String("detailed".to_string()),
+                ),
+                (
+                    "personality".to_string(),
+                    serde_json::Value::String("pragmatic".to_string()),
+                ),
+                (
+                    "web_search".to_string(),
+                    serde_json::Value::String("cached".to_string()),
+                ),
+            ]))
+        );
+    }
+
+    #[tokio::test]
+    async fn thread_resume_params_can_rejoin_without_overriding_existing_settings() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let config = build_config(&temp_dir).await;
+        let thread_id = ThreadId::new();
+
+        let params = thread_resume_params_from_config(
+            config,
+            thread_id,
+            ThreadParamsMode::Embedded,
+            /*remote_cwd_override*/ None,
+            ResumeModelSettings::PreserveExistingThread,
+        );
+
+        assert_eq!(
+            params,
+            ThreadResumeParams {
+                thread_id: thread_id.to_string(),
+                ..ThreadResumeParams::default()
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn persisted_resume_does_not_forward_implicit_service_tier() -> Result<()> {
+        let codex_home = tempfile::tempdir().expect("tempdir");
+        let mut config = build_config(&codex_home).await;
+        config.model = Some("gpt-5.4".to_string());
+        config.service_tier = None;
+        config
+            .features
+            .enable(Feature::FastMode)
+            .expect("enable fast mode");
+        let thread_id = ThreadId::from_string(
+            &create_fake_rollout(
+                codex_home.path(),
+                "2025-01-05T12-00-00",
+                "2025-01-05T12:00:00Z",
+                "Saved user message",
+                Some(config.model_provider_id.as_str()),
+                /*git_info*/ None,
+            )
+            .expect("create source rollout"),
+        )?;
+        let mut app_server = crate::start_embedded_app_server_for_picker(&config).await?;
+        let mut preset = crate::test_support::TEST_MODEL_PRESETS
+            .iter()
+            .find(|preset| preset.model == "gpt-5.4")
+            .expect("gpt-5.4 test preset")
+            .clone();
+        preset.service_tiers = vec![ModelServiceTier {
+            id: ServiceTier::Fast.request_value().to_string(),
+            name: "fast".to_string(),
+            description: "Fast tier".to_string(),
+        }];
+        preset.default_service_tier = Some(ServiceTier::Fast.request_value().to_string());
+        app_server.available_models = vec![preset];
+
+        let resumed = app_server
+            .resume_thread(config, thread_id, ResumeModelSettings::RestoreFromThread)
+            .await?;
+
+        assert_eq!(resumed.session.service_tier, None);
+        app_server.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn side_fork_skips_parent_title_lookup_but_normal_ephemeral_fork_keeps_it() -> Result<()>
+    {
+        let codex_home = tempfile::tempdir().expect("tempdir");
+        let config = build_config(&codex_home).await;
+        let source_thread_id = ThreadId::from_string(
+            &create_fake_rollout(
+                codex_home.path(),
+                "2025-01-05T12-00-00",
+                "2025-01-05T12:00:00Z",
+                "Saved user message",
+                Some(config.model_provider_id.as_str()),
+                /*git_info*/ None,
+            )
+            .expect("create source rollout"),
+        )?;
+        let mut app_server = crate::start_embedded_app_server_for_picker(&config).await?;
+        app_server
+            .resume_thread(
+                config.clone(),
+                source_thread_id,
+                ResumeModelSettings::RestoreFromThread,
+            )
+            .await?;
+        app_server
+            .thread_set_name(source_thread_id, "Source thread".to_string())
+            .await?;
+
+        let mut ephemeral_config = config;
+        ephemeral_config.ephemeral = true;
+        let normal_ephemeral_fork = app_server
+            .fork_thread(ephemeral_config.clone(), source_thread_id)
+            .await?;
+        let side_fork = app_server
+            .fork_side_thread(ephemeral_config, source_thread_id)
+            .await?;
+
+        assert_eq!(
+            normal_ephemeral_fork.session.fork_parent_title.as_deref(),
+            Some("Source thread")
+        );
+        assert_eq!(side_fork.session.fork_parent_title, None);
+        app_server.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ephemeral_paginated_fork_skips_unsupported_history_hydration() -> Result<()> {
+        let codex_home = tempfile::tempdir()?;
+        let config = build_config(&codex_home).await;
+        let source_thread_id = ThreadId::from_string(
+            &create_fake_paginated_rollout(
+                codex_home.path(),
+                "2025-01-05T12-00-00",
+                "2025-01-05T12:00:00Z",
+                "Saved user message",
+                Some(config.model_provider_id.as_str()),
+                /*git_info*/ None,
+            )
+            .map_err(|error| {
+                color_eyre::eyre::eyre!("failed to create paginated rollout: {error}")
+            })?,
+        )?;
+        let mut app_server = crate::start_embedded_app_server_for_picker(&config).await?;
+        let mut ephemeral_config = config;
+        ephemeral_config.ephemeral = true;
+
+        let fork = app_server
+            .fork_thread(ephemeral_config, source_thread_id)
+            .await?;
+
+        assert_eq!(fork.session.forked_from_id, Some(source_thread_id));
+        assert!(fork.turns.is_empty());
+        app_server.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn side_fork_uses_one_request_for_long_paginated_history() -> Result<()> {
+        let codex_home = tempfile::tempdir().expect("tempdir");
+        let mut config = build_config(&codex_home).await;
+        config.terminal_resize_reflow.max_rows =
+            crate::legacy_core::config::TerminalResizeReflowMaxRows::Limit(100);
+        let filename_ts = "2025-01-05T12-00-00";
+        let source_id = create_fake_paginated_rollout(
+            codex_home.path(),
+            filename_ts,
+            "2025-01-05T12:00:00Z",
+            "Saved user message",
+            Some(config.model_provider_id.as_str()),
+            /*git_info*/ None,
+        )
+        .expect("create long paginated source rollout");
+        let source_path =
+            app_test_support::rollout_path(codex_home.path(), filename_ts, source_id.as_str());
+        let mut contents = std::fs::read_to_string(&source_path)?;
+        let rollout_line = |ordinal: usize, payload: serde_json::Value| {
+            serde_json::json!({
+                "timestamp": "2025-01-05T12:00:00Z",
+                "type": "event_msg",
+                "payload": payload,
+                "ordinal": ordinal,
+            })
+        };
+        let started = rollout_line(
+            /*ordinal*/ 3,
+            serde_json::json!({
+                "type": "task_started",
+                "turn_id": "long-history-turn",
+                "model_context_window": null,
+            }),
+        );
+        contents.push_str(&format!("{started}\n"));
+        for index in 0..256 {
+            let item = rollout_line(
+                index + 4,
+                serde_json::json!({
+                    "type": "item_completed",
+                    "thread_id": source_id,
+                    "turn_id": "long-history-turn",
+                    "item": {
+                        "type": "UserMessage",
+                        "id": format!("long-history-user-{index}"),
+                        "content": [{
+                            "type": "text",
+                            "text": format!("long history message {index}"),
+                        }],
+                    },
+                }),
+            );
+            contents.push_str(&format!("{item}\n"));
+        }
+        std::fs::write(source_path, contents)?;
+
+        let source_thread_id = ThreadId::from_string(source_id.as_str())?;
+        let mut app_server = crate::start_embedded_app_server_for_picker(&config).await?;
+        let resumed = app_server
+            .resume_thread(
+                config.clone(),
+                source_thread_id,
+                ResumeModelSettings::RestoreFromThread,
+            )
+            .await?;
+        let loaded_items: usize = resumed.turns.iter().map(|turn| turn.items.len()).sum();
+        assert!(loaded_items <= HISTORY_ITEM_PAGE_LIMIT as usize);
+        assert!(app_server.has_older_history(source_thread_id));
+
+        let mut side_config = config;
+        side_config.ephemeral = true;
+        let next_request_id = app_server.next_request_id;
+        let side = app_server
+            .fork_side_thread(side_config, source_thread_id)
+            .await?;
+
+        assert_eq!(app_server.next_request_id, next_request_id + 1);
+        assert_eq!(side.session.forked_from_id, Some(source_thread_id));
+        assert_eq!(side.turns, Vec::<Turn>::new());
+        assert!(app_server.has_older_history(source_thread_id));
+        assert!(
+            !app_server
+                .history_pagination
+                .contains_key(&side.session.thread_id)
+        );
+
+        app_server.shutdown().await?;
+        Ok(())
     }
 
     #[tokio::test]
@@ -2243,11 +3168,12 @@ mod tests {
         let temp_dir = tempfile::tempdir().expect("tempdir");
         let mut config = build_config(&temp_dir).await;
         config.base_instructions = Some("Base override.".to_string());
+        config.base_instructions_provenance = Some(BaseInstructionsProvenance::Custom);
         config.developer_instructions = Some("Developer override.".to_string());
         let thread_id = ThreadId::new();
 
         let params = thread_fork_params_from_config(
-            config,
+            config.clone(),
             thread_id,
             ThreadParamsMode::Embedded,
             /*remote_cwd_override*/ None,
@@ -2258,6 +3184,53 @@ mod tests {
             params.developer_instructions.as_deref(),
             Some("Developer override.")
         );
+
+        config.base_instructions_provenance = Some(BaseInstructionsProvenance::Model {
+            model: "gpt-5.2".to_string(),
+        });
+        let params = thread_fork_params_from_config(
+            config,
+            thread_id,
+            ThreadParamsMode::Remote,
+            /*remote_cwd_override*/ None,
+        );
+
+        assert_eq!(params.base_instructions, None);
+    }
+
+    #[tokio::test]
+    async fn side_fork_excludes_turns_without_clearing_regular_ephemeral_fork() -> Result<()> {
+        let codex_home = tempfile::tempdir().expect("tempdir");
+        let mut config = build_config(&codex_home).await;
+        config.ephemeral = true;
+        let thread_id = ThreadId::from_string(
+            &create_fake_rollout(
+                codex_home.path(),
+                "2025-01-05T12-00-00",
+                "2025-01-05T12:00:00Z",
+                "Saved user message",
+                Some(config.model_provider_id.as_str()),
+                /*git_info*/ None,
+            )
+            .expect("create rollout"),
+        )?;
+        let mut app_server = crate::start_embedded_app_server_for_picker(&config).await?;
+
+        let regular = app_server.fork_thread(config.clone(), thread_id).await?;
+        let side = app_server.fork_side_thread(config, thread_id).await?;
+
+        assert_eq!(regular.turns.len(), 1);
+        assert!(matches!(
+            regular.turns[0].items.as_slice(),
+            [codex_app_server_protocol::ThreadItem::UserMessage { content, .. }]
+                if content == &[UserInput::Text {
+                    text: "Saved user message".to_string(),
+                    text_elements: Vec::new(),
+                }]
+        ));
+        assert_eq!(side.turns, Vec::<Turn>::new());
+        app_server.shutdown().await?;
+        Ok(())
     }
 
     #[tokio::test]
@@ -2278,6 +3251,7 @@ mod tests {
             thread_id,
             ThreadParamsMode::Embedded,
             /*remote_cwd_override*/ None,
+            ResumeModelSettings::OverrideFromCurrentConfig,
         );
         let control_fork = thread_fork_params_from_config(
             config.clone(),
@@ -2307,6 +3281,7 @@ mod tests {
             thread_id,
             ThreadParamsMode::Embedded,
             /*remote_cwd_override*/ None,
+            ResumeModelSettings::OverrideFromCurrentConfig,
         );
         let treatment_fork = thread_fork_params_from_config(
             config,
@@ -2349,6 +3324,9 @@ mod tests {
                 parent_thread_id: None,
                 preview: "hello".to_string(),
                 ephemeral: false,
+                section: None,
+                section_entered_at: None,
+                project_id: None,
                 history_mode: Default::default(),
                 model_provider: "openai".to_string(),
                 created_at: 1,
@@ -2359,6 +3337,7 @@ mod tests {
                 cwd: test_path_buf("/tmp/project").abs(),
                 cli_version: "0.0.0".to_string(),
                 source: codex_app_server_protocol::SessionSource::Cli,
+                can_accept_direct_input: None,
                 thread_source: None,
                 agent_nickname: None,
                 agent_role: None,
@@ -2381,6 +3360,7 @@ mod tests {
                             text: "assistant reply".to_string(),
                             phase: None,
                             memory_citation: None,
+                            delivery: None,
                         },
                     ],
                     status: TurnStatus::Completed,
@@ -2411,6 +3391,8 @@ mod tests {
             reasoning_effort: None,
             multi_agent_mode: Default::default(),
             initial_turns_page: None,
+            turns_backwards_cursor: None,
+            items_backwards_cursor: None,
         };
 
         let started = started_thread_from_resume_response(
@@ -2432,6 +3414,7 @@ mod tests {
         assert_eq!(started.session.permission_profile, read_only_profile);
         assert_eq!(started.turns.len(), 1);
         assert_eq!(started.turns[0], response.thread.turns[0]);
+        assert!(!started.blocks_direct_input);
 
         let embedded_config = ConfigBuilder::default()
             .codex_home(temp_dir.path().join("embedded-codex-home"))
@@ -2604,6 +3587,18 @@ mod tests {
         );
         assert!(matches!(
             team,
+            Some(StatusAccountDisplay::ChatGpt {
+                email: None,
+                plan: Some(ref plan),
+            }) if plan == "Business"
+        ));
+
+        let business_prolite = status_account_display_from_auth_mode(
+            Some(AuthMode::Chatgpt),
+            Some(codex_protocol::account::PlanType::SelfServeBusinessProLite),
+        );
+        assert!(matches!(
+            business_prolite,
             Some(StatusAccountDisplay::ChatGpt {
                 email: None,
                 plan: Some(ref plan),
