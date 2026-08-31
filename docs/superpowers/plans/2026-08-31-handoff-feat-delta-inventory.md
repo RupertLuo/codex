@@ -37,9 +37,10 @@ where the stable 0.151.0 APIs required a semantic port rather than a cherry-pick
   be re-designed against the current binary before porting. The native client
   method list from `b0b17bf811` is already present in
   `app-server-protocol/src/protocol/common.rs`; do not replay it.
-- TUI model/credential onboarding commits: compare against the stable TUI
-  runtime first; preserve stable provider abstractions and add snapshots only
-  for behavior that is actually retained.
+- TUI model/credential onboarding commits are already represented by the
+  stable target: the only sync-branch TUI diff is the runtime-options field
+  required by our later transport seam. No additional model/credential picker
+  or snapshot port is justified; preserve the stable provider abstractions.
 - The remaining compaction transactionality work needs failure-order tests and
   rollout/history verification; the current CAS and buffering boundaries are
   partial safeguards, not final proof.
