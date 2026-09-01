@@ -3619,6 +3619,13 @@ async fn turn_start_emits_spawn_agent_item_with_model_metadata_v2() -> Result<()
         .first()
         .cloned()
         .expect("spawn completion should include child thread id");
+    let child_settings: ThreadSettingsUpdatedNotification = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_notification("thread/settings/updated"),
+    )
+    .await??;
+    assert_eq!(child_settings.thread_id, receiver_thread_id);
+    assert_eq!(child_settings.thread_settings.model, REQUESTED_MODEL);
     assert_eq!(id, SPAWN_CALL_ID);
     assert_eq!(tool, CollabAgentTool::SpawnAgent);
     assert_eq!(status, CollabAgentToolCallStatus::Completed);
