@@ -1,26 +1,37 @@
-use codex_core_skills::SKILLS_HOW_TO_USE_WITH_ABSOLUTE_PATHS;
-use codex_core_skills::render_available_skills_body;
 use codex_extension_api::ContextualUserFragment;
 use codex_protocol::protocol::SKILLS_INSTRUCTIONS_CLOSE_TAG;
 use codex_protocol::protocol::SKILLS_INSTRUCTIONS_OPEN_TAG;
 
-use crate::tools::SkillToolAddress;
+use crate::catalog_prompt::SkillPromptKind;
+use crate::catalog_prompt::render_available_skills_body;
+use crate::tools::SkillToolAuthority;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct AvailableSkillsInstructions {
+    prompt_kind: SkillPromptKind,
+    skill_root_lines: Vec<String>,
     skill_lines: Vec<String>,
 }
 
 impl AvailableSkillsInstructions {
     pub(crate) fn from_skill_lines(
+        prompt_kind: SkillPromptKind,
+        skill_root_lines: Vec<String>,
         mut skill_lines: Vec<String>,
         include_skills_usage_instructions: bool,
     ) -> Self {
         if include_skills_usage_instructions {
             skill_lines.push("### How to use skills".to_string());
-            skill_lines.push(SKILLS_HOW_TO_USE_WITH_ABSOLUTE_PATHS.to_string());
+            if let Some(instructions) = prompt_kind.alias_instructions() {
+                skill_lines.push(instructions.to_string());
+            }
+            skill_lines.push(prompt_kind.usage_instructions().to_string());
         }
-        Self { skill_lines }
+        Self {
+            prompt_kind,
+            skill_root_lines,
+            skill_lines,
+        }
     }
 }
 
@@ -38,7 +49,7 @@ impl ContextualUserFragment for AvailableSkillsInstructions {
     }
 
     fn body(&self) -> String {
-        render_available_skills_body(&[], &self.skill_lines)
+        render_available_skills_body(self.prompt_kind, &self.skill_root_lines, &self.skill_lines)
     }
 }
 
@@ -46,25 +57,15 @@ impl ContextualUserFragment for AvailableSkillsInstructions {
 pub(crate) struct SkillInstructions {
     pub(crate) name: String,
     pub(crate) path: String,
-    pub(crate) access: Option<SkillAccess>,
     pub(crate) contents: String,
+    pub(crate) resource_access: Option<SkillResourceAccess>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct SkillAccess {
-    authority_kind: String,
-    package: String,
-    main_resource: String,
-}
-
-impl From<SkillToolAddress> for SkillAccess {
-    fn from(address: SkillToolAddress) -> Self {
-        Self {
-            authority_kind: address.authority.kind().to_string(),
-            package: address.package,
-            main_resource: address.main_resource,
-        }
-    }
+pub(crate) struct SkillResourceAccess {
+    pub(crate) authority: SkillToolAuthority,
+    pub(crate) package: String,
+    pub(crate) main_resource: String,
 }
 
 impl ContextualUserFragment for SkillInstructions {
@@ -84,29 +85,18 @@ impl ContextualUserFragment for SkillInstructions {
         let name = &self.name;
         let path = &self.path;
         let contents = &self.contents;
-        let access = self.access.as_ref().map_or_else(String::new, |access| {
-            let authority_kind = escape_xml_text(&access.authority_kind);
-            let package = escape_xml_text(&access.package);
-            let main_resource = escape_xml_text(&access.main_resource);
-            format!(
-                "<access>\n<authority-kind>{authority_kind}</authority-kind>\n<package>{package}</package>\n<main-resource>{main_resource}</main-resource>\n</access>\n"
-            )
-        });
-        format!("\n<name>{name}</name>\n<path>{path}</path>\n{access}{contents}\n")
+        let resource_access = self
+            .resource_access
+            .as_ref()
+            .map(|access| {
+                let metadata = serde_json::json!({
+                    "authority": access.authority,
+                    "package": access.package,
+                    "main_resource": access.main_resource,
+                });
+                format!("\n<resource_access>{metadata}</resource_access>")
+            })
+            .unwrap_or_default();
+        format!("\n<name>{name}</name>\n<path>{path}</path>{resource_access}\n{contents}\n")
     }
-}
-
-fn escape_xml_text(value: &str) -> String {
-    let mut escaped = String::with_capacity(value.len());
-    for character in value.chars() {
-        match character {
-            '&' => escaped.push_str("&amp;"),
-            '<' => escaped.push_str("&lt;"),
-            '>' => escaped.push_str("&gt;"),
-            '"' => escaped.push_str("&quot;"),
-            '\'' => escaped.push_str("&apos;"),
-            _ => escaped.push(character),
-        }
-    }
-    escaped
 }

@@ -2,6 +2,8 @@ use std::sync::Arc;
 
 use codex_exec_server::EnvironmentManager;
 use codex_exec_server::ExecServerRuntimePaths;
+use codex_extension_api::ExtensionRegistry;
+use codex_extension_api::ExtensionRegistryBuilder;
 use codex_extension_api::UserInstructionsProvider;
 use codex_login::AuthManager;
 use codex_protocol::error::CodexErr;
@@ -13,48 +15,21 @@ use tokio_util::sync::CancellationToken;
 
 use crate::config::Config;
 use crate::resolve_installation_id;
-use crate::session::TurnInput;
 use crate::session::session::Session;
 use crate::session::turn::build_prompt;
-use crate::session::turn::build_skills_and_plugins;
-use crate::session::turn::built_tools;
 use crate::state_db_bridge::StateDbHandle;
+use crate::thread_manager::StartThreadOptions;
 use crate::thread_manager::ThreadManager;
 use crate::thread_manager::ThreadManagerRuntimeOptions;
 use crate::thread_manager::thread_store_from_config;
-use codex_extension_api::ExtensionRegistryBuilder;
 
-/// Everything a single debug turn would send to the model: the `instructions`
-/// field (base instructions) plus the model-visible `input` list.
-#[doc(hidden)]
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, serde::Serialize)]
 pub struct PromptDebugSnapshot {
     pub instructions: String,
     pub input: Vec<ResponseItem>,
 }
 
-/// Build the model-visible `input` list for a single debug turn.
-#[doc(hidden)]
-pub async fn build_prompt_input(
-    config: Config,
-    input: Vec<UserInput>,
-    state_db: Option<StateDbHandle>,
-    user_instructions_provider: Arc<dyn UserInstructionsProvider>,
-) -> CodexResult<Vec<ResponseItem>> {
-    build_prompt_snapshot_with_runtime_options(
-        config,
-        input,
-        state_db,
-        user_instructions_provider,
-        ThreadManagerRuntimeOptions::default(),
-    )
-    .await
-    .map(|snapshot| snapshot.input)
-}
-
-/// Build both halves of a single debug turn's request, reproducing a host's
-/// runtime options (required base instructions, model catalog, runtime
-/// extensions) so the dump matches what that host would actually send.
+/// Builds a model-visible prompt using the same process-local options as an embedding host.
 #[doc(hidden)]
 pub async fn build_prompt_snapshot_with_runtime_options(
     mut config: Config,
@@ -64,33 +39,33 @@ pub async fn build_prompt_snapshot_with_runtime_options(
     runtime_options: ThreadManagerRuntimeOptions,
 ) -> CodexResult<PromptDebugSnapshot> {
     config.ephemeral = true;
-
     let auth_manager =
-        AuthManager::shared_from_config(&config, /*enable_codex_api_key_env*/ false).await;
-
+        AuthManager::shared_from_config(&config, /*enable_codex_api_key_env*/ false)
+            .await
+            .map_err(|err| CodexErr::Fatal(err.to_string()))?;
     let local_runtime_paths = ExecServerRuntimePaths::from_optional_paths(
         config.codex_self_exe.clone(),
         config.codex_linux_sandbox_exe.clone(),
     )?;
-
     let thread_store = thread_store_from_config(&config, state_db.clone());
     let installation_id = resolve_installation_id(&config.codex_home).await?;
     let mut extensions_builder = ExtensionRegistryBuilder::<Config>::new();
-    // Provider-backed skills reach a turn only through the skills extension, and only the app
-    // server was installing it. Without this the snapshot silently drops every skill that is not
-    // file-backed — the private catalog most of all — so a dump used to check how a private skill
-    // is presented showed a session in which none exist.
     let mut skill_providers = codex_skills_extension::SkillProviders::new();
     for source in runtime_options.skill_provider_sources() {
         skill_providers = skill_providers.with_provider(source.clone());
     }
-    codex_skills_extension::install_with_providers(
+    codex_skills_extension::install_with_providers_and_metrics(
         &mut extensions_builder,
         skill_providers,
+        codex_otel::global(),
         |config: &Config| codex_skills_extension::SkillsExtensionConfig {
             include_instructions: config.include_skill_instructions,
+            max_context_tokens: config.skill_max_context_tokens,
             bundled_skills_enabled: config.bundled_skills_enabled(),
             orchestrator_skills_enabled: config.orchestrator_skills_enabled,
+            shadow_selection_enabled: config
+                .features
+                .enabled(codex_features::Feature::SkillSearch),
         },
     );
     for extension in runtime_options.runtime_extensions() {
@@ -99,11 +74,14 @@ pub async fn build_prompt_snapshot_with_runtime_options(
     let thread_manager = ThreadManager::new_with_runtime_options(
         &config,
         Arc::clone(&auth_manager),
+        crate::thread_manager::build_models_manager(&config, Arc::clone(&auth_manager)),
+        crate::CodexAppsToolsCache::default(),
         SessionSource::Exec,
         Arc::new(
             EnvironmentManager::from_codex_home(
                 config.codex_home.clone(),
                 Some(local_runtime_paths),
+                config.http_client_factory(),
             )
             .await
             .map_err(|err| CodexErr::Fatal(err.to_string()))?,
@@ -118,9 +96,68 @@ pub async fn build_prompt_snapshot_with_runtime_options(
         /*external_time_provider*/ None,
         runtime_options,
     );
-    let thread = thread_manager.start_thread(config).await?;
+    let thread = thread_manager
+        .start_thread(StartThreadOptions::new(config))
+        .await?;
+    let output = build_prompt_snapshot_from_session(&thread.thread.session, input).await;
+    let shutdown = thread.thread.shutdown_and_wait().await;
+    let _removed = thread_manager.remove_thread(&thread.thread_id).await;
+    shutdown?;
+    output
+}
 
-    let output = build_prompt_input_from_session(&thread.thread.codex.session, input).await;
+/// Build the model-visible `input` list for a single debug turn.
+#[doc(hidden)]
+pub async fn build_prompt_input(
+    mut config: Config,
+    input: Vec<UserInput>,
+    state_db: Option<StateDbHandle>,
+    extensions: Arc<ExtensionRegistry<Config>>,
+    user_instructions_provider: Arc<dyn UserInstructionsProvider>,
+) -> CodexResult<Vec<ResponseItem>> {
+    config.ephemeral = true;
+
+    let auth_manager =
+        AuthManager::shared_from_config(&config, /*enable_codex_api_key_env*/ false)
+            .await
+            .map_err(|err| CodexErr::Fatal(err.to_string()))?;
+
+    let local_runtime_paths = ExecServerRuntimePaths::from_optional_paths(
+        config.codex_self_exe.clone(),
+        config.codex_linux_sandbox_exe.clone(),
+    )?;
+
+    let thread_store = thread_store_from_config(&config, state_db.clone());
+    let installation_id = resolve_installation_id(&config.codex_home).await?;
+    let thread_manager = ThreadManager::new(
+        &config,
+        Arc::clone(&auth_manager),
+        crate::thread_manager::build_models_manager(&config, Arc::clone(&auth_manager)),
+        crate::CodexAppsToolsCache::default(),
+        SessionSource::Exec,
+        Arc::new(
+            EnvironmentManager::from_codex_home(
+                config.codex_home.clone(),
+                Some(local_runtime_paths),
+                config.http_client_factory(),
+            )
+            .await
+            .map_err(|err| CodexErr::Fatal(err.to_string()))?,
+        ),
+        extensions,
+        user_instructions_provider,
+        /*analytics_events_client*/ None,
+        thread_store,
+        crate::local_agent_graph_store_from_state_db(state_db.as_ref()),
+        installation_id,
+        /*attestation_provider*/ None,
+        /*external_time_provider*/ None,
+    );
+    let thread = thread_manager
+        .start_thread(StartThreadOptions::new(config))
+        .await?;
+
+    let output = build_prompt_input_from_session(&thread.thread.session, input).await;
     let shutdown = thread.thread.shutdown_and_wait().await;
     let _removed = thread_manager.remove_thread(&thread.thread_id).await;
 
@@ -131,36 +168,17 @@ pub async fn build_prompt_snapshot_with_runtime_options(
 pub(crate) async fn build_prompt_input_from_session(
     sess: &Arc<Session>,
     input: Vec<UserInput>,
-) -> CodexResult<PromptDebugSnapshot> {
+) -> CodexResult<Vec<ResponseItem>> {
     let turn_context = sess.new_default_turn().await;
     // Prompt debugging builds a standalone request without entering run_turn.
-    let step_context = sess.capture_step_context(Arc::clone(&turn_context)).await;
+    let step_context = sess
+        .capture_step_context(Arc::clone(&turn_context), &CancellationToken::new())
+        .await?;
     sess.record_context_updates_and_set_reference_context_item(step_context.as_ref())
-        .await;
-
-    // Mirror run_turn's ordering: user message first, then the skill, plugin and
-    // extension turn-input fragments that turn derives from it.
-    let cancellation_token = CancellationToken::new();
-    let turn_input = vec![TurnInput::UserInput {
-        content: input.clone(),
-        client_id: None,
-    }];
-    let injection_items = build_skills_and_plugins(
-        sess,
-        step_context.as_ref(),
-        &turn_input,
-        &cancellation_token,
-    )
-    .await
-    .map(|(items, _connectors)| items)
-    .unwrap_or_default();
+        .await?;
 
     if !input.is_empty() {
         let response_item = sess.response_item_from_user_input(input);
-        sess.record_conversation_items(turn_context.as_ref(), std::slice::from_ref(&response_item))
-            .await;
-    }
-    for response_item in injection_items {
         sess.record_conversation_items(turn_context.as_ref(), std::slice::from_ref(&response_item))
             .await;
     }
@@ -168,16 +186,34 @@ pub(crate) async fn build_prompt_input_from_session(
     let prompt_input = sess
         .clone_history()
         .await
-        .for_prompt(&turn_context.model_info.input_modalities);
-    let router = built_tools(sess, step_context.as_ref(), &cancellation_token).await?;
+        .for_prompt(&step_context.model_info.input_modalities);
     let base_instructions = sess.get_base_instructions().await;
-    let prompt = build_prompt(
-        prompt_input,
-        router.as_ref(),
-        turn_context.as_ref(),
-        base_instructions,
-    );
+    let prompt = build_prompt(prompt_input, step_context.as_ref(), base_instructions);
 
+    Ok(prompt.input)
+}
+
+async fn build_prompt_snapshot_from_session(
+    sess: &Arc<Session>,
+    input: Vec<UserInput>,
+) -> CodexResult<PromptDebugSnapshot> {
+    let turn_context = sess.new_default_turn().await;
+    let step_context = sess
+        .capture_step_context(Arc::clone(&turn_context), &CancellationToken::new())
+        .await?;
+    sess.record_context_updates_and_set_reference_context_item(step_context.as_ref())
+        .await?;
+    if !input.is_empty() {
+        let response_item = sess.response_item_from_user_input(input);
+        sess.record_conversation_items(turn_context.as_ref(), std::slice::from_ref(&response_item))
+            .await;
+    }
+    let prompt_input = sess
+        .clone_history()
+        .await
+        .for_prompt(&step_context.model_info.input_modalities);
+    let base_instructions = sess.get_base_instructions().await;
+    let prompt = build_prompt(prompt_input, step_context.as_ref(), base_instructions);
     Ok(PromptDebugSnapshot {
         instructions: prompt.base_instructions.text,
         input: prompt.input,

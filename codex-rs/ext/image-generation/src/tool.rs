@@ -8,10 +8,7 @@ use codex_api::ImageEditRequest;
 use codex_api::ImageGenerationRequest;
 use codex_api::ImageQuality;
 use codex_api::ImageUrl;
-use codex_core::context::extension_image_generation_output_hint;
-use codex_core::image_generation_artifact_path;
 use codex_exec_server::CreateDirectoryOptions;
-use codex_exec_server::ExecutorFileSystem;
 use codex_exec_server::LOCAL_FS;
 use codex_extension_api::ExtensionTurnItem;
 use codex_extension_api::FunctionCallError;
@@ -23,7 +20,11 @@ use codex_extension_api::ToolOutput;
 use codex_extension_api::ToolPayload;
 use codex_extension_api::ToolSpec;
 use codex_extension_api::parse_tool_input_schema;
-use codex_protocol::items::ImageGenerationItem;
+use codex_extension_items::ExtensionItem;
+use codex_extension_items::image_generation::ImageGenerationFailure;
+use codex_extension_items::image_generation::ImageGenerationItem;
+use codex_protocol::error::CodexErr;
+use codex_protocol::error::CodexErrorDetails;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::DEFAULT_IMAGE_DETAIL;
 use codex_protocol::models::FunctionCallOutputBody;
@@ -31,6 +32,9 @@ use codex_protocol::models::FunctionCallOutputContentItem;
 use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::ResponseInputItem;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::ImageGenerationBeginEvent;
+use codex_protocol::protocol::ImageGenerationEndEvent;
 use codex_tools::ResponsesApiNamespace;
 use codex_tools::ResponsesApiNamespaceTool;
 use codex_tools::ResponsesApiTool;
@@ -48,10 +52,15 @@ use serde_json::Value;
 
 use crate::IMAGE_GEN_NAMESPACE;
 use crate::IMAGEGEN_TOOL_NAME;
+use crate::artifact::image_generation_artifact_path;
+use crate::artifact::image_generation_output_hint;
 use crate::backend::CodexImagesBackend;
 
 const IMAGE_MODEL: &str = "gpt-image-2";
 const MAX_EDIT_IMAGES: usize = 5;
+const MAX_EXECUTOR_GENERATED_IMAGE_BYTES: usize = 32 * 1024 * 1024;
+const MAX_EXECUTOR_GENERATED_IMAGE_BASE64_BYTES: usize =
+    MAX_EXECUTOR_GENERATED_IMAGE_BYTES.div_ceil(3) * 4;
 const IMAGEGEN_DESCRIPTION: &str = include_str!("../imagegen_description.md");
 
 #[derive(Clone)]
@@ -86,6 +95,25 @@ struct ImagegenArgs {
     num_last_images_to_include: Option<usize>,
 }
 
+fn legacy_end_event(item: &ImageGenerationItem) -> EventMsg {
+    EventMsg::ImageGenerationEnd(ImageGenerationEndEvent {
+        call_id: item.id.clone(),
+        status: item.status.clone(),
+        revised_prompt: item.revised_prompt.clone(),
+        result: item.result.clone(),
+        transparent_background: item.transparent_background,
+        failure: item.failure.clone(),
+        saved_path: item.saved_path.clone(),
+    })
+}
+
+fn extension_turn_item(item: ImageGenerationItem, legacy_event: EventMsg) -> ExtensionTurnItem {
+    ExtensionTurnItem {
+        item: ExtensionItem::ImageGeneration(item),
+        legacy_events: vec![legacy_event],
+    }
+}
+
 impl ToolExecutor<ToolCall> for ImageGenerationTool {
     /// Keeps the tool in the existing image-generation Responses namespace.
     fn tool_name(&self) -> ToolName {
@@ -115,79 +143,87 @@ impl ImageGenerationTool {
             request_for_call_args(&args, call.conversation_history.items(), &call.environments)
                 .await?;
         call.turn_item_emitter
-            .emit_started(ExtensionTurnItem::ImageGeneration(ImageGenerationItem {
-                id: call.call_id.clone(),
-                status: "in_progress".to_string(),
-                revised_prompt: None,
-                result: String::new(),
-                saved_path: None,
-            }))
+            .emit_started(extension_turn_item(
+                ImageGenerationItem {
+                    id: call.call_id.clone(),
+                    status: "in_progress".to_string(),
+                    revised_prompt: None,
+                    result: String::new(),
+                    transparent_background: None,
+                    failure: None,
+                    saved_path: None,
+                },
+                EventMsg::ImageGenerationBegin(ImageGenerationBeginEvent {
+                    call_id: call.call_id.clone(),
+                }),
+            ))
             .await;
         let result = match request {
-            ImageRequest::Generate(request) => self.backend.generate(request).await,
-            ImageRequest::Edit(request) => self.backend.edit(request).await,
+            ImageRequest::Generate(request) => self.backend.generate(request, &call.turn_id).await,
+            ImageRequest::Edit(request) => self.backend.edit(request, &call.turn_id).await,
         }
-        .map_err(|err| format!("image generation failed: {err}"))
+        .map_err(|error| {
+            (
+                format!("image generation failed: {}", error.message()),
+                usage_limit_failure(error.codex_error()),
+            )
+        })
         .and_then(|response| {
+            let transparent_background = match response.background {
+                Some(ImageBackground::Transparent) => Some(true),
+                Some(ImageBackground::Opaque) => Some(false),
+                Some(ImageBackground::Auto) | None => None,
+            };
             response
                 .data
                 .into_iter()
                 .next()
-                .map(|data| data.b64_json)
-                .ok_or_else(|| "image generation returned no image data".to_string())
+                .map(|data| (data.b64_json, transparent_background))
+                .ok_or_else(|| ("image generation returned no image data".to_string(), None))
         });
-        let result = match result {
+        let (result, transparent_background) = match result {
             Ok(result) => result,
-            Err(message) => {
+            Err((message, failure)) => {
+                let item = ImageGenerationItem {
+                    id: call.call_id.clone(),
+                    status: "failed".to_string(),
+                    revised_prompt: Some(args.prompt),
+                    result: String::new(),
+                    transparent_background: None,
+                    failure,
+                    saved_path: None,
+                };
+                let legacy_event = legacy_end_event(&item);
                 call.turn_item_emitter
-                    .emit_completed(ExtensionTurnItem::ImageGeneration(ImageGenerationItem {
-                        id: call.call_id.clone(),
-                        status: "failed".to_string(),
-                        revised_prompt: Some(args.prompt.clone()),
-                        result: String::new(),
-                        saved_path: None,
-                    }))
+                    .emit_completed(extension_turn_item(item, legacy_event))
                     .await;
                 return Err(FunctionCallError::RespondToModel(message));
             }
         };
-        let saved_path = match self.save_root.as_ref() {
-            Some(save_root) => match save_image_generation_result(
-                LOCAL_FS.as_ref(),
-                save_root,
-                &self.thread_id,
-                &call.call_id,
-                &result,
-            )
-            .await
-            {
-                Ok(path) => Some(path),
-                Err(error) => {
-                    let output_path =
-                        image_generation_artifact_path(save_root, &self.thread_id, &call.call_id);
-                    let output_dir = output_path.parent().unwrap_or_else(|| save_root.clone());
-                    tracing::warn!(
-                        call_id = %call.call_id,
-                        output_dir = %output_dir.display(),
-                        "failed to save generated image: {error}"
-                    );
-                    None
-                }
-            },
-            None => None,
+        let saved_path = save_image_generation_result(
+            self.save_root.as_ref(),
+            call.environments.first(),
+            &self.thread_id,
+            &call.call_id,
+            &result,
+        )
+        .await;
+        let item = ImageGenerationItem {
+            id: call.call_id.clone(),
+            status: "completed".to_string(),
+            revised_prompt: Some(args.prompt),
+            result: result.clone(),
+            transparent_background,
+            failure: None,
+            saved_path: saved_path.clone(),
         };
+        let legacy_event = legacy_end_event(&item);
         call.turn_item_emitter
-            .emit_completed(ExtensionTurnItem::ImageGeneration(ImageGenerationItem {
-                id: call.call_id.clone(),
-                status: "completed".to_string(),
-                revised_prompt: Some(args.prompt),
-                result: result.clone(),
-                saved_path: saved_path.clone(),
-            }))
+            .emit_completed(extension_turn_item(item, legacy_event))
             .await;
         let output_hint = saved_path.as_ref().and_then(|output_path| {
             let output_dir = output_path.parent()?;
-            extension_image_generation_output_hint(output_dir.display(), output_path.display())
+            image_generation_output_hint(output_dir.display(), output_path.display())
         });
         Ok(Box::new(GeneratedImageOutput {
             result,
@@ -196,28 +232,164 @@ impl ImageGenerationTool {
     }
 }
 
+fn usage_limit_failure(error: &CodexErr) -> Option<ImageGenerationFailure> {
+    let CodexErrorDetails::UsageLimitReached(usage_limit) = error.details() else {
+        return None;
+    };
+    let rate_limits = usage_limit.rate_limits.as_deref()?;
+    let limit_id = rate_limits.limit_id.as_deref()?;
+    if limit_id != "image_gen" {
+        return None;
+    }
+
+    let resets_at = if let Some(reset_at) = usage_limit.resets_at.as_ref() {
+        Some(reset_at.timestamp())
+    } else {
+        [rate_limits.primary.as_ref(), rate_limits.secondary.as_ref()]
+            .into_iter()
+            .flatten()
+            .filter(|window| window.used_percent >= 100.0)
+            .filter_map(|window| window.resets_at)
+            .max()
+    };
+
+    Some(ImageGenerationFailure::UsageLimitExceeded {
+        limit_id: limit_id.to_string(),
+        resets_at,
+    })
+}
+
 async fn save_image_generation_result(
-    fs: &dyn ExecutorFileSystem,
-    save_root: &AbsolutePathBuf,
+    save_root: Option<&AbsolutePathBuf>,
+    environment: Option<&ToolEnvironment>,
     session_id: &str,
     call_id: &str,
     result: &str,
-) -> io::Result<AbsolutePathBuf> {
-    let bytes = BASE64_STANDARD
-        .decode(result.trim().as_bytes())
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-    let path = image_generation_artifact_path(save_root, session_id, call_id);
-    if let Some(parent) = path.parent() {
-        fs.create_directory(
-            &PathUri::from_abs_path(&parent),
-            CreateDirectoryOptions { recursive: true },
-            /*sandbox*/ None,
-        )
-        .await?;
+) -> Option<AbsolutePathBuf> {
+    let (output_dir, save_result) = match save_root {
+        Some(save_root) => {
+            let path = image_generation_artifact_path(save_root, session_id, call_id);
+            let output_dir = path.parent().unwrap_or_else(|| save_root.clone());
+            let save_result: io::Result<AbsolutePathBuf> = async {
+                let bytes = BASE64_STANDARD
+                    .decode(result.trim().as_bytes())
+                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+                if let Some(parent) = path.parent() {
+                    LOCAL_FS
+                        .create_directory(
+                            &PathUri::from_abs_path(&parent),
+                            CreateDirectoryOptions {
+                                recursive: true,
+                                follow_symlinks: true,
+                            },
+                            /*sandbox*/ None,
+                        )
+                        .await?;
+                }
+                LOCAL_FS
+                    .write_file(
+                        &PathUri::from_abs_path(&path),
+                        bytes,
+                        Default::default(),
+                        /*sandbox*/ None,
+                    )
+                    .await?;
+                Ok(path)
+            }
+            .await;
+            (output_dir, save_result)
+        }
+        None => {
+            let environment = environment?;
+            let output_dir = environment.cwd.join("generated_images");
+            let save_result: io::Result<AbsolutePathBuf> = async {
+                let result = result.trim();
+                if result.len() > MAX_EXECUTOR_GENERATED_IMAGE_BASE64_BYTES {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "generated image exceeds the executor file size limit",
+                    ));
+                }
+                let bytes = BASE64_STANDARD
+                    .decode(result.as_bytes())
+                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+                if bytes.len() > MAX_EXECUTOR_GENERATED_IMAGE_BYTES {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "generated image exceeds the executor file size limit",
+                    ));
+                }
+
+                let artifact_path =
+                    image_generation_artifact_path(&environment.cwd, session_id, call_id);
+                let path = output_dir.join(artifact_path.as_path().file_name().unwrap_or_default());
+                let sandbox = Some(&environment.file_system_sandbox_context);
+                if let Some(parent) = path.parent() {
+                    let parent_uri = PathUri::from_abs_path(&parent);
+                    environment
+                        .file_system
+                        .create_directory(
+                            &parent_uri,
+                            CreateDirectoryOptions {
+                                recursive: true,
+                                follow_symlinks: true,
+                            },
+                            sandbox,
+                        )
+                        .await?;
+
+                    // Full-access executor contexts do not prevent symlinked output directories.
+                    let metadata = environment
+                        .file_system
+                        .get_metadata(&parent_uri, Default::default(), sandbox)
+                        .await?;
+                    if metadata.is_symlink || !metadata.is_directory {
+                        return Err(io::Error::new(
+                            io::ErrorKind::PermissionDenied,
+                            "generated image directory is not a real directory",
+                        ));
+                    }
+                }
+
+                // Existing destination hardlinks could otherwise overwrite files outside the workspace.
+                let path_uri = PathUri::from_abs_path(&path);
+                match environment
+                    .file_system
+                    .get_metadata(&path_uri, Default::default(), sandbox)
+                    .await
+                {
+                    Ok(_) => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::AlreadyExists,
+                            "generated image destination already exists",
+                        ));
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error),
+                }
+
+                environment
+                    .file_system
+                    .write_file(&path_uri, bytes, Default::default(), sandbox)
+                    .await?;
+                Ok(path)
+            }
+            .await;
+            (output_dir, save_result)
+        }
+    };
+
+    match save_result {
+        Ok(path) => Some(path),
+        Err(error) => {
+            tracing::warn!(
+                call_id = %call_id,
+                output_dir = %output_dir.display(),
+                "failed to save generated image: {error}"
+            );
+            None
+        }
     }
-    fs.write_file(&PathUri::from_abs_path(&path), bytes, /*sandbox*/ None)
-        .await?;
-    Ok(path)
 }
 
 #[derive(Debug, PartialEq)]
@@ -333,7 +505,9 @@ fn recent_images(history: &[ResponseItem], count: usize) -> Vec<ImageUrl> {
             ResponseItem::Message { content, .. } => {
                 image_urls.extend(content.iter().rev().filter_map(|item| match item {
                     ContentItem::InputImage { image_url, .. } => Some(image_url.clone()),
-                    ContentItem::InputText { .. } | ContentItem::OutputText { .. } => None,
+                    ContentItem::InputText { .. }
+                    | ContentItem::InputAudio { .. }
+                    | ContentItem::OutputText { .. } => None,
                 }));
             }
             ResponseItem::FunctionCallOutput {
@@ -387,6 +561,7 @@ fn output_image_urls(output: &FunctionCallOutputPayload) -> impl Iterator<Item =
         .filter_map(|item| match item {
             FunctionCallOutputContentItem::InputImage { image_url, .. } => Some(image_url.clone()),
             FunctionCallOutputContentItem::InputText { .. }
+            | FunctionCallOutputContentItem::InputAudio { .. }
             | FunctionCallOutputContentItem::EncryptedContent { .. } => None,
         })
 }
@@ -399,7 +574,7 @@ async fn image_url(
     let sandbox = environment.file_system_sandbox_context.clone();
     let bytes = environment
         .file_system
-        .read_file(&path_uri, Some(&sandbox))
+        .read_file(&path_uri, Default::default(), Some(&sandbox))
         .await
         .map_err(|error| {
             FunctionCallError::RespondToModel(format!(

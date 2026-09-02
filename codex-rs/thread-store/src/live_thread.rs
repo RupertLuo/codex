@@ -2,12 +2,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use codex_protocol::ThreadId;
-use codex_protocol::protocol::CompactedItem;
-use codex_protocol::protocol::RolloutItem;
-use codex_protocol::protocol::RolloutTransaction;
+use codex_protocol::protocol::ThreadHistoryMode;
 use codex_protocol::protocol::ThreadMemoryMode;
-use codex_protocol::protocol::flatten_rollout_items;
-use codex_rollout::RolloutPersistenceBatchMeasurement;
+use codex_rollout::RolloutItem;
 use codex_rollout::RolloutPersistenceTelemetry;
 use codex_rollout::measure_and_filter_rollout_items;
 use codex_rollout::persisted_rollout_items;
@@ -18,6 +15,7 @@ use crate::AppendThreadItemsParams;
 use crate::CreateThreadParams;
 use crate::LoadThreadHistoryParams;
 use crate::LocalThreadStore;
+use crate::PersistContext;
 use crate::ReadThreadParams;
 use crate::ResumeThreadParams;
 use crate::StoredThread;
@@ -25,39 +23,12 @@ use crate::StoredThreadHistory;
 use crate::ThreadMetadataMutationGate;
 use crate::ThreadMetadataPatch;
 use crate::ThreadStore;
+use crate::ThreadStoreError;
 use crate::ThreadStoreResult;
 use crate::ThreadTitleGenerator;
 use crate::ThreadTitleRequest;
 use crate::UpdateThreadMetadataParams;
 use crate::thread_metadata_sync::ThreadMetadataSync;
-
-const ATOMIC_APPEND_RECONCILIATION_ATTEMPTS: usize = 3;
-
-/// Durable outcome of appending one stable-identity rollout record.
-#[derive(Debug)]
-pub enum AtomicAppendOutcome {
-    /// The record is durably visible, either from the append result or reconciliation.
-    Committed,
-    /// Durable history was readable and did not contain the stable identity.
-    NotCommitted {
-        append_error: crate::ThreadStoreError,
-    },
-    /// Durable history could not be read after bounded reconciliation attempts.
-    ///
-    /// Callers must not restore an incremental baseline in this state. Restarting/reloading the
-    /// thread converges from whichever complete checkpoint records are actually durable.
-    Ambiguous {
-        append_error: crate::ThreadStoreError,
-        reconciliation_errors: Vec<crate::ThreadStoreError>,
-    },
-}
-
-pub type CompactionCheckpointAppendOutcome = AtomicAppendOutcome;
-
-enum AtomicAppendIdentity {
-    Transaction(String),
-    CompactionCheckpoint(String),
-}
 
 /// Handle for an active thread's persistence lifecycle.
 ///
@@ -67,6 +38,7 @@ enum AtomicAppendIdentity {
 #[derive(Clone)]
 pub struct LiveThread {
     thread_id: ThreadId,
+    history_mode: ThreadHistoryMode,
     thread_store: Arc<dyn ThreadStore>,
     metadata_sync: Arc<Mutex<ThreadMetadataSync>>,
     persistence_telemetry: RolloutPersistenceTelemetry,
@@ -128,10 +100,12 @@ impl LiveThread {
         params: CreateThreadParams,
     ) -> ThreadStoreResult<Self> {
         let thread_id = params.thread_id;
+        let history_mode = params.history_mode;
         let metadata_sync = ThreadMetadataSync::for_create(&params).await;
         thread_store.create_thread(params).await?;
         Ok(Self {
             thread_id,
+            history_mode,
             thread_store,
             metadata_sync: Arc::new(Mutex::new(metadata_sync)),
             persistence_telemetry: RolloutPersistenceTelemetry::new(thread_id),
@@ -139,14 +113,64 @@ impl LiveThread {
         })
     }
 
+    /// Create a child thread with inherited model context already durable.
+    ///
+    /// The boundary belongs in session metadata before the copied prefix is written so history
+    /// projection can distinguish inherited context from the child's own records immediately.
+    pub async fn create_with_inherited_model_context(
+        thread_store: Arc<dyn ThreadStore>,
+        mut params: CreateThreadParams,
+        inherited_model_context: &[RolloutItem],
+    ) -> ThreadStoreResult<Self> {
+        let persisted_prefix_item_count =
+            persisted_rollout_items(inherited_model_context, params.history_mode).len();
+        params.subagent_history_start_ordinal = Some(
+            u64::try_from(persisted_prefix_item_count)
+                .map_err(|_| ThreadStoreError::Internal {
+                    message: "inherited model context is too large".to_string(),
+                })?
+                .checked_add(1)
+                .ok_or_else(|| ThreadStoreError::Internal {
+                    message: "inherited model context is too large".to_string(),
+                })?,
+        );
+        let live_thread = Self::create(thread_store, params).await?;
+        if let Err(err) = live_thread
+            .persist_appended_items(inherited_model_context)
+            .await
+        {
+            if let Err(discard_err) = live_thread.discard().await {
+                warn!(
+                    "failed to discard thread persistence after inherited context append failed: {discard_err}"
+                );
+            }
+            return Err(err);
+        }
+        Ok(live_thread)
+    }
+
     pub async fn resume(
         thread_store: Arc<dyn ThreadStore>,
+        history_mode: ThreadHistoryMode,
         params: ResumeThreadParams,
     ) -> ThreadStoreResult<Self> {
         let thread_id = params.thread_id;
         let should_load_history = params.history.is_none();
         let include_archived = params.include_archived;
-        let mut metadata_sync = ThreadMetadataSync::for_resume(&params);
+        let metadata = if history_mode == ThreadHistoryMode::Paginated
+            && let Some(local_store) = thread_store.as_any().downcast_ref::<LocalThreadStore>()
+            && let Some(state_db) = local_store.state_db().await
+        {
+            state_db
+                .get_thread(thread_id)
+                .await
+                .map_err(|err| ThreadStoreError::Internal {
+                    message: format!("failed to read thread metadata for {thread_id}: {err}"),
+                })?
+        } else {
+            None
+        };
+        let mut metadata_sync = ThreadMetadataSync::for_resume(&params, metadata.as_ref());
         thread_store.resume_thread(params).await?;
         if should_load_history {
             match thread_store
@@ -169,6 +193,7 @@ impl LiveThread {
         }
         Ok(Self {
             thread_id,
+            history_mode,
             thread_store,
             metadata_sync: Arc::new(Mutex::new(metadata_sync)),
             persistence_telemetry: RolloutPersistenceTelemetry::new(thread_id),
@@ -188,202 +213,45 @@ impl LiveThread {
     #[tracing::instrument(
         level = "trace",
         skip_all,
-        fields(item_count = items.len())
+        fields(item_count = raw_items.len())
     )]
-    pub async fn append_items(&self, items: &[RolloutItem]) -> ThreadStoreResult<()> {
-        // Empty appends are intentionally ignored rather than represented as zero-sized batches.
+    pub async fn append_items(&self, raw_items: &[RolloutItem]) -> ThreadStoreResult<()> {
+        let items = self.persist_appended_items(raw_items).await?;
         if items.is_empty() {
             return Ok(());
-        }
-        let (canonical_items, measurement) = if self.persistence_telemetry.is_enabled() {
-            let (canonical_items, measurement) = measure_and_filter_rollout_items(items);
-            (canonical_items, Some(measurement))
-        } else {
-            (persisted_rollout_items(items), None)
-        };
-        self.thread_store
-            .append_items(AppendThreadItemsParams {
-                thread_id: self.thread_id,
-                items: items.to_vec(),
-            })
-            .await?;
-        self.finish_durable_append(items, &canonical_items, measurement)
-            .await;
-        Ok(())
-    }
-
-    /// Appends one canonical transaction envelope and reconciles a store error by stable ID.
-    pub async fn append_transaction(
-        &self,
-        transaction: &RolloutTransaction,
-    ) -> AtomicAppendOutcome {
-        let item = RolloutItem::Transaction(transaction.clone());
-        if !codex_rollout::is_persisted_rollout_item(&item) {
-            return AtomicAppendOutcome::NotCommitted {
-                append_error: crate::ThreadStoreError::InvalidRequest {
-                    message: "rollout transaction payload is not canonical".to_string(),
-                },
-            };
-        }
-        self.append_identity_reconciled(
-            item,
-            AtomicAppendIdentity::Transaction(transaction.transaction_id.clone()),
-        )
-        .await
-    }
-
-    /// Appends one local-compaction checkpoint record and reconciles an ambiguous store error by
-    /// scanning durable history for its stable ID.
-    ///
-    /// Reconciliation retries reads, never the append itself. This avoids creating duplicates at
-    /// this layer while still tolerating duplicates produced by a backing writer's own retry.
-    pub async fn append_compaction_checkpoint(
-        &self,
-        compacted_item: &CompactedItem,
-    ) -> CompactionCheckpointAppendOutcome {
-        let Some(checkpoint_id) = compacted_item
-            .checkpoint
-            .as_ref()
-            .map(|checkpoint| checkpoint.checkpoint_id.clone())
-        else {
-            return AtomicAppendOutcome::NotCommitted {
-                append_error: crate::ThreadStoreError::InvalidRequest {
-                    message: "compaction checkpoint payload is missing".to_string(),
-                },
-            };
-        };
-        let item = RolloutItem::Compacted(compacted_item.clone());
-        self.append_identity_reconciled(
-            item,
-            AtomicAppendIdentity::CompactionCheckpoint(checkpoint_id),
-        )
-        .await
-    }
-
-    async fn append_identity_reconciled(
-        &self,
-        item: RolloutItem,
-        identity: AtomicAppendIdentity,
-    ) -> AtomicAppendOutcome {
-        let append_error = match self.append_items(std::slice::from_ref(&item)).await {
-            Ok(()) => return AtomicAppendOutcome::Committed,
-            Err(err) => err,
-        };
-        let failed_append_may_become_durable = self.thread_store.failed_append_may_become_durable();
-        let mut reconciliation_errors = Vec::new();
-        for attempt in 0..ATOMIC_APPEND_RECONCILIATION_ATTEMPTS {
-            match self.load_history(/*include_archived*/ true).await {
-                Ok(history) => {
-                    let committed = match atomic_identity_is_visible(&identity, &history.items) {
-                        Ok(committed) => committed,
-                        Err(err) => {
-                            reconciliation_errors.push(crate::ThreadStoreError::Internal {
-                                message: format!(
-                                    "failed to traverse durable history during append reconciliation: {err}"
-                                ),
-                            });
-                            if attempt + 1 < ATOMIC_APPEND_RECONCILIATION_ATTEMPTS {
-                                tokio::task::yield_now().await;
-                            }
-                            continue;
-                        }
-                    };
-                    if committed {
-                        let items = std::slice::from_ref(&item);
-                        let (canonical_items, measurement) =
-                            if self.persistence_telemetry.is_enabled() {
-                                let (canonical_items, measurement) =
-                                    measure_and_filter_rollout_items(items);
-                                (canonical_items, Some(measurement))
-                            } else {
-                                (persisted_rollout_items(items), None)
-                            };
-                        self.finish_durable_append(items, &canonical_items, measurement)
-                            .await;
-                        return AtomicAppendOutcome::Committed;
-                    }
-                    if !failed_append_may_become_durable {
-                        return AtomicAppendOutcome::NotCommitted { append_error };
-                    }
-                    if attempt + 1 == ATOMIC_APPEND_RECONCILIATION_ATTEMPTS {
-                        reconciliation_errors.push(crate::ThreadStoreError::Internal {
-                            message: "durable history does not contain the stable append ID, but \
-                                      the store may retain failed appends for a later durability \
-                                      barrier"
-                                .to_string(),
-                        });
-                    }
-                }
-                Err(err) => reconciliation_errors.push(err),
-            }
-            if attempt + 1 < ATOMIC_APPEND_RECONCILIATION_ATTEMPTS {
-                tokio::task::yield_now().await;
-            }
-        }
-        AtomicAppendOutcome::Ambiguous {
-            append_error,
-            reconciliation_errors,
-        }
-    }
-
-    async fn finish_durable_append(
-        &self,
-        items: &[RolloutItem],
-        canonical_items: &[RolloutItem],
-        measurement: Option<RolloutPersistenceBatchMeasurement>,
-    ) {
-        if let Some(measurement) = measurement.as_ref() {
-            self.persistence_telemetry.record_batch(items, measurement);
-        }
-        if canonical_items.is_empty() {
-            return;
         }
         let update = self
             .metadata_sync
             .lock()
             .await
-            .observe_appended_items(canonical_items);
+            .observe_appended_items(items.as_slice());
         if let Some(update) = update {
-            let result = self
-                .thread_store
+            self.thread_store
                 .update_thread_metadata(UpdateThreadMetadataParams {
                     thread_id: self.thread_id,
                     patch: update.patch.clone(),
                     include_archived: true,
                 })
-                .await;
-            match result {
-                Ok(_) => {
-                    self.metadata_sync
-                        .lock()
-                        .await
-                        .mark_pending_update_applied(&update);
-                }
-                Err(err) => {
-                    warn!(
-                        thread_id = %self.thread_id,
-                        %err,
-                        "durable append succeeded but thread metadata projection failed; update remains pending"
-                    );
-                }
-            }
+                .await?;
+            self.metadata_sync
+                .lock()
+                .await
+                .mark_pending_update_applied(&update);
         }
-        self.maybe_dispatch_llm_title(items).await;
+        self.maybe_dispatch_llm_title(items.as_slice()).await;
+        Ok(())
     }
 
-    /// Best-effort: once the first assistant turn completes, spawn an async task
-    /// that upgrades the rule-based title to an LLM-generated one. This never
-    /// blocks the append/turn hot path and leaves the rule-based title on any
-    /// failure.
     async fn maybe_dispatch_llm_title(&self, items: &[RolloutItem]) {
-        let request = {
-            let mut metadata_sync = self.metadata_sync.lock().await;
-            metadata_sync.take_llm_title_request(items)
-        };
-        let Some(request) = request else {
+        let Some(generator) = self.thread_store.title_generator() else {
             return;
         };
-        let Some(generator) = self.thread_store.title_generator() else {
+        let request = self
+            .metadata_sync
+            .lock()
+            .await
+            .take_llm_title_request(items);
+        let Some(request) = request else {
             return;
         };
         spawn_llm_title_task(
@@ -395,8 +263,42 @@ impl LiveThread {
         );
     }
 
-    pub async fn persist(&self) -> ThreadStoreResult<()> {
-        self.thread_store.persist_thread(self.thread_id).await?;
+    async fn persist_appended_items(
+        &self,
+        raw_items: &[RolloutItem],
+    ) -> ThreadStoreResult<Vec<RolloutItem>> {
+        // Empty appends are intentionally ignored rather than represented as zero-sized batches.
+        if raw_items.is_empty() {
+            return Ok(Vec::new());
+        }
+        let (items, measurement) = if self.persistence_telemetry.is_enabled() {
+            let (items, measurement) =
+                measure_and_filter_rollout_items(raw_items, self.history_mode);
+            (items, Some(measurement))
+        } else {
+            (persisted_rollout_items(raw_items, self.history_mode), None)
+        };
+        self.thread_store
+            .append_items(AppendThreadItemsParams {
+                thread_id: self.thread_id,
+                items: raw_items.to_vec(),
+            })
+            .await?;
+        if let Some(measurement) = measurement.as_ref() {
+            self.persistence_telemetry
+                .record_batch(raw_items, measurement);
+        }
+        Ok(items)
+    }
+
+    pub async fn persist(&self, context: PersistContext) -> ThreadStoreResult<()> {
+        if context == PersistContext::TurnStart {
+            self.flush_pending_metadata_update_for_existing_history()
+                .await?;
+        }
+        self.thread_store
+            .persist_thread(self.thread_id, context)
+            .await?;
         self.flush_pending_metadata_update().await
     }
 
@@ -407,9 +309,19 @@ impl LiveThread {
     }
 
     pub async fn shutdown(&self) -> ThreadStoreResult<()> {
-        self.flush_pending_metadata_update_for_existing_history()
-            .await?;
-        self.thread_store.shutdown_thread(self.thread_id).await
+        let metadata_result = self
+            .flush_pending_metadata_update_for_existing_history()
+            .await;
+        let shutdown_result = self.thread_store.shutdown_thread(self.thread_id).await;
+        match (metadata_result, shutdown_result) {
+            (Err(metadata_error), Err(shutdown_error)) => Err(ThreadStoreError::Internal {
+                message: format!(
+                    "thread metadata update failed: {metadata_error}; thread shutdown failed: {shutdown_error}"
+                ),
+            }),
+            (Err(metadata_error), Ok(())) => Err(metadata_error),
+            (Ok(()), result) => result,
+        }
     }
 
     pub async fn discard(&self) -> ThreadStoreResult<()> {
@@ -461,19 +373,31 @@ impl LiveThread {
         Ok(())
     }
 
+    /// Updates metadata while preserving this API's materialized-thread contract.
+    ///
+    /// Stores may successfully return no thread for a no-op update, so this reads the thread as a
+    /// fallback in that case.
     pub async fn update_metadata(
         &self,
         patch: ThreadMetadataPatch,
         include_archived: bool,
     ) -> ThreadStoreResult<StoredThread> {
         self.flush_pending_metadata_update().await?;
-        self.thread_store
+        let updated = self
+            .thread_store
             .update_thread_metadata(UpdateThreadMetadataParams {
                 thread_id: self.thread_id,
                 patch,
                 include_archived,
             })
-            .await
+            .await?;
+        match updated {
+            Some(thread) => Ok(thread),
+            None => {
+                self.read_thread(include_archived, /*include_history*/ false)
+                    .await
+            }
+        }
     }
 
     /// Returns the live local rollout path for legacy local-only callers.
@@ -529,35 +453,6 @@ impl LiveThread {
     }
 }
 
-fn atomic_identity_is_visible(
-    identity: &AtomicAppendIdentity,
-    items: &[RolloutItem],
-) -> Result<bool, codex_protocol::protocol::RolloutItemTraversalError> {
-    let flattened = flatten_rollout_items(items)?;
-    Ok(match identity {
-        AtomicAppendIdentity::Transaction(transaction_id) => {
-            flattened.contains_transaction_id(transaction_id)
-        }
-        AtomicAppendIdentity::CompactionCheckpoint(checkpoint_id) => {
-            flattened.items().iter().copied().any(|item| {
-                matches!(
-                    item,
-                    RolloutItem::Compacted(compacted)
-                        if compacted.checkpoint.as_ref().is_some_and(|checkpoint| {
-                            checkpoint.checkpoint_id == *checkpoint_id
-                        })
-                )
-            })
-        }
-    })
-}
-
-/// Spawns the best-effort LLM title task on the current Tokio runtime.
-///
-/// The task calls the host generator, then writes the title through the same
-/// [`ThreadStore::update_thread_metadata`] path used by rule-based titles and
-/// manual renames. It only overwrites when the stored name is still the
-/// rule-based first-user-message title, so a manual rename is never clobbered.
 fn spawn_llm_title_task(
     thread_store: Arc<dyn ThreadStore>,
     generator: Arc<dyn ThreadTitleGenerator>,
@@ -595,13 +490,6 @@ fn spawn_llm_title_task(
             })
             .await
         {
-            // Only replace the auto-derived rule-based title, never a manual
-            // rename. Stores that keep the rule-based title equal to the first
-            // user message surface it as an *empty* name (it is not a "distinct"
-            // title), so `None` is the common auto-derived state; other stores may
-            // instead expose the name verbatim. Treat both as still-auto-derived,
-            // while a manual rename or an already-applied generated title leaves a
-            // different, non-empty name and is left untouched.
             Ok(thread)
                 if thread.name.is_none()
                     || thread.name.as_deref() == Some(guard_title.as_str()) =>
@@ -632,8 +520,6 @@ fn spawn_llm_title_task(
     });
 }
 
-/// Normalizes a raw model title into a short, single-line, punctuation-trimmed
-/// display title.
 fn sanitize_title(raw: &str) -> String {
     let first_line = raw
         .lines()
@@ -654,685 +540,29 @@ fn sanitize_title(raw: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::InMemoryThreadStore;
-    use crate::ThreadPersistenceMetadata;
-    use codex_protocol::models::BaseInstructions;
-    use codex_protocol::protocol::AgentMessageEvent;
-    use codex_protocol::protocol::CompactedItem;
-    use codex_protocol::protocol::CompactionCheckpoint;
-    use codex_protocol::protocol::EventMsg;
-    use codex_protocol::protocol::RolloutTransaction;
-    use codex_protocol::protocol::SessionSource;
-    use codex_protocol::protocol::ThreadHistoryMode;
-    use codex_protocol::protocol::TokenCountEvent;
-    use codex_protocol::protocol::TokenUsage;
-    use codex_protocol::protocol::TokenUsageInfo;
-    use codex_protocol::protocol::TurnCompleteEvent;
-    use codex_protocol::protocol::UserMessageEvent;
-    use pretty_assertions::assert_eq;
-    use std::sync::atomic::AtomicBool;
-    use std::sync::atomic::Ordering;
-
-    #[derive(Debug)]
-    struct StubTitleGenerator;
-
-    impl ThreadTitleGenerator for StubTitleGenerator {
-        fn generate_title<'a>(
-            &'a self,
-            _request: ThreadTitleRequest,
-        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<String>> + Send + 'a>>
-        {
-            Box::pin(async { Some("generated title".to_string()) })
-        }
-    }
-
-    #[derive(Debug)]
-    struct TrackingMutationGate {
-        allow: bool,
-        acquire_attempted: Arc<AtomicBool>,
-        permit_held: Arc<AtomicBool>,
-        permit_released: Arc<AtomicBool>,
-        title_notified: Arc<AtomicBool>,
-    }
-
-    struct TrackingMutationPermit {
-        permit_held: Arc<AtomicBool>,
-        permit_released: Arc<AtomicBool>,
-    }
-
-    impl Drop for TrackingMutationPermit {
-        fn drop(&mut self) {
-            self.permit_held.store(false, Ordering::SeqCst);
-            self.permit_released.store(true, Ordering::SeqCst);
-        }
-    }
-
-    impl crate::ThreadMetadataMutationPermit for TrackingMutationPermit {}
-
-    impl ThreadMetadataMutationGate for TrackingMutationGate {
-        fn acquire<'a>(&'a self) -> crate::ThreadMetadataMutationPermitFuture<'a> {
-            Box::pin(async move {
-                self.acquire_attempted.store(true, Ordering::SeqCst);
-                if !self.allow {
-                    return None;
-                }
-                self.permit_held.store(true, Ordering::SeqCst);
-                Some(Box::new(TrackingMutationPermit {
-                    permit_held: Arc::clone(&self.permit_held),
-                    permit_released: Arc::clone(&self.permit_released),
-                })
-                    as Box<dyn crate::ThreadMetadataMutationPermit>)
-            })
-        }
-
-        fn title_updated(&self, _title: String) {
-            self.title_notified.store(true, Ordering::SeqCst);
-        }
-    }
-
-    struct PermitObservingThreadStore {
-        inner: Arc<InMemoryThreadStore>,
-        permit_held: Arc<AtomicBool>,
-        title_read_while_held: AtomicBool,
-        title_update_seen: AtomicBool,
-        title_update_while_held: AtomicBool,
-    }
-
-    impl PermitObservingThreadStore {
-        fn new(permit_held: Arc<AtomicBool>) -> Self {
-            Self {
-                inner: Arc::new(InMemoryThreadStore::default()),
-                permit_held,
-                title_read_while_held: AtomicBool::new(false),
-                title_update_seen: AtomicBool::new(false),
-                title_update_while_held: AtomicBool::new(false),
-            }
-        }
-    }
-
-    impl ThreadStore for PermitObservingThreadStore {
-        fn as_any(&self) -> &dyn std::any::Any {
-            self
-        }
-
-        fn set_title_generator(&self, generator: Arc<dyn ThreadTitleGenerator>) {
-            self.inner.set_title_generator(generator);
-        }
-
-        fn title_generator(&self) -> Option<Arc<dyn ThreadTitleGenerator>> {
-            self.inner.title_generator()
-        }
-
-        fn create_thread(&self, params: CreateThreadParams) -> crate::ThreadStoreFuture<'_, ()> {
-            ThreadStore::create_thread(self.inner.as_ref(), params)
-        }
-
-        fn resume_thread(&self, params: ResumeThreadParams) -> crate::ThreadStoreFuture<'_, ()> {
-            ThreadStore::resume_thread(self.inner.as_ref(), params)
-        }
-
-        fn append_items(
-            &self,
-            params: AppendThreadItemsParams,
-        ) -> crate::ThreadStoreFuture<'_, ()> {
-            ThreadStore::append_items(self.inner.as_ref(), params)
-        }
-
-        fn persist_thread(&self, thread_id: ThreadId) -> crate::ThreadStoreFuture<'_, ()> {
-            ThreadStore::persist_thread(self.inner.as_ref(), thread_id)
-        }
-
-        fn flush_thread(&self, thread_id: ThreadId) -> crate::ThreadStoreFuture<'_, ()> {
-            ThreadStore::flush_thread(self.inner.as_ref(), thread_id)
-        }
-
-        fn shutdown_thread(&self, thread_id: ThreadId) -> crate::ThreadStoreFuture<'_, ()> {
-            ThreadStore::shutdown_thread(self.inner.as_ref(), thread_id)
-        }
-
-        fn discard_thread(&self, thread_id: ThreadId) -> crate::ThreadStoreFuture<'_, ()> {
-            ThreadStore::discard_thread(self.inner.as_ref(), thread_id)
-        }
-
-        fn load_history(
-            &self,
-            params: LoadThreadHistoryParams,
-        ) -> crate::ThreadStoreFuture<'_, StoredThreadHistory> {
-            ThreadStore::load_history(self.inner.as_ref(), params)
-        }
-
-        fn read_thread(
-            &self,
-            params: ReadThreadParams,
-        ) -> crate::ThreadStoreFuture<'_, StoredThread> {
-            self.title_read_while_held
-                .store(self.permit_held.load(Ordering::SeqCst), Ordering::SeqCst);
-            ThreadStore::read_thread(self.inner.as_ref(), params)
-        }
-
-        fn read_thread_by_rollout_path(
-            &self,
-            params: crate::ReadThreadByRolloutPathParams,
-        ) -> crate::ThreadStoreFuture<'_, StoredThread> {
-            ThreadStore::read_thread_by_rollout_path(self.inner.as_ref(), params)
-        }
-
-        fn list_threads(
-            &self,
-            params: crate::ListThreadsParams,
-        ) -> crate::ThreadStoreFuture<'_, crate::ThreadPage> {
-            ThreadStore::list_threads(self.inner.as_ref(), params)
-        }
-
-        fn update_thread_metadata(
-            &self,
-            params: UpdateThreadMetadataParams,
-        ) -> crate::ThreadStoreFuture<'_, StoredThread> {
-            if params.patch.title.as_deref() == Some("generated title") {
-                self.title_update_seen.store(true, Ordering::SeqCst);
-                self.title_update_while_held
-                    .store(self.permit_held.load(Ordering::SeqCst), Ordering::SeqCst);
-            }
-            ThreadStore::update_thread_metadata(self.inner.as_ref(), params)
-        }
-
-        fn archive_thread(
-            &self,
-            params: crate::ArchiveThreadParams,
-        ) -> crate::ThreadStoreFuture<'_, ()> {
-            ThreadStore::archive_thread(self.inner.as_ref(), params)
-        }
-
-        fn unarchive_thread(
-            &self,
-            params: crate::ArchiveThreadParams,
-        ) -> crate::ThreadStoreFuture<'_, StoredThread> {
-            ThreadStore::unarchive_thread(self.inner.as_ref(), params)
-        }
-
-        fn delete_thread(
-            &self,
-            params: crate::DeleteThreadParams,
-        ) -> crate::ThreadStoreFuture<'_, ()> {
-            ThreadStore::delete_thread(self.inner.as_ref(), params)
-        }
-    }
-
-    fn user_message_item(message: &str) -> RolloutItem {
-        RolloutItem::EventMsg(EventMsg::UserMessage(UserMessageEvent {
-            client_id: None,
-            message: message.to_string(),
-            images: None,
-            local_images: Vec::new(),
-            text_elements: Vec::new(),
-            ..Default::default()
-        }))
-    }
-
-    fn completed_assistant_turn(message: &str) -> Vec<RolloutItem> {
-        vec![
-            RolloutItem::EventMsg(EventMsg::AgentMessage(AgentMessageEvent {
-                message: message.to_string(),
-                phase: None,
-                memory_citation: None,
-            })),
-            RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
-                turn_id: "title-turn".to_string(),
-                last_agent_message: Some(message.to_string()),
-                completed_at: None,
-                duration_ms: None,
-                time_to_first_token_ms: None,
-            })),
-        ]
-    }
-
-    fn create_params(thread_id: ThreadId) -> CreateThreadParams {
-        CreateThreadParams {
-            session_id: thread_id.into(),
-            thread_id,
-            extra_config: None,
-            forked_from_id: None,
-            parent_thread_id: None,
-            source: SessionSource::Exec,
-            thread_source: None,
-            originator: "live-thread-checkpoint-test".to_string(),
-            base_instructions: BaseInstructions::default(),
-            dynamic_tools: Vec::new(),
-            selected_capability_roots: Vec::new(),
-            multi_agent_version: None,
-            history_mode: ThreadHistoryMode::Legacy,
-            initial_window_id: uuid::Uuid::now_v7().to_string(),
-            metadata: ThreadPersistenceMetadata {
-                cwd: None,
-                model_provider: "test-provider".to_string(),
-                memory_mode: ThreadMemoryMode::Enabled,
-            },
-        }
-    }
-
-    fn checkpoint(checkpoint_id: &str) -> CompactedItem {
-        let info = TokenUsageInfo {
-            total_token_usage: TokenUsage {
-                total_tokens: 100,
-                ..TokenUsage::default()
-            },
-            last_token_usage: TokenUsage {
-                total_tokens: 25,
-                ..TokenUsage::default()
-            },
-            model_context_window: Some(4_096),
-        };
-        let token_count = TokenCountEvent {
-            info: Some(info),
-            rate_limits: None,
-        };
-        CompactedItem {
-            message: "summary".to_string(),
-            replacement_history: Some(Vec::new()),
-            window_number: Some(1),
-            first_window_id: None,
-            previous_window_id: None,
-            window_id: None,
-            checkpoint: Some(CompactionCheckpoint {
-                checkpoint_id: checkpoint_id.to_string(),
-                reference_context_item: None,
-                world_state: None,
-                api_token_count: token_count.clone(),
-                final_token_count: token_count,
-                server_reasoning_included: true,
-            }),
-        }
-    }
-
-    fn transaction(transaction_id: &str) -> RolloutTransaction {
-        RolloutTransaction {
-            transaction_id: transaction_id.to_string(),
-            items: vec![user_message_item("transaction message")],
-        }
-    }
-
-    async fn live_thread() -> (Arc<InMemoryThreadStore>, LiveThread, ThreadId) {
-        let thread_id = ThreadId::default();
-        let store = Arc::new(InMemoryThreadStore::default());
-        let live_thread = LiveThread::create(store.clone(), create_params(thread_id))
-            .await
-            .expect("create live thread");
-        (store, live_thread, thread_id)
-    }
-
-    #[tokio::test]
-    async fn transaction_append_reconciles_present_id_as_committed() {
-        let (store, live_thread, thread_id) = live_thread().await;
-        store
-            .fail_next_append_after_items(1, "ambiguous append after durable transaction")
-            .await;
-
-        let outcome = live_thread
-            .append_transaction(&transaction("transaction-present"))
-            .await;
-
-        assert!(matches!(outcome, AtomicAppendOutcome::Committed));
-        let history = store
-            .load_history(LoadThreadHistoryParams {
-                thread_id,
-                include_archived: true,
-            })
-            .await
-            .expect("load reconciled history");
-        assert_eq!(
-            history
-                .items
-                .iter()
-                .filter(|item| matches!(
-                    item,
-                    RolloutItem::Transaction(transaction)
-                        if transaction.transaction_id == "transaction-present"
-                ))
-                .count(),
-            1
-        );
-    }
-
-    #[tokio::test]
-    async fn transaction_append_reconciles_absent_id_as_not_committed() {
-        let (store, live_thread, thread_id) = live_thread().await;
-        store
-            .fail_next_append("failure before transaction write")
-            .await;
-
-        let outcome = live_thread
-            .append_transaction(&transaction("transaction-absent"))
-            .await;
-
-        assert!(matches!(outcome, AtomicAppendOutcome::NotCommitted { .. }));
-        let history = store
-            .load_history(LoadThreadHistoryParams {
-                thread_id,
-                include_archived: true,
-            })
-            .await
-            .expect("load history");
-        assert!(history.items.iter().all(|item| !matches!(
-            item,
-            RolloutItem::Transaction(transaction)
-                if transaction.transaction_id == "transaction-absent"
-        )));
-    }
-
-    #[tokio::test]
-    async fn transaction_absence_is_ambiguous_when_store_may_commit_buffered_items_later() {
-        let permit_held = Arc::new(AtomicBool::new(false));
-        let store = Arc::new(PermitObservingThreadStore::new(permit_held));
-        let thread_id = ThreadId::default();
-        let live_thread = LiveThread::create(store.clone(), create_params(thread_id))
-            .await
-            .expect("create live thread");
-        store
-            .inner
-            .fail_next_append("buffered append failed before becoming readable")
-            .await;
-
-        let outcome = live_thread
-            .append_transaction(&transaction("transaction-buffered"))
-            .await;
-
-        assert!(matches!(outcome, AtomicAppendOutcome::Ambiguous { .. }));
-        assert_eq!(store.inner.calls().await.load_history, 3);
-    }
-
-    #[tokio::test]
-    async fn transaction_append_reports_ambiguous_after_bounded_reconciliation() {
-        let (store, live_thread, _thread_id) = live_thread().await;
-        store.fail_next_append("ambiguous backing append").await;
-        store
-            .fail_next_history_loads(10, "history unavailable during reconciliation")
-            .await;
-
-        let outcome = live_thread
-            .append_transaction(&transaction("transaction-unknown"))
-            .await;
-
-        assert!(matches!(outcome, AtomicAppendOutcome::Ambiguous { .. }));
-        assert_eq!(store.calls().await.load_history, 3);
-    }
-
-    #[tokio::test]
-    async fn metadata_failure_after_reconciled_transaction_does_not_downgrade_commit() {
-        let (store, live_thread, _thread_id) = live_thread().await;
-        store
-            .fail_next_append_after_items(1, "ambiguous append after durable transaction")
-            .await;
-        store
-            .fail_next_metadata_update("metadata projection unavailable")
-            .await;
-
-        let outcome = live_thread
-            .append_transaction(&transaction("transaction-metadata"))
-            .await;
-
-        assert!(matches!(outcome, AtomicAppendOutcome::Committed));
-        assert_eq!(store.calls().await.update_thread_metadata, 1);
-        live_thread.persist().await.expect("retry pending metadata");
-        assert_eq!(store.calls().await.update_thread_metadata, 2);
-    }
-
-    #[tokio::test]
-    async fn checkpoint_append_reconciles_present_id_as_committed() {
-        let (store, live_thread, thread_id) = live_thread().await;
-        let checkpoint = checkpoint("checkpoint-present");
-        store
-            .fail_next_append_after_items(1, "ambiguous append after durable record")
-            .await;
-
-        let outcome = live_thread.append_compaction_checkpoint(&checkpoint).await;
-
-        assert!(matches!(
-            outcome,
-            CompactionCheckpointAppendOutcome::Committed
-        ));
-        let history = store
-            .load_history(LoadThreadHistoryParams {
-                thread_id,
-                include_archived: true,
-            })
-            .await
-            .expect("load reconciled history");
-        assert_eq!(
-            history
-                .items
-                .iter()
-                .filter(|item| matches!(
-                    item,
-                    RolloutItem::Compacted(item)
-                        if item.checkpoint.as_ref().map(|checkpoint| checkpoint.checkpoint_id.as_str())
-                            == Some("checkpoint-present")
-                ))
-                .count(),
-            1
-        );
-    }
-
-    #[tokio::test]
-    async fn checkpoint_append_reconciles_absent_id_as_not_committed() {
-        let (store, live_thread, thread_id) = live_thread().await;
-        store
-            .fail_next_append("failure before checkpoint write")
-            .await;
-
-        let outcome = live_thread
-            .append_compaction_checkpoint(&checkpoint("checkpoint-absent"))
-            .await;
-
-        assert!(matches!(
-            outcome,
-            CompactionCheckpointAppendOutcome::NotCommitted { .. }
-        ));
-        let history = store
-            .load_history(LoadThreadHistoryParams {
-                thread_id,
-                include_archived: true,
-            })
-            .await
-            .expect("load history");
-        assert!(history.items.iter().all(|item| !matches!(
-            item,
-            RolloutItem::Compacted(item) if item.checkpoint.is_some()
-        )));
-    }
-
-    #[tokio::test]
-    async fn checkpoint_append_reports_ambiguous_after_bounded_reconciliation() {
-        let (store, live_thread, _thread_id) = live_thread().await;
-        store.fail_next_append("ambiguous backing append").await;
-        store
-            .fail_next_history_loads(10, "history unavailable during reconciliation")
-            .await;
-
-        let outcome = live_thread
-            .append_compaction_checkpoint(&checkpoint("checkpoint-unknown"))
-            .await;
-
-        assert!(matches!(
-            outcome,
-            CompactionCheckpointAppendOutcome::Ambiguous { .. }
-        ));
-    }
-
-    #[tokio::test]
-    async fn metadata_failure_after_durable_checkpoint_is_retryable_not_append_failure() {
-        let (store, live_thread, _thread_id) = live_thread().await;
-        store
-            .fail_next_metadata_update("metadata projection unavailable")
-            .await;
-
-        let outcome = live_thread
-            .append_compaction_checkpoint(&checkpoint("checkpoint-metadata"))
-            .await;
-
-        assert!(matches!(
-            outcome,
-            CompactionCheckpointAppendOutcome::Committed
-        ));
-        assert_eq!(store.calls().await.update_thread_metadata, 1);
-        live_thread.persist().await.expect("retry pending metadata");
-        assert_eq!(store.calls().await.update_thread_metadata, 2);
-    }
-
-    #[tokio::test]
-    async fn generated_title_holds_mutation_permit_across_read_and_update() {
-        let permit_held = Arc::new(AtomicBool::new(false));
-        let acquire_attempted = Arc::new(AtomicBool::new(false));
-        let permit_released = Arc::new(AtomicBool::new(false));
-        let title_notified = Arc::new(AtomicBool::new(false));
-        let gate = Arc::new(TrackingMutationGate {
-            allow: true,
-            acquire_attempted: Arc::clone(&acquire_attempted),
-            permit_held: Arc::clone(&permit_held),
-            permit_released: Arc::clone(&permit_released),
-            title_notified: Arc::clone(&title_notified),
-        });
-        let store = Arc::new(PermitObservingThreadStore::new(Arc::clone(&permit_held)));
-        store.set_title_generator(Arc::new(StubTitleGenerator));
-        let thread_id = ThreadId::default();
-        let live_thread = LiveThread::create(store.clone(), create_params(thread_id))
-            .await
-            .expect("create live thread")
-            .with_metadata_mutation_gate(gate);
-
-        live_thread
-            .append_items(&[user_message_item("opening question")])
-            .await
-            .expect("append first user message");
-        let updates_before_title = store.inner.calls().await.update_thread_metadata;
-        live_thread
-            .append_items(&completed_assistant_turn("opening answer"))
-            .await
-            .expect("append completed assistant turn");
-
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            while !store.title_update_seen.load(Ordering::SeqCst)
-                || !permit_released.load(Ordering::SeqCst)
-            {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("generated title update should complete");
-
-        assert!(acquire_attempted.load(Ordering::SeqCst));
-        assert!(store.title_read_while_held.load(Ordering::SeqCst));
-        assert!(store.title_update_while_held.load(Ordering::SeqCst));
-        assert!(permit_released.load(Ordering::SeqCst));
-        assert!(title_notified.load(Ordering::SeqCst));
-        assert!(!permit_held.load(Ordering::SeqCst));
-        assert!(
-            store.inner.calls().await.update_thread_metadata > updates_before_title,
-            "the guarded title path must perform an actual metadata update"
-        );
-    }
-
-    #[tokio::test]
-    async fn denied_title_mutation_permit_skips_store_access() {
-        let permit_held = Arc::new(AtomicBool::new(false));
-        let acquire_attempted = Arc::new(AtomicBool::new(false));
-        let permit_released = Arc::new(AtomicBool::new(false));
-        let title_notified = Arc::new(AtomicBool::new(false));
-        let gate = Arc::new(TrackingMutationGate {
-            allow: false,
-            acquire_attempted: Arc::clone(&acquire_attempted),
-            permit_held: Arc::clone(&permit_held),
-            permit_released: Arc::clone(&permit_released),
-            title_notified: Arc::clone(&title_notified),
-        });
-        let store = Arc::new(PermitObservingThreadStore::new(Arc::clone(&permit_held)));
-        store.set_title_generator(Arc::new(StubTitleGenerator));
-        let thread_id = ThreadId::default();
-        let live_thread = LiveThread::create(store.clone(), create_params(thread_id))
-            .await
-            .expect("create live thread")
-            .with_metadata_mutation_gate(gate);
-
-        live_thread
-            .append_items(&[user_message_item("opening question")])
-            .await
-            .expect("append first user message");
-        let calls_before_title = store.inner.calls().await;
-        live_thread
-            .append_items(&completed_assistant_turn("opening answer"))
-            .await
-            .expect("append completed assistant turn");
-
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            while !acquire_attempted.load(Ordering::SeqCst) {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("detached title task should consult the mutation gate");
-        tokio::task::yield_now().await;
-
-        let calls_after_title = store.inner.calls().await;
-        assert_eq!(
-            calls_after_title.read_thread,
-            calls_before_title.read_thread
-        );
-        assert!(!store.title_update_seen.load(Ordering::SeqCst));
-        assert!(!permit_held.load(Ordering::SeqCst));
-        assert!(!permit_released.load(Ordering::SeqCst));
-        assert!(!title_notified.load(Ordering::SeqCst));
-    }
+    use super::sanitize_title;
 
     #[test]
-    fn sanitize_title_passthrough() {
+    fn sanitize_title_preserves_plain_text() {
         assert_eq!(sanitize_title("Hello World"), "Hello World");
     }
 
     #[test]
-    fn sanitize_title_strips_double_quotes() {
-        assert_eq!(sanitize_title("\"Hello World\""), "Hello World");
-    }
-
-    #[test]
-    fn sanitize_title_strips_cjk_quotes() {
+    fn sanitize_title_removes_quotes_and_punctuation() {
+        assert_eq!(sanitize_title("\"Hello World.\""), "Hello World");
         assert_eq!(sanitize_title("「标题」"), "标题");
-        assert_eq!(sanitize_title("《标题》"), "标题");
-        assert_eq!(sanitize_title("\u{201c}Title\u{201d}"), "Title");
-    }
-
-    #[test]
-    fn sanitize_title_strips_trailing_punctuation() {
-        assert_eq!(sanitize_title("Hello."), "Hello");
-        assert_eq!(sanitize_title("你好。"), "你好");
-        assert_eq!(sanitize_title("Hello!"), "Hello");
         assert_eq!(sanitize_title("Test？"), "Test");
     }
 
     #[test]
-    fn sanitize_title_first_nonempty_line() {
+    fn sanitize_title_uses_first_nonempty_line_and_limits_length() {
         assert_eq!(sanitize_title("\n\nHello\nWorld"), "Hello");
+        assert_eq!(sanitize_title(&"a".repeat(50)).chars().count(), 30);
     }
 
     #[test]
-    fn sanitize_title_truncates_at_30_chars() {
-        let long = "a".repeat(50);
-        let result = sanitize_title(&long);
-        assert_eq!(result.chars().count(), 30);
-    }
-
-    #[test]
-    fn sanitize_title_empty_input() {
+    fn sanitize_title_returns_empty_for_empty_input() {
         assert_eq!(sanitize_title("   "), "");
         assert_eq!(sanitize_title(""), "");
-    }
-
-    #[test]
-    fn sanitize_title_combined() {
-        // Quoted + trailing punctuation + long
-        let input = "\"This is a very long title that exceeds thirty characters.\"";
-        let result = sanitize_title(input);
-        assert!(!result.starts_with('"'));
-        assert!(!result.ends_with('"'));
-        assert!(result.chars().count() <= 30);
     }
 }

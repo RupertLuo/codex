@@ -42,6 +42,7 @@ pub(super) struct AutoCompactWindow {
     /// resume/recompute baselines when available.
     prefill_input_tokens: Option<AutoCompactWindowPrefill>,
     token_budget_reminder_delivered: bool,
+    auto_compact_fallback_delivered: bool,
 }
 
 impl AutoCompactWindow {
@@ -52,6 +53,7 @@ impl AutoCompactWindow {
             new_context_window_requested: false,
             prefill_input_tokens: None,
             token_budget_reminder_delivered: false,
+            auto_compact_fallback_delivered: false,
         }
     }
 
@@ -72,48 +74,22 @@ impl AutoCompactWindow {
         self.ids = ids;
     }
 
-    #[cfg(test)]
     pub(super) fn advance(&mut self) -> (u64, AutoCompactWindowIds) {
-        let prepared = self.prepare_advance();
-        let committed = self.commit_prepared_advance(prepared.0, prepared.1);
-        debug_assert!(committed, "freshly prepared compact window should commit");
-        prepared
-    }
-
-    pub(super) fn prepare_advance(&self) -> (u64, AutoCompactWindowIds) {
-        let mut ids = self.ids;
-        ids.previous_window_id = Some(ids.window_id);
-        ids.window_id = Uuid::now_v7();
-        (self.window_number.saturating_add(1), ids)
-    }
-
-    pub(super) fn commit_prepared_advance(
-        &mut self,
-        window_number: u64,
-        ids: AutoCompactWindowIds,
-    ) -> bool {
-        if !self.can_commit_prepared_advance(window_number, ids) {
-            return false;
-        }
-        self.window_number = window_number;
-        self.ids = ids;
+        self.window_number = self.window_number.saturating_add(1);
+        self.ids.previous_window_id = Some(self.ids.window_id);
+        self.ids.window_id = Uuid::now_v7();
         self.new_context_window_requested = false;
         self.token_budget_reminder_delivered = false;
-        true
-    }
-
-    pub(super) fn can_commit_prepared_advance(
-        &self,
-        window_number: u64,
-        ids: AutoCompactWindowIds,
-    ) -> bool {
-        !(window_number != self.window_number.saturating_add(1)
-            || ids.first_window_id != self.ids.first_window_id
-            || ids.previous_window_id != Some(self.ids.window_id))
+        self.auto_compact_fallback_delivered = false;
+        (self.window_number, self.ids)
     }
 
     pub(super) fn claim_token_budget_reminder(&mut self) -> bool {
         !std::mem::replace(&mut self.token_budget_reminder_delivered, true)
+    }
+
+    pub(super) fn claim_auto_compact_fallback(&mut self) -> bool {
+        !std::mem::replace(&mut self.auto_compact_fallback_delivered, true)
     }
 
     pub(super) fn request_new_context_window(&mut self) {
@@ -200,6 +176,8 @@ mod tests {
         assert_eq!(window.ids().window_id, restored_window_id);
         assert!(window.claim_token_budget_reminder());
         assert!(!window.claim_token_budget_reminder());
+        assert!(window.claim_auto_compact_fallback());
+        assert!(!window.claim_auto_compact_fallback());
         window.request_new_context_window();
         assert!(window.take_new_context_window_request());
         assert!(!window.take_new_context_window_request());
@@ -214,6 +192,7 @@ mod tests {
         assert_ne!(ids.window_id, restored_window_id);
         assert!(!window.take_new_context_window_request());
         assert!(window.claim_token_budget_reminder());
+        assert!(window.claim_auto_compact_fallback());
 
         assert_eq!(
             window.snapshot(),

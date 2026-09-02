@@ -1,20 +1,20 @@
 use crate::ARCHIVED_SESSIONS_SUBDIR;
+use crate::RolloutItem;
 use crate::SESSIONS_SUBDIR;
 use crate::compression;
-use crate::list::parse_timestamp_uuid_from_filename;
 use crate::recorder::RolloutRecorder;
+use crate::rollout_file_name::RolloutFileName;
 use crate::state_db::normalize_cwd_for_state_db;
 use chrono::DateTime;
 use chrono::NaiveDateTime;
 use chrono::Timelike;
 use chrono::Utc;
-use codex_protocol::ThreadId;
+use codex_protocol::RolloutId;
 use codex_protocol::protocol::AskForApproval;
-use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::SandboxPolicy;
 use codex_protocol::protocol::SessionMetaLine;
 use codex_protocol::protocol::SessionSource;
-use codex_protocol::protocol::flatten_rollout_items;
+use codex_protocol::protocol::ThreadHistoryMode;
 use codex_state::BackfillState;
 use codex_state::BackfillStats;
 use codex_state::BackfillStatus;
@@ -66,51 +66,46 @@ pub(crate) fn builder_from_session_meta(
 pub fn builder_from_items(
     items: &[RolloutItem],
     rollout_path: &Path,
-) -> Result<Option<ThreadMetadataBuilder>, codex_protocol::protocol::RolloutItemTraversalError> {
-    let flattened = flatten_rollout_items(items)?;
-    if let Some(session_meta) = flattened
-        .items()
-        .iter()
-        .copied()
-        .find_map(|item| match item {
-            RolloutItem::SessionMeta(meta_line) => Some(meta_line),
-            RolloutItem::ResponseItem(_)
-            | RolloutItem::InterAgentCommunication(_)
-            | RolloutItem::InterAgentCommunicationMetadata { .. }
-            | RolloutItem::Compacted(_)
-            | RolloutItem::TurnContext(_)
-            | RolloutItem::WorldState(_)
-            | RolloutItem::Transaction(_)
-            | RolloutItem::EventMsg(_) => None,
-        })
-        && let Some(builder) = builder_from_session_meta(session_meta, rollout_path)
+) -> Option<ThreadMetadataBuilder> {
+    if let Some(session_meta) = items.iter().find_map(|item| match item {
+        RolloutItem::SessionMeta(meta_line) => Some(meta_line),
+        RolloutItem::ResponseItem(_)
+        | RolloutItem::InterAgentCommunication(_)
+        | RolloutItem::InterAgentCommunicationMetadata { .. }
+        | RolloutItem::Compacted(_)
+        | RolloutItem::TurnContext(_)
+        | RolloutItem::WorldState(_)
+        | RolloutItem::SecurityRiskScore(_)
+        | RolloutItem::EventMsg(_) => None,
+    }) && let Some(builder) = builder_from_session_meta(session_meta, rollout_path)
     {
-        return Ok(Some(builder));
+        return Some(builder);
     }
 
-    let Some(file_name) = rollout_path.file_name().and_then(|name| name.to_str()) else {
-        return Ok(None);
-    };
-    let Some(file_name) = compression::parse_rollout_file_name(file_name) else {
-        return Ok(None);
-    };
-    let Some((created_ts, uuid)) = parse_timestamp_uuid_from_filename(file_name) else {
-        return Ok(None);
-    };
-    let Some(created_at) = DateTime::<Utc>::from_timestamp(created_ts.unix_timestamp(), 0)
-        .and_then(|timestamp| timestamp.with_nanosecond(0))
-    else {
-        return Ok(None);
-    };
-    let Ok(id) = ThreadId::from_string(&uuid.to_string()) else {
-        return Ok(None);
-    };
-    Ok(Some(ThreadMetadataBuilder::new(
-        id,
+    let file_name = rollout_path.file_name()?.to_str()?;
+    let file_name = RolloutFileName::parse(file_name)?;
+    let created_ts = file_name.timestamp();
+    let created_at =
+        DateTime::<Utc>::from_timestamp(created_ts.unix_timestamp(), 0)?.with_nanosecond(0)?;
+    Some(ThreadMetadataBuilder::new(
+        file_name.thread_id(),
         rollout_path.to_path_buf(),
         created_at,
         SessionSource::default(),
-    )))
+    ))
+}
+
+/// Returns the rollout ID encoded in a canonical rollout filename.
+///
+/// Normal rollouts use `rollout-<timestamp>-<thread-id>.jsonl`, where the thread ID and rollout ID
+/// are the same. Threads that have been `reverted` use
+/// `rollout-<timestamp>-<thread-id>_<rollout-id>.jsonl`, where this returns the ID after `_`.
+///
+/// This can differ from [`SessionMeta::id`] when `thread/revert` keeps the thread ID stable while
+/// switching to a new immutable rollout file.
+pub fn rollout_id_from_path(rollout_path: &Path) -> Option<RolloutId> {
+    let file_name = rollout_path.file_name()?.to_str()?;
+    Some(RolloutFileName::parse(file_name)?.rollout_id())
 }
 
 pub async fn extract_metadata_from_rollout(
@@ -125,21 +120,15 @@ pub async fn extract_metadata_from_rollout(
             rollout_path.display()
         ));
     }
-    let flattened = flatten_rollout_items(items.as_slice()).map_err(|err| {
-        anyhow::anyhow!(
-            "failed to traverse rollout history in {}: {err}",
-            rollout_path.display()
-        )
-    })?;
-    let builder = builder_from_items(items.as_slice(), rollout_path)?.ok_or_else(|| {
+    let builder = builder_from_items(items.as_slice(), rollout_path).ok_or_else(|| {
         anyhow::anyhow!(
             "rollout missing metadata builder: {}",
             rollout_path.display()
         )
     })?;
     let mut metadata = builder.build(default_provider);
-    for item in flattened.items() {
-        apply_rollout_item(&mut metadata, item, default_provider)?;
+    for item in &items {
+        apply_rollout_item(&mut metadata, item, default_provider);
     }
     if let Some(updated_at) = file_modified_time_utc(rollout_path).await {
         metadata.updated_at = updated_at;
@@ -147,22 +136,17 @@ pub async fn extract_metadata_from_rollout(
     }
     Ok(ExtractionOutcome {
         metadata,
-        memory_mode: flattened
-            .items()
-            .iter()
-            .rev()
-            .copied()
-            .find_map(|item| match item {
-                RolloutItem::SessionMeta(meta_line) => meta_line.meta.memory_mode.clone(),
-                RolloutItem::ResponseItem(_)
-                | RolloutItem::InterAgentCommunication(_)
-                | RolloutItem::InterAgentCommunicationMetadata { .. }
-                | RolloutItem::Compacted(_)
-                | RolloutItem::TurnContext(_)
-                | RolloutItem::WorldState(_)
-                | RolloutItem::Transaction(_)
-                | RolloutItem::EventMsg(_) => None,
-            }),
+        memory_mode: items.iter().rev().find_map(|item| match item {
+            RolloutItem::SessionMeta(meta_line) => meta_line.meta.memory_mode.clone(),
+            RolloutItem::ResponseItem(_)
+            | RolloutItem::InterAgentCommunication(_)
+            | RolloutItem::InterAgentCommunicationMetadata { .. }
+            | RolloutItem::Compacted(_)
+            | RolloutItem::TurnContext(_)
+            | RolloutItem::WorldState(_)
+            | RolloutItem::SecurityRiskScore(_)
+            | RolloutItem::EventMsg(_) => None,
+        }),
         parse_errors,
     })
 }
@@ -296,9 +280,14 @@ pub(crate) async fn backfill_sessions_with_lease(
                     let mut metadata = outcome.metadata;
                     metadata.cwd = normalize_cwd_for_state_db(&metadata.cwd);
                     let memory_mode = outcome.memory_mode.unwrap_or_else(|| "enabled".to_string());
-                    if let Ok(Some(existing_metadata)) = runtime.get_thread(metadata.id).await {
-                        metadata.prefer_existing_git_info(&existing_metadata);
-                        metadata.prefer_existing_explicit_title(&existing_metadata);
+                    let existing_metadata = runtime.get_thread(metadata.id).await.ok().flatten();
+                    // Paginated metadata updates are SQLite-only. Use the rollout mode to seed a
+                    // missing row, then keep the value from SQLite.
+                    let restore_memory_mode_from_rollout = existing_metadata.is_none()
+                        || matches!(metadata.history_mode, ThreadHistoryMode::Legacy);
+                    if let Some(existing_metadata) = existing_metadata.as_ref() {
+                        metadata.prefer_existing_git_info(existing_metadata);
+                        metadata.prefer_existing_explicit_title(existing_metadata);
                     }
                     if rollout.archived && metadata.archived_at.is_none() {
                         let fallback_archived_at = metadata.updated_at;
@@ -310,9 +299,10 @@ pub(crate) async fn backfill_sessions_with_lease(
                         stats.failed = stats.failed.saturating_add(1);
                         warn!("failed to upsert rollout {}: {err}", rollout.path.display());
                     } else {
-                        if let Err(err) = runtime
-                            .set_thread_memory_mode(metadata.id, memory_mode.as_str())
-                            .await
+                        if restore_memory_mode_from_rollout
+                            && let Err(err) = runtime
+                                .set_thread_memory_mode(metadata.id, memory_mode.as_str())
+                                .await
                         {
                             stats.failed = stats.failed.saturating_add(1);
                             warn!(

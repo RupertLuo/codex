@@ -3,19 +3,9 @@ use std::path::PathBuf;
 use std::process::Command;
 
 #[test]
-fn catalyst_profile_environment_is_ignored_off_windows() {
-    assert_eq!(
-        PowerShellProfileMode::from_environment_value(Some(std::ffi::OsStr::new(
-            "/runtime/Catalyst.Profile.ps1",
-        ))),
-        PowerShellProfileMode::Standard
-    );
-}
-
-#[test]
 #[cfg(target_os = "macos")]
 fn detects_zsh() {
-    let zsh_shell = get_shell(ShellType::Zsh, /*path*/ None).unwrap();
+    let zsh_shell = get_shell(ShellType::Zsh).unwrap();
 
     let shell_path = zsh_shell.shell_path;
 
@@ -34,7 +24,7 @@ fn fish_fallback_to_zsh() {
 
 #[test]
 fn detects_bash() {
-    let bash_shell = get_shell(ShellType::Bash, /*path*/ None).unwrap();
+    let bash_shell = get_shell(ShellType::Bash).unwrap();
     let shell_path = bash_shell.shell_path;
 
     assert!(
@@ -45,7 +35,7 @@ fn detects_bash() {
 
 #[test]
 fn detects_sh() {
-    let sh_shell = get_shell(ShellType::Sh, /*path*/ None).unwrap();
+    let sh_shell = get_shell(ShellType::Sh).unwrap();
     let shell_path = sh_shell.shell_path;
     assert!(
         shell_path.file_name().and_then(|name| name.to_str()) == Some("sh"),
@@ -58,12 +48,12 @@ fn can_run_on_shell_test() {
     let cmd = "echo \"Works\"";
     if cfg!(windows) {
         assert!(shell_works(
-            get_shell(ShellType::PowerShell, /*path*/ None),
+            get_shell(ShellType::PowerShell),
             "Out-String 'Works'",
             /*required*/ true,
         ));
         assert!(shell_works(
-            get_shell(ShellType::Cmd, /*path*/ None),
+            get_shell(ShellType::Cmd),
             cmd,
             /*required*/ true,
         ));
@@ -79,17 +69,17 @@ fn can_run_on_shell_test() {
             /*required*/ true
         ));
         assert!(shell_works(
-            get_shell(ShellType::Zsh, /*path*/ None),
+            get_shell(ShellType::Zsh),
             cmd,
             /*required*/ false
         ));
         assert!(shell_works(
-            get_shell(ShellType::Bash, /*path*/ None),
+            get_shell(ShellType::Bash),
             cmd,
             /*required*/ true
         ));
         assert!(shell_works(
-            get_shell(ShellType::Sh, /*path*/ None),
+            get_shell(ShellType::Sh),
             cmd,
             /*required*/ true
         ));
@@ -143,9 +133,6 @@ fn derive_exec_args() {
         shell_type: ShellType::PowerShell,
         shell_path: PathBuf::from("pwsh.exe"),
     };
-    // Deliberately the bare command: safety classification, policy matching, and the command shown
-    // to the user are all derived from this, so the UTF-8 piping fix is applied at the spawn
-    // boundary instead (see `spawn::with_powershell_utf8_piping`).
     assert_eq!(
         test_powershell_shell.derive_exec_args("echo hello", /*use_login_shell*/ false),
         vec!["pwsh.exe", "-NoProfile", "-Command", "echo hello"]
@@ -194,7 +181,7 @@ fn finds_powershell() {
         return;
     }
 
-    let powershell_shell = get_shell(ShellType::PowerShell, /*path*/ None).unwrap();
+    let powershell_shell = get_shell(ShellType::PowerShell).unwrap();
     let shell_path = powershell_shell.shell_path;
 
     assert!(shell_path.ends_with("pwsh.exe") || shell_path.ends_with("powershell.exe"));

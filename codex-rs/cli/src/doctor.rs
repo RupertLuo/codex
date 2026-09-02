@@ -39,6 +39,10 @@ use codex_core::config::ConfigBuilder;
 use codex_core::config::ConfigOverrides;
 use codex_core::config::find_codex_home;
 use codex_features::FEATURES;
+use codex_http_client::ClientRouteClass;
+use codex_http_client::HttpClientFactory;
+use codex_http_client::OutboundProxyPolicy;
+use codex_http_client::RouteAwareClientPool;
 use codex_install_context::CodexPackageLayout;
 use codex_install_context::InstallContext;
 use codex_install_context::InstallMethod;
@@ -49,7 +53,7 @@ use codex_login::CODEX_ACCESS_TOKEN_ENV_VAR;
 use codex_login::CODEX_API_KEY_ENV_VAR;
 use codex_login::CodexAuth;
 use codex_login::OPENAI_API_KEY_ENV_VAR;
-use codex_login::default_client::build_reqwest_client;
+use codex_login::default_client::create_client_without_request_logging;
 use codex_login::default_client::default_headers;
 use codex_login::load_auth_dot_json;
 use codex_model_provider::create_model_provider;
@@ -63,18 +67,30 @@ use codex_tui::Cli as TuiCli;
 use codex_utils_cli::CliConfigOverrides;
 use http::HeaderMap;
 use http::HeaderValue;
+use http::Method;
 use serde::Serialize;
 use supports_color::Stream;
 
 mod background;
+mod desktop;
+mod disk;
 mod git;
+mod network;
 mod output;
 mod progress;
 mod runtime;
+mod sandbox;
+mod security;
 mod system;
 mod thread_inventory;
 mod title;
 mod updates;
+#[cfg(target_os = "windows")]
+mod windows_dev_drive;
+
+#[cfg(test)]
+#[path = "doctor/desktop_tests.rs"]
+mod desktop_tests;
 
 use background::background_server_check;
 use git::git_check;
@@ -85,6 +101,7 @@ use progress::DoctorProgress;
 use progress::doctor_progress;
 use runtime::runtime_check;
 use runtime::search_check;
+use sandbox::sandbox_check;
 use system::system_check;
 use thread_inventory::thread_inventory_check;
 use title::terminal_title_check;
@@ -340,6 +357,7 @@ async fn build_report(
     let progress = doctor_progress(command.json);
     let mut checks = Vec::new();
     checks.push(run_sync_check("system", progress.clone(), system_check));
+    checks.push(run_async_check("endpoint protection", progress.clone(), security::check()).await);
     checks.push(run_sync_check("installation", progress.clone(), || {
         installation_check(!command.summary)
     }));
@@ -348,11 +366,34 @@ async fn build_report(
 
     progress.begin("config");
     let config_result = load_config(root_config_overrides, interactive, arg0_paths).await;
+    let cwd = config_result
+        .as_ref()
+        .map(|config| config.cwd.as_path().to_path_buf())
+        .unwrap_or_else(|_| {
+            let mut cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+            if let Some(requested_cwd) = &interactive.cwd {
+                cwd.push(requested_cwd);
+            }
+            cwd
+        });
+    checks.push(run_sync_check("disk", progress.clone(), || {
+        disk::check(config_result.as_ref().ok(), &cwd)
+    }));
+    #[cfg(target_os = "windows")]
+    checks.push(run_sync_check("dev drive", progress.clone(), || {
+        windows_dev_drive::check(&cwd)
+    }));
     match &config_result {
         Ok(config) => {
-            let auth_manager =
+            let auth_manager_result =
                 AuthManager::shared_from_config(config, /*enable_codex_api_key_env*/ true).await;
+            let auth_manager = auth_manager_result.as_ref().ok().cloned();
             let reachability_plan = provider_reachability_plan(config);
+            #[cfg(target_os = "macos")]
+            let reachability_url = reachability_plan
+                .endpoints
+                .first()
+                .map(|endpoint| endpoint.url.clone());
             let (
                 config_check,
                 auth_check,
@@ -370,13 +411,29 @@ async fn build_report(
                 reachability_check,
             ) = tokio::join!(
                 async { run_sync_check("config", progress.clone(), || config_check(config)) },
-                async { run_sync_check("auth", progress.clone(), || auth_check(config)) },
+                async {
+                    run_sync_check("auth", progress.clone(), || match &auth_manager_result {
+                        Ok(_) => auth_check(config),
+                        Err(error) => DoctorCheck::new(
+                            "auth.load",
+                            "auth",
+                            CheckStatus::Fail,
+                            "authentication could not be initialized",
+                        )
+                        .detail(error.to_string())
+                        .remediation(
+                            "Fix the reported authentication error, then rerun codex doctor.",
+                        ),
+                    })
+                },
                 async { run_sync_check("updates", progress.clone(), || updates_check(config)) },
-                async { run_sync_check("network", progress.clone(), network_check) },
+                async {
+                    run_sync_check("network", progress.clone(), || network::check(Some(config)))
+                },
                 run_async_check(
                     "websocket",
                     progress.clone(),
-                    websocket_reachability_check(config, Some(auth_manager)),
+                    websocket_reachability_check(config, auth_manager),
                 ),
                 run_async_check("MCP", progress.clone(), mcp_check(config)),
                 async {
@@ -412,6 +469,12 @@ async fn build_report(
                     provider_reachability_check(reachability_plan),
                 ),
             );
+            #[cfg(target_os = "macos")]
+            let reachability_check = network::with_system_proxy_remediation(
+                reachability_check,
+                config,
+                reachability_url.as_deref(),
+            );
             checks.extend([
                 config_check,
                 auth_check,
@@ -431,10 +494,6 @@ async fn build_report(
         }
         Err(err) => {
             let reachability_plan = default_reachability_plan();
-            let fallback_cwd = interactive
-                .cwd
-                .clone()
-                .unwrap_or_else(|| env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
             let (
                 config_check,
                 network_check,
@@ -455,13 +514,17 @@ async fn build_report(
                         .remediation("Fix the reported config error, then rerun codex doctor.")
                     })
                 },
-                async { run_sync_check("network", progress.clone(), network_check) },
+                async {
+                    run_sync_check("network", progress.clone(), || {
+                        network::check(/*config*/ None)
+                    })
+                },
                 async {
                     run_sync_check("terminal", progress.clone(), || {
                         terminal_check(command.no_color)
                     })
                 },
-                run_async_check("git", progress.clone(), git_check(fallback_cwd.as_path())),
+                run_async_check("git", progress.clone(), git_check(&cwd)),
                 async { run_sync_check("state", progress.clone(), fallback_state_check) },
                 run_async_check(
                     "provider reachability",
@@ -478,6 +541,17 @@ async fn build_report(
                 reachability_check,
             ]);
         }
+    }
+
+    progress.begin("desktop");
+    if let Some(desktop) = desktop::collect().await {
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        if let Some(application) = desktop.application.as_ref() {
+            updates::append_desktop_update(&mut checks, config_result.as_ref().ok(), application)
+                .await;
+        }
+        progress.finish("desktop", overall_status(&desktop.checks));
+        checks.extend(desktop.checks);
     }
 
     progress.settle();
@@ -797,6 +871,10 @@ fn installation_check(show_details: bool) -> DoctorCheck {
         "managed by bun: {}",
         env::var_os("CODEX_MANAGED_BY_BUN").is_some()
     ));
+    details.push(format!(
+        "managed by pnpm: {}",
+        env::var_os("CODEX_MANAGED_BY_PNPM").is_some()
+    ));
     push_env_path_detail(
         &mut details,
         "managed package root",
@@ -885,6 +963,7 @@ fn doctor_managed_by_npm(current_exe: Option<&Path>) -> bool {
 fn inherited_managed_env_for_cargo_binary(current_exe: Option<&Path>) -> bool {
     if env::var_os("CODEX_MANAGED_BY_NPM").is_none()
         && env::var_os("CODEX_MANAGED_BY_BUN").is_none()
+        && env::var_os("CODEX_MANAGED_BY_PNPM").is_none()
     {
         return false;
     }
@@ -936,6 +1015,9 @@ fn describe_install_context(context: &InstallContext) -> String {
         }
         InstallMethod::Bun => {
             describe_method_with_package_layout("bun", context.package_layout.as_ref())
+        }
+        InstallMethod::Pnpm => {
+            describe_method_with_package_layout("pnpm", context.package_layout.as_ref())
         }
         InstallMethod::Brew => {
             describe_method_with_package_layout("brew", context.package_layout.as_ref())
@@ -1081,7 +1163,10 @@ fn config_check(config: &Config) -> DoctorCheck {
     ));
     details.push(format!("model provider: {}", config.model_provider_id));
     details.push(format!("log dir: {}", config.log_dir.display()));
-    details.push(format!("sqlite home: {}", config.sqlite_home.display()));
+    details.push(format!(
+        "sqlite home: {}",
+        config.sqlite_config().home().display()
+    ));
     details.push(format!("mcp servers: {}", config.mcp_servers.get().len()));
     feature_flag_details(config, &mut details);
     config_toml_details(config, &mut details);
@@ -1327,6 +1412,7 @@ fn stored_auth_mode(auth: &codex_login::AuthDotJson) -> &'static str {
         AuthMode::ApiKey => "api_key",
         AuthMode::Chatgpt => "chatgpt",
         AuthMode::ChatgptAuthTokens => "chatgpt_auth_tokens",
+        AuthMode::Headers => "headers",
         AuthMode::AgentIdentity => "agent_identity",
         AuthMode::PersonalAccessToken => "personal_access_token",
         AuthMode::BedrockApiKey => "bedrock_api_key",
@@ -1397,6 +1483,9 @@ fn stored_auth_issues(
                 issues.push("external ChatGPT auth is missing refresh metadata");
             }
         }
+        AuthMode::Headers => {
+            issues.push("header auth cannot be loaded from auth storage");
+        }
         AuthMode::AgentIdentity => {
             if auth
                 .agent_identity
@@ -1422,42 +1511,6 @@ fn stored_auth_issues(
         }
     }
     issues
-}
-
-fn network_check() -> DoctorCheck {
-    let mut details = Vec::new();
-    push_proxy_env_details(&mut details);
-
-    let mut status = CheckStatus::Ok;
-    let mut summary = "network-related environment looks readable".to_string();
-    for name in ["CODEX_CA_CERTIFICATE", "SSL_CERT_FILE"] {
-        if let Some(raw) = env::var_os(name) {
-            let path = PathBuf::from(raw);
-            match std::fs::metadata(&path) {
-                Ok(metadata) if metadata.is_file() => {
-                    if let Err(err) = read_probe_file(&path) {
-                        status = CheckStatus::Warning;
-                        summary = "custom CA env var points at an unreadable file".to_string();
-                        details.push(format!("{name}: {} ({err})", path.display()));
-                    } else {
-                        details.push(format!("{name}: readable file {}", path.display()));
-                    }
-                }
-                Ok(_) => {
-                    status = CheckStatus::Warning;
-                    summary = "custom CA env var does not point at a file".to_string();
-                    details.push(format!("{name}: not a file {}", path.display()));
-                }
-                Err(err) => {
-                    status = CheckStatus::Warning;
-                    summary = "custom CA env var points at an unreadable path".to_string();
-                    details.push(format!("{name}: {} ({err})", path.display()));
-                }
-            }
-        }
-    }
-
-    DoctorCheck::new("network.env", "network", status, summary).details(details)
 }
 
 fn push_proxy_env_details(details: &mut Vec<String>) {
@@ -1645,41 +1698,6 @@ async fn mcp_check_from_servers(servers: &HashMap<String, McpServerConfig>) -> D
         check = check.remediation("Set the missing MCP env vars or disable the affected server.");
     }
     check
-}
-
-fn sandbox_check(config: &Config, arg0_paths: &Arg0DispatchPaths) -> DoctorCheck {
-    let mut details = Vec::new();
-    details.push(format!(
-        "approval policy: {:?}",
-        config.permissions.approval_policy.value()
-    ));
-    let file_system_sandbox = config.permissions.file_system_sandbox_policy();
-    details.push(format!("filesystem sandbox: {}", file_system_sandbox.kind));
-    details.push(format!(
-        "network sandbox: {}",
-        config.permissions.network_sandbox_policy()
-    ));
-    push_path_detail(
-        &mut details,
-        "codex-linux-sandbox helper",
-        arg0_paths.codex_linux_sandbox_exe.as_deref(),
-    );
-    push_path_detail(
-        &mut details,
-        "execve wrapper helper",
-        arg0_paths.main_execve_wrapper_exe.as_deref(),
-    );
-
-    let mut status = CheckStatus::Ok;
-    let mut summary = "sandbox configuration is readable".to_string();
-    if let Some(helper) = arg0_paths.codex_linux_sandbox_exe.as_deref()
-        && !helper.exists()
-    {
-        status = CheckStatus::Warning;
-        summary = "Linux sandbox helper path does not exist".to_string();
-    }
-
-    DoctorCheck::new("sandbox.helpers", "sandbox", status, summary).details(details)
 }
 
 #[derive(Clone, Debug)]
@@ -2151,11 +2169,18 @@ async fn state_check(config: &Config) -> DoctorCheck {
     let mut details = Vec::new();
     path_readiness(&mut details, "CODEX_HOME", &config.codex_home);
     path_readiness(&mut details, "log dir", &config.log_dir);
-    path_readiness(&mut details, "sqlite home", &config.sqlite_home);
+    path_readiness(&mut details, "sqlite home", config.sqlite_config().home());
     let mut integrity_failures = Vec::new();
-    for db in codex_state::runtime_db_paths(&config.sqlite_home) {
+    for db in config.sqlite_config().runtime_db_paths() {
         path_readiness(&mut details, db.label, &db.path);
-        sqlite_integrity_detail(&mut details, &mut integrity_failures, db.label, &db.path).await;
+        sqlite_integrity_detail(
+            config.sqlite_config(),
+            &mut details,
+            &mut integrity_failures,
+            db.label,
+            &db.path,
+        )
+        .await;
     }
     rollout_stats_details(&mut details, &config.codex_home);
     standalone_release_cache_details(&mut details);
@@ -2180,6 +2205,7 @@ async fn state_check(config: &Config) -> DoctorCheck {
 }
 
 async fn sqlite_integrity_detail(
+    sqlite: &codex_state::SqliteConfig,
     details: &mut Vec<String>,
     integrity_failures: &mut Vec<String>,
     label: &str,
@@ -2190,7 +2216,7 @@ async fn sqlite_integrity_detail(
         return;
     }
 
-    match codex_state::sqlite_integrity_check(path).await {
+    match codex_state::sqlite_integrity_check(sqlite, path).await {
         Ok(rows) if rows.iter().all(|row| row == "ok") => {
             details.push(format!("{label} integrity: ok"));
         }
@@ -2371,9 +2397,11 @@ async fn websocket_reachability_check(
         HeaderValue::from_static(RESPONSES_WEBSOCKETS_V2_BETA_HEADER_VALUE),
     );
     let client = ResponsesWebsocketClient::new(api_provider, api_auth);
+    let http_client_factory = config.http_client_factory();
     match tokio::time::timeout(
         provider.websocket_connect_timeout(),
         client.probe_handshake(
+            &http_client_factory,
             extra_headers,
             default_headers(),
             WEBSOCKET_IMMEDIATE_CLOSE_GRACE,
@@ -2384,10 +2412,6 @@ async fn websocket_reachability_check(
         Ok(Ok(probe)) => {
             details.push(format!("handshake result: HTTP {}", probe.status));
             details.push(format!("reasoning header: {}", probe.reasoning_included));
-            details.push(format!(
-                "models etag present: {}",
-                probe.models_etag_present
-            ));
             details.push(format!(
                 "server model present: {}",
                 probe.server_model_present
@@ -2457,6 +2481,7 @@ fn websocket_error_detail(err: &ApiError) -> String {
         | ApiError::RateLimit(_)
         | ApiError::InvalidRequest { .. }
         | ApiError::CyberPolicy { .. }
+        | ApiError::MisalignmentPolicyViolation { .. }
         | ApiError::ServerOverloaded => format!("handshake error: {err}"),
     }
 }
@@ -2466,6 +2491,7 @@ fn auth_mode_name(auth: &CodexAuth) -> &'static str {
         AuthMode::ApiKey => "api_key",
         AuthMode::Chatgpt => "chatgpt",
         AuthMode::ChatgptAuthTokens => "chatgpt_auth_tokens",
+        AuthMode::Headers => "headers",
         AuthMode::AgentIdentity => "agent_identity",
         AuthMode::PersonalAccessToken => "personal_access_token",
         AuthMode::BedrockApiKey => "bedrock_api_key",
@@ -2523,6 +2549,7 @@ fn fallback_state_check() -> DoctorCheck {
 struct ReachabilityPlan {
     description: String,
     endpoints: Vec<ReachabilityEndpoint>,
+    http_client_factory: HttpClientFactory,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2560,10 +2587,12 @@ fn provider_reachability_plan(config: &Config) -> ReachabilityPlan {
     .flatten();
     let mode = provider_auth_reachability_mode_from_auth(
         config.model_provider.requires_openai_auth,
+        config.model_provider.env_key.as_deref(),
+        config.model_provider.base_url.as_deref(),
         env_var_present,
         stored_auth.as_ref(),
     );
-    provider_reachability_plan_from_parts(
+    let mut plan = provider_reachability_plan_from_parts(
         mode,
         &config.model_provider_id,
         &config.model_provider.name,
@@ -2571,7 +2600,9 @@ fn provider_reachability_plan(config: &Config) -> ReachabilityPlan {
         config.model_provider.query_params.as_ref(),
         config.model_provider.is_amazon_bedrock(),
         &config.chatgpt_base_url,
-    )
+    );
+    plan.http_client_factory = config.http_client_factory();
+    plan
 }
 
 fn default_reachability_plan() -> ReachabilityPlan {
@@ -2588,13 +2619,19 @@ fn default_reachability_plan() -> ReachabilityPlan {
 
 fn provider_auth_reachability_mode_from_auth(
     requires_openai_auth: bool,
+    provider_env_key: Option<&str>,
+    provider_base_url: Option<&str>,
     env_var_present: impl Fn(&str) -> bool,
     stored_auth: Option<&AuthDotJson>,
 ) -> ProviderAuthReachabilityMode {
     if !requires_openai_auth {
         return ProviderAuthReachabilityMode::NotRequired;
     }
-    if env_var_present(OPENAI_API_KEY_ENV_VAR) || env_var_present(CODEX_API_KEY_ENV_VAR) {
+    if provider_base_url.is_some_and(|url| !url.trim().is_empty())
+        && provider_env_key
+            .is_some_and(|env_key| !env_key.trim().is_empty() && env_var_present(env_key))
+        || env_var_present(CODEX_API_KEY_ENV_VAR)
+    {
         return ProviderAuthReachabilityMode::ApiKey;
     }
     if env_var_present(CODEX_ACCESS_TOKEN_ENV_VAR) {
@@ -2605,6 +2642,7 @@ fn provider_auth_reachability_mode_from_auth(
         Some(
             AuthMode::Chatgpt
             | AuthMode::ChatgptAuthTokens
+            | AuthMode::Headers
             | AuthMode::AgentIdentity
             | AuthMode::PersonalAccessToken,
         )
@@ -2629,35 +2667,29 @@ fn provider_reachability_plan_from_parts(
             should_probe_models_route(provider_name, url, is_amazon_bedrock)
                 .then(|| provider_url_for_path(url, "models", provider_query_params))
         });
-    let endpoints = match mode {
-        ProviderAuthReachabilityMode::ApiKey => vec![ReachabilityEndpoint {
+    let endpoints = match (mode, provider_base_url) {
+        (ProviderAuthReachabilityMode::ApiKey, _) | (_, Some(_)) => vec![ReachabilityEndpoint {
             label: format!("{provider_id} API"),
-            url: provider_base_url
-                .unwrap_or("https://api.openai.com/v1")
-                .to_string(),
+            url: provider_url_for_path(
+                provider_base_url.unwrap_or("https://api.openai.com/v1"),
+                "responses",
+                provider_query_params,
+            ),
             required: true,
             route_probe_url: provider_route_probe_url,
         }],
-        ProviderAuthReachabilityMode::Chatgpt => vec![ReachabilityEndpoint {
+        (ProviderAuthReachabilityMode::Chatgpt, None) => vec![ReachabilityEndpoint {
             label: "ChatGPT".to_string(),
-            url: chatgpt_base_url.to_string(),
+            url: provider_url_for_path(chatgpt_base_url, "codex/responses", provider_query_params),
             required: true,
             route_probe_url: None,
         }],
-        ProviderAuthReachabilityMode::NotRequired => provider_base_url
-            .map(|url| {
-                vec![ReachabilityEndpoint {
-                    label: format!("{provider_id} API"),
-                    url: url.to_string(),
-                    required: true,
-                    route_probe_url: provider_route_probe_url,
-                }]
-            })
-            .unwrap_or_default(),
+        (ProviderAuthReachabilityMode::NotRequired, None) => Vec::new(),
     };
     ReachabilityPlan {
         description: mode.description().to_string(),
         endpoints,
+        http_client_factory: HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
     }
 }
 
@@ -2708,15 +2740,20 @@ async fn provider_reachability_check(plan: ReachabilityPlan) -> DoctorCheck {
         .details(details);
     }
 
+    let client = RouteAwareClientPool::with_chatgpt_cloudflare_cookies_without_request_logging(
+        plan.http_client_factory,
+        ClientRouteClass::Api,
+    )
+    .with_legacy_custom_ca_fallback();
     let mut failures = Vec::new();
     let mut optional_failures = Vec::new();
     let mut route_failures = Vec::new();
     let mut route_warnings = Vec::new();
     let mut issues = Vec::new();
     for endpoint in plan.endpoints {
-        match http_probe_url(&endpoint.url).await {
+        match network::probe_status(&client, &endpoint.url, Method::HEAD, default_headers()).await {
             Ok(status) => details.push(format!(
-                "{} base URL: {} reachable ({status})",
+                "{} inference URL: {} reachable (HTTP {status})",
                 endpoint.label, endpoint.url
             )),
             Err(err) => {
@@ -2726,7 +2763,7 @@ async fn provider_reachability_check(plan: ReachabilityPlan) -> DoctorCheck {
                     "optional"
                 };
                 details.push(format!(
-                    "{} base URL: {} {err} ({requirement})",
+                    "{} inference URL: {} {err} ({requirement})",
                     endpoint.label, endpoint.url
                 ));
                 if endpoint.required {
@@ -2741,7 +2778,7 @@ async fn provider_reachability_check(plan: ReachabilityPlan) -> DoctorCheck {
         let Some(route_probe_url) = endpoint.route_probe_url.as_deref() else {
             continue;
         };
-        match provider_route_probe_url(route_probe_url).await {
+        match provider_route_probe_url(&client, route_probe_url).await {
             RouteProbeOutcome::Ok(status) => {
                 details.push(format!(
                     "{} route probe: {route_probe_url} route exists ({status})",
@@ -2819,8 +2856,8 @@ enum RouteProbeOutcome {
     TransportError(String),
 }
 
-async fn provider_route_probe_url(url: &str) -> RouteProbeOutcome {
-    match http_get_probe_status_with_timeout(url, Duration::from_secs(3)).await {
+async fn provider_route_probe_url(client: &RouteAwareClientPool, url: &str) -> RouteProbeOutcome {
+    match network::probe_status(client, url, Method::GET, default_headers()).await {
         Ok(status) if (200..300).contains(&status) || matches!(status, 401 | 403) => {
             RouteProbeOutcome::Ok(format!("HTTP {status}"))
         }
@@ -2850,10 +2887,6 @@ fn provider_reachability_outcome(
     }
 }
 
-async fn http_probe_url(url: &str) -> Result<String, String> {
-    http_probe_url_with_timeout(url, Duration::from_secs(3)).await
-}
-
 async fn mcp_http_probe_url(url: &str) -> Result<String, String> {
     mcp_http_probe_url_with_timeout(url, Duration::from_secs(3)).await
 }
@@ -2869,7 +2902,7 @@ async fn mcp_http_probe_url_with_timeout(url: &str, timeout: Duration) -> Result
 }
 
 async fn http_probe_url_with_timeout(url: &str, timeout: Duration) -> Result<String, String> {
-    let response = build_reqwest_client()
+    let response = create_client_without_request_logging()
         .head(url)
         .timeout(timeout)
         .send()
@@ -2895,7 +2928,7 @@ async fn http_get_probe_url_with_timeout(url: &str, timeout: Duration) -> Result
 }
 
 async fn http_get_probe_status_with_timeout(url: &str, timeout: Duration) -> Result<u16, String> {
-    let response = build_reqwest_client()
+    let response = create_client_without_request_logging()
         .get(url)
         .timeout(timeout)
         .send()
@@ -3595,6 +3628,8 @@ mod tests {
         assert_eq!(
             provider_auth_reachability_mode_from_auth(
                 /*requires_openai_auth*/ true,
+                /*provider_env_key*/ None,
+                /*provider_base_url*/ None,
                 |_| false,
                 Some(&api_key_auth),
             ),
@@ -3603,8 +3638,46 @@ mod tests {
         assert_eq!(
             provider_auth_reachability_mode_from_auth(
                 /*requires_openai_auth*/ true,
-                |name| name == OPENAI_API_KEY_ENV_VAR,
+                /*provider_env_key*/ None,
+                /*provider_base_url*/ None,
+                |name| name == CODEX_API_KEY_ENV_VAR,
                 /*stored_auth*/ None,
+            ),
+            ProviderAuthReachabilityMode::ApiKey
+        );
+
+        let chatgpt_auth = AuthDotJson {
+            auth_mode: Some(AuthMode::Chatgpt),
+            openai_api_key: None,
+            ..api_key_auth
+        };
+        assert_eq!(
+            provider_auth_reachability_mode_from_auth(
+                /*requires_openai_auth*/ true,
+                /*provider_env_key*/ None,
+                Some("https://custom.example/v1"),
+                |name| name == OPENAI_API_KEY_ENV_VAR,
+                Some(&chatgpt_auth),
+            ),
+            ProviderAuthReachabilityMode::Chatgpt
+        );
+        assert_eq!(
+            provider_auth_reachability_mode_from_auth(
+                /*requires_openai_auth*/ true,
+                Some(OPENAI_API_KEY_ENV_VAR),
+                Some("https://custom.example/v1"),
+                |name| name == OPENAI_API_KEY_ENV_VAR,
+                Some(&chatgpt_auth),
+            ),
+            ProviderAuthReachabilityMode::ApiKey
+        );
+        assert_eq!(
+            provider_auth_reachability_mode_from_auth(
+                /*requires_openai_auth*/ true,
+                /*provider_env_key*/ None,
+                /*provider_base_url*/ None,
+                |name| name == CODEX_API_KEY_ENV_VAR,
+                Some(&chatgpt_auth),
             ),
             ProviderAuthReachabilityMode::ApiKey
         );
@@ -3626,10 +3699,11 @@ mod tests {
                 description: "provider auth".to_string(),
                 endpoints: vec![ReachabilityEndpoint {
                     label: "azure API".to_string(),
-                    url: "https://example.openai.azure.com/openai/v1".to_string(),
+                    url: "https://example.openai.azure.com/openai/v1/responses".to_string(),
                     required: true,
                     route_probe_url: None,
                 }],
+                http_client_factory: HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
             }
         );
     }
@@ -3638,28 +3712,38 @@ mod tests {
     fn provider_reachability_adds_models_route_probe_for_openai_compatible_base_urls() {
         let query_params = HashMap::from([("api-version".to_string(), "2026-01-01".to_string())]);
 
-        assert_eq!(
-            provider_reachability_plan_from_parts(
-                ProviderAuthReachabilityMode::NotRequired,
-                "custom",
-                "Custom",
-                Some("https://example.com/openai/v1/"),
-                Some(&query_params),
-                /*is_amazon_bedrock*/ false,
-                "https://chatgpt.com/backend-api/",
-            ),
-            ReachabilityPlan {
-                description: "provider auth".to_string(),
-                endpoints: vec![ReachabilityEndpoint {
-                    label: "custom API".to_string(),
-                    url: "https://example.com/openai/v1/".to_string(),
-                    required: true,
-                    route_probe_url: Some(
-                        "https://example.com/openai/v1/models?api-version=2026-01-01".to_string()
+        for (mode, description) in [
+            (ProviderAuthReachabilityMode::NotRequired, "provider auth"),
+            (ProviderAuthReachabilityMode::Chatgpt, "ChatGPT auth"),
+        ] {
+            assert_eq!(
+                provider_reachability_plan_from_parts(
+                    mode,
+                    "custom",
+                    "Custom",
+                    Some("https://example.com/openai/v1/"),
+                    Some(&query_params),
+                    /*is_amazon_bedrock*/ false,
+                    "https://chatgpt.com/backend-api/",
+                ),
+                ReachabilityPlan {
+                    description: description.to_string(),
+                    endpoints: vec![ReachabilityEndpoint {
+                        label: "custom API".to_string(),
+                        url: "https://example.com/openai/v1/responses?api-version=2026-01-01"
+                            .to_string(),
+                        required: true,
+                        route_probe_url: Some(
+                            "https://example.com/openai/v1/models?api-version=2026-01-01"
+                                .to_string()
+                        ),
+                    }],
+                    http_client_factory: HttpClientFactory::new(
+                        OutboundProxyPolicy::ReqwestDefault
                     ),
-                }],
-            }
-        );
+                }
+            );
+        }
     }
 
     #[test]
@@ -3693,9 +3777,22 @@ mod tests {
             plan.endpoints,
             vec![ReachabilityEndpoint {
                 label: "openai API".to_string(),
-                url: "https://api.openai.com/v1".to_string(),
+                url: "https://api.openai.com/v1/responses".to_string(),
                 required: true,
                 route_probe_url: Some("https://api.openai.com/v1/models".to_string()),
+            }]
+        );
+    }
+
+    #[test]
+    fn provider_reachability_chatgpt_uses_inference_endpoint() {
+        assert_eq!(
+            default_reachability_plan().endpoints,
+            vec![ReachabilityEndpoint {
+                label: "ChatGPT".to_string(),
+                url: "https://chatgpt.com/backend-api/codex/responses".to_string(),
+                required: true,
+                route_probe_url: None,
             }]
         );
     }
@@ -3835,7 +3932,9 @@ mod tests {
                 .expect("write response");
         });
 
-        let status = http_probe_url(&format!("http://{addr}/mcp")).await;
+        let status =
+            http_probe_url_with_timeout(&format!("http://{addr}/mcp"), Duration::from_secs(3))
+                .await;
         server.join().expect("probe server thread should finish");
 
         assert_eq!(status, Ok("HTTP 405".to_string()));

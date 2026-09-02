@@ -7,8 +7,10 @@ use codex_protocol::ThreadId;
 use codex_protocol::items::TurnItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::EventMsg;
-use codex_protocol::protocol::RolloutItem;
+use codex_protocol::protocol::ThreadHistoryMode;
 
+use crate::ResponseItemEnvelope;
+use crate::RolloutItem;
 use crate::policy::is_persisted_rollout_item;
 
 const ITEM_BYTES_METRIC: &str = "codex.rollout.persistence.item_bytes";
@@ -95,6 +97,7 @@ struct TurnMeasurementUpdate {
 /// Measures logical JSON sizes while applying the shared rollout persistence policy once.
 pub fn measure_and_filter_rollout_items(
     items: &[RolloutItem],
+    history_mode: ThreadHistoryMode,
 ) -> (Vec<RolloutItem>, RolloutPersistenceBatchMeasurement) {
     let mut persisted = Vec::new();
     let mut measurement = RolloutPersistenceBatchMeasurement {
@@ -103,7 +106,7 @@ pub fn measure_and_filter_rollout_items(
     };
 
     for item in items {
-        let kept = is_persisted_rollout_item(item);
+        let kept = is_persisted_rollout_item(item, history_mode);
         let decision = if kept {
             PersistenceDecision::Kept
         } else {
@@ -233,7 +236,7 @@ fn rollout_item_type(item: &RolloutItem) -> String {
         RolloutItem::Compacted(_) => "compacted".to_string(),
         RolloutItem::TurnContext(_) => "turn_context".to_string(),
         RolloutItem::WorldState(_) => "world_state".to_string(),
-        RolloutItem::Transaction(_) => "transaction".to_string(),
+        RolloutItem::SecurityRiskScore(_) => "security_risk_score".to_string(),
         RolloutItem::EventMsg(EventMsg::ItemCompleted(event)) => {
             format!("event.item_completed.{}", turn_item_type(&event.item))
         }
@@ -254,16 +257,18 @@ fn turn_item_type(item: &TurnItem) -> &'static str {
         TurnItem::SubAgentActivity(_) => "sub_agent_activity",
         TurnItem::WebSearch(_) => "web_search",
         TurnItem::ImageView(_) => "image_view",
-        TurnItem::Sleep(_) => "sleep",
+        TurnItem::Extension(_) => "extension",
         TurnItem::ImageGeneration(_) => "image_generation",
+        TurnItem::EnteredReviewMode(_) => "entered_review_mode",
+        TurnItem::ExitedReviewMode(_) => "exited_review_mode",
         TurnItem::FileChange(_) => "file_change",
         TurnItem::McpToolCall(_) => "mcp_tool_call",
         TurnItem::ContextCompaction(_) => "context_compaction",
     }
 }
 
-fn response_item_type(item: &ResponseItem) -> &'static str {
-    match item {
+fn response_item_type(item: &ResponseItemEnvelope) -> &'static str {
+    match &item.item {
         ResponseItem::Message { .. } => "response.message",
         ResponseItem::AdditionalTools { .. } => "response.additional_tools",
         ResponseItem::AgentMessage { .. } => "response.agent_message",
