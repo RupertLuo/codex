@@ -1,5 +1,7 @@
-use codex_core_skills::model::SkillDependencies;
+use codex_protocol::protocol::SkillScope;
+use codex_skills::SkillDependencies;
 use codex_utils_path_uri::PathUri;
+use std::sync::Arc;
 
 /// Source authority that owns a skill package and must be used to read it.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -57,10 +59,27 @@ impl SkillAuthority {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct SkillPackageId(pub String);
 
+/// A provider-owned skill package needed by another package.
+///
+/// This is separate from [`SkillDependencies`], which describes runtime tool
+/// dependencies declared by a skill manifest.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SkillPackageDependency {
     pub authority: SkillAuthority,
     pub package: SkillPackageId,
+}
+
+impl SkillPackageId {
+    pub(crate) fn relative_resource_path<'a>(&self, resource: &'a str) -> Option<&'a str> {
+        let relative = resource
+            .strip_prefix(self.0.trim_end_matches('/'))?
+            .strip_prefix('/')?;
+        (!relative.is_empty()
+            && relative
+                .split('/')
+                .all(|segment| !matches!(segment, "" | "." | "..")))
+        .then_some(relative)
+    }
 }
 
 /// Opaque resource id inside a skill package, optionally bound to the
@@ -84,11 +103,32 @@ impl SkillResourceId {
         environment_id: impl Into<String>,
         path: PathUri,
     ) -> Self {
+        let package_root = path.parent().unwrap_or_else(|| path.clone());
         Self {
             id: id.into(),
             environment_path: Some(EnvironmentSkillResource {
                 environment_id: environment_id.into(),
+                package_root,
                 path,
+                contents: None,
+            }),
+        }
+    }
+
+    pub fn environment_with_contents(
+        id: impl Into<String>,
+        environment_id: impl Into<String>,
+        path: PathUri,
+        contents: String,
+    ) -> Self {
+        let package_root = path.parent().unwrap_or_else(|| path.clone());
+        Self {
+            id: id.into(),
+            environment_path: Some(EnvironmentSkillResource {
+                environment_id: environment_id.into(),
+                package_root,
+                path,
+                contents: Some(contents.into()),
             }),
         }
     }
@@ -97,17 +137,45 @@ impl SkillResourceId {
         &self.id
     }
 
+    pub(crate) fn bind_environment_package_resource(
+        &self,
+        package: &SkillPackageId,
+        resource: impl Into<String>,
+    ) -> Option<Self> {
+        let resource = resource.into();
+        let relative = package.relative_resource_path(&resource)?;
+        let environment = self.environment_path.as_ref()?;
+        let path = environment.package_root.join(relative).ok()?;
+        path.starts_with(&environment.package_root).then(|| Self {
+            id: resource,
+            environment_path: Some(EnvironmentSkillResource {
+                environment_id: environment.environment_id.clone(),
+                package_root: environment.package_root.clone(),
+                path,
+                contents: None,
+            }),
+        })
+    }
+
     pub(crate) fn environment_path(&self) -> Option<(&str, &PathUri)> {
         self.environment_path
             .as_ref()
             .map(|resource| (resource.environment_id.as_str(), &resource.path))
+    }
+
+    pub(crate) fn environment_contents(&self) -> Option<&str> {
+        self.environment_path
+            .as_ref()
+            .and_then(|resource| resource.contents.as_deref())
     }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct EnvironmentSkillResource {
     environment_id: String,
+    package_root: PathUri,
     path: PathUri,
+    contents: Option<Arc<str>>,
 }
 
 /// Metadata shown in the always-visible skills catalog.
@@ -120,6 +188,12 @@ pub struct SkillCatalogEntry {
     pub short_description: Option<String>,
     pub main_prompt: SkillResourceId,
     pub display_path: Option<String>,
+    pub(crate) canonical_skill_id: Option<String>,
+    pub(crate) plugin_id: Option<String>,
+    pub(crate) analytics_scope: Option<SkillScope>,
+    alias_root: Option<String>,
+    alias_root_order: Option<usize>,
+    prompt_scope: Option<SkillScope>,
     pub dependencies: Option<SkillDependencies>,
     pub package_dependencies: Vec<SkillPackageDependency>,
     pub enabled: bool,
@@ -142,6 +216,12 @@ impl SkillCatalogEntry {
             short_description: None,
             main_prompt,
             display_path: None,
+            canonical_skill_id: None,
+            plugin_id: None,
+            analytics_scope: None,
+            alias_root: None,
+            alias_root_order: None,
+            prompt_scope: None,
             dependencies: None,
             package_dependencies: Vec::new(),
             enabled: true,
@@ -156,6 +236,22 @@ impl SkillCatalogEntry {
 
     pub fn with_display_path(mut self, display_path: impl Into<String>) -> Self {
         self.display_path = Some(display_path.into());
+        self
+    }
+
+    /// Sets the shared locator prefix that may be compacted in model-visible skill catalogs.
+    pub fn with_alias_root(mut self, alias_root: impl Into<String>) -> Self {
+        self.alias_root = Some(alias_root.into());
+        self
+    }
+
+    pub(crate) fn with_alias_root_order(mut self, alias_root_order: usize) -> Self {
+        self.alias_root_order = Some(alias_root_order);
+        self
+    }
+
+    pub(crate) fn with_prompt_scope(mut self, prompt_scope: SkillScope) -> Self {
+        self.prompt_scope = Some(prompt_scope);
         self
     }
 
@@ -179,10 +275,26 @@ impl SkillCatalogEntry {
         self
     }
 
+    pub(crate) fn is_model_visible(&self) -> bool {
+        self.enabled && self.prompt_visible
+    }
+
     pub(crate) fn rendered_path(&self) -> &str {
         self.display_path
             .as_deref()
             .unwrap_or_else(|| self.main_prompt.as_str())
+    }
+
+    pub(crate) fn alias_root(&self) -> Option<&str> {
+        self.alias_root.as_deref()
+    }
+
+    pub(crate) fn alias_root_order(&self) -> Option<usize> {
+        self.alias_root_order
+    }
+
+    pub(crate) fn prompt_scope(&self) -> Option<SkillScope> {
+        self.prompt_scope
     }
 }
 
@@ -239,48 +351,27 @@ pub struct SkillSearchMatch {
 pub struct SkillProviderError {
     pub code: Option<String>,
     pub message: String,
-    pub internal_message: String,
 }
 
 impl SkillProviderError {
     pub fn new(message: impl Into<String>) -> Self {
-        let message = message.into();
         Self {
             code: None,
-            internal_message: message.clone(),
-            message,
+            message: message.into(),
         }
     }
 
     pub fn coded(code: impl Into<String>, message: impl Into<String>) -> Self {
-        let message = message.into();
-        Self {
-            code: Some(code.into()),
-            internal_message: message.clone(),
-            message,
-        }
-    }
-
-    pub fn coded_with_internal(
-        code: impl Into<String>,
-        message: impl Into<String>,
-        internal_message: impl Into<String>,
-    ) -> Self {
         Self {
             code: Some(code.into()),
             message: message.into(),
-            internal_message: internal_message.into(),
         }
     }
 }
 
 impl std::fmt::Display for SkillProviderError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if let Some(code) = &self.code {
-            write!(formatter, "{code}: {}", self.internal_message)
-        } else {
-            self.internal_message.fmt(formatter)
-        }
+        self.message.fmt(formatter)
     }
 }
 

@@ -107,10 +107,20 @@ impl SkillProviders {
             .any(|source| source.kind == SkillSourceKind::Orchestrator)
     }
 
-    pub(crate) fn has_custom_provider(&self) -> bool {
+    pub(crate) fn has_host_provider(&self) -> bool {
         self.sources
             .iter()
-            .any(|source| matches!(source.kind, SkillSourceKind::Custom(_)))
+            .any(|source| source.kind == SkillSourceKind::Host)
+    }
+
+    pub(crate) fn custom_provider_kinds(&self) -> Vec<String> {
+        self.sources
+            .iter()
+            .filter_map(|source| match &source.kind {
+                SkillSourceKind::Custom(kind) => Some(kind.clone()),
+                _ => None,
+            })
+            .collect()
     }
 
     pub(crate) async fn list_for_turn(&self, query: SkillListQuery) -> SkillCatalog {
@@ -146,20 +156,19 @@ impl SkillProviders {
             .await
     }
 
-    pub(crate) async fn list_custom_for_turn(
-        &self,
-        query: SkillListQuery,
-        kind: &SkillSourceKind,
-    ) -> SkillCatalog {
-        self.list_matching(&query, |source| source.owns_kind(kind))
+    pub(crate) async fn list_host_for_turn(&self, query: SkillListQuery) -> SkillCatalog {
+        self.list_matching(&query, |source| source.kind == SkillSourceKind::Host)
             .await
     }
 
-    pub(crate) async fn list_all_custom_for_turn(&self, query: SkillListQuery) -> SkillCatalog {
-        self.list_matching(&query, |source| {
-            matches!(source.kind, SkillSourceKind::Custom(_))
-        })
-        .await
+    pub(crate) async fn list_custom_for_turn(
+        &self,
+        kind: &str,
+        query: SkillListQuery,
+    ) -> SkillCatalog {
+        let kind = SkillSourceKind::Custom(kind.to_string());
+        self.list_matching(&query, |source| source.kind == kind)
+            .await
     }
 
     async fn list_matching(

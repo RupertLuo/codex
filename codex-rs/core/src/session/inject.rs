@@ -1,16 +1,10 @@
-use super::input_queue::TurnInput;
+use super::TurnInput as PendingTurnInput;
 use super::session::Session;
 use super::turn_context::TurnContext;
-use crate::codex_thread::InjectIfRunningError;
-use crate::codex_thread::InjectIfRunningRejectionReason;
-use crate::codex_thread::TryStartTurnIfIdleError;
-use crate::codex_thread::TryStartTurnIfIdleRejectionReason;
-use crate::state::ActiveTurn;
-use crate::state::TurnState;
-use crate::tasks::RegularTask;
-use codex_protocol::config_types::ModeKind;
+use codex_features::Feature;
+use codex_history::CodexHarnessMetadata;
+use codex_history::ResponseItemEnvelope;
 use codex_protocol::models::ResponseItem;
-use std::sync::Arc;
 
 impl Session {
     /// Returns the input if there is no active turn to inject into.
@@ -21,215 +15,113 @@ impl Session {
     pub async fn inject_if_running(
         &self,
         input: Vec<ResponseItem>,
-    ) -> Result<(), InjectIfRunningError> {
-        let lifecycle = self.acquire_persistence_side_effect().await.map_err(|_| {
-            InjectIfRunningError::new(
-                InjectIfRunningRejectionReason::PersistenceQuarantined,
-                input.clone(),
-            )
-        })?;
-        self.inject_if_running_with_guard(&lifecycle, input).await
-    }
-
-    #[allow(
-        clippy::await_holding_invalid_type,
-        reason = "active-turn identity and pending-input mutation must remain atomic; the caller already holds lifecycle and this helper never reacquires it"
-    )]
-    async fn inject_if_running_with_guard(
-        &self,
-        lifecycle: &tokio::sync::MutexGuard<'_, crate::session::session::PersistenceLifecycle>,
-        input: Vec<ResponseItem>,
-    ) -> Result<(), InjectIfRunningError> {
-        if matches!(
-            &**lifecycle,
-            crate::session::session::PersistenceLifecycle::Quarantined { .. }
-        ) {
-            return Err(InjectIfRunningError::new(
-                InjectIfRunningRejectionReason::PersistenceQuarantined,
-                input,
-            ));
-        }
+    ) -> Result<(), Vec<ResponseItem>> {
         let mut active = self.active_turn.lock().await;
         match active.as_mut() {
             Some(active_turn) => {
                 self.input_queue
-                    .extend_pending_input_for_turn_state(
+                    .extend_pending_input_and_accept_mailbox_delivery_for_turn_state(
                         active_turn.turn_state.as_ref(),
-                        input.into_iter().map(TurnInput::ResponseItem).collect(),
+                        input
+                            .into_iter()
+                            .map(ResponseItemEnvelope::new)
+                            .map(PendingTurnInput::ResponseItem)
+                            .collect(),
                     )
                     .await;
                 Ok(())
             }
-            None => Err(InjectIfRunningError::new(
-                InjectIfRunningRejectionReason::NoActiveTurn,
-                input,
-            )),
+            None => Err(input),
         }
     }
 
-    /// Starts a regular turn with the provided items only if automatic idle work
-    /// is allowed for the current session state.
-    ///
-    /// This is the shared gate for extension-initiated idle work. It refuses to
-    /// start a turn when user/client-triggered work is queued, any task is still
-    /// active, or the session is currently in Plan mode. Active Review tasks are
-    /// covered by the active-task check because Review turns are not steerable.
-    #[allow(
+    /// Preserves trusted client provenance while items wait for an active turn.
+    #[expect(
         clippy::await_holding_invalid_type,
-        reason = "idle reservation, queue checks, and task registration are one lifecycle-owned transaction with lifecycle-first lock order"
+        reason = "active turn checks and turn state updates must remain atomic"
     )]
-    pub(crate) async fn try_start_turn_if_idle(
-        self: &Arc<Self>,
-        input: Vec<ResponseItem>,
-    ) -> Result<(), TryStartTurnIfIdleError> {
-        if input.is_empty() {
-            return Ok(());
+    pub(crate) async fn inject_client_response_items(
+        &self,
+        items: Vec<ResponseItem>,
+        turn_context: &TurnContext,
+    ) {
+        let items = items
+            .into_iter()
+            .map(|item| self.annotate_client_response_item(item))
+            .collect::<Vec<_>>();
+        let mut active = self.active_turn.lock().await;
+        if let Some(active_turn) = active.as_mut() {
+            self.input_queue
+                .extend_pending_input_and_accept_mailbox_delivery_for_turn_state(
+                    active_turn.turn_state.as_ref(),
+                    items
+                        .into_iter()
+                        .map(PendingTurnInput::ResponseItem)
+                        .collect(),
+                )
+                .await;
+            return;
         }
-        let lifecycle = self.acquire_persistence_side_effect().await.map_err(|_| {
-            TryStartTurnIfIdleError::new(
-                TryStartTurnIfIdleRejectionReason::PersistenceQuarantined,
-                input.clone(),
-            )
-        })?;
-        if self.input_queue.has_trigger_turn_mailbox_items().await {
-            return Err(TryStartTurnIfIdleError::new(
-                TryStartTurnIfIdleRejectionReason::PendingTriggerTurn,
-                input,
-            ));
-        }
-        if self.collaboration_mode().await.mode == ModeKind::Plan {
-            return Err(TryStartTurnIfIdleError::new(
-                TryStartTurnIfIdleRejectionReason::PlanMode,
-                input,
-            ));
-        }
-
-        let turn_state = {
-            let mut active_turn = self.active_turn.lock().await;
-            if active_turn.is_some() {
-                return Err(TryStartTurnIfIdleError::new(
-                    TryStartTurnIfIdleRejectionReason::Busy,
-                    input,
-                ));
-            }
-            let active_turn = active_turn.get_or_insert_with(ActiveTurn::default);
-            Arc::clone(&active_turn.turn_state)
-        };
-
-        if self.input_queue.has_trigger_turn_mailbox_items().await {
-            self.clear_reserved_idle_turn(&turn_state).await;
-            drop(lifecycle);
-            self.maybe_start_turn_for_pending_work().await;
-            return Err(TryStartTurnIfIdleError::new(
-                TryStartTurnIfIdleRejectionReason::PendingTriggerTurn,
-                input,
-            ));
-        }
-
-        let turn_context = self
-            .new_default_turn_with_sub_id(uuid::Uuid::new_v4().to_string())
+        drop(active);
+        self.record_annotated_conversation_items(turn_context, items)
             .await;
-        if turn_context.collaboration_mode.mode == ModeKind::Plan {
-            self.clear_reserved_idle_turn(&turn_state).await;
-            drop(lifecycle);
-            self.maybe_start_turn_for_pending_work().await;
-            return Err(TryStartTurnIfIdleError::new(
-                TryStartTurnIfIdleRejectionReason::PlanMode,
-                input,
-            ));
-        }
-        self.maybe_emit_model_warnings_for_turn_with_guard(&lifecycle, turn_context.as_ref())
-            .await;
-        if self.input_queue.has_trigger_turn_mailbox_items().await {
-            self.clear_reserved_idle_turn(&turn_state).await;
-            drop(lifecycle);
-            self.maybe_start_turn_for_pending_work().await;
-            return Err(TryStartTurnIfIdleError::new(
-                TryStartTurnIfIdleRejectionReason::PendingTriggerTurn,
-                input,
-            ));
-        }
-        let still_reserved = {
-            let active_turn = self.active_turn.lock().await;
-            active_turn.as_ref().is_some_and(|active_turn| {
-                active_turn.task.is_none() && Arc::ptr_eq(&active_turn.turn_state, &turn_state)
-            })
-        };
-        if !still_reserved {
-            self.clear_reserved_idle_turn(&turn_state).await;
-            return Err(TryStartTurnIfIdleError::new(
-                TryStartTurnIfIdleRejectionReason::Busy,
-                input,
-            ));
-        }
-
-        self.input_queue
-            .extend_pending_input_for_turn_state(
-                turn_state.as_ref(),
-                input.into_iter().map(TurnInput::ResponseItem).collect(),
-            )
-            .await;
-        self.start_task_with_persistence_guard(
-            &lifecycle,
-            turn_context,
-            Vec::new(),
-            RegularTask::new(),
-        )
-        .await;
-        Ok(())
     }
 
-    async fn clear_reserved_idle_turn(&self, turn_state: &Arc<tokio::sync::Mutex<TurnState>>) {
-        let mut active_turn_guard = self.active_turn.lock().await;
-        if let Some(active_turn) = active_turn_guard.as_ref()
-            && active_turn.task.is_none()
-            && Arc::ptr_eq(&active_turn.turn_state, turn_state)
+    pub(crate) fn annotate_client_response_item(&self, item: ResponseItem) -> ResponseItemEnvelope {
+        let metadata = (self.enabled(Feature::RetainClientDeveloperMessages)
+            && matches!(&item, ResponseItem::Message { role, .. } if role == "developer"))
+        .then_some(CodexHarnessMetadata {
+            client_authored: true,
+        });
+
+        ResponseItemEnvelope { item, metadata }
+    }
+
+    pub(crate) async fn record_annotated_conversation_items(
+        &self,
+        turn_context: &TurnContext,
+        items: Vec<ResponseItemEnvelope>,
+    ) {
+        if !self.enabled(Feature::RetainClientDeveloperMessages)
+            || items.iter().all(|item| item.metadata.is_none())
         {
-            *active_turn_guard = None;
+            let items = items
+                .into_iter()
+                .map(ResponseItemEnvelope::into_item)
+                .collect::<Vec<_>>();
+            self.record_conversation_items(turn_context, &items).await;
+            return;
         }
+
+        let mut annotated_items = Vec::with_capacity(items.len());
+        let mut image_preparations = Vec::new();
+        for envelope in items {
+            let (prepared_items, prepared_images) = self.prepare_conversation_items_for_history(
+                turn_context,
+                std::slice::from_ref(&envelope.item),
+            );
+            image_preparations.extend(prepared_images);
+
+            let mut metadata = envelope.metadata;
+            annotated_items.extend(prepared_items.into_owned().into_iter().map(|item| {
+                ResponseItemEnvelope {
+                    item,
+                    metadata: metadata.take(),
+                }
+            }));
+        }
+        self.record_prepared_conversation_items(turn_context, annotated_items, image_preparations)
+            .await;
     }
 
     /// Injects items into active work, or records them without starting a turn.
-    #[allow(
-        clippy::await_holding_invalid_type,
-        reason = "active-turn selection and durable-first history installation are one lifecycle-owned transaction with lifecycle-first lock order"
-    )]
     pub(crate) async fn inject_no_new_turn(
         &self,
         items: Vec<ResponseItem>,
         current_turn_context: Option<&TurnContext>,
     ) {
-        if let Some(hook) = self.services.compact_commit_test_hook.as_ref() {
-            hook.pause_task_start_before_gate_if_requested().await;
-        }
-        let mut lifecycle = match self.acquire_persistence_side_effect().await {
-            Ok(lifecycle) => lifecycle,
-            Err(_) => return,
-        };
-        if let Err(err) = self
-            .inject_no_new_turn_with_guard(&mut lifecycle, items, current_turn_context)
-            .await
-        {
-            tracing::error!("failed to inject conversation items: {err:#}");
-        }
-    }
-
-    pub(crate) async fn inject_no_new_turn_with_guard(
-        &self,
-        lifecycle: &mut tokio::sync::MutexGuard<'_, crate::session::session::PersistenceLifecycle>,
-        items: Vec<ResponseItem>,
-        current_turn_context: Option<&TurnContext>,
-    ) -> codex_thread_store::ThreadStoreResult<()> {
-        if let crate::session::session::PersistenceLifecycle::Quarantined { reason, .. } =
-            &**lifecycle
-        {
-            return Err(codex_thread_store::ThreadStoreError::InvalidRequest {
-                message: reason.clone(),
-            });
-        }
-        let items = match self.inject_if_running_with_guard(lifecycle, items).await {
-            Ok(()) => return Ok(()),
-            Err(err) => err.into_input(),
+        let Err(items) = self.inject_if_running(items).await else {
+            return;
         };
         let default_turn_context;
         let turn_context = match current_turn_context {
@@ -239,7 +131,6 @@ impl Session {
                 default_turn_context.as_ref()
             }
         };
-        self.try_record_conversation_items_with_guard(lifecycle, turn_context, &items)
-            .await
+        self.record_conversation_items(turn_context, &items).await;
     }
 }

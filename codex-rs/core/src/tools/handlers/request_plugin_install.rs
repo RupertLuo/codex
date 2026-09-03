@@ -79,7 +79,7 @@ impl ToolExecutor<ToolInvocation> for RequestPluginInstallHandler {
     }
 
     fn supports_parallel_tool_calls(&self) -> bool {
-        true
+        false
     }
 
     fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
@@ -100,7 +100,7 @@ impl RequestPluginInstallHandler {
             ..
         } = invocation;
         let turn = Arc::clone(&step_context.turn);
-        let manager = step_context.mcp.manager();
+        let mcp = &step_context.mcp;
 
         let arguments = match payload {
             ToolPayload::Function { arguments } => arguments,
@@ -177,6 +177,31 @@ impl RequestPluginInstallHandler {
                     "{argument_name} must match one of {source}"
                 ))
             })?;
+        let tool = if self.presentation == ToolSuggestPresentation::RecommendationContext {
+            let plugin_id = tool.id().to_string();
+            let auth = session.services.auth_manager.auth().await;
+            let plugins_config = turn.config.plugins_config_input();
+            match codex_core_plugins::hydrate_selected_recommended_plugin_install_metadata(
+                &plugins_config,
+                auth.as_ref(),
+                tool,
+            )
+            .await
+            {
+                Ok(Some(tool)) => tool,
+                Ok(None) => return Err(recommended_plugins_no_longer_available()),
+                Err(err) => {
+                    warn!(
+                        plugin_id,
+                        error = %err,
+                        "failed to hydrate selected recommended plugin install metadata"
+                    );
+                    return Err(recommended_plugin_metadata_retryable());
+                }
+            }
+        } else {
+            tool
+        };
         let tool_type = tool.tool_type();
 
         let suggestion_id = format!("request_plugin_install_{call_id}");
@@ -230,7 +255,7 @@ impl RequestPluginInstallHandler {
 
         let auth = session.services.auth_manager.auth().await;
         let completed = if user_confirmed {
-            verify_request_plugin_install_completed(&session, &turn, manager, &tool, auth.as_ref())
+            verify_request_plugin_install_completed(&session, &turn, mcp, &tool, auth.as_ref())
                 .await
         } else {
             false
@@ -251,6 +276,7 @@ impl RequestPluginInstallHandler {
                 Some(ElicitationAction::Accept) => "accept",
                 Some(ElicitationAction::Decline) => "decline",
                 Some(ElicitationAction::Cancel) => "cancel",
+                Some(_) => "unknown",
                 None => "unavailable",
             };
             turn.session_telemetry.record_plugin_install_suggestion(
@@ -283,6 +309,18 @@ impl RequestPluginInstallHandler {
             Some(true),
         )))
     }
+}
+
+fn recommended_plugins_no_longer_available() -> FunctionCallError {
+    FunctionCallError::RespondToModel(
+        "The recommended plugins for this turn are no longer available.".to_string(),
+    )
+}
+
+fn recommended_plugin_metadata_retryable() -> FunctionCallError {
+    FunctionCallError::RespondToModel(
+        "The selected recommended plugin could not be verified right now. Retry request_plugin_install with the same plugin_id.".to_string(),
+    )
 }
 
 impl CoreToolRuntime for RequestPluginInstallHandler {}
@@ -347,16 +385,17 @@ fn disabled_install_request(tool: &DiscoverableTool) -> ToolSuggestDisabledTool 
 }
 
 async fn verify_request_plugin_install_completed(
-    session: &crate::session::session::Session,
+    session: &Arc<crate::session::session::Session>,
     turn: &crate::session::turn_context::TurnContext,
-    manager: &codex_mcp::McpConnectionManager,
+    mcp: &codex_mcp::McpBinding,
     tool: &DiscoverableTool,
     auth: Option<&codex_login::CodexAuth>,
 ) -> bool {
     match tool {
         DiscoverableTool::Connector(connector) => refresh_missing_requested_connectors(
+            session,
             turn,
-            manager,
+            mcp,
             auth,
             std::slice::from_ref(&connector.id),
             connector.id.as_str(),
@@ -375,8 +414,9 @@ async fn verify_request_plugin_install_completed(
                         plugin.id.as_str(),
                     ),
                     refresh_missing_requested_connectors(
+                        session,
                         turn,
-                        manager,
+                        mcp,
                         auth,
                         &plugin.app_connector_ids,
                         plugin.id.as_str(),
@@ -398,8 +438,9 @@ async fn verify_request_plugin_install_completed(
                 session.services.plugins_manager.as_ref(),
             );
             let _ = refresh_missing_requested_connectors(
+                session,
                 turn,
-                manager,
+                mcp,
                 auth,
                 &plugin.app_connector_ids,
                 plugin.id.as_str(),
@@ -440,8 +481,9 @@ fn is_remote_plugin_install_suggestion(plugin_id: &str) -> bool {
 }
 
 async fn refresh_missing_requested_connectors(
+    session: &Arc<crate::session::session::Session>,
     turn: &crate::session::turn_context::TurnContext,
-    manager: &codex_mcp::McpConnectionManager,
+    mcp: &codex_mcp::McpBinding,
     auth: Option<&codex_login::CodexAuth>,
     expected_connector_ids: &[String],
     tool_id: &str,
@@ -450,21 +492,16 @@ async fn refresh_missing_requested_connectors(
         return Some(Vec::new());
     }
 
-    let mcp_tools = manager.list_all_tools().await;
-    let accessible_connectors = connectors::with_app_enabled_state(
-        connectors::accessible_connectors_from_mcp_tools(&mcp_tools),
-        &turn.config,
-    );
+    let mcp_tools = mcp.tools();
+    let accessible_connectors = connectors::accessible_connectors_from_mcp_tools(mcp_tools);
     if all_requested_connectors_picked_up(expected_connector_ids, &accessible_connectors) {
         return Some(accessible_connectors);
     }
 
-    match manager.hard_refresh_codex_apps_tools_cache().await {
+    match session.hard_refresh_latest_codex_apps_tools().await {
         Ok(mcp_tools) => {
-            let accessible_connectors = connectors::with_app_enabled_state(
-                connectors::accessible_connectors_from_mcp_tools(&mcp_tools),
-                &turn.config,
-            );
+            let accessible_connectors =
+                connectors::accessible_connectors_from_mcp_tools(&mcp_tools);
             connectors::refresh_accessible_connectors_cache_from_mcp_tools(
                 &turn.config,
                 auth,

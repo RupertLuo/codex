@@ -9,7 +9,7 @@ use super::X_CODEX_PARENT_THREAD_ID_HEADER;
 use super::X_CODEX_TURN_METADATA_HEADER;
 use super::X_CODEX_WINDOW_ID_HEADER;
 use super::X_OPENAI_SUBAGENT_HEADER;
-use super::build_reqwest_client;
+use super::is_unknown_previous_response;
 use crate::AttestationContext;
 use crate::AttestationProvider;
 use crate::GenerateAttestationFuture;
@@ -18,33 +18,37 @@ use crate::test_support::TestCodexResponsesRequestKind;
 use crate::test_support::responses_metadata as test_responses_metadata;
 use codex_api::AgentIdentityTelemetry;
 use codex_api::ApiError;
-use codex_api::HttpTransportHandle;
-use codex_api::Request;
-use codex_api::ReqwestTransport;
-use codex_api::Response;
 use codex_api::ResponseEvent;
-use codex_api::StreamResponse;
 use codex_api::TransportError;
+use codex_http_client::HttpClientFactory;
+use codex_http_client::OutboundProxyPolicy;
 use codex_login::AuthCredentialsStoreMode;
 use codex_login::AuthKeyringBackendKind;
 use codex_login::AuthManager;
 use codex_login::CodexAuth;
 use codex_login::auth::AgentIdentityAuthPolicy;
 use codex_model_provider::BearerAuthProvider;
+use codex_model_provider::ModelProvider;
+use codex_model_provider::ModelProviderFuture;
+use codex_model_provider::ProviderAccountResult;
+use codex_model_provider::ProviderUnauthorizedRecovery;
 use codex_model_provider::SharedModelProvider;
 use codex_model_provider::create_model_provider;
 use codex_model_provider_info::CHATGPT_CODEX_BASE_URL;
 use codex_model_provider_info::ModelProviderInfo;
 use codex_model_provider_info::WireApi;
 use codex_model_provider_info::create_oss_provider_with_base_url;
+use codex_models_manager::manager::SharedModelsManager;
 use codex_otel::SessionTelemetry;
 use codex_protocol::ThreadId;
 use codex_protocol::auth::AuthMode;
-use codex_protocol::config_types::ReasoningSummary as ReasoningSummaryConfig;
+use codex_protocol::error::CodexErr;
+use codex_protocol::error::CodexErrorDetails;
 use codex_protocol::models::BaseInstructions;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ModelInfo;
+use codex_protocol::openai_models::ModelsResponse;
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::InternalSessionSource;
 use codex_protocol::protocol::SessionSource;
@@ -58,12 +62,11 @@ use codex_rollout_trace::RolloutTrace;
 use codex_rollout_trace::TraceWriter;
 use codex_rollout_trace::replay_bundle;
 use futures::StreamExt;
-use http::HeaderMap;
-use http::StatusCode;
 use pretty_assertions::assert_eq;
 use serde_json::json;
 use std::collections::BTreeMap;
 use std::collections::VecDeque;
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -74,7 +77,6 @@ use std::task::Poll;
 use std::time::Duration;
 use tempfile::TempDir;
 use tokio::sync::Notify;
-use tokio_util::bytes::Bytes;
 use tracing::Event;
 use tracing::Subscriber;
 use tracing::field::Visit;
@@ -112,8 +114,9 @@ fn test_model_client_with_thread_id(
         /*enable_request_compression*/ false,
         /*include_timing_metrics*/ false,
         /*beta_features_header*/ None,
-        /*item_ids_enabled*/ false,
+        /*concurrent_reasoning_summaries_enabled*/ false,
         /*attestation_provider*/ None,
+        HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
     )
 }
 
@@ -156,8 +159,9 @@ async fn compact_uses_bearer_after_agent_identity_session_fallback() -> anyhow::
         /*enable_request_compression*/ false,
         /*include_timing_metrics*/ false,
         /*beta_features_header*/ None,
-        /*item_ids_enabled*/ false,
+        /*concurrent_reasoning_summaries_enabled*/ false,
         /*attestation_provider*/ None,
+        HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
     );
     let prompt = Prompt {
         input: vec![ResponseItem::Message {
@@ -171,6 +175,7 @@ async fn compact_uses_bearer_after_agent_identity_session_fallback() -> anyhow::
         }],
         base_instructions: BaseInstructions {
             text: "base instructions".to_string(),
+            provenance: None,
         },
         ..Default::default()
     };
@@ -226,16 +231,6 @@ async fn compact_uses_bearer_after_agent_identity_session_fallback() -> anyhow::
     Ok(())
 }
 
-#[test]
-fn model_client_accepts_http_transport_override() {
-    let transport =
-        HttpTransportHandle::from_transport(ReqwestTransport::new(build_reqwest_client()));
-
-    let client = test_model_client(SessionSource::Cli).with_http_transport(transport);
-
-    assert!(client.state.http_transport.is_some());
-}
-
 fn test_model_provider() -> SharedModelProvider {
     test_model_client(SessionSource::Cli).state.provider.clone()
 }
@@ -274,14 +269,11 @@ fn test_model_info() -> ModelInfo {
         "supported_in_api": true,
         "priority": 1,
         "upgrade": null,
-        "base_instructions": "base instructions",
         "model_messages": null,
-        "supports_reasoning_summaries": false,
         "support_verbosity": false,
         "default_verbosity": null,
         "apply_patch_tool_type": null,
         "truncation_policy": {"mode": "bytes", "limit": 10000},
-        "supports_parallel_tool_calls": false,
         "supports_image_detail_original": false,
         "context_window": 272000,
         "auto_compact_token_limit": null,
@@ -312,26 +304,8 @@ fn ultra_reasoning_uses_max_for_requests() {
             super::reasoning_effort_for_request(ReasoningEffort::Ultra),
             super::reasoning_effort_for_request(ReasoningEffort::High),
         ),
-        (
-            ReasoningEffort::Custom("max".to_string()),
-            ReasoningEffort::High,
-        )
+        (ReasoningEffort::Max, ReasoningEffort::High,)
     );
-}
-
-#[test]
-fn reasoning_effort_is_sent_without_reasoning_summary_support() {
-    let model = test_model_info();
-
-    let reasoning = ModelClient::build_reasoning(
-        &model,
-        Some(ReasoningEffort::High),
-        ReasoningSummaryConfig::Detailed,
-    )
-    .expect("advertised reasoning effort should produce a request object");
-
-    assert_eq!(reasoning.effort, Some(ReasoningEffort::High));
-    assert_eq!(reasoning.summary, None);
 }
 
 fn write_chatgpt_auth_json(codex_home: &std::path::Path) {
@@ -363,7 +337,7 @@ async fn chatgpt_auth_manager(
         /*forced_chatgpt_workspace_id*/ None,
         /*chatgpt_base_url*/ None,
         AuthKeyringBackendKind::default(),
-        /*auth_route_config*/ None,
+        codex_login::test_support::transport_default_auth_route_config(),
     )
     .await;
     let auth = auth_manager.auth().await.expect("auth should load");
@@ -447,7 +421,7 @@ fn started_inference_attempt(temp: &TempDir) -> anyhow::Result<InferenceTraceAtt
 
 fn output_message(id: &str, text: &str) -> ResponseItem {
     ResponseItem::Message {
-        id: Some(id.to_string()),
+        id: Some(codex_protocol::ResponseItemId::with_suffix("msg", id)),
         role: "assistant".to_string(),
         content: vec![ContentItem::OutputText {
             text: text.to_string(),
@@ -606,82 +580,6 @@ async fn summarize_memories_returns_empty_for_empty_input() {
 }
 
 #[tokio::test]
-async fn model_client_uses_injected_http_transport() -> anyhow::Result<()> {
-    let request_urls = Arc::new(Mutex::new(Vec::new()));
-    let sse_body = concat!(
-        "event: response.created\n",
-        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-injected\"}}\n\n",
-        "event: response.completed\n",
-        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-injected\"}}\n\n",
-    );
-
-    let transport = HttpTransportHandle::new(
-        |_request: Request| async {
-            Err::<Response, TransportError>(TransportError::Build(
-                "execute should not be called".to_string(),
-            ))
-        },
-        {
-            let request_urls = Arc::clone(&request_urls);
-            move |request: Request| {
-                let request_urls = Arc::clone(&request_urls);
-                async move {
-                    request_urls
-                        .lock()
-                        .expect("request URL lock")
-                        .push(request.url);
-                    Ok(StreamResponse {
-                        status: StatusCode::OK,
-                        headers: HeaderMap::new(),
-                        bytes: Box::pin(futures::stream::iter([Ok(Bytes::from_static(
-                            sse_body.as_bytes(),
-                        ))])),
-                    })
-                }
-            }
-        },
-    );
-
-    let client = test_model_client(SessionSource::Cli).with_http_transport(transport);
-    let model_info = test_model_info();
-    let session_telemetry = test_session_telemetry();
-    let responses_metadata = test_responses_metadata_for_client(
-        &client,
-        Some("turn-injected"),
-        format!("{}:0", client.state.thread_id),
-        /*parent_thread_id*/ None,
-        TestCodexResponsesRequestKind::Turn,
-    );
-    let mut client_session = client.new_session();
-    let mut stream = client_session
-        .stream_responses_api(
-            &crate::Prompt::default(),
-            &model_info,
-            &session_telemetry,
-            /*effort*/ None,
-            ReasoningSummaryConfig::Auto,
-            /*service_tier*/ None,
-            &responses_metadata,
-            &InferenceTraceContext::disabled(),
-        )
-        .await?;
-
-    let mut completed_response_id = None;
-    while let Some(event) = stream.next().await {
-        if let ResponseEvent::Completed { response_id, .. } = event? {
-            completed_response_id = Some(response_id);
-        }
-    }
-
-    assert_eq!(completed_response_id.as_deref(), Some("resp-injected"));
-    assert_eq!(
-        request_urls.lock().expect("request URL lock").as_slice(),
-        ["https://example.com/v1/responses"]
-    );
-    Ok(())
-}
-
-#[tokio::test]
 async fn dropped_response_stream_traces_cancelled_partial_output() -> anyhow::Result<()> {
     let temp = TempDir::new()?;
     let attempt = started_inference_attempt(&temp)?;
@@ -690,7 +588,7 @@ async fn dropped_response_stream_traces_cancelled_partial_output() -> anyhow::Re
     // response.completed event. The harness has enough information to keep this
     // item in history, so the trace should preserve it when the stream is
     // abandoned.
-    let item = output_message("msg-1", "partial answer");
+    let item = output_message("1", "partial answer");
     let api_stream = futures::stream::iter([Ok(ResponseEvent::OutputItemDone(item))])
         .chain(futures::stream::pending());
     let (mut stream, _) = super::map_response_events(
@@ -771,6 +669,7 @@ async fn bedrock_unauthorized_error_uses_provider_mapping() {
         /*auth_manager*/ None,
     );
     let mut auth_recovery = None;
+    let mut provider_auth_recovery_attempted = false;
     let url = "https://bedrock-mantle.us-east-2.api.aws/openai/v1/responses";
     let error = super::handle_unauthorized(
         TransportError::Http {
@@ -783,6 +682,7 @@ async fn bedrock_unauthorized_error_uses_provider_mapping() {
             ),
         },
         &mut auth_recovery,
+        &mut provider_auth_recovery_attempted,
         &test_session_telemetry(),
         &provider,
     )
@@ -797,6 +697,113 @@ async fn bedrock_unauthorized_error_uses_provider_mapping() {
     );
 }
 
+#[derive(Debug)]
+struct TestRecoveryProvider {
+    inner: SharedModelProvider,
+    should_fail: bool,
+    attempts: Arc<AtomicUsize>,
+}
+
+impl ModelProvider for TestRecoveryProvider {
+    fn info(&self) -> &ModelProviderInfo {
+        self.inner.info()
+    }
+
+    fn auth_manager(&self) -> Option<Arc<AuthManager>> {
+        None
+    }
+
+    fn auth(&self) -> ModelProviderFuture<'_, Option<CodexAuth>> {
+        self.inner.auth()
+    }
+
+    fn account_state(&self) -> ProviderAccountResult {
+        self.inner.account_state()
+    }
+
+    fn recover_from_unauthorized(
+        &self,
+    ) -> ModelProviderFuture<'_, codex_protocol::error::Result<ProviderUnauthorizedRecovery>> {
+        self.attempts.fetch_add(1, Ordering::Relaxed);
+        Box::pin(async move {
+            if self.should_fail {
+                Err(CodexErr::Io(std::io::Error::other(
+                    "provider recovery failed",
+                )))
+            } else {
+                Ok(ProviderUnauthorizedRecovery::Recovered)
+            }
+        })
+    }
+
+    fn models_manager(
+        &self,
+        codex_home: PathBuf,
+        config_model_catalog: Option<ModelsResponse>,
+    ) -> SharedModelsManager {
+        self.inner.models_manager(codex_home, config_model_catalog)
+    }
+}
+
+#[tokio::test]
+async fn provider_owned_auth_recovery_is_bounded_and_preserves_unauthorized_failures() {
+    for should_fail in [false, true] {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let provider: SharedModelProvider = Arc::new(TestRecoveryProvider {
+            inner: test_model_provider(),
+            should_fail,
+            attempts: Arc::clone(&attempts),
+        });
+        assert!(provider.auth_manager().is_none());
+
+        let unauthorized = || TransportError::Http {
+            status: http::StatusCode::UNAUTHORIZED,
+            url: Some("https://example.com/v1/responses".to_string()),
+            headers: None,
+            body: Some("unauthorized".to_string()),
+        };
+        let mut auth_recovery = None;
+        let mut provider_auth_recovery_attempted = false;
+        let telemetry = test_session_telemetry();
+        let result = super::handle_unauthorized(
+            unauthorized(),
+            &mut auth_recovery,
+            &mut provider_auth_recovery_attempted,
+            &telemetry,
+            &provider,
+        )
+        .await;
+
+        let error = if should_fail {
+            result.expect_err("failed provider recovery should return the original error")
+        } else {
+            let recovered = result.expect("provider recovery should succeed without AuthManager");
+            assert_eq!(
+                (recovered.mode, recovered.phase),
+                ("provider", "provider_refresh")
+            );
+            super::handle_unauthorized(
+                unauthorized(),
+                &mut auth_recovery,
+                &mut provider_auth_recovery_attempted,
+                &telemetry,
+                &provider,
+            )
+            .await
+            .expect_err("provider recovery should not run more than once")
+        };
+
+        match error.details() {
+            CodexErrorDetails::UnexpectedStatus(response) => {
+                assert_eq!(response.status, http::StatusCode::UNAUTHORIZED);
+                assert_eq!(response.body, "unauthorized");
+            }
+            other => panic!("unexpected error after provider recovery: {other}"),
+        }
+        assert_eq!(attempts.load(Ordering::Relaxed), 1);
+    }
+}
+
 #[tokio::test]
 async fn dropped_backpressured_response_stream_traces_cancelled_partial_output()
 -> anyhow::Result<()> {
@@ -808,7 +815,7 @@ async fn dropped_backpressured_response_stream_traces_cancelled_partial_output()
         events.push_back(ResponseEvent::Created);
     }
     events.push_back(ResponseEvent::OutputItemDone(output_message(
-        "msg-1",
+        "1",
         "partial answer",
     )));
     let api_stream = NotifyAfterEventStream {
@@ -934,10 +941,11 @@ fn model_client_with_counting_attestation(
         /*enable_request_compression*/ false,
         /*include_timing_metrics*/ false,
         /*beta_features_header*/ None,
-        /*item_ids_enabled*/ false,
+        /*concurrent_reasoning_summaries_enabled*/ false,
         Some(Arc::new(CountingAttestationProvider {
             calls: attestation_calls.clone(),
         })),
+        HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
     );
     (model_client, attestation_calls)
 }
@@ -1000,113 +1008,14 @@ async fn non_chatgpt_codex_endpoints_omit_attestation_generation() {
     assert_eq!(attestation_calls.load(Ordering::Relaxed), 0);
 }
 
-/// The exact body DashScope returns for an id it no longer has, and the ones it must not match.
-///
-/// Measured against the live API by sending a well-formed id that was never issued:
-/// `{"code":"InvalidParameter","message":"Not found previous_response_id: resp_..."}`. The retry
-/// this drives resends the whole conversation, so matching too widely turns an ordinary bad
-/// request into a large one that fails the same way — `InvalidParameter` is the code for every
-/// malformed field, which is why the message is what gets read.
 #[test]
-fn only_a_missing_previous_response_triggers_the_full_resend() {
-    fn as_api_error(body: &str) -> ApiError {
-        ApiError::Transport(TransportError::Http {
-            status: StatusCode::BAD_REQUEST,
-            url: None,
-            headers: None,
-            body: Some(body.to_string()),
-        })
-    }
+fn recognizes_structured_unknown_previous_response_error() {
+    let error = ApiError::Transport(TransportError::Http {
+        status: http::StatusCode::NOT_FOUND,
+        url: None,
+        headers: None,
+        body: Some(r#"{"code":"previous_response_not_found"}"#.to_string()),
+    });
 
-    assert!(super::is_unknown_previous_response(&as_api_error(
-        r#"{"request_id":"ad3301ad","code":"InvalidParameter","message":"Not found previous_response_id: resp_00000000-0000-4000-8000-000000000000."}"#
-    )));
-
-    // Same code, different field: resending the conversation cannot help, and doing so would
-    // double the cost of a request that was going to fail either way.
-    assert!(!super::is_unknown_previous_response(&as_api_error(
-        r#"{"code":"InvalidParameter","message":"Invalid value for parameter temperature."}"#
-    )));
-    // The other measured failure at this status, which has its own handling.
-    assert!(!super::is_unknown_previous_response(&as_api_error(
-        r#"{"code":"BadRequest.TooLarge","message":"Exceeded limit on max bytes to request body : 6291456"}"#
-    )));
-}
-
-/// The rewrite has to be visible to whatever records what was sent.
-///
-/// It used to run on the way to the wire, after the baseline had already been taken, so a tool
-/// result carrying an image left the backend holding one more item than we had counted. Every
-/// later request then extended a conversation of a different shape than the one it named.
-#[test]
-fn tool_output_image_relocation_is_ordered_and_idempotent() {
-    use codex_protocol::models::ContentItem;
-    use codex_protocol::models::FunctionCallOutputContentItem;
-    use codex_protocol::models::FunctionCallOutputPayload;
-    use codex_protocol::models::ResponseItem;
-
-    let mut input = vec![ResponseItem::FunctionCallOutput {
-        id: None,
-        internal_chat_message_metadata_passthrough: None,
-        call_id: "call-1".to_string(),
-        output: FunctionCallOutputPayload::from_content_items(vec![
-            FunctionCallOutputContentItem::InputText {
-                text: "screenshot taken".to_string(),
-            },
-            FunctionCallOutputContentItem::InputImage {
-                image_url: "data:image/png;base64,YQ==".to_string(),
-                detail: None,
-            },
-            FunctionCallOutputContentItem::InputImage {
-                image_url: "data:image/png;base64,Yg==".to_string(),
-                detail: None,
-            },
-        ]),
-    }];
-
-    super::relocate_tool_output_images(&mut input);
-    let after_first = input.clone();
-    super::relocate_tool_output_images(&mut input);
-
-    assert_eq!(input, after_first, "relocation must be idempotent");
-    assert_eq!(input.len(), 2, "the images travel in one adjacent item");
-    let ResponseItem::FunctionCallOutput { output, .. } = &input[0] else {
-        panic!("the tool result stays first");
-    };
-    assert_eq!(
-        output.content_items().map(|items| items.len()),
-        Some(1),
-        "its text stays so the model can tell which call the image answers"
-    );
-    let ResponseItem::Message { role, content, .. } = &input[1] else {
-        panic!("the image becomes a message");
-    };
-    assert_eq!(role, "user");
-    assert_eq!(content.len(), 2);
-    assert!(matches!(
-        content.as_slice(),
-        [
-            ContentItem::InputImage { image_url: first, .. },
-            ContentItem::InputImage { image_url: second, .. }
-        ] if first.ends_with("YQ==") && second.ends_with("Yg==")
-    ));
-}
-
-/// A tool result with no image is left exactly as it was, so nothing else shifts position.
-#[test]
-fn a_tool_result_without_an_image_is_left_alone() {
-    use codex_protocol::models::FunctionCallOutputPayload;
-    use codex_protocol::models::ResponseItem;
-
-    let original = vec![ResponseItem::FunctionCallOutput {
-        id: None,
-        internal_chat_message_metadata_passthrough: None,
-        call_id: "call-1".to_string(),
-        output: FunctionCallOutputPayload::from_text("Exit code: 0".to_string()),
-    }];
-    let mut input = original.clone();
-
-    super::relocate_tool_output_images(&mut input);
-
-    assert_eq!(input, original);
+    assert!(is_unknown_previous_response(&error));
 }

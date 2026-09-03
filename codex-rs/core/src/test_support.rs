@@ -1,7 +1,8 @@
 //! Test-only helpers exposed for cross-crate integration tests.
 //!
-//! Production code should not depend on this module. Synchronization hooks and direct state
-//! helpers are available only to unit tests or builds that explicitly enable `test-support`.
+//! Production code should not depend on this module.
+//! We prefer this to using a crate feature to avoid building multiple
+//! permutations of the crate.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -10,6 +11,8 @@ use codex_exec_server::EnvironmentManager;
 use codex_extension_api::LoadUserInstructionsFuture;
 use codex_extension_api::LoadedUserInstructions;
 use codex_extension_api::UserInstructionsProvider;
+use codex_http_client::HttpClientFactory;
+use codex_http_client::OutboundProxyPolicy;
 use codex_login::AuthManager;
 use codex_login::CodexAuth;
 use codex_model_provider::create_model_provider;
@@ -21,16 +24,14 @@ use codex_models_manager::test_support::construct_model_info_offline_for_tests;
 use codex_models_manager::test_support::get_model_offline_for_tests;
 use codex_protocol::ThreadId;
 use codex_protocol::config_types::CollaborationModeMask;
+use codex_protocol::mcp::ClientMcpExtensions;
+use codex_protocol::mcp::OPENAI_FORM_EXTENSION_ID;
 use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::openai_models::ModelPreset;
 use codex_protocol::protocol::SessionSource;
 use once_cell::sync::Lazy;
 
-#[cfg(any(test, feature = "test-support"))]
-use crate::CodexThread;
 use crate::ThreadManager;
-#[cfg(any(test, feature = "test-support"))]
-use crate::ThreadManagerRuntimeOptions;
 use crate::config::Config;
 use crate::responses_metadata::CodexResponsesMetadata;
 use crate::responses_metadata::CodexResponsesRequestKind;
@@ -38,264 +39,6 @@ use crate::responses_metadata::subagent_header_value;
 use crate::responses_metadata::subagent_metadata_kind;
 use crate::thread_manager;
 use crate::unified_exec;
-
-/// Instance-scoped synchronization for compaction integration tests.
-#[cfg(any(test, feature = "test-support"))]
-#[doc(hidden)]
-#[derive(Clone, Debug)]
-pub struct CompactCommitTestHook(crate::compact::CompactCommitTestHook);
-
-#[cfg(any(test, feature = "test-support"))]
-impl CompactCommitTestHook {
-    pub fn new() -> Self {
-        Self(crate::compact::CompactCommitTestHook::new())
-    }
-
-    pub async fn wait_until_commit_paused(&self) {
-        self.0.wait_until_commit_paused().await;
-    }
-
-    pub fn release_commit(&self) {
-        self.0.release_commit();
-    }
-
-    pub fn panic_commit_once(&self) {
-        self.0.panic_commit_once();
-    }
-
-    pub fn pause_item_started_once(&self) {
-        self.0.pause_item_started_once();
-    }
-
-    pub async fn wait_until_item_started_paused(&self) {
-        self.0.wait_until_item_started_paused().await;
-    }
-
-    pub async fn wait_until_item_started_cancelled(&self) {
-        self.0.wait_until_item_started_cancelled().await;
-    }
-
-    pub async fn wait_until_parent_wait_dropped(&self) {
-        self.0.wait_until_parent_wait_dropped().await;
-    }
-
-    pub async fn wait_until_commit_completed(&self) {
-        self.0.wait_until_commit_completed().await;
-    }
-
-    pub fn pause_task_start_before_gate_once(&self) {
-        self.0.pause_task_start_before_gate_once();
-    }
-
-    pub async fn wait_until_task_start_before_gate_paused(&self) {
-        self.0.wait_until_task_start_before_gate_paused().await;
-    }
-
-    pub fn release_task_start_before_gate(&self) {
-        self.0.release_task_start_before_gate();
-    }
-
-    pub fn pause_after_persistence_fatal_once(&self) {
-        self.0.pause_after_persistence_fatal_once();
-    }
-
-    pub async fn wait_until_persistence_fatal_paused(&self) {
-        self.0.wait_until_persistence_fatal_paused().await;
-    }
-
-    pub fn release_persistence_fatal(&self) {
-        self.0.release_persistence_fatal();
-    }
-
-    pub fn turn_abort_lifecycle_calls(&self) -> usize {
-        self.0.turn_abort_lifecycle_calls()
-    }
-}
-
-#[cfg(any(test, feature = "test-support"))]
-impl Default for CompactCommitTestHook {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-/// Install the compaction synchronization hook without adding a production runtime API.
-#[cfg(any(test, feature = "test-support"))]
-#[doc(hidden)]
-pub fn with_compact_commit_test_hook(
-    options: ThreadManagerRuntimeOptions,
-    hook: CompactCommitTestHook,
-) -> ThreadManagerRuntimeOptions {
-    options.with_compact_commit_test_hook_for_tests(hook.0)
-}
-
-/// Instance-scoped synchronization for realtime lifecycle integration tests.
-#[cfg(any(test, feature = "test-support"))]
-#[doc(hidden)]
-#[derive(Clone, Debug)]
-pub struct RealtimeStartTestHook(crate::realtime_conversation::RealtimeStartTestHook);
-
-#[cfg(any(test, feature = "test-support"))]
-impl RealtimeStartTestHook {
-    pub fn new() -> Self {
-        Self(crate::realtime_conversation::RealtimeStartTestHook::new())
-    }
-
-    pub fn pause_before_gate_once(&self) {
-        self.0.pause_before_gate_once();
-    }
-
-    pub async fn wait_until_before_gate_paused(&self) {
-        self.0.wait_until_before_gate_paused().await;
-    }
-
-    pub fn release_before_gate(&self) {
-        self.0.release_before_gate();
-    }
-
-    pub fn pause_after_gate_once(&self) {
-        self.0.pause_after_gate_once();
-    }
-
-    pub async fn wait_until_after_gate_paused(&self) {
-        self.0.wait_until_after_gate_paused().await;
-    }
-
-    pub fn release_after_gate(&self) {
-        self.0.release_after_gate();
-    }
-
-    pub fn pause_close_before_gate_once(&self) {
-        self.0.pause_close_before_gate_once();
-    }
-
-    pub async fn wait_until_close_before_gate_paused(&self) {
-        self.0.wait_until_close_before_gate_paused().await;
-    }
-
-    pub fn release_close_before_gate(&self) {
-        self.0.release_close_before_gate();
-    }
-
-    pub fn pause_close_after_claim_once(&self) {
-        self.0.pause_close_after_claim_once();
-    }
-
-    pub async fn wait_until_close_after_claim_paused(&self) {
-        self.0.wait_until_close_after_claim_paused().await;
-    }
-
-    pub fn release_close_after_claim(&self) {
-        self.0.release_close_after_claim();
-    }
-}
-
-#[cfg(any(test, feature = "test-support"))]
-impl Default for RealtimeStartTestHook {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-/// Install the realtime synchronization hook without adding a production runtime API.
-#[cfg(any(test, feature = "test-support"))]
-#[doc(hidden)]
-pub fn with_realtime_start_test_hook(
-    options: ThreadManagerRuntimeOptions,
-    hook: RealtimeStartTestHook,
-) -> ThreadManagerRuntimeOptions {
-    options.with_realtime_start_test_hook_for_tests(hook.0)
-}
-
-/// Snapshot of the state direct injection APIs must leave untouched on rejection.
-#[cfg(any(test, feature = "test-support"))]
-#[doc(hidden)]
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct DirectMutationTestSnapshot {
-    pub history_len: usize,
-    pub has_active_turn: bool,
-    pub has_pending_input: bool,
-}
-
-#[cfg(any(test, feature = "test-support"))]
-#[doc(hidden)]
-pub async fn direct_mutation_test_snapshot(thread: &CodexThread) -> DirectMutationTestSnapshot {
-    let (history_len, has_active_turn, has_pending_input) =
-        thread.direct_mutation_test_snapshot().await;
-    DirectMutationTestSnapshot {
-        history_len,
-        has_active_turn,
-        has_pending_input,
-    }
-}
-
-#[cfg(any(test, feature = "test-support"))]
-#[doc(hidden)]
-pub async fn context_persistence_test_snapshot(
-    thread: &CodexThread,
-) -> (
-    Option<codex_protocol::protocol::TurnContextItem>,
-    Option<serde_json::Value>,
-) {
-    thread.context_persistence_test_snapshot().await
-}
-
-#[cfg(any(test, feature = "test-support"))]
-#[doc(hidden)]
-pub async fn record_step_world_state_from_empty_for_test(
-    thread: &CodexThread,
-) -> codex_thread_store::ThreadStoreResult<()> {
-    thread.record_step_world_state_from_empty_for_test().await
-}
-
-#[cfg(any(test, feature = "test-support"))]
-#[doc(hidden)]
-pub async fn record_deferred_context_update_for_test(
-    thread: &CodexThread,
-) -> codex_thread_store::ThreadStoreResult<()> {
-    thread.record_deferred_context_update_for_test().await
-}
-
-#[cfg(any(test, feature = "test-support"))]
-#[doc(hidden)]
-pub async fn establish_stale_deferred_context_baseline_for_test(
-    thread: &CodexThread,
-) -> codex_thread_store::ThreadStoreResult<()> {
-    thread
-        .establish_stale_deferred_context_baseline_for_test()
-        .await
-}
-
-#[cfg(any(test, feature = "test-support"))]
-#[doc(hidden)]
-pub async fn conversation_history_for_test(
-    thread: &CodexThread,
-) -> Vec<codex_protocol::models::ResponseItem> {
-    thread.conversation_history_for_test().await
-}
-
-#[cfg(any(test, feature = "test-support"))]
-#[doc(hidden)]
-pub async fn realtime_close_pending_for_test(thread: &CodexThread) -> bool {
-    thread.realtime_close_pending_for_test().await
-}
-
-#[cfg(any(test, feature = "test-support"))]
-#[doc(hidden)]
-pub async fn inject_no_new_turn_for_test(
-    thread: &CodexThread,
-    items: Vec<codex_protocol::models::ResponseItem>,
-) {
-    thread.inject_no_new_turn_for_test(items).await;
-}
-
-#[cfg(any(test, feature = "test-support"))]
-#[doc(hidden)]
-pub async fn clear_reference_context_item_for_direct_mutation_test(thread: &CodexThread) {
-    thread
-        .clear_reference_context_item_for_direct_mutation_test()
-        .await;
-}
 
 static TEST_MODEL_PRESETS: Lazy<Vec<ModelPreset>> = Lazy::new(|| {
     let mut response = bundled_models_response()
@@ -332,6 +75,14 @@ pub fn auth_manager_from_auth_with_home(auth: CodexAuth, codex_home: PathBuf) ->
     AuthManager::from_auth_for_testing_with_home(auth, codex_home)
 }
 
+pub fn with_code_mode_host_program(
+    thread_manager: ThreadManager,
+    host_program: PathBuf,
+    config: &crate::config::Config,
+) -> ThreadManager {
+    thread_manager.with_code_mode_host_program_for_tests(host_program, config)
+}
+
 pub fn thread_manager_with_models_provider(
     auth: CodexAuth,
     provider: ModelProviderInfo,
@@ -353,22 +104,6 @@ pub fn thread_manager_with_models_provider_and_home(
     )
 }
 
-pub fn thread_manager_with_models_provider_home_and_state(
-    auth: CodexAuth,
-    provider: ModelProviderInfo,
-    codex_home: PathBuf,
-    environment_manager: Arc<EnvironmentManager>,
-    state_db: Option<crate::StateDbHandle>,
-) -> ThreadManager {
-    ThreadManager::with_models_provider_home_and_state_for_tests(
-        auth,
-        provider,
-        codex_home,
-        environment_manager,
-        state_db,
-    )
-}
-
 pub async fn start_thread_with_user_shell_override(
     thread_manager: &ThreadManager,
     config: Config,
@@ -379,7 +114,10 @@ pub async fn start_thread_with_user_shell_override(
         .start_thread_with_user_shell_override_for_tests(
             config,
             user_shell_override,
-            supports_openai_form_elicitation,
+            ClientMcpExtensions::new(
+                supports_openai_form_elicitation
+                    .then(|| (OPENAI_FORM_EXTENSION_ID.to_string(), serde_json::json!({}))),
+            ),
         )
         .await
 }
@@ -398,7 +136,10 @@ pub async fn resume_thread_from_rollout_with_user_shell_override(
             rollout_path,
             auth_manager,
             user_shell_override,
-            supports_openai_form_elicitation,
+            ClientMcpExtensions::new(
+                supports_openai_form_elicitation
+                    .then(|| (OPENAI_FORM_EXTENSION_ID.to_string(), serde_json::json!({}))),
+            ),
         )
         .await
 }
@@ -410,6 +151,10 @@ pub fn models_manager_with_provider(
 ) -> SharedModelsManager {
     let provider = create_model_provider(provider, Some(auth_manager));
     provider.models_manager(codex_home, /*config_model_catalog*/ None)
+}
+
+pub fn default_http_client_factory() -> HttpClientFactory {
+    HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault)
 }
 
 pub fn get_model_offline(model: Option<&str>) -> String {
@@ -456,6 +201,11 @@ pub fn responses_metadata(
             window_id,
         )
     }
+}
+
+pub fn with_parent_turn(mut metadata: CodexResponsesMetadata, id: &str) -> CodexResponsesMetadata {
+    metadata.parent_turn_id = Some(id.to_string());
+    metadata
 }
 
 pub fn all_model_presets() -> &'static Vec<ModelPreset> {

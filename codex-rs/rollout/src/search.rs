@@ -3,14 +3,12 @@ use std::collections::HashSet;
 use std::io;
 use std::path::Path;
 use std::path::PathBuf;
+use std::process::Stdio;
 
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::EventMsg;
-use codex_protocol::protocol::RolloutItem;
-use codex_protocol::protocol::RolloutItemFlattener;
-use codex_protocol::protocol::RolloutLine;
-use codex_protocol::protocol::USER_MESSAGE_BEGIN;
+use codex_protocol::protocol::strip_user_message_prefix;
 use regex::Regex;
 use regex::RegexBuilder;
 use tokio::process::Command;
@@ -18,6 +16,9 @@ use tokio::process::Command;
 use super::ARCHIVED_SESSIONS_SUBDIR;
 use super::SESSIONS_SUBDIR;
 use super::compression;
+use crate::ResponseItemEnvelope;
+use crate::RolloutItem;
+use crate::RolloutLine;
 
 const MATCH_CONTEXT_BEFORE_CHARS: usize = 48;
 const MATCH_CONTEXT_AFTER_CHARS: usize = 96;
@@ -54,17 +55,10 @@ pub async fn search_rollout_matches(
     let Some(plain_matches) =
         ripgrep_rollout_paths(rg_command, root.as_path(), json_search_term.as_str()).await?
     else {
-        return scan_rollout_matches(root.as_path(), search_term).await;
+        return scan_rollout_matches(root.as_path(), json_search_term.as_str(), search_term).await;
     };
-    let mut matches = RolloutSearchMatches::new();
-    for path in plain_matches {
-        if first_rollout_content_match_snippet(path.as_path(), search_term)
-            .await?
-            .is_some()
-        {
-            matches.insert(path, None);
-        }
-    }
+    let mut matches: RolloutSearchMatches =
+        plain_matches.into_iter().map(|path| (path, None)).collect();
     matches.extend(scan_compressed_rollout_matches(root.as_path(), search_term).await?);
     Ok(matches)
 }
@@ -88,6 +82,7 @@ async fn ripgrep_rollout_paths(
         .arg("--")
         .arg(search_term)
         .arg(root)
+        .stdin(Stdio::null())
         .output()
         .await
     {
@@ -122,9 +117,14 @@ async fn ripgrep_rollout_paths(
     Ok(Some(matches))
 }
 
-async fn scan_rollout_matches(root: &Path, search_term: &str) -> io::Result<RolloutSearchMatches> {
+async fn scan_rollout_matches(
+    root: &Path,
+    json_search_term: &str,
+    search_term: &str,
+) -> io::Result<RolloutSearchMatches> {
     let mut matches = HashMap::new();
     let mut dirs = vec![root.to_path_buf()];
+    let json_search_term = case_insensitive_literal_regex(json_search_term)?;
 
     while let Some(dir) = dirs.pop() {
         let mut entries = match tokio::fs::read_dir(dir).await {
@@ -156,16 +156,23 @@ async fn scan_rollout_matches(root: &Path, search_term: &str) -> io::Result<Roll
                 }
                 continue;
             }
-            if first_rollout_content_match_snippet(rollout_file.path(), search_term)
-                .await?
-                .is_some()
-            {
+            if rollout_contains(rollout_file.path(), &json_search_term).await? {
                 matches.insert(rollout_file.into_path(), None);
             }
         }
     }
 
     Ok(matches)
+}
+
+async fn rollout_contains(path: &Path, search_term: &Regex) -> io::Result<bool> {
+    let mut lines = compression::open_rollout_line_reader(path).await?;
+    while let Some(line) = lines.next_line().await? {
+        if search_term.is_match(line.as_str()) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 pub async fn first_rollout_content_match_snippet(
@@ -175,21 +182,11 @@ pub async fn first_rollout_content_match_snippet(
     let mut lines = compression::open_rollout_line_reader(path).await?;
     let json_search_term = case_insensitive_literal_regex(json_escaped_search_term(search_term)?)?;
     let search_term = case_insensitive_literal_regex(search_term)?;
-    let mut flattener = RolloutItemFlattener::default();
     while let Some(line) = lines.next_line().await? {
-        let parsed = serde_json::from_str::<RolloutLine>(line.trim());
-        let Ok(rollout_line) = parsed else {
-            continue;
-        };
-        let logical_items = flattener
-            .flatten(std::slice::from_ref(&rollout_line.item))
-            .map_err(io::Error::other)?;
-        if json_search_term.is_match(line.as_str()) {
-            for item in logical_items {
-                if let Some(snippet) = content_match_snippet_from_item(item, &search_term) {
-                    return Ok(Some(snippet));
-                }
-            }
+        if json_search_term.is_match(line.as_str())
+            && let Some(snippet) = content_match_snippet(line.as_str(), &search_term)
+        {
+            return Ok(Some(snippet));
         }
     }
     Ok(None)
@@ -250,8 +247,9 @@ fn case_insensitive_literal_regex(search_term: impl AsRef<str>) -> io::Result<Re
         .map_err(io::Error::other)
 }
 
-fn content_match_snippet_from_item(item: &RolloutItem, search_term: &Regex) -> Option<String> {
-    let text = conversation_text_from_item(item)?;
+fn content_match_snippet(jsonl_line: &str, search_term: &Regex) -> Option<String> {
+    let rollout_line = serde_json::from_str::<RolloutLine>(jsonl_line.trim()).ok()?;
+    let text = conversation_text_from_item(&rollout_line.item)?;
     excerpt_around_match(text.as_str(), search_term)
 }
 
@@ -272,7 +270,10 @@ fn conversation_text_from_item(item: &RolloutItem) -> Option<String> {
                 Some(agent.message.trim().to_string())
             }
         }
-        RolloutItem::ResponseItem(ResponseItem::Message { role, content, .. }) => {
+        RolloutItem::ResponseItem(ResponseItemEnvelope {
+            item: ResponseItem::Message { role, content, .. },
+            ..
+        }) => {
             let text = content
                 .iter()
                 .filter_map(content_item_text)
@@ -291,22 +292,15 @@ fn conversation_text_from_item(item: &RolloutItem) -> Option<String> {
         | RolloutItem::InterAgentCommunication(_)
         | RolloutItem::InterAgentCommunicationMetadata { .. }
         | RolloutItem::Compacted(_)
-        | RolloutItem::WorldState(_)
-        | RolloutItem::Transaction(_) => None,
+        | RolloutItem::SecurityRiskScore(_)
+        | RolloutItem::WorldState(_) => None,
     }
 }
 
 fn content_item_text(item: &ContentItem) -> Option<&str> {
     match item {
         ContentItem::InputText { text } | ContentItem::OutputText { text } => Some(text.as_str()),
-        ContentItem::InputImage { .. } => None,
-    }
-}
-
-fn strip_user_message_prefix(text: &str) -> &str {
-    match text.find(USER_MESSAGE_BEGIN) {
-        Some(idx) => text[idx + USER_MESSAGE_BEGIN.len()..].trim(),
-        None => text.trim(),
+        ContentItem::InputImage { .. } | ContentItem::InputAudio { .. } => None,
     }
 }
 

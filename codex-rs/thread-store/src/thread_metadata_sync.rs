@@ -1,6 +1,3 @@
-use std::collections::HashSet;
-#[cfg(test)]
-use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -10,46 +7,39 @@ use chrono::Utc;
 use codex_git_utils::collect_git_info;
 use codex_git_utils::get_git_repo_root;
 use codex_protocol::ThreadId;
+use codex_protocol::items::TurnItem;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::GitInfo;
-use codex_protocol::protocol::RolloutItem;
-use codex_protocol::protocol::RolloutItemFlattener;
+use codex_protocol::protocol::ThreadHistoryMode;
 use codex_protocol::protocol::ThreadMemoryMode;
-use codex_protocol::protocol::USER_MESSAGE_BEGIN;
 use codex_protocol::protocol::UserMessageEvent;
+use codex_protocol::protocol::strip_user_message_prefix;
+use codex_protocol::protocol::user_message_preview;
+use codex_rollout::RolloutItem;
+use codex_state::ThreadMetadata;
 
 use crate::CreateThreadParams;
 use crate::GitInfoPatch;
 use crate::ResumeThreadParams;
 use crate::ThreadMetadataPatch;
 use crate::ThreadTitleRequest;
+use crate::types::canonical_history_mode_from_rollout_items;
 
-const IMAGE_ONLY_USER_MESSAGE_PLACEHOLDER: &str = "[Image]";
-#[cfg(not(test))]
 const THREAD_UPDATED_AT_TOUCH_INTERVAL: Duration = Duration::from_secs(5);
-#[cfg(test)]
-const THREAD_UPDATED_AT_TOUCH_INTERVAL: Duration = Duration::from_millis(50);
 
-/// Live-thread helper that derives metadata updates from canonical rollout items.
+/// Live-thread helper that derives metadata updates from appended rollout items.
 ///
-/// Stores receive raw history plus explicit metadata patches. This helper keeps append-derived
-/// metadata observation in the live layer without owning persistence-policy filtering or making
-/// `append_items` infer metadata inside a `ThreadStore` implementation.
+/// Stores receive raw rollout items plus explicit metadata patches. This helper
+/// keeps append-derived metadata observation in the live layer without owning persistence-policy
+/// filtering or making `append_items` infer metadata inside a `ThreadStore` implementation.
 pub(crate) struct ThreadMetadataSync {
     thread_id: ThreadId,
     cwd_seen: bool,
     preview_seen: bool,
     first_user_message_seen: bool,
-    title_seen: bool,
-    /// Retained text of the first user message, used to build the LLM title
-    /// prompt and as the guard baseline against clobbering a manual rename.
     first_user_message: Option<String>,
-    /// Set once the best-effort LLM title task has been dispatched so it never
-    /// fires more than once per live thread.
     llm_title_dispatched: bool,
-    metadata_item_flattener: RolloutItemFlattener,
-    title_item_flattener: RolloutItemFlattener,
-    seen_compaction_checkpoint_ids: HashSet<String>,
+    title_seen: bool,
     pending_update: Option<ThreadMetadataPatch>,
     pending_update_generation: u64,
     last_touch_persisted_at: Option<Instant>,
@@ -95,12 +85,9 @@ impl ThreadMetadataSync {
             cwd_seen: !cwd.as_os_str().is_empty(),
             preview_seen: false,
             first_user_message_seen: false,
-            title_seen: false,
             first_user_message: None,
             llm_title_dispatched: false,
-            metadata_item_flattener: RolloutItemFlattener::default(),
-            title_item_flattener: RolloutItemFlattener::default(),
-            seen_compaction_checkpoint_ids: HashSet::new(),
+            title_seen: false,
             pending_update: Some(update),
             pending_update_generation: 1,
             last_touch_persisted_at: None,
@@ -109,7 +96,10 @@ impl ThreadMetadataSync {
         }
     }
 
-    pub(crate) fn for_resume(params: &ResumeThreadParams) -> Self {
+    pub(crate) fn for_resume(
+        params: &ResumeThreadParams,
+        metadata: Option<&ThreadMetadata>,
+    ) -> Self {
         let mut sync = Self {
             thread_id: params.thread_id,
             cwd_seen: params
@@ -117,14 +107,17 @@ impl ThreadMetadataSync {
                 .cwd
                 .as_ref()
                 .is_some_and(|cwd| !cwd.as_os_str().is_empty()),
-            preview_seen: false,
-            first_user_message_seen: false,
-            title_seen: false,
-            first_user_message: None,
-            llm_title_dispatched: false,
-            metadata_item_flattener: RolloutItemFlattener::default(),
-            title_item_flattener: RolloutItemFlattener::default(),
-            seen_compaction_checkpoint_ids: HashSet::new(),
+            preview_seen: metadata
+                .and_then(|metadata| metadata.preview.as_deref())
+                .is_some_and(|preview| !preview.is_empty()),
+            first_user_message_seen: metadata
+                .is_some_and(|metadata| metadata.first_user_message.is_some()),
+            first_user_message: metadata.and_then(|metadata| metadata.first_user_message.clone()),
+            llm_title_dispatched: metadata.is_some_and(|metadata| {
+                !metadata.title.is_empty()
+                    && metadata.first_user_message.as_deref() != Some(metadata.title.as_str())
+            }),
+            title_seen: metadata.is_some_and(|metadata| !metadata.title.is_empty()),
             pending_update: None,
             pending_update_generation: 0,
             last_touch_persisted_at: None,
@@ -139,9 +132,6 @@ impl ThreadMetadataSync {
 
     pub(crate) fn record_resume_history(&mut self, history: &[RolloutItem]) {
         let update = self.observe_resume_history(history);
-        if let Err(err) = self.title_item_flattener.flatten(history) {
-            tracing::warn!(%err, "failed to traverse resumed rollout history for title state");
-        }
         self.merge_pending_update(update);
         self.defer_resume_update_until_append = self.pending_update.is_some();
     }
@@ -182,29 +172,14 @@ impl ThreadMetadataSync {
     ) -> Option<PendingThreadMetadataPatch> {
         self.defer_create_update_until_history_exists = false;
         self.defer_resume_update_until_append = false;
-        let items = match self.metadata_item_flattener.flatten(items) {
-            Ok(items) => items,
-            Err(err) => {
-                tracing::warn!(%err, "failed to traverse appended rollout metadata");
-                return None;
-            }
-        };
-        let affects_metadata = match items.iter().copied().try_fold(false, |affects, item| {
-            codex_state::rollout_item_affects_thread_metadata(item)
-                .map(|item_affects| affects || item_affects)
-        }) {
-            Ok(affects_metadata) => affects_metadata,
-            Err(err) => {
-                tracing::warn!(%err, "failed to inspect appended rollout metadata");
-                return None;
-            }
-        };
+        let affects_metadata = items
+            .iter()
+            .any(codex_state::rollout_item_affects_thread_metadata);
         let advances_recency = items
             .iter()
-            .copied()
             .any(|item| matches!(item, RolloutItem::EventMsg(EventMsg::TurnStarted(_))));
         let mut update = if affects_metadata {
-            self.observe_items(&items)?
+            self.observe_items(items)?
         } else {
             thread_updated_at_touch()
         };
@@ -226,11 +201,6 @@ impl ThreadMetadataSync {
         self.take_pending_update()
     }
 
-    /// Returns a one-shot LLM title request when the first visible assistant
-    /// message is observed for a thread that already has a first user message.
-    ///
-    /// Subsequent calls return `None` so the best-effort summarizer never runs
-    /// more than once per live thread.
     pub(crate) fn take_llm_title_request(
         &mut self,
         items: &[RolloutItem],
@@ -239,33 +209,20 @@ impl ThreadMetadataSync {
             return None;
         }
         let first_user_message = self.first_user_message.clone()?;
-        let items = match self.title_item_flattener.flatten(items) {
-            Ok(items) => items,
-            Err(err) => {
-                tracing::warn!(%err, "failed to traverse appended rollout title state");
-                return None;
+        let first_assistant_message = items.iter().find_map(|item| match item {
+            RolloutItem::EventMsg(EventMsg::AgentMessage(event))
+                if !event.message.trim().is_empty() =>
+            {
+                Some(event.message.trim().to_string())
             }
-        };
-        let mut first_assistant_message: Option<String> = None;
-        for item in items {
-            match item {
-                RolloutItem::EventMsg(EventMsg::TurnComplete(event)) => {
-                    if first_assistant_message.is_none()
-                        && let Some(message) = event.last_agent_message.as_deref()
-                        && !message.trim().is_empty()
-                    {
-                        first_assistant_message = Some(message.trim().to_string());
-                    }
-                }
-                RolloutItem::EventMsg(EventMsg::AgentMessage(event))
-                    if first_assistant_message.is_none() && !event.message.trim().is_empty() =>
-                {
-                    first_assistant_message = Some(event.message.trim().to_string());
-                }
-                _ => {}
-            }
-        }
-        let first_assistant_message = first_assistant_message?;
+            RolloutItem::EventMsg(EventMsg::TurnComplete(event)) => event
+                .last_agent_message
+                .as_deref()
+                .map(str::trim)
+                .filter(|message| !message.is_empty())
+                .map(str::to_string),
+            _ => None,
+        })?;
         self.llm_title_dispatched = true;
         Some(ThreadTitleRequest {
             first_user_message,
@@ -273,7 +230,7 @@ impl ThreadMetadataSync {
         })
     }
 
-    fn observe_items(&mut self, items: &[&RolloutItem]) -> Option<ThreadMetadataPatch> {
+    fn observe_items(&mut self, items: &[RolloutItem]) -> Option<ThreadMetadataPatch> {
         self.observe_items_with_update(
             items,
             ThreadMetadataPatch {
@@ -284,25 +241,28 @@ impl ThreadMetadataSync {
     }
 
     fn observe_resume_history(&mut self, items: &[RolloutItem]) -> Option<ThreadMetadataPatch> {
-        let items = match self.metadata_item_flattener.flatten(items) {
-            Ok(items) => items,
-            Err(err) => {
-                tracing::warn!(%err, "failed to traverse resumed rollout metadata");
-                return None;
-            }
-        };
-        self.observe_items_with_update(&items, ThreadMetadataPatch::default())
+        let mut update = self.observe_items_with_update(items, ThreadMetadataPatch::default())?;
+        if matches!(
+            canonical_history_mode_from_rollout_items(items),
+            ThreadHistoryMode::Paginated
+        ) {
+            // Paginated rollouts never append metadata-only SessionMeta updates. Do not reapply
+            // initial metadata when resume history is flushed after the first append.
+            update.git_info = None;
+            update.memory_mode = None;
+        }
+        Some(update)
     }
 
     fn observe_items_with_update(
         &mut self,
-        items: &[&RolloutItem],
+        items: &[RolloutItem],
         mut update: ThreadMetadataPatch,
     ) -> Option<ThreadMetadataPatch> {
         if items.is_empty() {
             return None;
         }
-        for &item in items {
+        for item in items {
             match item {
                 RolloutItem::SessionMeta(meta_line) if meta_line.meta.id == self.thread_id => {
                     update.created_at = parse_session_timestamp(meta_line.meta.timestamp.as_str());
@@ -338,28 +298,19 @@ impl ThreadMetadataSync {
                         update.cwd = Some(turn_ctx.cwd.clone().into_path_buf());
                     }
                     update.model = Some(turn_ctx.model.clone());
-                    update.reasoning_effort = turn_ctx.effort.clone();
+                    update.reasoning_effort = Some(turn_ctx.effort.clone());
                     update.approval_mode = Some(turn_ctx.approval_policy);
                     update.permission_profile = Some(turn_ctx.permission_profile());
                 }
                 RolloutItem::EventMsg(EventMsg::UserMessage(user)) => {
-                    if let Some(preview) = user_message_preview(user) {
-                        if !self.first_user_message_seen {
-                            self.first_user_message_seen = true;
-                            self.first_user_message = Some(preview.clone());
-                            update.first_user_message = Some(preview.clone());
-                        }
-                        if !self.preview_seen {
-                            self.preview_seen = true;
-                            update.preview = Some(preview);
-                        }
-                    }
-                    if !self.title_seen {
-                        let title = strip_user_message_prefix(user.message.as_str());
-                        if !title.is_empty() {
-                            self.title_seen = true;
-                            update.title = Some(title.to_string());
-                        }
+                    self.observe_user_message(user, &mut update);
+                }
+                RolloutItem::EventMsg(EventMsg::ItemCompleted(event)) => {
+                    if let TurnItem::UserMessage(user) = &event.item {
+                        self.observe_user_message(
+                            &user.as_legacy_user_message_event(),
+                            &mut update,
+                        );
                     }
                 }
                 RolloutItem::EventMsg(EventMsg::TokenCount(token_count)) => {
@@ -376,40 +327,48 @@ impl ThreadMetadataSync {
                         }
                     }
                 }
-                RolloutItem::Compacted(compacted) => {
-                    let Some(checkpoint) = compacted.checkpoint.as_ref() else {
-                        continue;
-                    };
-                    if !self
-                        .seen_compaction_checkpoint_ids
-                        .insert(checkpoint.checkpoint_id.clone())
-                    {
-                        continue;
-                    }
-                    if let Some(turn_ctx) = checkpoint.reference_context_item.as_ref() {
-                        if !self.cwd_seen {
-                            self.cwd_seen = true;
-                            update.cwd = Some(turn_ctx.cwd.clone().into_path_buf());
-                        }
-                        update.model = Some(turn_ctx.model.clone());
-                        update.reasoning_effort = turn_ctx.effort.clone();
-                        update.approval_mode = Some(turn_ctx.approval_policy);
-                        update.permission_profile = Some(turn_ctx.permission_profile());
-                    }
-                    if let Some(info) = checkpoint.final_token_count.info.as_ref() {
-                        update.token_usage = Some(info.total_token_usage.clone());
-                    }
+                RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(event)) => {
+                    let settings = &event.thread_settings;
+                    self.cwd_seen = true;
+                    update.model = Some(settings.model.clone());
+                    update.model_provider = Some(settings.model_provider_id.clone());
+                    update.reasoning_effort = Some(settings.reasoning_effort.clone());
+                    update.cwd = Some(settings.cwd.clone().into_path_buf());
+                    update.approval_mode = Some(settings.approval_policy);
+                    update.permission_profile = Some(settings.permission_profile.clone());
                 }
                 RolloutItem::SessionMeta(_)
                 | RolloutItem::EventMsg(_)
                 | RolloutItem::ResponseItem(_)
                 | RolloutItem::InterAgentCommunication(_)
                 | RolloutItem::InterAgentCommunicationMetadata { .. }
-                | RolloutItem::WorldState(_)
-                | RolloutItem::Transaction(_) => {}
+                | RolloutItem::Compacted(_)
+                | RolloutItem::SecurityRiskScore(_)
+                | RolloutItem::WorldState(_) => {}
             }
         }
         Some(update)
+    }
+
+    fn observe_user_message(&mut self, user: &UserMessageEvent, update: &mut ThreadMetadataPatch) {
+        if let Some(preview) = user_message_preview(user) {
+            if !self.first_user_message_seen {
+                self.first_user_message_seen = true;
+                self.first_user_message = Some(preview.clone());
+                update.first_user_message = Some(preview.clone());
+            }
+            if !self.preview_seen {
+                self.preview_seen = true;
+                update.preview = Some(preview);
+            }
+        }
+        if !self.title_seen {
+            let title = strip_user_message_prefix(user.message.as_str());
+            if !title.is_empty() {
+                self.title_seen = true;
+                update.title = Some(title.to_string());
+            }
+        }
     }
 
     fn merge_pending_update(&mut self, update: Option<ThreadMetadataPatch>) {
@@ -440,29 +399,6 @@ fn parse_session_timestamp(value: &str) -> Option<DateTime<Utc>> {
                 .map(|timestamp| DateTime::from_naive_utc_and_offset(timestamp, Utc))
         })
         .ok()
-}
-
-fn strip_user_message_prefix(text: &str) -> &str {
-    match text.find(USER_MESSAGE_BEGIN) {
-        Some(idx) => text[idx + USER_MESSAGE_BEGIN.len()..].trim(),
-        None => text.trim(),
-    }
-}
-
-fn user_message_preview(user: &UserMessageEvent) -> Option<String> {
-    let message = strip_user_message_prefix(user.message.as_str());
-    if !message.is_empty() {
-        return Some(message.to_string());
-    }
-    if user
-        .images
-        .as_ref()
-        .is_some_and(|images| !images.is_empty())
-        || !user.local_images.is_empty()
-    {
-        return Some(IMAGE_ONLY_USER_MESSAGE_PLACEHOLDER.to_string());
-    }
-    None
 }
 
 fn thread_updated_at_touch() -> ThreadMetadataPatch {
@@ -506,35 +442,79 @@ fn git_info_patch_from_observation(git_info: GitInfo) -> GitInfoPatch {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use codex_protocol::config_types::ApprovalsReviewer;
+    use codex_protocol::config_types::CollaborationMode;
+    use codex_protocol::config_types::ModeKind;
+    use codex_protocol::config_types::ReasoningSummary;
+    use codex_protocol::config_types::Settings;
+    use codex_protocol::items::UserMessageItem;
+    use codex_protocol::models::PermissionProfile;
+    use codex_protocol::openai_models::ReasoningEffort;
     use codex_protocol::protocol::AgentMessageEvent;
-    use codex_protocol::protocol::CompactedItem;
-    use codex_protocol::protocol::CompactionCheckpoint;
+    use codex_protocol::protocol::AskForApproval;
+    use codex_protocol::protocol::ItemCompletedEvent;
     use codex_protocol::protocol::SessionMeta;
     use codex_protocol::protocol::SessionMetaLine;
     use codex_protocol::protocol::SessionSource;
     use codex_protocol::protocol::ThreadGoal;
     use codex_protocol::protocol::ThreadGoalStatus;
     use codex_protocol::protocol::ThreadGoalUpdatedEvent;
-    use codex_protocol::protocol::TokenCountEvent;
-    use codex_protocol::protocol::TokenUsage;
-    use codex_protocol::protocol::TokenUsageInfo;
+    use codex_protocol::protocol::ThreadSettingsAppliedEvent;
+    use codex_protocol::protocol::ThreadSettingsSnapshot;
     use codex_protocol::protocol::TurnStartedEvent;
     use codex_protocol::protocol::UserMessageEvent;
+    use codex_protocol::user_input::UserInput;
+    use codex_rollout::CompactedItem;
     use pretty_assertions::assert_eq;
 
     use super::*;
+    use crate::CreateThreadParams;
     use crate::ThreadPersistenceMetadata;
+
+    #[tokio::test]
+    async fn create_without_project_omits_project_patch() {
+        let thread_id = ThreadId::new();
+        let sync = ThreadMetadataSync::for_create(&CreateThreadParams {
+            session_id: thread_id.into(),
+            thread_id,
+            extra_config: None,
+            forked_from_id: None,
+            parent_thread_id: None,
+            source: SessionSource::Exec,
+            thread_source: None,
+            originator: "test_originator".to_string(),
+            base_instructions: codex_protocol::models::BaseInstructions::default(),
+            dynamic_tools: Vec::new(),
+            selected_capability_roots: Vec::new(),
+            multi_agent_version: None,
+            history_mode: ThreadHistoryMode::Legacy,
+            history_base: None,
+            subagent_history_start_ordinal: None,
+            initial_window_id: uuid::Uuid::now_v7().to_string(),
+            metadata: ThreadPersistenceMetadata {
+                cwd: None,
+                model_provider: "test-provider".to_string(),
+                memory_mode: ThreadMemoryMode::Enabled,
+            },
+        })
+        .await;
+
+        let update = sync.take_pending_update().expect("pending metadata update");
+        assert_eq!(update.patch.project_id, None);
+    }
 
     #[test]
     fn resume_history_keeps_derived_metadata_pending_until_applied() {
         let thread_id = ThreadId::new();
-        let mut sync = ThreadMetadataSync::for_resume(&resume_params(
+        let mut sync = resume_sync(
             thread_id,
             vec![
                 RolloutItem::SessionMeta(session_meta(thread_id)),
                 RolloutItem::EventMsg(EventMsg::UserMessage(user_message("hello metadata"))),
             ],
-        ));
+        );
 
         let update = sync.take_pending_update().expect("pending metadata update");
         assert_eq!(
@@ -562,27 +542,28 @@ mod tests {
     }
 
     #[test]
-    fn first_visible_agent_message_dispatches_llm_title_once() {
+    fn first_visible_assistant_message_dispatches_title_once() {
         let thread_id = ThreadId::new();
-        let mut sync = ThreadMetadataSync::for_resume(&resume_params(
+        let mut sync = resume_sync(
             thread_id,
             vec![RolloutItem::EventMsg(EventMsg::UserMessage(user_message(
                 "first user text",
             )))],
-        ));
+        );
         let item = RolloutItem::EventMsg(EventMsg::AgentMessage(AgentMessageEvent {
-            message: "first visible assistant text".to_string(),
+            message: "first assistant text".to_string(),
             phase: None,
             memory_citation: None,
+            delivery: None,
         }));
 
         let request = sync
             .take_llm_title_request(std::slice::from_ref(&item))
-            .expect("first visible response should trigger a title request");
+            .expect("first visible assistant reply should trigger title generation");
         assert_eq!(request.first_user_message, "first user text");
         assert_eq!(
             request.first_assistant_message.as_deref(),
-            Some("first visible assistant text")
+            Some("first assistant text")
         );
         assert!(sync.take_llm_title_request(&[item]).is_none());
     }
@@ -590,7 +571,7 @@ mod tests {
     #[test]
     fn goal_update_sets_preview_without_overriding_existing_preview() {
         let thread_id = ThreadId::new();
-        let sync = ThreadMetadataSync::for_resume(&resume_params(
+        let sync = resume_sync(
             thread_id,
             vec![
                 RolloutItem::EventMsg(EventMsg::ThreadGoalUpdated(goal_update(
@@ -599,26 +580,26 @@ mod tests {
                 ))),
                 RolloutItem::EventMsg(EventMsg::UserMessage(user_message("first user text"))),
             ],
-        ));
+        );
 
         let update = sync.take_pending_update().expect("pending metadata update");
         assert_eq!(update.patch.preview.as_deref(), Some("ship the refactor"));
+        assert_eq!(update.patch.title.as_deref(), Some("first user text"));
         assert_eq!(
             update.patch.first_user_message.as_deref(),
             Some("first user text")
         );
-        assert_eq!(update.patch.title.as_deref(), Some("first user text"));
     }
 
     #[test]
     fn later_user_messages_do_not_emit_existing_preview_fields() {
         let thread_id = ThreadId::new();
-        let mut sync = ThreadMetadataSync::for_resume(&resume_params(
+        let mut sync = resume_sync(
             thread_id,
             vec![RolloutItem::EventMsg(EventMsg::UserMessage(user_message(
                 "first user text",
             )))],
-        ));
+        );
         let pending = sync.take_pending_update().expect("pending resume metadata");
         sync.mark_pending_update_applied(&pending);
 
@@ -635,17 +616,44 @@ mod tests {
     }
 
     #[test]
+    fn completed_user_message_items_emit_metadata_fields() {
+        let thread_id = ThreadId::new();
+        let mut sync = resume_sync(thread_id, Vec::new());
+        let update = sync
+            .observe_appended_items(&[RolloutItem::EventMsg(EventMsg::ItemCompleted(
+                ItemCompletedEvent {
+                    thread_id,
+                    turn_id: "turn-1".to_string(),
+                    item: TurnItem::UserMessage(UserMessageItem::new(&[UserInput::Text {
+                        text: "first user text".to_string(),
+                        text_elements: Vec::new(),
+                    }])),
+                    started_at_ms: Some(0),
+                    completed_at_ms: 0,
+                },
+            ))])
+            .expect("completed user message metadata update");
+
+        assert_eq!(update.patch.preview.as_deref(), Some("first user text"));
+        assert_eq!(update.patch.title.as_deref(), Some("first user text"));
+        assert_eq!(
+            update.patch.first_user_message.as_deref(),
+            Some("first user text")
+        );
+    }
+
+    #[test]
     fn metadata_irrelevant_items_coalesce_updated_at_touches() {
         let thread_id = ThreadId::new();
-        let mut sync = ThreadMetadataSync::for_resume(&resume_params(thread_id, Vec::new()));
+        let mut sync = resume_sync(thread_id, Vec::new());
         let item = RolloutItem::Compacted(CompactedItem {
             message: "compacted".to_string(),
             replacement_history: None,
+            mcp_resource_origins: None,
             window_number: None,
             first_window_id: None,
             previous_window_id: None,
             window_id: None,
-            checkpoint: None,
         });
 
         let first = sync
@@ -668,7 +676,7 @@ mod tests {
     #[test]
     fn turn_start_advances_recency_at_without_changing_updated_at_behavior() {
         let thread_id = ThreadId::new();
-        let mut sync = ThreadMetadataSync::for_resume(&resume_params(thread_id, Vec::new()));
+        let mut sync = resume_sync(thread_id, Vec::new());
 
         let update = sync
             .observe_appended_items(&[RolloutItem::EventMsg(EventMsg::TurnStarted(
@@ -687,60 +695,83 @@ mod tests {
     }
 
     #[test]
-    fn checkpoint_projects_final_token_metadata_once_per_id() {
+    fn thread_settings_applied_updates_live_metadata() {
         let thread_id = ThreadId::new();
-        let mut sync = ThreadMetadataSync::for_resume(&resume_params(thread_id, Vec::new()));
-        let info = TokenUsageInfo {
-            total_token_usage: TokenUsage {
-                total_tokens: 321,
-                ..TokenUsage::default()
+        let mut sync = resume_sync(thread_id, Vec::new());
+        let permission_profile = PermissionProfile::workspace_write();
+        let cwd = std::env::current_dir()
+            .expect("current directory")
+            .join("updated/workspace");
+
+        let mut item = RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(
+            ThreadSettingsAppliedEvent {
+                thread_settings: ThreadSettingsSnapshot {
+                    model: "gpt-5.2-codex".to_string(),
+                    model_provider_id: "updated-provider".to_string(),
+                    service_tier: None,
+                    approval_policy: AskForApproval::Never,
+                    approvals_reviewer: ApprovalsReviewer::User,
+                    permission_profile: permission_profile.clone(),
+                    active_permission_profile: None,
+                    cwd: cwd.clone().try_into().expect("absolute settings cwd"),
+                    reasoning_effort: Some(ReasoningEffort::Ultra),
+                    reasoning_summary: Some(ReasoningSummary::Auto),
+                    personality: None,
+                    collaboration_mode: CollaborationMode {
+                        mode: ModeKind::Default,
+                        settings: Settings {
+                            model: "gpt-5.2-codex".to_string(),
+                            reasoning_effort: Some(ReasoningEffort::Ultra),
+                            developer_instructions: None,
+                        },
+                    },
+                },
             },
-            last_token_usage: TokenUsage::default(),
-            model_context_window: Some(4_096),
-        };
-        let token_count = TokenCountEvent {
-            info: Some(info.clone()),
-            rate_limits: None,
-        };
-        let item = RolloutItem::Compacted(CompactedItem {
-            message: "compacted".to_string(),
-            replacement_history: Some(Vec::new()),
-            window_number: Some(1),
-            first_window_id: None,
-            previous_window_id: None,
-            window_id: None,
-            checkpoint: Some(CompactionCheckpoint {
-                checkpoint_id: "checkpoint-id".to_string(),
-                reference_context_item: None,
-                world_state: None,
-                api_token_count: token_count.clone(),
-                final_token_count: token_count,
-                server_reasoning_included: false,
-            }),
-        });
+        ));
 
-        let first = sync
-            .observe_appended_items(std::slice::from_ref(&item))
-            .expect("first checkpoint projection");
-        assert_eq!(first.patch.token_usage, Some(info.total_token_usage));
-        sync.mark_pending_update_applied(&first);
+        let update = sync
+            .observe_appended_items(&[item.clone()])
+            .expect("thread settings metadata update");
 
-        let duplicate = sync
-            .observe_appended_items(std::slice::from_ref(&item))
-            .expect("duplicate checkpoint still touches updated_at");
-        assert_eq!(duplicate.patch.token_usage, None);
+        assert_eq!(update.patch.model.as_deref(), Some("gpt-5.2-codex"));
+        assert_eq!(
+            update.patch.model_provider.as_deref(),
+            Some("updated-provider")
+        );
+        assert_eq!(
+            update.patch.reasoning_effort,
+            Some(Some(ReasoningEffort::Ultra))
+        );
+        assert_eq!(update.patch.cwd, Some(cwd));
+        assert_eq!(update.patch.approval_mode, Some(AskForApproval::Never));
+        assert_eq!(update.patch.permission_profile, Some(permission_profile));
+
+        let RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(event)) = &mut item else {
+            panic!("thread settings applied item");
+        };
+        event.thread_settings.reasoning_effort = None;
+        event
+            .thread_settings
+            .collaboration_mode
+            .settings
+            .reasoning_effort = None;
+
+        let update = sync
+            .observe_appended_items(&[item])
+            .expect("thread settings clear metadata update");
+        assert_eq!(update.patch.reasoning_effort, Some(None));
     }
 
     #[test]
     fn resume_history_waits_for_append_before_flushing_metadata() {
         let thread_id = ThreadId::new();
-        let mut sync = ThreadMetadataSync::for_resume(&resume_params(
+        let mut sync = resume_sync(
             thread_id,
             vec![
                 RolloutItem::SessionMeta(session_meta(thread_id)),
                 RolloutItem::EventMsg(EventMsg::UserMessage(user_message("hello metadata"))),
             ],
-        ));
+        );
 
         assert!(
             sync.take_pending_update_for_existing_history().is_none(),
@@ -753,6 +784,65 @@ mod tests {
             .is_some(),
             "the first append should flush resume metadata together with append metadata"
         );
+    }
+
+    #[test]
+    fn paginated_resume_history_does_not_reapply_initial_metadata() {
+        let thread_id = ThreadId::new();
+        let mut meta = session_meta(thread_id);
+        meta.meta.history_mode = ThreadHistoryMode::Paginated;
+        meta.meta.memory_mode = Some("disabled".to_string());
+        meta.git = Some(GitInfo {
+            commit_hash: None,
+            branch: Some("stale-branch".to_string()),
+            repository_url: None,
+        });
+        let sync = resume_sync(
+            thread_id,
+            vec![
+                RolloutItem::SessionMeta(meta),
+                RolloutItem::EventMsg(EventMsg::UserMessage(user_message("hello metadata"))),
+            ],
+        );
+
+        let update = sync.take_pending_update().expect("pending metadata update");
+        assert_eq!(update.patch.git_info, None);
+        assert_eq!(update.patch.memory_mode, None);
+        assert_eq!(update.patch.preview.as_deref(), Some("hello metadata"));
+    }
+
+    #[test]
+    fn resume_preserves_existing_display_metadata_and_initializes_missing_title() {
+        let thread_id = ThreadId::new();
+        let mut metadata = codex_state::ThreadMetadataBuilder::new(
+            thread_id,
+            Default::default(),
+            Utc::now(),
+            SessionSource::Exec,
+        )
+        .build("test-provider");
+        metadata.preview = Some("goal-first preview".to_string());
+        metadata.first_user_message = Some("[Image]".to_string());
+        let params = resume_params(
+            thread_id,
+            vec![RolloutItem::EventMsg(EventMsg::UserMessage(user_message(
+                "first textual user message",
+            )))],
+        );
+
+        let sync = ThreadMetadataSync::for_resume(&params, Some(&metadata));
+        let update = sync.take_pending_update().expect("pending metadata update");
+
+        assert_eq!(update.patch.preview, None);
+        assert_eq!(update.patch.first_user_message, None);
+        assert_eq!(
+            update.patch.title.as_deref(),
+            Some("first textual user message")
+        );
+    }
+
+    fn resume_sync(thread_id: ThreadId, history: Vec<RolloutItem>) -> ThreadMetadataSync {
+        ThreadMetadataSync::for_resume(&resume_params(thread_id, history), /*metadata*/ None)
     }
 
     fn resume_params(thread_id: ThreadId, history: Vec<RolloutItem>) -> ResumeThreadParams {

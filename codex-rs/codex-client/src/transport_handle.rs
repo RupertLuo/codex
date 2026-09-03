@@ -11,10 +11,10 @@ use crate::TransportError;
 
 type ExecuteFn =
     dyn Fn(Request) -> BoxFuture<'static, Result<Response, TransportError>> + Send + Sync;
-
 type StreamFn =
     dyn Fn(Request) -> BoxFuture<'static, Result<StreamResponse, TransportError>> + Send + Sync;
 
+/// Cloneable, type-erased HTTP transport supplied by an embedding host.
 #[derive(Clone)]
 pub struct HttpTransportHandle {
     execute: Arc<ExecuteFn>,
@@ -45,6 +45,7 @@ impl HttpTransportHandle {
             stream: Arc::new(move |request| Box::pin(stream(request))),
         }
     }
+
     pub fn from_transport<T>(transport: T) -> Self
     where
         T: HttpTransport + 'static,
@@ -74,7 +75,3 @@ impl HttpTransport for HttpTransportHandle {
         (self.stream)(request).await
     }
 }
-
-#[cfg(test)]
-#[path = "transport_handle_tests.rs"]
-mod tests;
