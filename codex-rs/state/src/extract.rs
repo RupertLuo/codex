@@ -196,6 +196,9 @@ mod tests {
     use codex_protocol::protocol::ThreadHistoryMode;
     use codex_protocol::protocol::ThreadSettingsAppliedEvent;
     use codex_protocol::protocol::ThreadSettingsSnapshot;
+    use codex_protocol::protocol::TokenCountEvent;
+    use codex_protocol::protocol::TokenUsage;
+    use codex_protocol::protocol::TokenUsageInfo;
     use codex_protocol::protocol::TurnContextItem;
     use codex_protocol::protocol::USER_MESSAGE_BEGIN;
     use codex_protocol::protocol::UserMessageEvent;
@@ -727,115 +730,39 @@ mod tests {
     }
 
     #[test]
-    fn transaction_with_token_count_updates_metadata() {
-        use codex_protocol::protocol::RolloutTransaction;
-
+    fn token_count_event_updates_metadata() {
         let mut metadata = metadata_for_test();
-        let item = RolloutItem::Transaction(RolloutTransaction {
-            transaction_id: "txn-1".to_string(),
-            items: vec![RolloutItem::EventMsg(EventMsg::TokenCount(
-                TokenCountEvent {
-                    info: Some(TokenUsageInfo {
-                        total_token_usage: TokenUsage {
-                            total_tokens: 999,
-                            ..TokenUsage::default()
-                        },
-                        last_token_usage: TokenUsage::default(),
-                        model_context_window: Some(8_192),
-                    }),
-                    rate_limits: None,
+        let item = RolloutItem::EventMsg(EventMsg::TokenCount(TokenCountEvent {
+            info: Some(TokenUsageInfo {
+                total_token_usage: TokenUsage {
+                    total_tokens: 999,
+                    ..TokenUsage::default()
                 },
-            ))],
-        });
+                last_token_usage: TokenUsage::default(),
+                model_context_window: Some(8_192),
+            }),
+            rate_limits: None,
+        }));
 
         apply_rollout_item(&mut metadata, &item, "test-provider");
 
         assert_eq!(metadata.tokens_used, 999);
-        assert!(
-            super::rollout_item_affects_thread_metadata(&item)
-                .expect("test transaction should traverse")
-        );
+        assert!(super::rollout_item_affects_thread_metadata(&item));
     }
 
     #[test]
     fn compacted_without_checkpoint_does_not_affect_metadata() {
-        let item = RolloutItem::Compacted(CompactedItem {
+        let item = codex_history::CompactedItem {
             message: "compacted summary".to_string(),
             replacement_history: None,
+            mcp_resource_origins: None,
             window_number: None,
             first_window_id: None,
             previous_window_id: None,
             window_id: None,
-            checkpoint: None,
-        });
-
-        assert_eq!(
-            super::rollout_item_affects_thread_metadata(&item).expect("test item should traverse"),
-            false,
-        );
-    }
-
-    #[test]
-    fn compacted_with_reference_context_sets_model() {
-        let mut metadata = metadata_for_test();
-        let turn_context = TurnContextItem {
-            turn_id: Some("turn-compacted".to_string()),
-            cwd: serde_json::from_value(serde_json::json!(
-                std::env::current_dir()
-                    .expect("current directory")
-                    .join("compacted/workspace")
-            ))
-            .expect("absolute cwd"),
-            workspace_roots: None,
-            current_date: None,
-            timezone: None,
-            approval_policy: AskForApproval::Never,
-            sandbox_policy: SandboxPolicy::DangerFullAccess,
-            permission_profile: None,
-            network: None,
-            file_system_sandbox_policy: None,
-            model: "o3-pro".to_string(),
-            comp_hash: None,
-            personality: None,
-            collaboration_mode: None,
-            multi_agent_version: None,
-            multi_agent_mode: None,
-            realtime_active: None,
-            effort: Some(ReasoningEffort::Medium),
-            summary: codex_protocol::config_types::ReasoningSummary::Auto,
         };
-        let token_count = TokenCountEvent {
-            info: Some(TokenUsageInfo {
-                total_token_usage: TokenUsage {
-                    total_tokens: 500,
-                    ..TokenUsage::default()
-                },
-                last_token_usage: TokenUsage::default(),
-                model_context_window: Some(4_096),
-            }),
-            rate_limits: None,
-        };
-        let item = RolloutItem::Compacted(CompactedItem {
-            message: "compacted with context".to_string(),
-            replacement_history: Some(Vec::new()),
-            window_number: Some(2),
-            first_window_id: None,
-            previous_window_id: None,
-            window_id: None,
-            checkpoint: Some(CompactionCheckpoint {
-                checkpoint_id: "checkpoint-ctx".to_string(),
-                reference_context_item: Some(turn_context),
-                world_state: None,
-                api_token_count: token_count.clone(),
-                final_token_count: token_count,
-                server_reasoning_included: false,
-            }),
-        });
+        let item = RolloutItem::Compacted(item);
 
-        apply_rollout_item(&mut metadata, &item, "test-provider");
-
-        assert_eq!(metadata.model.as_deref(), Some("o3-pro"));
-        assert_eq!(metadata.reasoning_effort, Some(ReasoningEffort::Medium));
-        assert_eq!(metadata.tokens_used, 500);
+        assert_eq!(super::rollout_item_affects_thread_metadata(&item), false,);
     }
 }

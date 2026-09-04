@@ -25,6 +25,9 @@ mod update_thread_metadata;
 mod writer_lock;
 
 #[cfg(test)]
+#[path = "live_thread_title_tests.rs"]
+mod live_thread_title_tests;
+#[cfg(test)]
 #[path = "pending_thread_metadata_tests.rs"]
 mod pending_thread_metadata_tests;
 #[cfg(test)]
@@ -1934,7 +1937,7 @@ mod tests {
         }));
     }
 
-    fn create_thread_params(thread_id: ThreadId) -> CreateThreadParams {
+    pub(super) fn create_thread_params(thread_id: ThreadId) -> CreateThreadParams {
         CreateThreadParams {
             session_id: thread_id.into(),
             thread_id,
@@ -1973,7 +1976,7 @@ mod tests {
         }
     }
 
-    fn user_message_item(message: &str) -> RolloutItem {
+    pub(super) fn user_message_item(message: &str) -> RolloutItem {
         RolloutItem::EventMsg(EventMsg::UserMessage(UserMessageEvent {
             client_id: None,
             message: message.to_string(),
