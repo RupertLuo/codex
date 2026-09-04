@@ -359,7 +359,10 @@ pub fn process_responses_event(
         }
         "response.output_text.delta" => {
             if let Some(delta) = event.delta {
-                return Ok(Some(ResponseEvent::OutputTextDelta(delta)));
+                return Ok(Some(ResponseEvent::OutputTextDelta {
+                    item_id: event.item_id,
+                    delta,
+                }));
             }
         }
         "response.custom_tool_call_input.delta" => {
@@ -376,6 +379,7 @@ pub fn process_responses_event(
         "response.reasoning_summary_text.delta" => {
             if let (Some(delta), Some(summary_index)) = (event.delta, event.summary_index) {
                 return Ok(Some(ResponseEvent::ReasoningSummaryDelta {
+                    item_id: event.item_id,
                     delta,
                     summary_index,
                 }));
@@ -395,6 +399,7 @@ pub fn process_responses_event(
         "response.reasoning_text.delta" => {
             if let (Some(delta), Some(content_index)) = (event.delta, event.content_index) {
                 return Ok(Some(ResponseEvent::ReasoningContentDelta {
+                    item_id: event.item_id,
                     delta,
                     content_index,
                 }));
@@ -490,6 +495,7 @@ pub fn process_responses_event(
         "response.reasoning_summary_part.added" => {
             if let Some(summary_index) = event.summary_index {
                 return Ok(Some(ResponseEvent::ReasoningSummaryPartAdded {
+                    item_id: event.item_id,
                     summary_index,
                 }));
             }
@@ -913,6 +919,60 @@ mod tests {
                 text,
                 summary_index: 0,
             } if item_id == "reasoning-1" && text == "Checking"
+        );
+    }
+
+    #[tokio::test]
+    async fn preserves_stream_delta_item_ids() {
+        let events = run_sse(vec![
+            json!({
+                "type": "response.output_text.delta",
+                "item_id": "message-1",
+                "delta": "hello",
+            }),
+            json!({
+                "type": "response.reasoning_summary_part.added",
+                "item_id": "reasoning-1",
+                "summary_index": 0,
+            }),
+            json!({
+                "type": "response.reasoning_summary_text.delta",
+                "item_id": "reasoning-1",
+                "summary_index": 0,
+                "delta": "checking",
+            }),
+            json!({
+                "type": "response.reasoning_text.delta",
+                "item_id": "reasoning-1",
+                "content_index": 0,
+                "delta": "detail",
+            }),
+            json!({
+                "type": "response.completed",
+                "response": { "id": "resp1" },
+            }),
+        ])
+        .await;
+
+        assert_matches!(
+            &events[0],
+            ResponseEvent::OutputTextDelta { item_id, delta }
+                if item_id.as_deref() == Some("message-1") && delta == "hello"
+        );
+        assert_matches!(
+            &events[1],
+            ResponseEvent::ReasoningSummaryPartAdded { item_id, summary_index: 0 }
+                if item_id.as_deref() == Some("reasoning-1")
+        );
+        assert_matches!(
+            &events[2],
+            ResponseEvent::ReasoningSummaryDelta { item_id, delta, summary_index: 0 }
+                if item_id.as_deref() == Some("reasoning-1") && delta == "checking"
+        );
+        assert_matches!(
+            &events[3],
+            ResponseEvent::ReasoningContentDelta { item_id, delta, content_index: 0 }
+                if item_id.as_deref() == Some("reasoning-1") && delta == "detail"
         );
     }
 
@@ -1599,13 +1659,13 @@ mod tests {
                     && buffering.show_buffering_ui
                     && buffering.faster_model.as_deref() == Some("gpt-fast-wire")
         );
-        assert_matches!(&events[2], ResponseEvent::OutputTextDelta(delta) if delta == "hello");
+        assert_matches!(&events[2], ResponseEvent::OutputTextDelta { delta, .. } if delta == "hello");
         assert_matches!(
             &events[3],
             ResponseEvent::SafetyBuffering(buffering)
                 if buffering.use_cases == ["cyber"] && buffering.reasons == ["user_risk"]
         );
-        assert_matches!(&events[4], ResponseEvent::OutputTextDelta(delta) if delta == " world");
+        assert_matches!(&events[4], ResponseEvent::OutputTextDelta { delta, .. } if delta == " world");
         assert_matches!(
             &events[5],
             ResponseEvent::SafetyBuffering(buffering)

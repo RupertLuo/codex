@@ -809,6 +809,14 @@ pub fn ev_output_text_delta(delta: &str) -> Value {
     })
 }
 
+pub fn ev_output_text_delta_for_item(item_id: &str, delta: &str) -> Value {
+    serde_json::json!({
+        "type": "response.output_text.delta",
+        "item_id": item_id,
+        "delta": delta,
+    })
+}
+
 pub fn ev_reasoning_item(id: &str, summary: &[&str], raw_content: &[&str]) -> Value {
     let summary_entries: Vec<Value> = summary
         .iter()
@@ -862,6 +870,27 @@ pub fn ev_reasoning_summary_text_delta(delta: &str) -> Value {
         "type": "response.reasoning_summary_text.delta",
         "delta": delta,
         "summary_index": 0,
+    })
+}
+
+pub fn ev_reasoning_summary_part_added_for_item(item_id: &str, summary_index: i64) -> Value {
+    serde_json::json!({
+        "type": "response.reasoning_summary_part.added",
+        "item_id": item_id,
+        "summary_index": summary_index,
+    })
+}
+
+pub fn ev_reasoning_summary_text_delta_for_item(
+    item_id: &str,
+    summary_index: i64,
+    delta: &str,
+) -> Value {
+    serde_json::json!({
+        "type": "response.reasoning_summary_text.delta",
+        "item_id": item_id,
+        "delta": delta,
+        "summary_index": summary_index,
     })
 }
 

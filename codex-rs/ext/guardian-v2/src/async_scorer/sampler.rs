@@ -591,7 +591,7 @@ impl LunaSampler {
                     }
                 };
                 match event {
-                    ResponseEvent::OutputTextDelta(delta) => {
+                    ResponseEvent::OutputTextDelta { delta, .. } => {
                         deltas.push_str(&delta);
                     }
                     ResponseEvent::OutputItemDone(ResponseItem::Message {
