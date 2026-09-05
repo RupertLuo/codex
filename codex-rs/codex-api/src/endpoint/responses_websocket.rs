@@ -46,6 +46,10 @@ use tungstenite::extensions::compression::deflate::DeflateConfig;
 use tungstenite::protocol::WebSocketConfig;
 use url::Url;
 
+#[cfg(test)]
+#[path = "responses_websocket_liveness_tests.rs"]
+mod liveness_tests;
+
 struct WsStream {
     tx_command: mpsc::Sender<WsCommand>,
     rx_message: mpsc::UnboundedReceiver<Result<Message, WsError>>,
@@ -685,9 +689,15 @@ async fn run_websocket_response_stream(
     )
     .await?;
 
+    let mut progress_deadline = Instant::now() + idle_timeout;
     loop {
         let poll_start = Instant::now();
-        let response = tokio::time::timeout(idle_timeout, ws_stream.next())
+        if poll_start >= progress_deadline {
+            return Err(ApiError::Stream(
+                "idle timeout waiting for websocket".into(),
+            ));
+        }
+        let response = tokio::time::timeout_at(progress_deadline, ws_stream.next())
             .await
             .map_err(|_| ApiError::Stream("idle timeout waiting for websocket".into()));
         if let Some(t) = telemetry.as_ref() {
@@ -720,7 +730,13 @@ async fn run_websocket_response_stream(
                 let event = match serde_json::from_str::<ResponsesStreamEvent>(&text) {
                     Ok(event) => event,
                     Err(err) => {
-                        debug!("failed to parse websocket event: {err}, data: {text}");
+                        debug!(
+                            error_category = ?err.classify(),
+                            error_line = err.line(),
+                            error_column = err.column(),
+                            payload_bytes = text.len(),
+                            "failed to parse websocket event"
+                        );
                         continue;
                     }
                 };
@@ -797,6 +813,7 @@ async fn run_websocket_response_stream(
                         "response event consumer dropped".to_string(),
                     ));
                 }
+                let made_progress = event.is_progress();
                 match process_responses_event(event) {
                     Ok(Some(event)) => {
                         let is_completed = matches!(event, ResponseEvent::Completed { .. });
@@ -809,6 +826,9 @@ async fn run_websocket_response_stream(
                     Err(error) => {
                         return Err(error.into_api_error());
                     }
+                }
+                if made_progress {
+                    progress_deadline = Instant::now() + idle_timeout;
                 }
             }
             Message::Binary(_) => {

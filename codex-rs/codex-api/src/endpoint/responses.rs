@@ -14,6 +14,7 @@ use codex_client::EncodedJsonBody;
 use codex_client::HttpTransport;
 use codex_client::RequestCompression;
 use codex_client::RequestTelemetry;
+use codex_client::TransportError;
 use codex_protocol::protocol::SessionSource;
 use http::HeaderMap;
 use http::HeaderValue;
@@ -137,22 +138,25 @@ impl<T: HttpTransport> ResponsesClient<T> {
             Compression::Zstd => RequestCompression::Zstd,
         };
 
-        let stream_response = self
-            .session
-            .stream_encoded_json_with(
-                Method::POST,
-                Self::path(),
-                extra_headers,
-                Some(body),
-                |req| {
-                    req.headers.insert(
-                        http::header::ACCEPT,
-                        HeaderValue::from_static("text/event-stream"),
-                    );
-                    req.compression = request_compression;
-                },
-            )
-            .await?;
+        // Bound the pre-stream phase too. Setting Request.timeout would also
+        // limit the entire response body, incorrectly killing healthy streams.
+        let open_stream = self.session.stream_encoded_json_with(
+            Method::POST,
+            Self::path(),
+            extra_headers,
+            Some(body),
+            |req| {
+                req.headers.insert(
+                    http::header::ACCEPT,
+                    HeaderValue::from_static("text/event-stream"),
+                );
+                req.compression = request_compression;
+            },
+        );
+        let stream_response =
+            tokio::time::timeout(self.session.provider().stream_idle_timeout, open_stream)
+                .await
+                .map_err(|_| ApiError::Transport(TransportError::Timeout))??;
 
         Ok(spawn_response_stream(
             stream_response,

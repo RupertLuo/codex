@@ -21,7 +21,7 @@ use std::sync::OnceLock;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
-use tokio::time::timeout;
+use tokio::time::timeout_at;
 use tracing::debug;
 use tracing::trace;
 
@@ -188,6 +188,27 @@ where
 impl ResponsesStreamEvent {
     pub fn kind(&self) -> &str {
         &self.kind
+    }
+
+    /// Status/metadata traffic is not model progress. Function argument deltas
+    /// still count even though they are not projected into `ResponseEvent`.
+    pub(crate) fn is_progress(&self) -> bool {
+        match self.kind.as_str() {
+            "response.output_text.delta"
+            | "response.reasoning_text.delta"
+            | "response.reasoning_summary_text.delta"
+            | "response.custom_tool_call_input.delta"
+            | "response.function_call_arguments.delta" => {
+                self.delta.as_ref().is_some_and(|delta| !delta.is_empty())
+            }
+            "response.output_item.added" | "response.output_item.done" => self.item.is_some(),
+            "response.created" => self.response.is_some(),
+            "response.reasoning_summary_part.added" => self.summary_index.is_some(),
+            "response.reasoning_summary_text.done" => {
+                self.text.as_ref().is_some_and(|text| !text.is_empty())
+            }
+            _ => false,
+        }
     }
 
     /// Returns the effective model reported by the server, if present.
@@ -546,12 +567,24 @@ async fn process_sse_with_treatment(
     safety_buffering_treatment: SafetyBufferingTreatment,
 ) {
     let mut stream = stream.eventsource();
-    let mut response_error: Option<ApiError> = None;
+    let mut progress_deadline = Instant::now() + idle_timeout;
     let mut last_server_model: Option<String> = None;
 
     loop {
         let start = Instant::now();
-        let response = timeout(idle_timeout, stream.next()).await;
+        // Check before polling as well: an always-ready stream of ignored
+        // events must not starve the timer by winning every poll.
+        if start >= progress_deadline {
+            let _ = tx_event
+                .send(Err(ApiError::Stream("idle timeout waiting for SSE".into())))
+                .await;
+            return;
+        }
+        let response = tokio::select! {
+            biased;
+            _ = tx_event.closed() => return,
+            response = timeout_at(progress_deadline, stream.next()) => response,
+        };
         if let Some(t) = telemetry.as_ref() {
             t.on_sse_poll(&response, start.elapsed());
         }
@@ -563,9 +596,7 @@ async fn process_sse_with_treatment(
                 return;
             }
             Ok(None) => {
-                let error = response_error.unwrap_or(ApiError::Stream(
-                    "stream closed before response.completed".into(),
-                ));
+                let error = ApiError::Stream("stream closed before response.completed".into());
                 let _ = tx_event.send(Err(error)).await;
                 return;
             }
@@ -576,8 +607,6 @@ async fn process_sse_with_treatment(
                 return;
             }
         };
-
-        trace!("SSE event: {}", &sse.data);
 
         let event: ResponsesStreamEvent = match serde_json::from_str(&sse.data) {
             Ok(event) => event,
@@ -592,6 +621,8 @@ async fn process_sse_with_treatment(
                 continue;
             }
         };
+        trace!(event_type = %event.kind, payload_bytes = sse.data.len(), "SSE event");
+        let made_progress = event.is_progress();
         let model_verifications = event.model_verifications();
         let turn_moderation_metadata = event.turn_moderation_metadata();
         let safety_buffering = event.safety_buffering(&safety_buffering_treatment);
@@ -645,9 +676,13 @@ async fn process_sse_with_treatment(
             }
             Ok(None) => {}
             Err(error) => {
-                response_error = Some(error.into_api_error());
+                let _ = tx_event.send(Err(error.into_api_error())).await;
+                return;
             }
         };
+        if made_progress {
+            progress_deadline = Instant::now() + idle_timeout;
+        }
     }
 }
 
