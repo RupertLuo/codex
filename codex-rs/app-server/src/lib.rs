@@ -14,6 +14,7 @@ use codex_login::AuthManager;
 #[cfg(debug_assertions)]
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_cli::CliConfigOverrides;
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::io::ErrorKind;
@@ -22,6 +23,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::RwLock;
 use std::sync::atomic::AtomicBool;
+use toml::Value as TomlValue;
 
 use crate::analytics_utils::analytics_events_client_from_config;
 use crate::config_manager::ConfigManager;
@@ -461,6 +463,7 @@ impl Default for AppServerRuntimeOptions {
 pub struct AppServerProcessOverrides {
     thread_manager: ThreadManagerRuntimeOptions,
     rpc_extensions: Vec<Arc<dyn AppServerRpcExtension>>,
+    mcp_server_replacements: BTreeMap<String, TomlValue>,
 }
 
 impl AppServerProcessOverrides {
@@ -471,6 +474,14 @@ impl AppServerProcessOverrides {
 
     pub fn with_rpc_extension(mut self, value: Arc<dyn AppServerRpcExtension>) -> Self {
         self.rpc_extensions.push(value);
+        self
+    }
+
+    pub fn with_mcp_server_replacements(
+        mut self,
+        replacements: BTreeMap<String, TomlValue>,
+    ) -> Self {
+        self.mcp_server_replacements.extend(replacements);
         self
     }
 
@@ -522,6 +533,7 @@ pub async fn run_main_with_transport_options_and_overrides(
     let AppServerProcessOverrides {
         thread_manager,
         rpc_extensions,
+        mcp_server_replacements,
     } = process_overrides;
     let rpc_registry = Arc::new(
         rpc_extension::AppServerRpcRegistry::new(rpc_extensions)
@@ -559,7 +571,8 @@ pub async fn run_main_with_transport_options_and_overrides(
         Default::default(),
         arg0_paths.clone(),
         Arc::new(NoopThreadConfigLoader),
-    );
+    )
+    .with_process_mcp_server_replacements(mcp_server_replacements);
     match config_manager
         .load_latest_config(/*fallback_cwd*/ None)
         .await

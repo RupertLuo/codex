@@ -11,7 +11,10 @@ use codex_arg0::Arg0DispatchPaths;
 use codex_config::LoaderOverrides;
 use codex_protocol::protocol::SessionSource;
 use codex_utils_cli::CliConfigOverrides;
+use std::collections::BTreeMap;
+use std::io;
 use std::path::PathBuf;
+use toml::Value as TomlValue;
 
 #[cfg(debug_assertions)]
 const MANAGED_CONFIG_PATH_ENV_VAR: &str = "CODEX_APP_SERVER_MANAGED_CONFIG_PATH";
@@ -22,6 +25,14 @@ const DISABLE_MANAGED_CONFIG_ENV_VAR: &str = "CODEX_APP_SERVER_DISABLE_MANAGED_C
 pub struct AppServerServeArgs {
     #[command(flatten)]
     config_overrides: CliConfigOverrides,
+
+    #[arg(
+        long = "process-mcp-server",
+        value_name = "name=configuration",
+        action = clap::ArgAction::Append,
+        hide = true
+    )]
+    process_mcp_servers: Vec<String>,
 
     #[command(flatten)]
     code_mode_host: AppServerCodeModeHostArgs,
@@ -72,6 +83,10 @@ impl AppServerServeArgs {
             .raw_overrides
             .splice(0..0, values.into_iter().collect::<Vec<_>>());
     }
+
+    pub fn raw_process_mcp_servers(&self) -> &[String] {
+        &self.process_mcp_servers
+    }
 }
 
 pub async fn run_app_server_serve(
@@ -82,6 +97,7 @@ pub async fn run_app_server_serve(
 ) -> anyhow::Result<()> {
     let AppServerServeArgs {
         config_overrides,
+        process_mcp_servers,
         code_mode_host,
         listen,
         session_source,
@@ -91,6 +107,8 @@ pub async fn run_app_server_serve(
         disable_plugin_startup_tasks_for_tests,
         remote_control,
     } = args;
+    let process_overrides = process_overrides
+        .with_mcp_server_replacements(parse_process_mcp_server_replacements(process_mcp_servers)?);
     let loader_overrides = if disable_managed_config_from_debug_env() {
         LoaderOverrides::without_managed_config_for_tests()
     } else {
@@ -127,6 +145,32 @@ pub async fn run_app_server_serve(
     )
     .await?;
     Ok(())
+}
+
+fn parse_process_mcp_server_replacements(
+    raw_replacements: Vec<String>,
+) -> io::Result<BTreeMap<String, TomlValue>> {
+    let replacements = CliConfigOverrides {
+        raw_overrides: raw_replacements,
+    }
+    .parse_overrides()
+    .map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid --process-mcp-server replacement",
+        )
+    })?;
+    let mut parsed = BTreeMap::new();
+    for (name, value) in replacements {
+        if name.contains('.') || !value.is_table() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "--process-mcp-server requires a server name and complete TOML table",
+            ));
+        }
+        parsed.insert(name, value);
+    }
+    Ok(parsed)
 }
 
 fn disable_managed_config_from_debug_env() -> bool {
