@@ -151,7 +151,14 @@ use codex_response_debug_context::extract_response_debug_context_from_api_error;
 use codex_response_debug_context::telemetry_api_error_message;
 use codex_response_debug_context::telemetry_transport_error_message;
 
+// CATALYST: pure host adaptations; request/session orchestration stays in this module.
+#[path = "client/catalyst/host_http.rs"]
 mod host_http;
+#[path = "client/catalyst/model_policy.rs"]
+mod model_policy;
+
+// Preserve the Runtime-facing codex_core::client::ModelRuntimePolicy import path.
+pub use self::model_policy::ModelRuntimePolicy;
 
 use self::host_http::is_unknown_previous_response;
 use self::host_http::relocate_tool_output_images;
@@ -263,15 +270,8 @@ struct ModelClientState {
     cached_websocket_session: StdMutex<WebsocketSession>,
 }
 
-/// Host-supplied behavior for a model endpoint that is not part of the public model catalog.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct ModelRuntimePolicy {
-    pub supports_http_incremental_requests: bool,
-    pub relocates_tool_output_images: bool,
-    pub max_request_body_bytes: Option<u64>,
-    pub supports_parallel_tool_calls: Option<bool>,
-}
-
+// CATALYST: HTTP baseline state belongs to the existing model client, alongside its
+// upstream WebSocket state; it is not a separate Runtime-owned session lifecycle.
 #[derive(Debug, Default)]
 struct HttpIncrementalSession {
     last_request: Option<Box<ResponsesApiRequest>>,
@@ -1714,6 +1714,8 @@ impl ModelClientSession {
             if endpoint == ResponsesEndpoint::Guardian {
                 request.service_tier = None;
             }
+            // CATALYST: apply the host policy before capturing the typed baseline.
+            // Provider wire conversion stays in Runtime; Guardian never consumes this baseline.
             let runtime_policy = self.client.runtime_policy(&model_info.slug);
             if runtime_policy.relocates_tool_output_images {
                 relocate_tool_output_images(&mut request.input);

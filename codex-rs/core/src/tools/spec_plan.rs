@@ -1424,6 +1424,7 @@ fn append_extension_tool_executors(
 
     for executor in executors {
         let tool_name = executor.tool_name();
+        // CATALYST: identify host search by capability, retaining native compatibility and gates.
         let is_standalone_web_search =
             executor.is_standalone_web_search() || is_native_web_search_tool(&tool_name);
         if is_standalone_web_search && (!standalone_web_search_enabled || !web_search_mode_on) {

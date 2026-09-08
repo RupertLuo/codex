@@ -43,7 +43,7 @@ Runtime 装配补充证据：`runtime_composition.rs::image_capable_model_plans_
 | --- | --- | --- | --- |
 | TUI model runtime | `tui/src/model_runtime.rs`、`tui/src/app/`、`tui/src/chatwidget/` | TUI 只消费抽象 runtime，不把 provider 业务硬编码进 UI | `tui/src/app/tests/`、`chatwidget/tests/`、敏感输入单测 |
 | Credential workflow | `tui/src/model_runtime.rs`、`bottom_pane/sensitive_prompt_view.rs`、`chatwidget/credential_popups.rs` | secret 输入、redacted Debug、zeroize、失败恢复 | `sensitive_prompt_view_tests.rs` 与 TUI snapshots |
-| App Server RPC extension | `app-server/src/rpc_extension.rs`、`message_processor.rs` | 方法必须 namespaced，不得覆盖 native RPC；transport context 影响信任边界 | fork `rpc_extension_tests.rs` 与 `message_processor_rpc_tests.rs` 覆盖 registry/initialize/dispatch；native bridge 完整生命周期仍不能由 router 单测替代 |
+| App Server RPC extension | `app-server/src/catalyst/rpc_extension.rs`、`message_processor.rs` | 方法必须 namespaced，不得覆盖 native RPC；transport context 影响信任边界 | fork `rpc_extension_tests.rs` 与 `message_processor_rpc_tests.rs` 覆盖 registry/initialize/dispatch；native bridge 完整生命周期仍不能由 router 单测替代 |
 | Native turn/plugin bridge | `app-server/src/extensions.rs`、`request_processors/plugins.rs`、`rpc_extension.rs` | 只暴露受控 gateway；plugin selection 不能绕过现有生命周期 | Runtime `runtime_composition.rs::catalyst_turn_start_enters_the_native_turn_lifecycle_once`；fork plugin/queue 边界证据待补 |
 | Host Skill provider | `ext/skills/src/sources.rs`、`catalog.rs`、`tools/` | provider 按 authority/kind 路由；读取失败不能静默跨 authority | `core/tests/suite/skills_extension.rs` |
 | Thread title generator | `thread-store/src/title_generator.rs`、`live_thread.rs`、`local/mod.rs` | best-effort 异步生成；metadata mutation 必须通过 gate，不能覆盖手工标题 | thread-store/session tests |
@@ -55,7 +55,7 @@ Runtime 装配补充证据：`runtime_composition.rs::image_capable_model_plans_
 
 | 能力 | 代码/消费入口 | 验证入口与限制 |
 | --- | --- | --- |
-| process MCP 整表替换 | `app-server/src/cli.rs` → overrides → `config_manager.rs` → `core/src/config/mod.rs`；Runtime flatten 共享 CLI | `process_mcp_server_replacement_discards_stale_fields_across_rebuild`、`app_server_accepts_process_mcp_server_replacement`；`app-server/src/config_manager_tests.rs` 验证 refresh、request override 优先级、requirements 禁用和 typed validation；`cli_tests.rs` 验证 CLI 整表解析及非法输入 |
+| process MCP 整表替换 | `app-server/src/cli.rs` → overrides → `config_manager.rs` → `core/src/config/mod.rs`；Runtime flatten 共享 CLI | `process_mcp_server_replacement_discards_stale_fields_across_rebuild`、`app_server_accepts_process_mcp_server_replacement`；`app-server/src/catalyst/config_manager_tests.rs` 验证 refresh、request override 优先级、requirements 禁用和 typed validation；`cli_tests.rs` 验证 CLI 整表解析及非法输入 |
 | 流式 item ID 归属 | `codex-api/src/sse/responses.rs` → `core/src/session/turn.rs` | `preserves_stream_delta_item_ids`、`output_text_delta_before_output_item_added_is_buffered`、`interleaved_response_items_keep_delta_ownership` |
 | Skill roots 默认限制 | `ext/skills/src/host_roots.rs`；不自动扫描 home/repo `.agents/skills` | `resolved_roots_preserve_configured_sources_and_ignore_agents_dirs`；不等同仅允许私有 Skill |
 | 独立搜索能力 | `tools/src/tool_executor.rs::is_standalone_web_search` → `core/src/tools/spec_plan.rs`；Runtime `WebRunTool` 声明 | 任意宿主名称/gate、注册冲突、真实工具 schema 测试；保留原生名称兼容与历史 wire 名称 |
@@ -90,6 +90,6 @@ git diff --check
 
 ## HTTP 请求补丁的内部边界
 
-`core/src/client/host_http.rs` 只承担宿主 policy 启用的请求图片迁移与 previous response 失效识别；`client.rs` 保留 session baseline、delta 选择和重试顺序。迁移发生在保存 typed baseline 前，不改写持久化历史。公开 `ModelRuntimePolicy` 路径和 Runtime 注入接口不变。
+`core/src/client/catalyst/host_http.rs` 只承担宿主 policy 启用的请求图片迁移与 previous response 失效识别；`client.rs` 保留 session baseline、delta 选择和重试顺序。迁移发生在保存 typed baseline 前，不改写持久化历史。公开 `ModelRuntimePolicy` 路径和 Runtime 注入接口不变。
 
 验证入口：fork `client::host_http::tests::recognizes_qwen_unknown_previous_response_error`，以及 Runtime `qwen_incremental_fallback::synthetic_policy_to_core_fallback_matrix`。

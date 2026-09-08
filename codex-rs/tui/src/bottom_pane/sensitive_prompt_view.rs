@@ -1,3 +1,5 @@
+//! CATALYST: Sensitive host-input view used by credential interactions.
+
 use crossterm::event::KeyCode;
 use crossterm::event::KeyEvent;
 use crossterm::event::KeyModifiers;

@@ -783,6 +783,8 @@ impl MessageProcessor {
             Arc::clone(&self.outgoing),
             request_context.clone(),
             async {
+                // CATALYST: registered host methods share native initialize and Turn gateways.
+                // Methods outside registered host namespaces continue through native dispatch below.
                 if let Some(extension) = self.rpc_registry.get(&request_method).cloned() {
                     if !session.initialized() {
                         self.outgoing
@@ -1889,5 +1891,5 @@ impl MessageProcessor {
 mod message_processor_tracing_tests;
 
 #[cfg(test)]
-#[path = "message_processor_rpc_tests.rs"]
+#[path = "catalyst/message_processor_rpc_tests.rs"]
 mod message_processor_rpc_tests;

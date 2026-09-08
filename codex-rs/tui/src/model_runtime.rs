@@ -1,3 +1,5 @@
+//! CATALYST: Host model readiness and credential interaction contracts; implementations belong to Runtime.
+
 use std::error::Error;
 use std::fmt;
 use std::future::Future;

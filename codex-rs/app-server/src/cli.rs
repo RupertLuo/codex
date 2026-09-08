@@ -1,3 +1,6 @@
+//! CATALYST integration: shared CLI entry extracted from the native startup path.
+//! This is a mixed module: upstream arguments/startup plus process-scoped host overrides.
+
 use crate::AppServerCodeModeHostArgs;
 use crate::AppServerProcessOverrides;
 use crate::AppServerRuntimeOptions;

@@ -230,7 +230,8 @@ pub struct ThreadManager {
     _test_codex_home_guard: Option<TempCodexHomeGuard>,
 }
 
-/// Process-local capabilities supplied by an embedding host.
+/// CATALYST: process-local capabilities supplied by an embedding host.
+/// This is the injection contract; native ThreadManager still owns thread creation and lifetime.
 #[derive(Clone, Debug, Default)]
 pub struct ThreadManagerRuntimeOptions {
     http_transport: Option<HttpTransportHandle>,

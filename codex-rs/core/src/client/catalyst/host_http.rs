@@ -1,4 +1,4 @@
-//! Pure request adaptations enabled by host model policy.
+//! CATALYST: pure request adaptations enabled by host model policy.
 //!
 //! Runtime selects the policy and normalizes provider wire requests. The caller applies image
 //! relocation before saving the typed baseline; session ownership, delta selection, and retry

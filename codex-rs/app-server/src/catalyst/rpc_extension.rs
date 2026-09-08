@@ -1,3 +1,6 @@
+//! CATALYST: Host RPC contracts and native Turn/plugin gateways.
+//! Runtime implements product methods; the native dispatcher owns initialization and execution.
+
 use codex_app_server_protocol::JSONRPCErrorError;
 use codex_app_server_protocol::PluginListParams;
 use codex_app_server_protocol::PluginListResponse;
@@ -147,6 +150,8 @@ fn native_turn_gateway_unavailable() -> JSONRPCErrorError {
     }
 }
 
+/// Host implementation of namespaced product methods. Register through process overrides;
+/// use the supplied context to enter native Turn/plugin behavior rather than duplicating it.
 pub trait AppServerRpcExtension: Debug + Send + Sync {
     fn methods(&self) -> &'static [&'static str];
 

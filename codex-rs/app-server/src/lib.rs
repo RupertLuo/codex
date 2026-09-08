@@ -131,6 +131,8 @@ mod outgoing_message;
 mod plugin_config_reload;
 mod request_processors;
 mod request_serialization;
+// CATALYST: host RPC contracts live separately; public re-exports below remain stable.
+#[path = "catalyst/rpc_extension.rs"]
 mod rpc_extension;
 mod server_request_error;
 mod skills_watcher;
@@ -470,6 +472,8 @@ impl Default for AppServerRuntimeOptions {
     }
 }
 
+/// CATALYST: process-scoped host injection into the native App Server.
+/// Product RPC implementations and model policy selection remain in Runtime.
 #[derive(Clone, Debug, Default)]
 pub struct AppServerProcessOverrides {
     thread_manager: ThreadManagerRuntimeOptions,

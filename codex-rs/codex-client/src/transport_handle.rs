@@ -1,3 +1,5 @@
+//! CATALYST: Host-injected HTTP transport handle; Provider selection and credentials belong to Runtime.
+
 use std::future::Future;
 use std::sync::Arc;
 

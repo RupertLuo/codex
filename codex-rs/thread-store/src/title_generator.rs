@@ -1,3 +1,5 @@
+//! CATALYST: Host title-generation contract; the native thread store owns persistence.
+
 use std::future::Future;
 use std::pin::Pin;
 

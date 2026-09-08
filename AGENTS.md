@@ -34,10 +34,10 @@
 - Runtime 注入：`codex-rs/core/src/thread_manager.rs`、`codex-rs/core/src/client.rs`、`codex-rs/app-server/src/lib.rs`。
 - HTTP transport：`codex-rs/codex-client/src/transport_handle.rs` 和 Core client 的 transport override。
 - Model/TUI runtime：`codex-rs/tui/src/model_runtime.rs` 及 TUI startup/model picker 流程。
-- App Server 扩展：`codex-rs/app-server/src/rpc_extension.rs`、`message_processor.rs` 和 `extensions.rs`。
+- App Server 扩展：`codex-rs/app-server/src/catalyst/rpc_extension.rs`、`message_processor.rs` 和 `extensions.rs`。
 - Skill provider：`codex-rs/ext/skills/src/sources.rs` 及其 catalog/tool boundary。
 - Thread title：`codex-rs/thread-store/src/title_generator.rs`、`live_thread.rs`。
-- 增量请求和图片迁移：`codex-rs/core/src/client.rs`、`core/src/client/host_http.rs`、`core/src/session/turn.rs`、`core/tests/suite/incremental_http.rs`。
+- 增量请求和图片迁移：`codex-rs/core/src/client.rs`、`core/src/client/catalyst/host_http.rs`、`core/src/session/turn.rs`、`core/tests/suite/incremental_http.rs`。
 - Windows 隔离：`codex-rs/windows-sandbox-rs/src/desktop.rs` 及 unified-exec 调用方。
 
 宿主消费视角和治理优先级见 [`docs-cata/05-宿主消费与架构治理.md`](docs-cata/05-宿主消费与架构治理.md)。
@@ -67,3 +67,11 @@
 - 工具 wire 名称是历史兼容契约，不机械替换；Core 工具规划消费能力声明，不引入新的 Catalyst 名称判断。
 - Runtime 决定模型策略和 Provider 转换，Core 拥有 session baseline、增量计算及恢复状态；Core typed baseline 与最终 wire JSON 分层核对。
 - OpenAI HTTP 优化先验证 Runtime 策略；进程崩溃编排归宿主，只有执行/取消/退出状态证据指向 Core 时才修改 fork。
+
+## 阅读与模块来源
+
+- 模块分区和代码导航见 [`docs-cata/07-模块边界与代码识别.md`](docs-cata/07-模块边界与代码识别.md)。
+- `catalyst/` 是所属 crate 内的宿主适配实现目录，不增加产品运行时或独立生命周期；保留已有公开 Rust import 路径。
+- 独立宿主扩展用模块级 `CATALYST` 文档说明 owner；混合原生模块只在宿主接入点说明职责，不标记整份文件为产品实现。
+- 原生生命周期、状态、权限检查留在原 owner；不得仅为了目录整齐复制、搬走上游编排或放宽可见性。
+- 来源注释是导航，准确差异以当前官方基线的 Git diff 为准；未标记的代码不自动等于原版。
