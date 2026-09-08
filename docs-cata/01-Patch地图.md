@@ -41,8 +41,8 @@ Runtime 装配补充证据：`runtime_composition.rs::image_capable_model_plans_
 
 | 能力 | 主要入口 | 复核边界 | 测试/证据入口 |
 | --- | --- | --- | --- |
-| TUI model runtime | `tui/src/model_runtime.rs`、`tui/src/app/`、`tui/src/chatwidget/` | TUI 只消费抽象 runtime，不把 provider 业务硬编码进 UI | `tui/src/app/tests/`、`chatwidget/tests/`、敏感输入单测 |
-| Credential workflow | `tui/src/model_runtime.rs`、`bottom_pane/sensitive_prompt_view.rs`、`chatwidget/credential_popups.rs` | secret 输入、redacted Debug、zeroize、失败恢复 | `sensitive_prompt_view_tests.rs` 与 TUI snapshots |
+| TUI model runtime | `tui/src/catalyst/model_runtime.rs`、`tui/src/app/`、`tui/src/chatwidget/` | TUI 只消费抽象 runtime，不把 provider 业务硬编码进 UI | `tui/src/app/tests/`、`chatwidget/tests/`、敏感输入单测 |
+| Credential workflow | `tui/src/catalyst/model_runtime.rs`、`bottom_pane/sensitive_prompt_view.rs`、`chatwidget/credential_popups.rs` | secret 输入、redacted Debug、zeroize、失败恢复 | `sensitive_prompt_view_tests.rs` 与 TUI snapshots |
 | App Server RPC extension | `app-server/src/catalyst/rpc_extension.rs`、`message_processor.rs` | 方法必须 namespaced，不得覆盖 native RPC；transport context 影响信任边界 | fork `rpc_extension_tests.rs` 与 `message_processor_rpc_tests.rs` 覆盖 registry/initialize/dispatch；native bridge 完整生命周期仍不能由 router 单测替代 |
 | Native turn/plugin bridge | `app-server/src/extensions.rs`、`request_processors/plugins.rs`、`rpc_extension.rs` | 只暴露受控 gateway；plugin selection 不能绕过现有生命周期 | Runtime `runtime_composition.rs::catalyst_turn_start_enters_the_native_turn_lifecycle_once`；fork plugin/queue 边界证据待补 |
 | Host Skill provider | `ext/skills/src/sources.rs`、`catalog.rs`、`tools/` | provider 按 authority/kind 路由；读取失败不能静默跨 authority | `core/tests/suite/skills_extension.rs` |

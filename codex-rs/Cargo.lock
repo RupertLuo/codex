@@ -4550,6 +4550,7 @@ dependencies = [
  "codex-utils-path-uri",
  "codex-utils-plugins",
  "codex-utils-sandbox-summary",
+ "codex-utils-sensitive-string",
  "codex-utils-sleep-inhibitor",
  "codex-utils-string",
  "codex-windows-sandbox",
@@ -4847,6 +4848,14 @@ dependencies = [
  "codex-protocol",
  "codex-utils-absolute-path",
  "pretty_assertions",
+]
+
+[[package]]
+name = "codex-utils-sensitive-string"
+version = "0.153.4"
+dependencies = [
+ "pretty_assertions",
+ "zeroize",
 ]
 
 [[package]]

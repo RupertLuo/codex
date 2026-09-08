@@ -5,42 +5,18 @@ use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
 
-use zeroize::Zeroize;
+// Compatibility export: existing TUI callers keep the same underlying type.
+pub use codex_utils_sensitive_string::SensitiveString as SensitiveInput;
+
+#[path = "credentials.rs"]
+mod credentials;
+
+pub use credentials::CredentialEntry;
+pub use credentials::CredentialGroup;
+pub use credentials::CredentialMutation;
+pub use credentials::CredentialStatus;
 
 pub type ModelRuntimeFuture<T> = Pin<Box<dyn Future<Output = T> + Send + 'static>>;
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum CredentialStatus {
-    EnvironmentOverride,
-    Verified,
-    Unverified,
-    Missing,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
-pub enum CredentialGroup {
-    #[default]
-    ModelProviders,
-    SearchServices,
-}
-
-impl CredentialGroup {
-    pub fn display_name(self) -> &'static str {
-        match self {
-            Self::ModelProviders => "Model Providers",
-            Self::SearchServices => "Search Services",
-        }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CredentialEntry {
-    pub id: String,
-    pub display_name: String,
-    pub environment_variable: String,
-    pub status: CredentialStatus,
-    pub group: CredentialGroup,
-}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OnboardingProvider {
@@ -54,36 +30,6 @@ pub struct OnboardingProvider {
 pub enum ModelReadiness {
     Ready,
     MissingCredential(CredentialEntry),
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum CredentialMutation {
-    Verified,
-    SavedUnverified { warning: String },
-}
-
-pub struct SensitiveInput(String);
-
-impl SensitiveInput {
-    pub fn new(value: String) -> Self {
-        Self(value)
-    }
-
-    pub fn expose_secret(&self) -> &str {
-        &self.0
-    }
-}
-
-impl fmt::Debug for SensitiveInput {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("SensitiveInput([REDACTED])")
-    }
-}
-
-impl Drop for SensitiveInput {
-    fn drop(&mut self) {
-        self.0.zeroize();
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -119,6 +65,8 @@ impl fmt::Display for ModelRuntimeError {
 
 impl Error for ModelRuntimeError {}
 
+/// Host adapter for model readiness and credential interactions.
+/// Implementations delegate product policy and storage to Runtime services; TUI owns event flow.
 pub trait TuiModelRuntime: fmt::Debug + Send + Sync {
     fn list_onboarding_providers(
         &self,
@@ -150,17 +98,4 @@ pub trait TuiModelRuntime: fmt::Debug + Send + Sync {
         &self,
         credential_id: String,
     ) -> ModelRuntimeFuture<Result<(), ModelRuntimeError>>;
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn sensitive_input_debug_is_redacted() {
-        let input = SensitiveInput::new("provider-secret".to_string());
-
-        assert_eq!(format!("{input:?}"), "SensitiveInput([REDACTED])");
-        assert_eq!(input.expose_secret(), "provider-secret");
-    }
 }

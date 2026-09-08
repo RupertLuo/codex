@@ -33,7 +33,7 @@
 
 - Runtime 注入：`codex-rs/core/src/thread_manager.rs`、`codex-rs/core/src/client.rs`、`codex-rs/app-server/src/lib.rs`。
 - HTTP transport：`codex-rs/codex-client/src/transport_handle.rs` 和 Core client 的 transport override。
-- Model/TUI runtime：`codex-rs/tui/src/model_runtime.rs` 及 TUI startup/model picker 流程。
+- Model/TUI runtime：`codex-rs/tui/src/catalyst/model_runtime.rs` 及 TUI startup/model picker 流程。
 - App Server 扩展：`codex-rs/app-server/src/catalyst/rpc_extension.rs`、`message_processor.rs` 和 `extensions.rs`。
 - Skill provider：`codex-rs/ext/skills/src/sources.rs` 及其 catalog/tool boundary。
 - Thread title：`codex-rs/thread-store/src/title_generator.rs`、`live_thread.rs`。

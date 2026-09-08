@@ -183,6 +183,68 @@ async fn turn_submission_waits_for_model_readiness() {
 }
 
 #[tokio::test]
+async fn stale_model_readiness_rechecks_current_model_before_submission() {
+    let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(Some("gpt-5.2")).await;
+    chat.handle_thread_session(submission_session("gpt-5.2"));
+    drain_insert_history(&mut rx);
+    while op_rx.try_recv().is_ok() {}
+    chat.model_runtime = Some(Arc::new(SubmissionRuntime));
+
+    let text = "send this after readiness".to_string();
+    let text_elements = vec![TextElement::new((0..text.len()).into(), Some(text.clone()))];
+    let remote_image_url = "https://example.com/remote.png".to_string();
+    chat.submit_user_message(UserMessage {
+        text: text.clone(),
+        local_images: Vec::new(),
+        remote_image_urls: vec![remote_image_url.clone()],
+        text_elements: text_elements.clone(),
+        mention_bindings: Vec::new(),
+    });
+    assert_no_submit_op(&mut op_rx);
+    let requested_models = std::iter::from_fn(|| rx.try_recv().ok())
+        .filter_map(|event| match event {
+            AppEvent::CheckModelReadyForSubmission { model } => Some(model),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(requested_models, vec!["gpt-5.2".to_string()]);
+
+    // Deliver the earlier model's result only after the selected model has changed.
+    chat.set_model("gpt-5.5");
+    chat.resume_model_ready_submission("gpt-5.2".to_string());
+    assert_no_submit_op(&mut op_rx);
+    let requested_models = std::iter::from_fn(|| rx.try_recv().ok())
+        .filter_map(|event| match event {
+            AppEvent::CheckModelReadyForSubmission { model } => Some(model),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(requested_models, vec!["gpt-5.5".to_string()]);
+
+    chat.resume_model_ready_submission("gpt-5.5".to_string());
+    let items = match next_submit_op(&mut op_rx) {
+        Op::UserTurn { items, .. } => items,
+        other => panic!("expected one resumed user turn, got {other:?}"),
+    };
+    assert_eq!(
+        items,
+        vec![
+            UserInput::Image {
+                url: remote_image_url,
+                detail: None,
+            },
+            UserInput::Text {
+                text,
+                text_elements: text_elements.into_iter().map(Into::into).collect(),
+            },
+        ]
+    );
+    assert_no_submit_op(&mut op_rx);
+    chat.resume_model_ready_submission("gpt-5.5".to_string());
+    assert_no_submit_op(&mut op_rx);
+}
+
+#[tokio::test]
 async fn shell_submission_bypasses_model_readiness() {
     let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(Some("test-model")).await;
     chat.handle_thread_session(submission_session("test-model"));
