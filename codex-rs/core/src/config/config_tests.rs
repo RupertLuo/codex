@@ -5432,6 +5432,58 @@ async fn rebuild_preserving_session_layers_refreshes_requirements() -> std::io::
 }
 
 #[tokio::test]
+async fn process_mcp_server_replacement_discards_stale_fields_across_rebuild() -> std::io::Result<()>
+{
+    let codex_home = TempDir::new()?;
+    let process_mcp_server_replacements = BTreeMap::from([(
+        "cata_browser".to_string(),
+        toml::toml! {
+            command = "/app/node"
+            args = ["/app/browser.mjs"]
+            required = true
+        }
+        .into(),
+    )]);
+    let config = ConfigBuilder::without_managed_config_for_tests()
+        .codex_home(codex_home.path().to_path_buf())
+        .fallback_cwd(Some(codex_home.path().to_path_buf()))
+        .cli_overrides(vec![
+            (
+                "mcp_servers.cata_browser.url".to_string(),
+                TomlValue::String("https://stale.example/mcp".to_string()),
+            ),
+            (
+                "mcp_servers.cata_browser.future_stale_field".to_string(),
+                TomlValue::Boolean(true),
+            ),
+            (
+                "mcp_servers.other.command".to_string(),
+                TomlValue::String("other-command".to_string()),
+            ),
+        ])
+        .process_mcp_server_replacements(process_mcp_server_replacements)
+        .build()
+        .await?;
+
+    let expected = HashMap::from([
+        (
+            "cata_browser".to_string(),
+            McpServerConfig {
+                required: true,
+                ..stdio_mcp_with_args("/app/node", &["/app/browser.mjs"])
+            },
+        ),
+        ("other".to_string(), stdio_mcp("other-command")),
+    ]);
+    assert_eq!(config.mcp_servers.get(), &expected);
+
+    let rebuilt = config.rebuild_preserving_session_layers(&config).await?;
+    assert_eq!(rebuilt.mcp_servers.get(), &expected);
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn rebuild_preserving_session_layers_refreshes_plugin_derived_mcp_config()
 -> anyhow::Result<()> {
     let codex_home = TempDir::new()?;

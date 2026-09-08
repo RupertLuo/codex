@@ -2189,6 +2189,19 @@ fn assign_missing_streamed_response_item_id(
     Session::assign_missing_response_item_id(item);
 }
 
+fn streamed_item_for_event<'a>(
+    item_id: Option<&str>,
+    streamed_items: &'a HashMap<String, TurnItem>,
+    active_item: Option<&'a TurnItem>,
+    active_item_is_streaming_to_client: bool,
+) -> Option<&'a TurnItem> {
+    match item_id {
+        Some(item_id) => streamed_items.get(item_id),
+        None if active_item_is_streaming_to_client => active_item,
+        None => None,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 #[instrument(level = "trace",
     skip_all,
@@ -2247,6 +2260,10 @@ async fn try_run_sampling_request(
     let mut needs_follow_up = false;
     let mut last_agent_message: Option<String> = None;
     let mut active_item: Option<TurnItem> = None;
+    let mut streamed_items = HashMap::<String, TurnItem>::new();
+    let mut completed_streamed_item_ids = HashSet::<String>::new();
+    let mut pending_output_text_deltas = HashMap::<String, String>::new();
+    let mut pending_unkeyed_output_text_delta = String::new();
     let mut active_tool_argument_diff_consumer: Option<(
         String,
         Box<dyn ToolArgumentDiffConsumer>,
@@ -2331,18 +2348,43 @@ async fn try_run_sampling_request(
                         analytics_tool_call_ids.push(call_id.to_string());
                     }
                 }
-                if let Some((_, mut consumer)) = active_tool_argument_diff_consumer.take()
+                let completes_active_tool_call = active_tool_argument_diff_consumer
+                    .as_ref()
+                    .is_some_and(|(active_call_id, _)| {
+                        matches!(
+                            &item,
+                            ResponseItem::CustomToolCall { call_id, .. }
+                                if call_id == active_call_id
+                        )
+                    });
+                if completes_active_tool_call
+                    && let Some((_, mut consumer)) = active_tool_argument_diff_consumer.take()
                     && let Ok(Some(event)) = consumer.finish()
                 {
                     sess.send_event(&turn_context, event).await;
                 }
-                let previously_active_item = active_item.take();
-                let previously_streamed_item = if active_item_is_streaming_to_client {
-                    previously_active_item
-                } else {
-                    None
+                let completed_item_id = item.id().map(|item_id| item_id.as_str().to_owned());
+                let completes_active_item = match (&completed_item_id, active_item.as_ref()) {
+                    (Some(completed_item_id), Some(active)) => completed_item_id == &active.id(),
+                    _ => false,
                 };
-                active_item_is_streaming_to_client = false;
+                let previously_streamed_item = completed_item_id
+                    .as_deref()
+                    .and_then(|item_id| streamed_items.remove(item_id));
+                if let Some(completed_item_id) = completed_item_id {
+                    completed_streamed_item_ids.insert(completed_item_id.clone());
+                    if let Some(pending) = pending_output_text_deltas.remove(&completed_item_id) {
+                        warn!(
+                            item_id = completed_item_id,
+                            buffered_len = pending.len(),
+                            "dropping output text deltas for an item that completed before it was added"
+                        );
+                    }
+                }
+                if completes_active_item {
+                    active_item = None;
+                    active_item_is_streaming_to_client = false;
+                }
                 if let Some(previous) = previously_streamed_item.as_ref()
                     && matches!(previous, TurnItem::AgentMessage(_))
                 {
@@ -2450,27 +2492,47 @@ async fn try_run_sampling_request(
                 {
                     let mut turn_item = turn_item;
                     let stream_item_to_client = !defer_streamed_turn_items_for_contributors;
-                    let mut seeded_parsed: Option<ParsedAssistantTextDelta> = None;
-                    let mut seeded_item_id: Option<String> = None;
-                    if stream_item_to_client
-                        && matches!(turn_item, TurnItem::AgentMessage(_))
-                        && let Some(raw_text) = raw_assistant_output_text_from_item(&item)
-                    {
+                    let mut seeded_emit: Option<(String, ParsedAssistantTextDelta)> = None;
+                    let mut pending_emit: Option<(String, ParsedAssistantTextDelta)> = None;
+                    let raw_output_text = matches!(turn_item, TurnItem::AgentMessage(_))
+                        .then(|| raw_assistant_output_text_from_item(&item))
+                        .flatten();
+                    if stream_item_to_client && matches!(turn_item, TurnItem::AgentMessage(_)) {
                         let item_id = turn_item.id();
-                        let mut seeded =
-                            assistant_message_stream_parsers.seed_item_text(&item_id, &raw_text);
-                        if let TurnItem::AgentMessage(agent_message) = &mut turn_item {
-                            agent_message.content =
-                                vec![codex_protocol::items::AgentMessageContent::Text {
-                                    text: if plan_mode {
-                                        String::new()
-                                    } else {
-                                        std::mem::take(&mut seeded.visible_text)
-                                    },
-                                }];
+                        if let Some(raw_text) = raw_output_text.as_deref() {
+                            let mut seeded =
+                                assistant_message_stream_parsers.seed_item_text(&item_id, raw_text);
+                            if let TurnItem::AgentMessage(agent_message) = &mut turn_item {
+                                agent_message.content =
+                                    vec![codex_protocol::items::AgentMessageContent::Text {
+                                        text: if plan_mode {
+                                            String::new()
+                                        } else {
+                                            std::mem::take(&mut seeded.visible_text)
+                                        },
+                                    }];
+                            }
+                            seeded_emit = plan_mode.then_some((item_id.clone(), seeded));
                         }
-                        seeded_parsed = plan_mode.then_some(seeded);
-                        seeded_item_id = Some(item_id);
+                        let mut pending_delta = pending_output_text_deltas
+                            .remove(&item_id)
+                            .unwrap_or_default();
+                        if !pending_unkeyed_output_text_delta.is_empty() {
+                            pending_delta
+                                .push_str(&std::mem::take(&mut pending_unkeyed_output_text_delta));
+                        }
+                        if let Some(raw_text) = raw_output_text.as_deref() {
+                            if pending_delta.starts_with(raw_text) {
+                                pending_delta.drain(..raw_text.len());
+                            } else if raw_text.starts_with(&pending_delta) {
+                                pending_delta.clear();
+                            }
+                        }
+                        if !pending_delta.is_empty() {
+                            let parsed = assistant_message_stream_parsers
+                                .parse_delta(&item_id, &pending_delta);
+                            pending_emit = Some((item_id.clone(), parsed));
+                        }
                     }
                     if stream_item_to_client {
                         if let Some(state) = plan_mode_state.as_mut()
@@ -2483,20 +2545,27 @@ async fn try_run_sampling_request(
                         } else {
                             sess.emit_turn_item_started(&turn_context, &turn_item).await;
                         }
-                        if let (Some(state), Some(item_id), Some(parsed)) = (
-                            plan_mode_state.as_mut(),
-                            seeded_item_id.as_deref(),
-                            seeded_parsed,
-                        ) {
+                        if let Some((item_id, parsed)) = seeded_emit {
                             emit_streamed_assistant_text_delta(
                                 &sess,
                                 &turn_context,
-                                Some(state),
-                                item_id,
+                                plan_mode_state.as_mut(),
+                                &item_id,
                                 parsed,
                             )
                             .await;
                         }
+                        if let Some((item_id, parsed)) = pending_emit {
+                            emit_streamed_assistant_text_delta(
+                                &sess,
+                                &turn_context,
+                                plan_mode_state.as_mut(),
+                                &item_id,
+                                parsed,
+                            )
+                            .await;
+                        }
+                        streamed_items.insert(turn_item.id(), turn_item.clone());
                     }
                     active_item = Some(turn_item);
                     active_item_is_streaming_to_client = stream_item_to_client;
@@ -2562,6 +2631,17 @@ async fn try_run_sampling_request(
                 token_usage,
                 end_turn,
             } => {
+                let buffered_output_text_len = pending_unkeyed_output_text_delta.len()
+                    + pending_output_text_deltas
+                        .values()
+                        .map(String::len)
+                        .sum::<usize>();
+                if buffered_output_text_len > 0 {
+                    warn!(
+                        buffered_len = buffered_output_text_len,
+                        "dropping output text deltas without a matching streamed item"
+                    );
+                }
                 sess.services
                     .analytics_events_client
                     .track_code_mode_tool_call(
@@ -2603,21 +2683,24 @@ async fn try_run_sampling_request(
                     last_agent_message,
                 });
             }
-            ResponseEvent::OutputTextDelta(delta) => {
+            ResponseEvent::OutputTextDelta { item_id, delta } => {
                 // In review child threads, suppress assistant text deltas; the
                 // UI will show a selection popup from the final ReviewOutput.
-                if let Some(active) = active_item.as_ref() {
-                    if !active_item_is_streaming_to_client {
-                        continue;
-                    }
-                    let item_id = active.id();
-                    if matches!(active, TurnItem::AgentMessage(_)) {
-                        let parsed = assistant_message_stream_parsers.parse_delta(&item_id, &delta);
+                if let Some(streamed_item) = streamed_item_for_event(
+                    item_id.as_deref(),
+                    &streamed_items,
+                    active_item.as_ref(),
+                    active_item_is_streaming_to_client,
+                ) {
+                    let streamed_item_id = streamed_item.id();
+                    if matches!(streamed_item, TurnItem::AgentMessage(_)) {
+                        let parsed =
+                            assistant_message_stream_parsers.parse_delta(&streamed_item_id, &delta);
                         emit_streamed_assistant_text_delta(
                             &sess,
                             &turn_context,
                             plan_mode_state.as_mut(),
-                            &item_id,
+                            &streamed_item_id,
                             parsed,
                         )
                         .await;
@@ -2625,14 +2708,23 @@ async fn try_run_sampling_request(
                         let event = AgentMessageContentDeltaEvent {
                             thread_id: sess.thread_id.to_string(),
                             turn_id: turn_context.sub_id.clone(),
-                            item_id,
+                            item_id: streamed_item_id,
                             delta,
                         };
                         sess.send_event(&turn_context, EventMsg::AgentMessageContentDelta(event))
                             .await;
                     }
+                } else if let Some(item_id) = item_id {
+                    if completed_streamed_item_ids.contains(&item_id) {
+                        warn!(item_id, "dropping output text delta after item completion");
+                    } else {
+                        pending_output_text_deltas
+                            .entry(item_id)
+                            .or_default()
+                            .push_str(&delta);
+                    }
                 } else {
-                    error_or_panic("OutputTextDelta without active item".to_string());
+                    pending_unkeyed_output_text_delta.push_str(&delta);
                 }
             }
             ResponseEvent::ToolCallInputDelta {
@@ -2654,45 +2746,59 @@ async fn try_run_sampling_request(
                 }
             }
             ResponseEvent::ReasoningSummaryDelta {
+                item_id,
                 delta,
                 summary_index,
             } => {
                 if uses_sequential_cutoff_reasoning_summaries {
                     continue;
                 }
-                if let Some(active) = active_item.as_ref() {
-                    if !active_item_is_streaming_to_client {
-                        continue;
-                    }
+                if let Some(streamed_item) = streamed_item_for_event(
+                    item_id.as_deref(),
+                    &streamed_items,
+                    active_item.as_ref(),
+                    active_item_is_streaming_to_client,
+                ) {
                     let event = ReasoningContentDeltaEvent {
                         thread_id: sess.thread_id.to_string(),
                         turn_id: turn_context.sub_id.clone(),
-                        item_id: active.id(),
+                        item_id: streamed_item.id(),
                         delta,
                         summary_index,
                     };
                     sess.send_event(&turn_context, EventMsg::ReasoningContentDelta(event))
                         .await;
                 } else {
-                    error_or_panic("ReasoningSummaryDelta without active item".to_string());
+                    warn!(
+                        ?item_id,
+                        summary_index, "dropping orphan reasoning summary delta"
+                    );
                 }
             }
-            ResponseEvent::ReasoningSummaryPartAdded { summary_index } => {
+            ResponseEvent::ReasoningSummaryPartAdded {
+                item_id,
+                summary_index,
+            } => {
                 if uses_sequential_cutoff_reasoning_summaries {
                     continue;
                 }
-                if let Some(active) = active_item.as_ref() {
-                    if !active_item_is_streaming_to_client {
-                        continue;
-                    }
+                if let Some(streamed_item) = streamed_item_for_event(
+                    item_id.as_deref(),
+                    &streamed_items,
+                    active_item.as_ref(),
+                    active_item_is_streaming_to_client,
+                ) {
                     let event =
                         EventMsg::AgentReasoningSectionBreak(AgentReasoningSectionBreakEvent {
-                            item_id: active.id(),
+                            item_id: streamed_item.id(),
                             summary_index,
                         });
                     sess.send_event(&turn_context, event).await;
                 } else {
-                    error_or_panic("ReasoningSummaryPartAdded without active item".to_string());
+                    warn!(
+                        ?item_id,
+                        summary_index, "dropping orphan reasoning summary part"
+                    );
                 }
             }
             ResponseEvent::ReasoningSummaryDone {
@@ -2703,10 +2809,10 @@ async fn try_run_sampling_request(
                 if !uses_sequential_cutoff_reasoning_summaries {
                     continue;
                 }
-                let Some(active) = active_item.as_ref() else {
+                let Some(streamed_item) = streamed_items.get(&item_id) else {
                     continue;
                 };
-                if !active_item_is_streaming_to_client || active.id() != item_id {
+                if !matches!(streamed_item, TurnItem::Reasoning(_)) {
                     continue;
                 }
                 if summary_index > 0 {
@@ -2730,24 +2836,30 @@ async fn try_run_sampling_request(
                     .await;
             }
             ResponseEvent::ReasoningContentDelta {
+                item_id,
                 delta,
                 content_index,
             } => {
-                if let Some(active) = active_item.as_ref() {
-                    if !active_item_is_streaming_to_client {
-                        continue;
-                    }
+                if let Some(streamed_item) = streamed_item_for_event(
+                    item_id.as_deref(),
+                    &streamed_items,
+                    active_item.as_ref(),
+                    active_item_is_streaming_to_client,
+                ) {
                     let event = ReasoningRawContentDeltaEvent {
                         thread_id: sess.thread_id.to_string(),
                         turn_id: turn_context.sub_id.clone(),
-                        item_id: active.id(),
+                        item_id: streamed_item.id(),
                         delta,
                         content_index,
                     };
                     sess.send_event(&turn_context, EventMsg::ReasoningRawContentDelta(event))
                         .await;
                 } else {
-                    error_or_panic("ReasoningRawContentDelta without active item".to_string());
+                    warn!(
+                        ?item_id,
+                        content_index, "dropping orphan raw reasoning delta"
+                    );
                 }
             }
         }

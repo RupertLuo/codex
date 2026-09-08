@@ -227,6 +227,7 @@ pub struct ModelRuntimePolicy {
     pub supports_http_incremental_requests: bool,
     pub relocates_tool_output_images: bool,
     pub max_request_body_bytes: Option<u64>,
+    pub supports_parallel_tool_calls: Option<bool>,
 }
 
 #[derive(Debug, Default)]
@@ -1004,7 +1005,12 @@ impl ModelClient {
             input,
             tools,
             tool_choice: "auto".to_string(),
-            parallel_tool_calls: prompt.parallel_tool_calls && !model_info.use_responses_lite,
+            parallel_tool_calls: prompt.parallel_tool_calls
+                && self
+                    .runtime_policy(&model_info.slug)
+                    .supports_parallel_tool_calls
+                    .unwrap_or(true)
+                && !model_info.use_responses_lite,
             reasoning: Some(reasoning),
             store: false,
             stream: true,

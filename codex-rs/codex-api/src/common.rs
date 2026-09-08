@@ -96,13 +96,17 @@ pub enum ResponseEvent {
         /// so we rely on fallback logic when this is `None`.
         end_turn: Option<bool>,
     },
-    OutputTextDelta(String),
+    OutputTextDelta {
+        item_id: Option<String>,
+        delta: String,
+    },
     ToolCallInputDelta {
         item_id: String,
         call_id: Option<String>,
         delta: String,
     },
     ReasoningSummaryDelta {
+        item_id: Option<String>,
         delta: String,
         summary_index: i64,
     },
@@ -112,10 +116,12 @@ pub enum ResponseEvent {
         summary_index: i64,
     },
     ReasoningContentDelta {
+        item_id: Option<String>,
         delta: String,
         content_index: i64,
     },
     ReasoningSummaryPartAdded {
+        item_id: Option<String>,
         summary_index: i64,
     },
     RateLimits(RateLimitSnapshot),

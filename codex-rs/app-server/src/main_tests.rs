@@ -22,6 +22,22 @@ fn app_server_accepts_cli_config_overrides() {
 }
 
 #[test]
+fn app_server_accepts_process_mcp_server_replacement() {
+    let replacement =
+        r#"cata_browser={ command = "/app/node", args = ["/app/browser.mjs"], required = true }"#;
+    let args = AppServerCli::try_parse_from([
+        "codex-app-server",
+        "--process-mcp-server",
+        replacement,
+        "--listen",
+        "off",
+    ])
+    .expect("parse app-server args");
+
+    assert_eq!(args.serve.raw_process_mcp_servers(), [replacement]);
+}
+
+#[test]
 fn app_server_accepts_process_scoped_code_mode_host() {
     let args = AppServerCli::try_parse_from([
         "codex-app-server",

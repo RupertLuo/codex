@@ -31,6 +31,7 @@ use codex_config::config_toml::ThreadStoreToml;
 use codex_config::config_toml::validate_model_providers;
 use codex_config::loader::load_config_layers_state;
 use codex_config::loader::project_trust_key;
+use codex_config::loader::resolve_relative_paths_in_config_toml;
 use codex_config::permissions_toml::PermissionProfileToml;
 use codex_config::permissions_toml::PermissionsToml;
 use codex_config::sandbox_mode_requirement_for_permission_profile;
@@ -787,6 +788,9 @@ pub struct Config {
     /// Definition for MCP servers that Codex can reach out to for tool calls.
     pub mcp_servers: Constrained<HashMap<String, McpServerConfig>>,
 
+    /// Complete MCP server tables owned by the app-server process rather than config files.
+    process_mcp_server_replacements: BTreeMap<String, TomlValue>,
+
     /// When present, only these MCP servers omit the legacy `mcp__` namespace prefix.
     pub non_prefixed_mcp_tool_servers: Option<Vec<String>>,
 
@@ -1316,6 +1320,7 @@ impl AuthManagerConfig for Config {
 pub struct ConfigBuilder {
     codex_home: Option<PathBuf>,
     cli_overrides: Option<Vec<(String, TomlValue)>>,
+    process_mcp_server_replacements: BTreeMap<String, TomlValue>,
     harness_overrides: Option<ConfigOverrides>,
     loader_overrides: Option<LoaderOverrides>,
     strict_config: bool,
@@ -1332,6 +1337,14 @@ impl ConfigBuilder {
 
     pub fn cli_overrides(mut self, cli_overrides: Vec<(String, TomlValue)>) -> Self {
         self.cli_overrides = Some(cli_overrides);
+        self
+    }
+
+    pub fn process_mcp_server_replacements(
+        mut self,
+        replacements: BTreeMap<String, TomlValue>,
+    ) -> Self {
+        self.process_mcp_server_replacements = replacements;
         self
     }
 
@@ -1377,6 +1390,7 @@ impl ConfigBuilder {
         let Self {
             codex_home,
             cli_overrides,
+            process_mcp_server_replacements,
             harness_overrides,
             loader_overrides,
             strict_config,
@@ -1400,7 +1414,7 @@ impl ConfigBuilder {
         let config_layer_stack = load_config_layers_state(
             LOCAL_FS.as_ref(),
             &codex_home,
-            Some(cwd),
+            Some(cwd.clone()),
             &cli_overrides,
             ConfigLoadOptions {
                 loader_overrides,
@@ -1412,7 +1426,12 @@ impl ConfigBuilder {
                 .unwrap_or(&codex_config::NoopThreadConfigLoader),
         )
         .await?;
-        let merged_toml = config_layer_stack.effective_config();
+        let process_mcp_server_replacements = resolve_process_mcp_server_replacements(
+            process_mcp_server_replacements,
+            cwd.as_path(),
+        )?;
+        let mut merged_toml = config_layer_stack.effective_config();
+        replace_mcp_server_tables(&mut merged_toml, &process_mcp_server_replacements)?;
 
         // Note that each layer in ConfigLayerStack should have resolved
         // relative paths to absolute paths based on the parent folder of the
@@ -1436,14 +1455,16 @@ impl ConfigBuilder {
                 return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, err));
             }
         };
-        Config::load_config_with_layer_stack(
+        let mut config = Config::load_config_with_layer_stack(
             LOCAL_FS.as_ref(),
             config_toml,
             harness_overrides,
             codex_home,
             config_layer_stack,
         )
-        .await
+        .await?;
+        config.process_mcp_server_replacements = process_mcp_server_replacements;
+        Ok(config)
     }
 
     #[cfg(test)]
@@ -1768,8 +1789,12 @@ impl Config {
                 .config_layer_stack
                 .ignore_user_and_project_exec_policy_rules(),
         );
-        let cfg: ConfigToml = config_layer_stack
-            .effective_config()
+        let mut effective_config = config_layer_stack.effective_config();
+        replace_mcp_server_tables(
+            &mut effective_config,
+            &refreshed_config.process_mcp_server_replacements,
+        )?;
+        let cfg: ConfigToml = effective_config
             .try_into()
             .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
         let default_zsh_path = refreshed_config
@@ -1778,7 +1803,7 @@ impl Config {
             .map(AbsolutePathBuf::try_from)
             .transpose()?;
 
-        Self::load_config_with_layer_stack(
+        let mut config = Self::load_config_with_layer_stack(
             LOCAL_FS.as_ref(),
             cfg,
             ConfigOverrides {
@@ -1789,7 +1814,10 @@ impl Config {
             refreshed_config.codex_home.clone(),
             config_layer_stack,
         )
-        .await
+        .await?;
+        config.process_mcp_server_replacements =
+            refreshed_config.process_mcp_server_replacements.clone();
+        Ok(config)
     }
 
     /// This is the preferred way to create an instance of [Config].
@@ -2374,6 +2402,61 @@ fn thread_store_config(thread_store: Option<ThreadStoreToml>) -> ThreadStoreConf
 
 fn is_session_layer(source: &ConfigLayerSource) -> bool {
     matches!(source, ConfigLayerSource::SessionFlags)
+}
+
+fn replace_mcp_server_tables(
+    config: &mut TomlValue,
+    replacements: &BTreeMap<String, TomlValue>,
+) -> std::io::Result<()> {
+    if replacements.is_empty() {
+        return Ok(());
+    }
+    let root = config.as_table_mut().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "effective config root must be a table",
+        )
+    })?;
+    let mcp_servers = root
+        .entry("mcp_servers")
+        .or_insert_with(|| TomlValue::Table(toml::Table::new()))
+        .as_table_mut()
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "effective mcp_servers config must be a table",
+            )
+        })?;
+    mcp_servers.extend(replacements.clone());
+    Ok(())
+}
+
+fn resolve_process_mcp_server_replacements(
+    replacements: BTreeMap<String, TomlValue>,
+    base_dir: &Path,
+) -> std::io::Result<BTreeMap<String, TomlValue>> {
+    if replacements.is_empty() {
+        return Ok(replacements);
+    }
+    let replacement_layer = TomlValue::Table(toml::Table::from_iter([(
+        "mcp_servers".to_string(),
+        TomlValue::Table(replacements.into_iter().collect()),
+    )]));
+    let mut resolved = resolve_relative_paths_in_config_toml(replacement_layer, base_dir)?;
+    let replacements = resolved
+        .as_table_mut()
+        .and_then(|root| root.remove("mcp_servers"))
+        .and_then(|value| match value {
+            TomlValue::Table(table) => Some(table),
+            _ => None,
+        })
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "process MCP server replacements must be tables",
+            )
+        })?;
+    Ok(replacements.into_iter().collect())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4054,6 +4137,7 @@ impl Config {
                 ),
             },
             mcp_servers,
+            process_mcp_server_replacements: BTreeMap::new(),
             non_prefixed_mcp_tool_servers,
             // The config.toml omits "_mode" because it's a config file. However, "_mode"
             // is important in code to differentiate the mode from the store implementation.

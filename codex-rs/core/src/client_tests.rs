@@ -1,8 +1,10 @@
 use super::AuthRequestTelemetryContext;
 use super::CompactConversationRequestSettings;
 use super::ModelClient;
+use super::ModelRuntimePolicy;
 use super::PendingUnauthorizedRetry;
 use super::Prompt;
+use super::ReasoningSummaryConfig;
 use super::UnauthorizedRecoveryExecution;
 use super::X_CODEX_INSTALLATION_ID_HEADER;
 use super::X_CODEX_PARENT_THREAD_ID_HEADER;
@@ -65,6 +67,7 @@ use futures::StreamExt;
 use pretty_assertions::assert_eq;
 use serde_json::json;
 use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -306,6 +309,42 @@ fn ultra_reasoning_uses_max_for_requests() {
         ),
         (ReasoningEffort::Max, ReasoningEffort::High,)
     );
+}
+
+#[test]
+fn runtime_policy_disables_parallel_tool_calls() {
+    let model_info = test_model_info();
+    let client =
+        test_model_client(SessionSource::Cli).with_model_runtime_policies(HashMap::from([(
+            model_info.slug.clone(),
+            ModelRuntimePolicy {
+                supports_parallel_tool_calls: Some(false),
+                ..Default::default()
+            },
+        )]));
+    let metadata = test_responses_metadata_for_client(
+        &client,
+        /*turn_id*/ None,
+        format!("{}:0", client.state.thread_id),
+        /*parent_thread_id*/ None,
+        TestCodexResponsesRequestKind::Turn,
+    );
+
+    let request = client
+        .build_responses_request(
+            &Prompt {
+                parallel_tool_calls: true,
+                ..Default::default()
+            },
+            &model_info,
+            /*effort*/ None,
+            ReasoningSummaryConfig::None,
+            /*service_tier*/ None,
+            &metadata,
+        )
+        .expect("request should build");
+
+    assert!(!request.parallel_tool_calls);
 }
 
 fn write_chatgpt_auth_json(codex_home: &std::path::Path) {
@@ -1009,12 +1048,14 @@ async fn non_chatgpt_codex_endpoints_omit_attestation_generation() {
 }
 
 #[test]
-fn recognizes_structured_unknown_previous_response_error() {
+fn recognizes_qwen_unknown_previous_response_error() {
     let error = ApiError::Transport(TransportError::Http {
-        status: http::StatusCode::NOT_FOUND,
+        status: http::StatusCode::BAD_REQUEST,
         url: None,
         headers: None,
-        body: Some(r#"{"code":"previous_response_not_found"}"#.to_string()),
+        body: Some(
+            r#"{"code":"InvalidParameter","message":"Not found previous_response_id"}"#.to_string(),
+        ),
     });
 
     assert!(is_unknown_previous_response(&error));

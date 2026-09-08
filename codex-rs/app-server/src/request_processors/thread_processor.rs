@@ -13,6 +13,7 @@ use codex_app_server_protocol::ThreadSection;
 use codex_app_server_protocol::ThreadSectionAppearance;
 use codex_app_server_protocol::ThreadSectionMoveParams;
 use codex_app_server_protocol::ThreadSectionMoveResponse;
+use codex_app_server_protocol::ThreadSettingsUpdatedNotification;
 use codex_extension_api::ExtensionDataInit;
 use codex_extension_api::ThreadIdleCause;
 use codex_protocol::config_types::MultiAgentMode;
@@ -3455,6 +3456,14 @@ impl ThreadRequestProcessor {
                 .upsert_thread(&thread_id.to_string())
                 .await;
             if let Some(parent_thread_id) = config_snapshot.parent_thread_id {
+                self.outgoing
+                    .send_server_notification(ServerNotification::ThreadSettingsUpdated(
+                        ThreadSettingsUpdatedNotification {
+                            thread_id: thread_id.to_string(),
+                            thread_settings: thread_settings_from_config_snapshot(&config_snapshot),
+                        },
+                    ))
+                    .await;
                 raw_events_enabled = self
                     .thread_state_manager
                     .thread_state(parent_thread_id)
