@@ -212,7 +212,7 @@ impl TracingHarness {
     }
 }
 
-async fn build_test_config(codex_home: &Path, server_uri: &str) -> Result<Config> {
+pub(super) async fn build_test_config(codex_home: &Path, server_uri: &str) -> Result<Config> {
     write_mock_responses_config_toml(
         codex_home,
         server_uri,
@@ -229,7 +229,7 @@ async fn build_test_config(codex_home: &Path, server_uri: &str) -> Result<Config
         .await?)
 }
 
-async fn build_test_processor(
+pub(super) async fn build_test_processor(
     config: Arc<Config>,
 ) -> (
     Arc<MessageProcessor>,

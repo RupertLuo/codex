@@ -1813,3 +1813,7 @@ impl MessageProcessor {
 #[cfg(test)]
 #[path = "message_processor_tracing_tests.rs"]
 mod message_processor_tracing_tests;
+
+#[cfg(test)]
+#[path = "message_processor_rpc_tests.rs"]
+mod message_processor_rpc_tests;

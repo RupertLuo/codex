@@ -216,3 +216,7 @@ impl AppServerRpcRegistry {
         })
     }
 }
+
+#[cfg(test)]
+#[path = "rpc_extension_tests.rs"]
+mod tests;
