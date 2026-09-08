@@ -370,3 +370,7 @@ pub(crate) fn apply_runtime_feature_enablement(
         }
     }
 }
+
+#[cfg(test)]
+#[path = "config_manager_tests.rs"]
+mod tests;

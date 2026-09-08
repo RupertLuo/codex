@@ -53,7 +53,7 @@ Runtime 的 App Server 装配入口为其仓库 `crates/catalyst-app-server/src/
 
 | 能力 | 代码/消费入口 | 验证入口与限制 |
 | --- | --- | --- |
-| process MCP 整表替换 | `app-server/src/cli.rs` → overrides → `config_manager.rs` → `core/src/config/mod.rs`；Runtime flatten 共享 CLI | `process_mcp_server_replacement_discards_stale_fields_across_rebuild`、`app_server_accepts_process_mcp_server_replacement`；refresh/非法输入链仍需补证据 |
+| process MCP 整表替换 | `app-server/src/cli.rs` → overrides → `config_manager.rs` → `core/src/config/mod.rs`；Runtime flatten 共享 CLI | `process_mcp_server_replacement_discards_stale_fields_across_rebuild`、`app_server_accepts_process_mcp_server_replacement`；`app-server/src/config_manager_tests.rs` 验证 refresh、request override 优先级、requirements 禁用和 typed validation；`cli_tests.rs` 验证 CLI 整表解析及非法输入 |
 | 流式 item ID 归属 | `codex-api/src/sse/responses.rs` → `core/src/session/turn.rs` | `preserves_stream_delta_item_ids`、`output_text_delta_before_output_item_added_is_buffered`、`interleaved_response_items_keep_delta_ownership` |
 | Skill roots 默认限制 | `ext/skills/src/host_roots.rs`；不自动扫描 home/repo `.agents/skills` | `resolved_roots_preserve_configured_sources_and_ignore_agents_dirs`；不等同仅允许私有 Skill |
 | 独立搜索能力 | `tools/src/tool_executor.rs::is_standalone_web_search` → `core/src/tools/spec_plan.rs`；Runtime `WebRunTool` 声明 | 任意宿主名称/gate、注册冲突、真实工具 schema 测试；保留原生名称兼容与历史 wire 名称 |

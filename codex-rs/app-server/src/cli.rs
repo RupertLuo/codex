@@ -188,3 +188,7 @@ fn managed_config_path_from_debug_env() -> Option<PathBuf> {
     }
     None
 }
+
+#[cfg(test)]
+#[path = "cli_tests.rs"]
+mod tests;
