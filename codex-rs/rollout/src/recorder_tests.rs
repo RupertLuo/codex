@@ -1523,6 +1523,7 @@ fn fill_missing_thread_item_metadata_preserves_identity_and_prefers_state_git_fi
         git_sha: Some("filesystem-sha".to_string()),
         git_origin_url: Some("https://example.com/filesystem.git".to_string()),
         source: None,
+        thread_source: None,
         history_mode: Default::default(),
         parent_thread_id: None,
         agent_nickname: None,
@@ -1549,6 +1550,9 @@ fn fill_missing_thread_item_metadata_preserves_identity_and_prefers_state_git_fi
         git_sha: Some("state-sha".to_string()),
         git_origin_url: Some("https://example.com/state.git".to_string()),
         source: Some(SessionSource::Exec),
+        thread_source: Some(codex_protocol::protocol::ThreadSource::Feature(
+            "catalyst:ppt-pro".to_string(),
+        )),
         history_mode: Default::default(),
         parent_thread_id: None,
         agent_nickname: Some("state-agent".to_string()),
@@ -1585,6 +1589,12 @@ fn fill_missing_thread_item_metadata_preserves_identity_and_prefers_state_git_fi
         Some("https://example.com/state.git")
     );
     assert_eq!(item.source, Some(SessionSource::Exec));
+    assert_eq!(
+        item.thread_source,
+        Some(codex_protocol::protocol::ThreadSource::Feature(
+            "catalyst:ppt-pro".to_string()
+        ))
+    );
     assert_eq!(item.agent_nickname.as_deref(), Some("state-agent"));
     assert_eq!(item.agent_role.as_deref(), Some("state-role"));
     assert_eq!(item.model_provider.as_deref(), Some("state-provider"));
