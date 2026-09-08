@@ -1,6 +1,6 @@
 # Catalyst Patch 地图
 
-本文按当前主线代码整理；2026-09-08 的固定身份与完整差异见 [差异索引](04-官方基线差异索引.md)，宿主装配差异和测试缺口见 [架构治理](05-宿主消费与架构治理.md)。当前基线是 `rust-v0.149.0`；地图只表示人工复核入口，不表示整个文件都由 Catalyst 编写。
+本文按当前主线代码整理；2026-09-08 的固定身份与完整差异见 [差异索引](04-官方基线差异索引.md)，宿主装配差异和测试缺口见 [架构治理](05-宿主消费与架构治理.md)。当前基线是 `rust-v0.153.4`；地图只表示人工复核入口，不表示整个文件都由 Catalyst 编写。
 
 ## 一、Runtime 注入主链
 
@@ -72,7 +72,7 @@ Runtime 装配补充证据：`runtime_composition.rs::image_capable_model_plans_
 
 ## 四、审查一个差异的顺序
 
-1. 对照 `rust-v0.149.0` 确认差异，而不是对照旧 fork 或旧同步分支。
+1. 对照 `rust-v0.153.4` 确认差异，而不是对照旧 fork 或旧同步分支。
 2. 读取引入差异的提交，区分产品能力、上游适配、测试/生成物和同步基础设施。
 3. 找到调用方、公开 API 或运行时制品中的实际消费者。
 4. 检查 focused test、schema、snapshot 或 wire body 证据。
@@ -81,8 +81,8 @@ Runtime 装配补充证据：`runtime_composition.rs::image_capable_model_plans_
 ## 五、常用命令
 
 ```bash
-git diff --stat rust-v0.149.0..HEAD
-git diff --name-status rust-v0.149.0..HEAD -- codex-rs/
+git diff --stat rust-v0.153.4..HEAD
+git diff --name-status rust-v0.153.4..HEAD -- codex-rs/
 git log --follow --oneline -- codex-rs/core/src/client.rs
 git blame <commit> -- codex-rs/core/src/thread_manager.rs
 git diff --check

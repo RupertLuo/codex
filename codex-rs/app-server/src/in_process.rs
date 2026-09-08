@@ -63,6 +63,7 @@ use crate::outgoing_message::OutgoingEnvelope;
 use crate::outgoing_message::OutgoingMessage;
 use crate::outgoing_message::OutgoingMessageSender;
 use crate::outgoing_message::QueuedOutgoingMessage;
+use crate::plugin_config_reload::PluginStartupConfig;
 use crate::transport::CHANNEL_CAPACITY;
 use crate::transport::OutboundConnectionState;
 use crate::transport::route_outgoing_envelope;
@@ -498,7 +499,7 @@ async fn start_uninitialized(
                 code_mode_session_provider: None,
                 rpc_transport: AppServerRpcTransport::InProcess,
                 remote_control_handle: None,
-                plugin_startup_tasks: crate::PluginStartupTasks::Start,
+                plugin_startup_tasks: Some(PluginStartupConfig::Current),
                 thread_manager_runtime_options,
                 rpc_registry: Arc::new(crate::rpc_extension::AppServerRpcRegistry::default()),
             }));
@@ -751,6 +752,7 @@ async fn start_uninitialized(
                                 match send_error {
                                     mpsc::error::TrySendError::Full(_) => {
                                         warn!("dropping in-process server notification (queue full)");
+                                        continue;
                                     }
                                     mpsc::error::TrySendError::Closed(_) => {
                                         break;
@@ -1053,6 +1055,7 @@ mod tests {
                     phase: None,
                     memory_citation: None,
                     delivery: Some(AgentMessageDelivery::Async),
+                    questions: None,
                 },
                 thread_id: "thread-1".to_string(),
                 turn_id: "turn-1".to_string(),

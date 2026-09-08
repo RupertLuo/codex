@@ -130,6 +130,8 @@ impl ChatWidget {
             startup_model_warning,
             pending_ready_submission: None,
             approved_submission_model: None,
+            model_popup_request_id: None,
+            model_popup_model_ids: Vec::new(),
             session_telemetry,
             session_header: SessionHeader::new(header_model),
             initial_user_message,
@@ -156,6 +158,8 @@ impl ChatWidget {
             codex_rate_limit_reached_type: None,
             codex_spend_control_reached: None,
             rate_limit_warnings: RateLimitWarningState::default(),
+            backend_banner_state: backend_banners::BackendBannerState::default(),
+            backend_banner_notice_model: None,
             warning_display_state: WarningDisplayState::default(),
             rate_limit_switch_prompt: RateLimitSwitchPromptState::default(),
             add_credits_nudge_email_in_flight: None,
@@ -209,8 +213,8 @@ impl ChatWidget {
             #[cfg(test)]
             pet_image_support_override: None,
             thread_id: None,
-            dismissed_plan_mode_nudge_scopes: HashSet::new(),
             thread_name: None,
+            pending_automatic_thread_names: HashSet::new(),
             thread_rename_block_message: None,
             active_side_conversation: false,
             blocks_direct_input: false,
@@ -222,6 +226,7 @@ impl ChatWidget {
             input_queue: InputQueueState::default(),
             safety_buffering_prompt: None,
             chat_keymap,
+            permission_shortcut_pending: false,
             queued_message_edit_hint_binding,
             show_welcome_banner: is_first_run,
             startup_tooltip_override,
@@ -244,6 +249,7 @@ impl ChatWidget {
             last_terminal_title_requires_action: false,
             terminal_title_setup_original_items: None,
             terminal_title_animation_origin: Instant::now(),
+            terminal_title_next_refresh: None,
             status_line_project_root_name_cache: None,
             status_line_branch: None,
             status_line_branch_cwd: None,
@@ -270,9 +276,11 @@ impl ChatWidget {
         if let Some(keymap) = runtime_keymap {
             widget.bottom_pane.set_keymap_bindings(&keymap);
         }
-        widget
-            .bottom_pane
-            .set_vim_enabled(widget.config.tui_vim_mode_default);
+        if widget.config.tui_vim_mode_default {
+            widget.bottom_pane.enable_vim_in_insert_mode();
+        } else {
+            widget.bottom_pane.set_vim_enabled(/*enabled*/ false);
+        }
         widget
             .bottom_pane
             .set_status_line_enabled(!widget.configured_status_line_items().is_empty());

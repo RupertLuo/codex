@@ -457,7 +457,6 @@ mod tests {
             }
         ));
     }
-
 }
 
 fn stores_guard() -> MutexGuard<'static, HashMap<String, Arc<InMemoryThreadStore>>> {

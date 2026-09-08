@@ -80,12 +80,13 @@ pub(crate) async fn run_codex_thread_interactive(
         warnings: Vec::new(),
     };
     let session_source = SessionSource::SubAgent(subagent_source.clone());
-    let extensions = if crate::guardian::is_guardian_reviewer_source(&session_source) {
+    let is_guardian_reviewer = crate::guardian::is_basic_session_source(&session_source);
+    let extensions = if is_guardian_reviewer {
         codex_extension_api::empty_extension_registry()
     } else {
         Arc::clone(&parent_session.services.extensions)
     };
-    let (session, io) = Box::pin(Session::spawn(SessionSpawnArgs {
+    let (session, io) = Session::spawn(SessionSpawnArgs {
         config,
         http_transport: None,
         model_runtime_policies: parent_session.services.model_client.runtime_policies(),
@@ -94,6 +95,7 @@ pub(crate) async fn run_codex_thread_interactive(
         installation_id: parent_session.installation_id.clone(),
         auth_manager,
         models_manager,
+        git_root_discovery: Arc::clone(&parent_session.services.git_root_discovery),
         environment_manager: parent_session
             .services
             .turn_environments
@@ -109,7 +111,11 @@ pub(crate) async fn run_codex_thread_interactive(
         session_source,
         forked_from_thread_id,
         parent_thread_id: Some(parent_session.thread_id),
-        thread_source: Some(ThreadSource::Subagent),
+        thread_source: Some(if is_guardian_reviewer {
+            ThreadSource::GuardianReview
+        } else {
+            ThreadSource::Subagent
+        }),
         originator: parent_ctx.originator.clone(),
         agent_control: parent_session.services.agent_control.clone(),
         dynamic_tools: Vec::new(),
@@ -130,7 +136,7 @@ pub(crate) async fn run_codex_thread_interactive(
         inherited_multi_agent_version: Some(MultiAgentVersion::Disabled),
         git_enrichment_policy,
         windows_sandbox_proxy_settings_mode,
-    }))
+    })
     .or_cancel(&cancel_token)
     .await??;
     let thread_config = session.thread_config_snapshot().await;
@@ -211,8 +217,10 @@ pub(crate) async fn run_codex_thread_one_shot(
         .submit_turn_input(
             TurnInputRequest::user_input(input).on_start(TurnStartOptions {
                 final_output_json_schema,
+                service_tier: None,
                 parent_turn_id: Some(parent_turn_id),
                 root_turn_id,
+                ..Default::default()
             }),
             TurnInputMode::StartIfIdle,
         )

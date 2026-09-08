@@ -12,6 +12,7 @@ use codex_protocol::config_types::ModelProviderAuthInfo;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::EnvVarError;
 use codex_protocol::error::Result as CodexResult;
+use codex_utils_redacted_string::RedactedString;
 use http::HeaderMap;
 use http::header::HeaderName;
 use http::header::HeaderValue;
@@ -44,6 +45,7 @@ pub const AMAZON_BEDROCK_RUNTIME_PROVIDER_ID: &str = "amazon-bedrock-runtime";
 pub const AMAZON_BEDROCK_GPT_5_5_MODEL_ID: &str = "openai.gpt-5.5";
 pub const AMAZON_BEDROCK_GPT_5_4_MODEL_ID: &str = "openai.gpt-5.4";
 pub const AMAZON_BEDROCK_GPT_5_6_SOL_MODEL_ID: &str = "openai.gpt-5.6-sol";
+pub const AMAZON_BEDROCK_GPT_6_ASTRA_MODEL_ID: &str = "openai.gpt-6-astra";
 pub const AMAZON_BEDROCK_GPT_5_6_TERRA_MODEL_ID: &str = "openai.gpt-5.6-terra";
 pub const AMAZON_BEDROCK_GPT_5_6_LUNA_MODEL_ID: &str = "openai.gpt-5.6-luna";
 pub const AMAZON_BEDROCK_RUNTIME_GLOBAL_GPT_5_6_TERRA_MODEL_ID: &str =
@@ -107,7 +109,7 @@ pub struct ModelProviderInfo {
     /// Value to use with `Authorization: Bearer <token>` header. Use of this
     /// config is discouraged in favor of `env_key` for security reasons, but
     /// this may be necessary when using this programmatically.
-    pub experimental_bearer_token: Option<String>,
+    pub experimental_bearer_token: Option<RedactedString>,
     /// Command-backed bearer-token configuration for this provider.
     pub auth: Option<ModelProviderAuthInfo>,
     /// AWS SigV4 auth configuration for this provider.
@@ -116,10 +118,10 @@ pub struct ModelProviderInfo {
     #[serde(default)]
     pub wire_api: WireApi,
     /// Optional query parameters to append to the base URL.
-    pub query_params: Option<HashMap<String, String>>,
+    pub query_params: Option<HashMap<String, RedactedString>>,
     /// Additional HTTP headers to include in requests to this provider where
     /// the (key, value) pairs are the header name and value.
-    pub http_headers: Option<HashMap<String, String>>,
+    pub http_headers: Option<HashMap<String, RedactedString>>,
     /// Optional HTTP headers to include in requests to this provider where the
     /// (key, value) pairs are the header name and _environment variable_ whose
     /// value should be used. If the environment variable is not set, or the
@@ -169,7 +171,7 @@ pub struct AwsAuthRefreshConfig {
     pub command: String,
     /// Arguments passed to the refresh command.
     #[serde(default)]
-    pub args: Vec<String>,
+    pub args: Vec<RedactedString>,
     /// Maximum time to wait for the refresh command to complete.
     #[serde(default = "default_aws_auth_refresh_timeout_ms")]
     pub timeout_ms: NonZeroU64,
@@ -265,7 +267,9 @@ impl ModelProviderInfo {
         let mut headers = HeaderMap::with_capacity(capacity);
         if let Some(extra) = &self.http_headers {
             for (k, v) in extra {
-                if let (Ok(name), Ok(value)) = (HeaderName::try_from(k), HeaderValue::try_from(v)) {
+                if let (Ok(name), Ok(value)) =
+                    (HeaderName::try_from(k), HeaderValue::try_from(v.as_str()))
+                {
                     headers.insert(name, value);
                 }
             }
@@ -318,7 +322,12 @@ impl ModelProviderInfo {
         Ok(ApiProvider {
             name: self.name.clone(),
             base_url,
-            query_params: self.query_params.clone(),
+            query_params: self.query_params.clone().map(|params| {
+                params
+                    .into_iter()
+                    .map(|(name, value)| (name, value.into_inner()))
+                    .collect()
+            }),
             headers,
             retry,
             stream_idle_timeout: self.stream_idle_timeout(),
@@ -386,7 +395,7 @@ impl ModelProviderInfo {
             wire_api: WireApi::Responses,
             query_params: None,
             http_headers: Some(
-                [("version".to_string(), env!("CARGO_PKG_VERSION").to_string())]
+                [("version".to_string(), env!("CARGO_PKG_VERSION").into())]
                     .into_iter()
                     .collect(),
             ),
@@ -434,7 +443,7 @@ impl ModelProviderInfo {
             query_params: None,
             http_headers: Some(HashMap::from([(
                 AMAZON_BEDROCK_MANTLE_CLIENT_AGENT_HEADER.to_string(),
-                AMAZON_BEDROCK_MANTLE_CLIENT_AGENT_VALUE.to_string(),
+                AMAZON_BEDROCK_MANTLE_CLIENT_AGENT_VALUE.into(),
             )])),
             env_http_headers: None,
             request_max_retries: None,
@@ -458,6 +467,15 @@ impl ModelProviderInfo {
 
     pub fn is_openai(&self) -> bool {
         self.name == OPENAI_PROVIDER_NAME
+    }
+
+    pub fn supports_codex_backend_routes(&self) -> bool {
+        self.is_openai()
+            && self.base_url.as_deref().is_none_or(|base_url| {
+                base_url
+                    .trim_end_matches('/')
+                    .ends_with("/backend-api/codex")
+            })
     }
 
     pub fn uses_openai_actor_authorization(&self) -> bool {

@@ -8,7 +8,7 @@
 
 - `OpenAI Codex`：官方上游项目，基线来自 `openai/codex`。
 - `Catalyst Codex Fork`：本仓库，在上游实现上提供宿主可注入的 Runtime 能力和必要适配。
-- 当前主线对应的官方基线是 `rust-v0.149.0`（commit `758ef40f50c1a458425c7cfbf1eb12cbc07af0b0`）。
+- 当前升级分支对应的官方基线是 `rust-v0.153.4`（commit `3d2ee51ca2d5db578f328aa75e20aa22c0197c9a`）。
 - 本仓是 Catalyst Runtime 的源码依赖；Provider、账号、凭据、私有 Skill 解密和产品 RPC 实现归 Runtime 仓库，fork 只维护其所需的通用接入边界。
 - `codex-rs/` 是 Rust 实现目录，不是 patch 目录；一个文件可以同时包含上游实现、适配和少量 fork 行为。
 
@@ -27,7 +27,7 @@
 - 新能力优先设计成 process/thread/turn scoped 的显式 override、provider 或 extension。
 - 只有当 Runtime 无法在现有 boundary 接入时，才修改上游核心路径；修改必须有调用方和 focused test。
 - 若新上游已经提供等价能力，删除 fork duplicate，而不是继续维护两套实现。
-- 代码变更相对 `rust-v0.149.0` 的完整盘点称为 `fork delta`；其中仍属于 Catalyst 产品契约的部分才称为 `Catalyst patch`。
+- 代码变更相对当前官方基线的完整盘点称为 `fork delta`；其中仍属于 Catalyst 产品契约的部分才称为 `Catalyst patch`。
 
 ## 当前重点入口
 

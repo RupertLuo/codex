@@ -38,20 +38,6 @@ fn app_server_accepts_process_mcp_server_replacement() {
 }
 
 #[test]
-fn app_server_accepts_process_scoped_code_mode_host() {
-    let args = AppServerCli::try_parse_from([
-        "codex-app-server",
-        "--code-mode-host",
-        "wss://example.test/code-mode",
-        "--listen",
-        "off",
-    ])
-    .expect("parse app-server args");
-
-    assert!(args.serve.raw_config_overrides().is_empty());
-}
-
-#[test]
 fn app_server_accepts_process_scoped_grpc_code_mode_host() {
     let args = AppServerCli::try_parse_from([
         "codex-app-server",
@@ -70,7 +56,13 @@ fn app_server_rejects_invalid_code_mode_host() {
     for endpoint in [
         "ftp://127.0.0.1:8765",
         "ws://",
+        "ws://127.0.0.1:8765",
+        "wss://example.test/code-mode",
+        "ws://alice:secret@example.test/code-mode",
+        "wss://alice:secret@example.test/code-mode",
         "wss://example.test/code-mode#fragment",
+        "http://",
+        "https://example.test/#fragment",
         "https://example.test/code-mode",
         "http://alice:secret@example.test",
         "https://alice:secret@example.test",

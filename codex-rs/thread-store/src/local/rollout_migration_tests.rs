@@ -45,13 +45,16 @@ use serde_json::json;
 use tempfile::TempDir;
 
 use super::LocalThreadStore;
+use super::RolloutMigrationFailureReason;
 use super::RolloutMigrationMode;
 use super::RolloutMigrationOptions;
+use super::RolloutMigrationPaths;
 use super::RolloutMigrationProgress;
 use super::RolloutMigrationStatus;
 #[cfg(unix)]
 use super::decompress_rollout_to_path;
 use super::migration_journal_path;
+use super::telemetry::RolloutMigrationTrigger;
 use super::thread_history;
 use super::write_migration_journal;
 use crate::ItemSortKey;
@@ -157,6 +160,7 @@ fn agent_message(text: &str) -> RolloutItem {
         phase: None,
         memory_citation: None,
         delivery: None,
+        questions: None,
     }))
 }
 
@@ -227,11 +231,14 @@ fn compacted(replacement_history: Vec<ResponseItem>) -> RolloutItem {
     RolloutItem::Compacted(CompactedItem {
         message: "checkpoint".to_string(),
         replacement_history: Some(replacement_history.into_iter().map(Into::into).collect()),
+        guardian_history: None,
         mcp_resource_origins: None,
         window_number: Some(1),
         first_window_id: None,
         previous_window_id: None,
         window_id: None,
+        compaction_response_id: None,
+        latest_token_usage_record: None,
     })
 }
 
@@ -261,6 +268,16 @@ fn apply_options() -> RolloutMigrationOptions {
         max_mib_per_second: Some(1024),
         ..RolloutMigrationOptions::default()
     }
+}
+
+fn assert_failed_with_reason(
+    outcome: &super::RolloutMigrationOutcome,
+    failure_reason: RolloutMigrationFailureReason,
+) {
+    assert_eq!(
+        (outcome.status, outcome.failure_reason),
+        (RolloutMigrationStatus::Failed, Some(failure_reason))
+    );
 }
 
 async fn indexed_store(home: &Path) -> LocalThreadStore {
@@ -428,6 +445,7 @@ async fn migration_preserves_image_generation_failure_metadata() {
             resets_at: Some(1_786_150_800),
         }),
         saved_path: None,
+        imagegen_request_id: None,
     };
     let image_completion =
         RolloutItem::EventMsg(EventMsg::ImageGenerationEnd(ImageGenerationEndEvent {
@@ -716,6 +734,10 @@ async fn migration_rolls_back_response_and_inter_agent_user_boundaries() {
         SessionSource::Cli,
         vec![
             rollout_response_item(input_response_message("user", "keep first boundary")),
+            rollout_response_item(input_response_message(
+                "developer",
+                "<managed_developer_instructions>context only</managed_developer_instructions>",
+            )),
             rollout_response_item(input_response_message(
                 "developer",
                 "<permissions instructions>context only</permissions instructions>",
@@ -1388,11 +1410,14 @@ async fn migration_compacts_subagent_prefix_and_does_not_project_it() {
             RolloutItem::Compacted(CompactedItem {
                 message: "superseded checkpoint".repeat(1024),
                 replacement_history: Some(Vec::new()),
+                guardian_history: None,
                 mcp_resource_origins: None,
                 window_number: Some(1),
                 first_window_id: None,
                 previous_window_id: None,
                 window_id: None,
+                compaction_response_id: None,
+                latest_token_usage_record: None,
             }),
             RolloutItem::Compacted(CompactedItem {
                 message: "latest checkpoint".to_string(),
@@ -1408,15 +1433,19 @@ async fn migration_compacts_subagent_prefix_and_does_not_project_it() {
                     }
                     .into(),
                 ]),
+                guardian_history: None,
                 mcp_resource_origins: None,
                 window_number: Some(2),
                 first_window_id: None,
                 previous_window_id: None,
                 window_id: None,
+                compaction_response_id: None,
+                latest_token_usage_record: None,
             }),
             started("child-turn"),
             RolloutItem::TurnContext(TurnContextItem {
                 turn_id: Some("child-turn".to_string()),
+                root_turn_id: None,
                 cwd: serde_json::from_value(json!(home.path())).expect("absolute cwd"),
                 workspace_roots: None,
                 current_date: None,
@@ -1435,6 +1464,7 @@ async fn migration_compacts_subagent_prefix_and_does_not_project_it() {
                 multi_agent_version: None,
                 multi_agent_mode: None,
                 realtime_active: None,
+                cyber_access_program: None,
                 effort: None,
                 summary: ReasoningSummary::Auto,
             }),
@@ -1769,6 +1799,37 @@ async fn migration_migrates_archived_rollouts_without_unarchiving_them() {
         .expect("read archived projected turns");
     assert_eq!(turns.turns.len(), 1);
     assert_eq!(turns.turns[0].items.len(), 2);
+}
+
+#[tokio::test]
+async fn migration_retries_a_rollout_moved_after_path_discovery() {
+    let home = TempDir::new().expect("create Codex home");
+    let thread_id = ThreadId::new();
+    let active_path = write_rollout(
+        home.path(),
+        thread_id,
+        SessionSource::Cli,
+        vec![user_message("question"), agent_message("answer")],
+    );
+    let store = indexed_store(home.path()).await;
+    let archived_path = move_to_archived(home.path(), active_path.clone());
+
+    let report = store
+        .migrate_rollouts_with_progress_for_trigger(
+            apply_options(),
+            |_| {},
+            RolloutMigrationTrigger::Startup,
+            RolloutMigrationPaths::Known(vec![active_path]),
+        )
+        .await
+        .expect("migrate moved rollout");
+
+    assert_eq!(report.outcomes[0].status, RolloutMigrationStatus::Migrated);
+    assert!(matches!(
+        &read_rollout(&archived_path)[0].item,
+        RolloutItem::SessionMeta(metadata)
+            if metadata.meta.history_mode == ThreadHistoryMode::Paginated
+    ));
 }
 
 #[tokio::test]
@@ -2245,6 +2306,57 @@ async fn migration_skips_empty_rollout_files() {
             .await
             .expect("read thread metadata")
             .is_none()
+    );
+}
+
+#[tokio::test]
+async fn migration_reports_missing_sqlite_metadata() {
+    let home = TempDir::new().expect("create Codex home");
+    let thread_id = ThreadId::new();
+    write_rollout(
+        home.path(),
+        thread_id,
+        SessionSource::Cli,
+        vec![user_message("question")],
+    );
+    let store = indexed_store(home.path()).await;
+    store
+        .state_db
+        .as_ref()
+        .expect("state db")
+        .delete_thread(thread_id)
+        .await
+        .expect("remove thread metadata");
+
+    let report = store
+        .migrate_rollouts(apply_options())
+        .await
+        .expect("inspect rollout with missing metadata");
+
+    assert_failed_with_reason(
+        &report.outcomes[0],
+        RolloutMigrationFailureReason::MissingSqliteMetadata,
+    );
+}
+
+#[tokio::test]
+async fn migration_reports_invalid_session_metadata() {
+    let home = TempDir::new().expect("create Codex home");
+    let thread_id = ThreadId::new();
+    let directory = home.path().join("sessions/2025/01/03");
+    fs::create_dir_all(&directory).expect("create rollout directory");
+    let path = directory.join(format!("rollout-2025-01-03T12-00-00-{thread_id}.jsonl"));
+    fs::write(path, "not a rollout record\n").expect("write malformed rollout");
+    let store = indexed_store(home.path()).await;
+
+    let report = store
+        .migrate_rollouts(apply_options())
+        .await
+        .expect("inspect rollout with invalid metadata");
+
+    assert_failed_with_reason(
+        &report.outcomes[0],
+        RolloutMigrationFailureReason::InvalidSessionMetadata,
     );
 }
 
