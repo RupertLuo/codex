@@ -8,7 +8,8 @@
 
 - `OpenAI Codex`：官方上游项目，基线来自 `openai/codex`。
 - `Catalyst Codex Fork`：本仓库，在上游实现上提供宿主可注入的 Runtime 能力和必要适配。
-- 当前主线对应的官方基线是 `rust-v0.149.0`。
+- 当前主线对应的官方基线是 `rust-v0.149.0`（commit `758ef40f50c1a458425c7cfbf1eb12cbc07af0b0`）。
+- 本仓是 Catalyst Runtime 的源码依赖；Provider、账号、凭据、私有 Skill 解密和产品 RPC 实现归 Runtime 仓库，fork 只维护其所需的通用接入边界。
 - `codex-rs/` 是 Rust 实现目录，不是 patch 目录；一个文件可以同时包含上游实现、适配和少量 fork 行为。
 
 ## 文档边界
@@ -39,6 +40,8 @@
 - 增量请求和图片迁移：`codex-rs/core/src/client.rs`、`core/src/session/turn.rs`、`core/tests/suite/incremental_http.rs`。
 - Windows 隔离：`codex-rs/windows-sandbox-rs/src/desktop.rs` 及 unified-exec 调用方。
 
+宿主消费视角和治理优先级见 [`docs-cata/05-宿主消费与架构治理.md`](docs-cata/05-宿主消费与架构治理.md)。
+
 完整归类和验证入口见 `docs-cata/01-Patch地图.md`、`docs-cata/04-官方基线差异索引.md`。
 
 ## 同步和验证
@@ -47,3 +50,20 @@
 - 不使用 blanket `ours`/`theirs` 解决 core、protocol、state、security 或 app-server 冲突。
 - 代码、配置、协议或 UI 行为变化必须遵循 `AGENTS.origin.md` 中对应的测试、schema、snapshot 和格式要求。
 - 同步流程见 `docs-cata/02-上游同步手册.md`。当前 patch 的代码证据和边界见 `docs-cata/01-Patch地图.md`。
+
+## Catalyst 验证与补丁维护
+
+- 每项补丁须标明：相对上游的行为变化、宿主调用方、作用域（process/thread/turn）、默认行为、直接测试及合并热点。
+- 区分显式 opt-in 接口与改变所有调用方的默认行为；当前 Skill roots 和流式 item 归属属于后者，不得将空 overrides 当作完整的上游行为等价证明。
+- `AGENTS.origin.md` 随所选官方基线原样更新，不混入 Catalyst 规则；可用 `git rev-parse <tag>:AGENTS.md` 与 `git hash-object AGENTS.origin.md` 核验。
+- 本节覆盖原版的例行全套测试要求：按受影响补丁选择最低充分验证，不因依赖 core/protocol 自动执行整个 Codex workspace 测试。
+- Fork 使用根 `justfile` 的 `just test`（实际为 nextest）；精确选择 `-p <crate> --test <target> -E 'test(=<完整用例名>)'`，lib 用 `--lib`。先核对目标、用例和收集范围，零用例不算通过。
+- Runtime 的 Cargo workspace 不会因 path dependency 自动执行依赖 crate 自身的测试；接线测试、fork 行为测试、目标平台资格须分别记录。
+- 纯文档治理检查链接、基线身份与 `git diff --check`；不触发 Rust 编译、全仓格式化或 schema 生成。代码变更仍遵循原版相应格式、schema、snapshot 和依赖维护规则。
+
+## 命名与请求状态边界
+
+- 新增 Catalyst 专属实现使用 `catalyst` 命名；通用宿主接口按能力命名，不给修改过的原生函数批量加前缀。
+- 工具 wire 名称是历史兼容契约，不机械替换；Core 工具规划消费能力声明，不引入新的 Catalyst 名称判断。
+- Runtime 决定模型策略和 Provider 转换，Core 拥有 session baseline、增量计算及恢复状态；Core typed baseline 与最终 wire JSON 分层核对。
+- OpenAI HTTP 优化先验证 Runtime 策略；进程崩溃编排归宿主，只有执行/取消/退出状态证据指向 Core 时才修改 fork。

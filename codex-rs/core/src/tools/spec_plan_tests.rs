@@ -335,6 +335,26 @@ impl ToolExecutor<ExtensionToolCall> for TestNamespaceExtensionTool {
     }
 }
 
+struct StandaloneSearchExtensionTool(TestNamespaceExtensionTool);
+
+impl ToolExecutor<ExtensionToolCall> for StandaloneSearchExtensionTool {
+    fn tool_name(&self) -> ToolName {
+        self.0.tool_name()
+    }
+
+    fn spec(&self) -> ToolSpec {
+        self.0.spec()
+    }
+
+    fn is_standalone_web_search(&self) -> bool {
+        true
+    }
+
+    fn handle(&self, call: ExtensionToolCall) -> codex_tools::ToolExecutorFuture<'_> {
+        self.0.handle(call)
+    }
+}
+
 struct DeferredExtensionTool;
 
 impl ToolExecutor<ExtensionToolCall> for DeferredExtensionTool {
@@ -2716,6 +2736,73 @@ async fn hosted_web_search_fallback_follows_winning_browser_runtime() {
     };
     assert_eq!(namespace.description, "Tools from browser_collision.");
     plan.assert_visible_contains(&["web_search"]);
+}
+
+#[tokio::test]
+async fn declared_search_capability_controls_hosted_fallback_and_runtime_gates() {
+    for (feature_enabled, mode, search_registered, hosted_visible) in [
+        (true, WebSearchMode::Live, true, false),
+        (true, WebSearchMode::Disabled, false, false),
+        (false, WebSearchMode::Live, false, true),
+    ] {
+        let plan = probe_with(
+            |turn| {
+                set_feature(turn, Feature::StandaloneWebSearch, feature_enabled);
+                set_web_search_mode(turn, mode);
+            },
+            ToolPlanInputs {
+                extension_tool_executors: vec![Arc::new(StandaloneSearchExtensionTool(
+                    TestNamespaceExtensionTool {
+                        namespace: "host_lookup",
+                        tool_name: "search",
+                    },
+                ))],
+                ..Default::default()
+            },
+        )
+        .await;
+        assert_eq!(
+            plan.registered_names
+                .iter()
+                .any(|name| name == &ToolName::namespaced("host_lookup", "search").to_string()),
+            search_registered,
+        );
+        assert_eq!(
+            plan.visible_names.iter().any(|name| name == "web_search"),
+            hosted_visible,
+        );
+    }
+}
+
+#[tokio::test]
+async fn colliding_search_capability_does_not_suppress_hosted_search() {
+    let plan = probe_with(
+        |turn| {
+            set_feature(turn, Feature::StandaloneWebSearch, /*enabled*/ true);
+            set_web_search_mode(turn, WebSearchMode::Live);
+        },
+        ToolPlanInputs {
+            tool_runtimes: vec![mcp_runtime(
+                "lookup_server",
+                "host_lookup",
+                "search",
+                ToolExposure::Direct,
+            )],
+            extension_tool_executors: vec![Arc::new(StandaloneSearchExtensionTool(
+                TestNamespaceExtensionTool {
+                    namespace: "host_lookup",
+                    tool_name: "search",
+                },
+            ))],
+            ..Default::default()
+        },
+    )
+    .await;
+    plan.assert_visible_contains(&["host_lookup", "web_search"]);
+    let ToolSpec::Namespace(namespace) = plan.visible_spec("host_lookup") else {
+        panic!("expected the winning MCP namespace");
+    };
+    assert_eq!(namespace.description, "Tools from lookup_server.");
 }
 
 #[tokio::test]

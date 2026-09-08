@@ -128,10 +128,12 @@ pub use thread_manager::build_models_manager;
 pub use thread_manager::local_agent_graph_store_from_state_db;
 pub use thread_manager::thread_store_from_config;
 pub use tools::handlers::WaitForEnvironmentToolConfig;
-pub use tools::spec_plan::IMAGE_GEN_NAMESPACE as STANDALONE_IMAGE_GEN_NAMESPACE;
-pub use tools::spec_plan::IMAGEGEN_TOOL_NAME as STANDALONE_IMAGEGEN_TOOL_NAME;
-pub use tools::spec_plan::WEB_SEARCH_NAMESPACE as STANDALONE_WEB_SEARCH_NAMESPACE;
-pub use tools::spec_plan::WEB_SEARCH_TOOL_NAME as STANDALONE_WEB_SEARCH_TOOL_NAME;
+// Historical Catalyst wire identities retained for source compatibility and history consumers.
+// Tool planning uses ToolExecutor capabilities, not these product names.
+pub const STANDALONE_IMAGE_GEN_NAMESPACE: &str = "catalyst_image";
+pub const STANDALONE_IMAGEGEN_TOOL_NAME: &str = "imagegen";
+pub const STANDALONE_WEB_SEARCH_NAMESPACE: &str = "catalyst_web";
+pub const STANDALONE_WEB_SEARCH_TOOL_NAME: &str = "run";
 pub use web_search::web_search_action_detail;
 pub use windows_sandbox_read_grants::grant_read_root_non_elevated;
 #[deprecated(note = "use ThreadManager")]

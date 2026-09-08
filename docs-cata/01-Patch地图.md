@@ -1,6 +1,6 @@
 # Catalyst Patch 地图
 
-本文按当前主线代码整理。当前基线是 `rust-v0.149.0`；地图只表示人工复核入口，不表示整个文件都由 Catalyst 编写。
+本文按当前主线代码整理；2026-09-08 的固定身份与完整差异见 [差异索引](04-官方基线差异索引.md)，宿主装配差异和测试缺口见 [架构治理](05-宿主消费与架构治理.md)。当前基线是 `rust-v0.149.0`；地图只表示人工复核入口，不表示整个文件都由 Catalyst 编写。
 
 ## 一、Runtime 注入主链
 
@@ -16,7 +16,7 @@ host
 | --- | --- | --- |
 | 进程级 Runtime options | `codex-rs/core/src/thread_manager.rs` | `ThreadManagerRuntimeOptions` 的 builder 与创建 session 的传递 |
 | App Server 宿主接入 | `codex-rs/app-server/src/lib.rs`、`in_process.rs` | `AppServerProcessOverrides`、`run_main_with_transport_options_and_overrides` |
-| 可复用 App Server client | `codex-rs/app-server-client/src/lib.rs` | `start_with_thread_manager_options` |
+| 可复用 App Server client | `codex-rs/app-server-client/src/lib.rs` | `start_with_thread_manager_options`；Runtime 中用于 dev 测试，不是生产主入口 |
 | HTTP transport override | `codex-rs/codex-client/src/transport_handle.rs`、`core/src/client.rs` | 注入后请求统一走 host transport，避免隐式切换 WebSocket |
 | 静态 model catalog | `core/src/thread_manager.rs`、`models-manager` | `StaticModelsManager` 只在宿主提供 catalog 时替换默认 manager |
 
@@ -33,7 +33,7 @@ Runtime 的 App Server 装配入口为其仓库 `crates/catalyst-app-server/src/
 | 标题 | `with_title_generator` | `core/src/thread_manager.rs` → `thread-store/src/local/mod.rs` → `thread-store/src/live_thread.rs`；持久化前取得 metadata mutation gate | `thread-store/src/local/live_thread_title_tests.rs::manual_thread_rename_wins_over_in_flight_llm_title`、`rejected_metadata_mutation_gate_skips_llm_title_and_callback` |
 | 产品 RPC | `AppServerProcessOverrides::with_rpc_extension` | `app-server/src/lib.rs` → `rpc_extension.rs::AppServerRpcRegistry` → `message_processor.rs` | Runtime `crates/catalyst-app-server/tests/rpc_router.rs` 的 duplicate、namespace、manifest 和 handler error 用例；这些验证 Runtime router，不替代 Codex registry 的 native-method 防覆盖测试 |
 
-空 overrides 仍走默认宿主路径；工具最终集合由实际装配及 gate 决定，不以固定工具数量作为长期不变量。
+空 overrides 使用默认装配，但 Skill roots、流式 item 等默认行为补丁仍生效，不能据此认定等同官方；工具最终集合由实际装配及 gate 决定，不以固定工具数量作为长期不变量。
 
 ## 二、可保留的产品能力
 
@@ -41,13 +41,24 @@ Runtime 的 App Server 装配入口为其仓库 `crates/catalyst-app-server/src/
 | --- | --- | --- | --- |
 | TUI model runtime | `tui/src/model_runtime.rs`、`tui/src/app/`、`tui/src/chatwidget/` | TUI 只消费抽象 runtime，不把 provider 业务硬编码进 UI | `tui/src/app/tests/`、`chatwidget/tests/`、敏感输入单测 |
 | Credential workflow | `tui/src/model_runtime.rs`、`bottom_pane/sensitive_prompt_view.rs`、`chatwidget/credential_popups.rs` | secret 输入、redacted Debug、zeroize、失败恢复 | `sensitive_prompt_view_tests.rs` 与 TUI snapshots |
-| App Server RPC extension | `app-server/src/rpc_extension.rs`、`message_processor.rs` | 方法必须 namespaced，不得覆盖 native RPC；transport context 影响信任边界 | app-server message processor tests |
-| Native turn/plugin bridge | `app-server/src/extensions.rs`、`request_processors/plugins.rs`、`rpc_extension.rs` | 只暴露受控 gateway；plugin selection 不能绕过现有生命周期 | app-server integration tests |
+| App Server RPC extension | `app-server/src/rpc_extension.rs`、`message_processor.rs` | 方法必须 namespaced，不得覆盖 native RPC；transport context 影响信任边界 | fork registry/initialize/native bridge 直接覆盖待补；Runtime router 测试不能替代 |
+| Native turn/plugin bridge | `app-server/src/extensions.rs`、`request_processors/plugins.rs`、`rpc_extension.rs` | 只暴露受控 gateway；plugin selection 不能绕过现有生命周期 | Runtime `runtime_composition.rs::catalyst_turn_start_enters_the_native_turn_lifecycle_once`；fork plugin/queue 边界证据待补 |
 | Host Skill provider | `ext/skills/src/sources.rs`、`catalog.rs`、`tools/` | provider 按 authority/kind 路由；读取失败不能静默跨 authority | `core/tests/suite/skills_extension.rs` |
 | Thread title generator | `thread-store/src/title_generator.rs`、`live_thread.rs`、`local/mod.rs` | best-effort 异步生成；metadata mutation 必须通过 gate，不能覆盖手工标题 | thread-store/session tests |
 | HTTP incremental requests | `core/src/client.rs`、`session/turn.rs` | baseline 与 wire request 必须一致；previous response 失效时回退 full request | `core/tests/suite/incremental_http.rs` 与 client suite |
 | 工具图片迁移 | `core/src/client.rs` | 先从 function output 移出图片，再捕获 baseline；保留 output array 形状和图片顺序 | incremental request shape tests |
 | Windows private desktop | `windows-sandbox-rs/src/desktop.rs`、`unified_exec/` | 仅复用相同账户和有效权限；非法名称、权限变化和并发创建需隔离 | `desktop_tests.rs`、unified exec tests |
+
+### 当前必须单独跟踪的补充能力
+
+| 能力 | 代码/消费入口 | 验证入口与限制 |
+| --- | --- | --- |
+| process MCP 整表替换 | `app-server/src/cli.rs` → overrides → `config_manager.rs` → `core/src/config/mod.rs`；Runtime flatten 共享 CLI | `process_mcp_server_replacement_discards_stale_fields_across_rebuild`、`app_server_accepts_process_mcp_server_replacement`；refresh/非法输入链仍需补证据 |
+| 流式 item ID 归属 | `codex-api/src/sse/responses.rs` → `core/src/session/turn.rs` | `preserves_stream_delta_item_ids`、`output_text_delta_before_output_item_added_is_buffered`、`interleaved_response_items_keep_delta_ownership` |
+| Skill roots 默认限制 | `ext/skills/src/host_roots.rs`；不自动扫描 home/repo `.agents/skills` | `resolved_roots_preserve_configured_sources_and_ignore_agents_dirs`；不等同仅允许私有 Skill |
+| 独立搜索能力 | `tools/src/tool_executor.rs::is_standalone_web_search` → `core/src/tools/spec_plan.rs`；Runtime `WebRunTool` 声明 | 任意宿主名称/gate、注册冲突、真实工具 schema 测试；保留原生名称兼容与历史 wire 名称 |
+| 基础指令与 prompt debug | `core/src/thread_manager.rs`、`prompt_debug.rs`；Runtime 两条 main 和 debug prompt 消费 | Runtime `system_prompt.rs`、`private_skills_runtime.rs`；prompt snapshot 不代替真实工具执行 |
+| 标题 metadata gate | `core/src/session/session.rs`、`session/handlers.rs` | `metadata_mutation_gate_tests`；gate 由 Core 创建，不是 Runtime update-install 门禁 |
 
 ## 三、不要误判为 patch 的内容
 

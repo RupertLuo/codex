@@ -103,24 +103,13 @@ use std::sync::Arc;
 use tracing::instrument;
 
 const MULTI_AGENT_V2_NAMESPACE_DESCRIPTION: &str = "Tools for spawning and managing sub-agents.";
-pub const WEB_SEARCH_NAMESPACE: &str = "catalyst_web";
-pub const WEB_SEARCH_TOOL_NAME: &str = "run";
-pub const IMAGE_GEN_NAMESPACE: &str = "catalyst_image";
-pub const IMAGEGEN_TOOL_NAME: &str = "imagegen";
-const UPSTREAM_WEB_SEARCH_NAMESPACE: &str = "web";
-const UPSTREAM_IMAGE_GEN_NAMESPACE: &str = "image_gen";
-
-fn is_standalone_web_search_tool(tool_name: &ToolName) -> bool {
-    tool_name.name == WEB_SEARCH_TOOL_NAME
-        && matches!(
-            tool_name.namespace.as_deref(),
-            Some(WEB_SEARCH_NAMESPACE | UPSTREAM_WEB_SEARCH_NAMESPACE)
-        )
+// Preserve native tool identities; embedding hosts declare capabilities on their executors.
+fn is_native_web_search_tool(tool_name: &ToolName) -> bool {
+    tool_name.name == "run" && tool_name.namespace.as_deref() == Some("web")
 }
 
 fn requires_native_image_generation_gate(tool_name: &ToolName) -> bool {
-    tool_name.name == IMAGEGEN_TOOL_NAME
-        && tool_name.namespace.as_deref() == Some(UPSTREAM_IMAGE_GEN_NAMESPACE)
+    tool_name.name == "imagegen" && tool_name.namespace.as_deref() == Some("image_gen")
 }
 
 #[derive(Clone, Copy)]
@@ -566,7 +555,7 @@ fn spec_for_model_request(
 #[instrument(level = "trace", skip_all)]
 fn hosted_model_tool_specs(
     turn_context: &TurnContext,
-    registered_extension_tool_names: &[ToolName],
+    registered_standalone_web_search_tools: &[ToolName],
 ) -> Vec<ToolSpec> {
     // Responses Lite accepts schemas for client-executed tools, not hosted Responses tools.
     if turn_context.model_info.use_responses_lite
@@ -577,9 +566,7 @@ fn hosted_model_tool_specs(
 
     let mut specs = Vec::new();
     let standalone_web_search_available = standalone_web_search_enabled(turn_context)
-        && registered_extension_tool_names
-            .iter()
-            .any(is_standalone_web_search_tool);
+        && !registered_standalone_web_search_tools.is_empty();
     // `Some(Cached/Live/Disabled)` are the options for mode when standalone search is unavailable
     // and the provider supports hosted search. `None` prevents emitting a hosted search tool.
     let web_search_mode = (!standalone_web_search_available
@@ -1310,7 +1297,8 @@ fn append_extension_tool_executors(
 
     for executor in executors {
         let tool_name = executor.tool_name();
-        let is_standalone_web_search = is_standalone_web_search_tool(&tool_name);
+        let is_standalone_web_search =
+            executor.is_standalone_web_search() || is_native_web_search_tool(&tool_name);
         if is_standalone_web_search && (!standalone_web_search_enabled || !web_search_mode_on) {
             continue;
         }

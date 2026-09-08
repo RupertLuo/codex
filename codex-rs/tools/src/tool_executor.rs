@@ -119,6 +119,15 @@ pub trait ToolExecutor<Invocation>: Send + Sync {
         ToolSearchInfo::from_tool_spec(spec, /*source_info*/ None)
     }
 
+    /// Declares client-executed web search, independent of the tool's wire name.
+    ///
+    /// Core applies the standalone-search feature and web-search mode gates to extension
+    /// executors with this capability. A successfully registered executor replaces hosted
+    /// web search; merely declaring it does not bypass registration or other tool policy.
+    fn is_standalone_web_search(&self) -> bool {
+        false
+    }
+
     fn supports_parallel_tool_calls(&self) -> bool {
         false
     }
