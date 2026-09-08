@@ -35,6 +35,8 @@ Runtime 的 App Server 装配入口为其仓库 `crates/catalyst-app-server/src/
 
 空 overrides 使用默认装配，但 Skill roots、流式 item 等默认行为补丁仍生效，不能据此认定等同官方；工具最终集合由实际装配及 gate 决定，不以固定工具数量作为长期不变量。
 
+Runtime 装配补充证据：`runtime_composition.rs::image_capable_model_plans_product_tools_without_hosted_duplicates` 验证实际 Qwen 请求；TUI `main.rs::tests::catalyst_tui_assembly_preserves_runtime_extensions_and_optional_catalog`（需 `test-support`）验证生产 helper 的 extension 引用身份与可选 catalog。范围与结果见[架构治理](05-宿主消费与架构治理.md)第 11 节。
+
 ## 二、可保留的产品能力
 
 | 能力 | 主要入口 | 复核边界 | 测试/证据入口 |
