@@ -20,6 +20,21 @@ host
 | HTTP transport override | `codex-rs/codex-client/src/transport_handle.rs`、`core/src/client.rs` | 注入后请求统一走 host transport，避免隐式切换 WebSocket |
 | 静态 model catalog | `core/src/thread_manager.rs`、`models-manager` | `StaticModelsManager` 只在宿主提供 catalog 时替换默认 manager |
 
+### 五类接线的直接验证路由
+
+Runtime 的 App Server 装配入口为其仓库 `crates/catalyst-app-server/src/lib.rs::process_overrides`。
+下表 Codex 路径相对 `codex-rs/`；Runtime 路径相对 Runtime 仓库根。测试是复核入口，不表示每次文档更新都执行了测试。
+
+| 能力 | Runtime 注入 | Codex 消费 | 直接测试路由 |
+| --- | --- | --- | --- |
+| 模型目录 | `with_model_catalog`；目录来自 `crates/catalyst-codex/src/model_catalog.rs::build_model_catalog` | `core/src/thread_manager.rs::new_with_runtime_options` → `StaticModelsManager` | Runtime `crates/catalyst-app-server/tests/runtime_composition.rs::app_server_overrides_include_transport_catalog_and_tavily_extension` 验证装配；`crates/catalyst-codex/src/model_catalog.rs::tests::catalog_is_default_first_then_product_id` 验证目录投影 |
+| HTTP / 模型策略 | `with_http_transport`、逐模型 `with_model_runtime_policy` | `core/src/thread_manager.rs` → `core/src/session/session.rs` → `core/src/client.rs::ModelClient`；HTTP override 禁用模型 WebSocket | `core/tests/suite/incremental_http.rs::host_policy_resends_full_history_when_previous_response_expires`；Runtime `crates/catalyst-codex/tests/qwen_incremental_fallback.rs::synthetic_policy_to_core_fallback_matrix` 覆盖真实 policy/transport 到 Core 的消费 |
+| 工具 / Skill | `with_runtime_extension`、`with_skill_provider`；Browser 条件注入 | `core/src/tools/spec_plan.rs` 装配工具，`ext/skills/src/sources.rs` 按 authority/kind 路由 | `core/src/tools/spec_plan_tests.rs::hosted_web_search_and_standalone_image_generation_follow_runtime_gates`；`core/tests/suite/skills_extension.rs::production_turn_uses_provider_host_catalog_and_core_snapshot_injection`；Runtime `crates/catalyst-private-skills/tests/provider.rs::read_rejects_unentitled_unknown_legacy_and_invalid_handles_before_key_delivery` |
+| 标题 | `with_title_generator` | `core/src/thread_manager.rs` → `thread-store/src/local/mod.rs` → `thread-store/src/live_thread.rs`；持久化前取得 metadata mutation gate | `thread-store/src/local/live_thread_title_tests.rs::manual_thread_rename_wins_over_in_flight_llm_title`、`rejected_metadata_mutation_gate_skips_llm_title_and_callback` |
+| 产品 RPC | `AppServerProcessOverrides::with_rpc_extension` | `app-server/src/lib.rs` → `rpc_extension.rs::AppServerRpcRegistry` → `message_processor.rs` | Runtime `crates/catalyst-app-server/tests/rpc_router.rs` 的 duplicate、namespace、manifest 和 handler error 用例；这些验证 Runtime router，不替代 Codex registry 的 native-method 防覆盖测试 |
+
+空 overrides 仍走默认宿主路径；工具最终集合由实际装配及 gate 决定，不以固定工具数量作为长期不变量。
+
 ## 二、可保留的产品能力
 
 | 能力 | 主要入口 | 复核边界 | 测试/证据入口 |
