@@ -8,7 +8,7 @@
 
 - `OpenAI Codex`：官方上游项目，基线来自 `openai/codex`。
 - `Catalyst Codex Fork`：本仓库，在上游实现上提供宿主可注入的 Runtime 能力和必要适配。
-- 当前升级分支对应的官方基线是 `rust-v0.153.4`（commit `3d2ee51ca2d5db578f328aa75e20aa22c0197c9a`）。
+- 当前官方基线是 `rust-v0.153.4`（commit `3d2ee51ca2d5db578f328aa75e20aa22c0197c9a`）。
 - 本仓是 Catalyst Runtime 的源码依赖；Provider、账号、凭据、私有 Skill 解密和产品 RPC 实现归 Runtime 仓库，fork 只维护其所需的通用接入边界。
 - `codex-rs/` 是 Rust 实现目录，不是 patch 目录；一个文件可以同时包含上游实现、适配和少量 fork 行为。
 
@@ -33,12 +33,13 @@
 
 - Runtime 注入：`codex-rs/core/src/thread_manager.rs`、`codex-rs/core/src/client.rs`、`codex-rs/app-server/src/lib.rs`。
 - HTTP transport：`codex-rs/codex-client/src/transport_handle.rs` 和 Core client 的 transport override。
+- 敏感值基础类型：`codex-rs/utils/sensitive-string/`；Runtime 底层直接依赖该 crate，不得为敏感值重新依赖 TUI。TUI 保留 `SensitiveInput` 兼容别名。
 - Model/TUI runtime：`codex-rs/tui/src/catalyst/model_runtime.rs` 及 TUI startup/model picker 流程。
 - App Server 扩展：`codex-rs/app-server/src/catalyst/rpc_extension.rs`、`message_processor.rs` 和 `extensions.rs`。
 - Skill provider：`codex-rs/ext/skills/src/sources.rs` 及其 catalog/tool boundary。
 - Thread title：`codex-rs/thread-store/src/title_generator.rs`、`live_thread.rs`。
 - 增量请求和图片迁移：`codex-rs/core/src/client.rs`、`core/src/client/catalyst/host_http.rs`、`core/src/session/turn.rs`、`core/tests/suite/incremental_http.rs`。
-- Windows 隔离：`codex-rs/windows-sandbox-rs/src/desktop.rs` 及 unified-exec 调用方。
+- Windows 上游平台能力（当前无独立 fork delta）：`codex-rs/windows-sandbox-rs/src/desktop.rs` 及 unified-exec 调用方。
 
 宿主消费视角和治理优先级见 [`docs-cata/05-宿主消费与架构治理.md`](docs-cata/05-宿主消费与架构治理.md)。
 

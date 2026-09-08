@@ -1,29 +1,20 @@
-# 敏感值分层与 Cata 测试设计
+# 敏感值分层与 Cata 测试
 
-状态：设计已批准，实现与验证完成。基于 fork `a4e491828b`、Runtime `d7b095ee`；官方基线保持 0.153.4。
+当前实现：Fork `c591ecb93a`、Runtime `5bcd93b8`，官方基线 `rust-v0.153.4`。本次分层保持凭据存储格式、工具 wire 名称及原生 Turn/session 生命周期。
 
-## 整理前已确认的问题
+## 类型与模块职责
 
-`codex-tui::SensitiveInput` 同时用于交互输入、Provider 请求凭据和凭据存储。整理前 Runtime 的 `catalyst-provider-core` 与 `catalyst-credentials` 因这个类型直接依赖 `codex-tui`；`CatalystControlService` 也使用该类型。基础能力因此反向依赖展示层，类型名称也不能准确表达非交互用途。
-
-当前类型具有固定脱敏 Debug、显式 `expose_secret`、Drop 时 zeroize 的行为。官方 `RedactedString` 具有 Serialize、Clone、Deref 等不同语义且没有相同的 Drop 实现，不能直接作为等价替代。
-
-## 方案比较
-
-| 方案 | 收益 | 代价 |
+| 模块 | 负责 | 不负责 |
 | --- | --- | --- |
-| 推荐：共享基础类型下沉 | Fork TUI 与 Runtime 使用同一个类型，消除基础层到 TUI 的依赖，无需在适配层复制敏感文本 | 增加一个很小的基础 crate；两仓修改依赖和 import |
-| Runtime 使用自己的 SecretString，TUI 保留原类型 | 不增加共享 crate，Runtime 也能去掉 TUI 依赖 | 边界上保留两种敏感值表示及转换，调用方迁移范围依然存在 |
+| `utils/sensitive-string` | `SensitiveString` 存储、显式读取、固定脱敏 Debug、Drop 时 zeroize | UI、Provider 策略、凭据有效性 |
+| `tui/src/catalyst/credentials.rs` | 凭据状态与操作结果的展示契约 | 凭据持久化与认证 |
+| `tui/src/catalyst/model_runtime.rs` | 模型 readiness、onboarding 的宿主接口 | 具体产品 Provider 实现 |
+| Runtime `tui_model_runtime.rs` | 领域结果到 TUI 契约的适配 | 再造模型请求或 Turn 生命周期 |
+| Runtime `tui_model_runtime_tests.rs` | 适配行为、错误映射和成熟 fixture | 真实远程 Provider 验证 |
 
-## 推荐设计
+TUI 与 Runtime 共用同一个基础类型，`codex_tui::SensitiveInput` 保留为别名，不在适配边界复制敏感文本。Debug 保留 `SensitiveInput([REDACTED])` 以兼容既有诊断；类型没有 Clone、Display、Serialize 或 Deref。官方 `RedactedString` 的能力和 Drop 语义不同，不能作为等价替换。
 
-1. Fork 新增 `codex-utils-sensitive-string`，目录 `codex-rs/utils/sensitive-string/`，提供 `SensitiveString`。这是通用基础类型；源码标明 Catalyst fork 所增，不放入业务 Provider、模型策略或 UI 行为。
-2. 从 TUI 原样下沉敏感值的存储、显式读取、脱敏和 zeroize 逻辑。保持既有 Debug 输出，避免额外引入 Clone、Display、Serialize 或 Deref。类型本身不负责凭据有效性和权限。
-3. TUI 的宿主扩展契约集中到 `tui/src/catalyst/`，按模型 readiness、凭据交互、敏感值来源明确职责。保留现有 `codex_tui::SensitiveInput` 别名供旧源码调用方迁移；不在本批删除兼容别名。
-4. Runtime 的 Provider、credentials、control 和适配层改用 `SensitiveString`。删除 `catalyst-provider-core`、`catalyst-credentials` 对 `codex-tui` 的直接依赖。TUI 状态、交互结果与领域结果的转换继续归 `tui_model_runtime` 适配层。
-5. 将该适配层约 400 行测试从生产实现文件分出，保留成熟的 fixture 和行为断言。命名按职责调整，不批量给原生函数加前缀。
-
-依赖方向为：TUI / Runtime 适配层 → credentials / provider-core → 敏感值基础类型。基础类型不依赖 TUI、Core 或 Runtime。原生 Turn/session、持久化格式、工具 wire 名称及 Workbench 均不在本批改动范围。
+依赖方向：TUI → 敏感值基础类型；Runtime 凭据/Provider → 敏感值基础类型；Runtime TUI 适配 → 领域接口与 TUI 契约。基础 crate 不依赖 Core、TUI 或 Runtime。
 
 ## Cata 测试与验收
 
@@ -39,12 +30,6 @@
 | 依赖边界 | provider-core 与 credentials 的依赖图不再到达 codex-tui | 用 Cargo metadata/tree 核验实际图，不能只检查两个 Cargo.toml 的文本 |
 
 依赖和锁文件同步后运行要求的 Bazel lock 更新；Bazel crate 接线随新增基础 crate 一起维护。不跑全 workspace 测试，不使用真实凭据或远程 Provider。
-
-## 实施顺序与停止条件
-
-先完成基础类型及 TUI 接线，再联动 Runtime import 和依赖，最后整理直接测试并执行一次最低充分验证。修改前确认两仓仍在同一升级分支且工作区干净。只处理直接阻断本批验收的问题，通过后分别提交两仓。
-
-预计 20–30 分钟，主要成本是两仓受依赖变化影响的增量编译。若发现持久化、公开协议或凭据语义必须改变，停止扩展，单独列出证据与选择。
 
 ## 实际迁移范围
 

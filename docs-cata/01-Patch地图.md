@@ -35,21 +35,21 @@ Runtime 的 App Server 装配入口为其仓库 `crates/catalyst-app-server/src/
 
 空 overrides 使用默认装配，但 Skill roots、流式 item 等默认行为补丁仍生效，不能据此认定等同官方；工具最终集合由实际装配及 gate 决定，不以固定工具数量作为长期不变量。
 
-Runtime 装配补充证据：`runtime_composition.rs::image_capable_model_plans_product_tools_without_hosted_duplicates` 验证实际 Qwen 请求；TUI `main.rs::tests::catalyst_tui_assembly_preserves_runtime_extensions_and_optional_catalog`（需 `test-support`）验证生产 helper 的 extension 引用身份与可选 catalog。范围与结果见[架构治理](05-宿主消费与架构治理.md)第 11 节。
+Runtime 装配补充证据：`runtime_composition.rs::image_capable_model_plans_product_tools_without_hosted_duplicates` 验证实际 Qwen 请求；TUI `main.rs::tests::catalyst_tui_assembly_preserves_runtime_extensions_and_optional_catalog`（需 `test-support`）验证生产 helper 的 extension 引用身份与可选 catalog。范围与结果见[升级验证](06-0.153.4升级验证.md)和[分层验证](08-敏感值分层与Cata测试设计.md)。
 
 ## 二、可保留的产品能力
 
 | 能力 | 主要入口 | 复核边界 | 测试/证据入口 |
 | --- | --- | --- | --- |
+| 敏感值基础类型 | `utils/sensitive-string/src/lib.rs` | Runtime 与 TUI 共用；旧 `SensitiveInput` 是同类型别名，基础 crate 不依赖 UI | `sensitive_string_tests.rs`；Runtime credentials 与适配测试 |
 | TUI model runtime | `tui/src/catalyst/model_runtime.rs`、`tui/src/app/`、`tui/src/chatwidget/` | TUI 只消费抽象 runtime，不把 provider 业务硬编码进 UI | `tui/src/app/tests/`、`chatwidget/tests/`、敏感输入单测 |
-| Credential workflow | `tui/src/catalyst/model_runtime.rs`、`bottom_pane/sensitive_prompt_view.rs`、`chatwidget/credential_popups.rs` | secret 输入、redacted Debug、zeroize、失败恢复 | `sensitive_prompt_view_tests.rs` 与 TUI snapshots |
+| Credential workflow | `tui/src/catalyst/credentials.rs`、`bottom_pane/sensitive_prompt_view.rs`、`chatwidget/credential_popups.rs` | secret 输入、redacted Debug、zeroize、失败恢复 | `sensitive_prompt_view_tests.rs` 与 TUI snapshots |
 | App Server RPC extension | `app-server/src/catalyst/rpc_extension.rs`、`message_processor.rs` | 方法必须 namespaced，不得覆盖 native RPC；transport context 影响信任边界 | fork `rpc_extension_tests.rs` 与 `message_processor_rpc_tests.rs` 覆盖 registry/initialize/dispatch；native bridge 完整生命周期仍不能由 router 单测替代 |
 | Native turn/plugin bridge | `app-server/src/extensions.rs`、`request_processors/plugins.rs`、`rpc_extension.rs` | 只暴露受控 gateway；plugin selection 不能绕过现有生命周期 | Runtime `runtime_composition.rs::catalyst_turn_start_enters_the_native_turn_lifecycle_once`；fork plugin/queue 边界证据待补 |
 | Host Skill provider | `ext/skills/src/sources.rs`、`catalog.rs`、`tools/` | provider 按 authority/kind 路由；读取失败不能静默跨 authority | `core/tests/suite/skills_extension.rs` |
 | Thread title generator | `thread-store/src/title_generator.rs`、`live_thread.rs`、`local/mod.rs` | best-effort 异步生成；metadata mutation 必须通过 gate，不能覆盖手工标题 | thread-store/session tests |
 | HTTP incremental requests | `core/src/client.rs`、`session/turn.rs` | baseline 与 wire request 必须一致；previous response 失效时回退 full request | `core/tests/suite/incremental_http.rs` 与 client suite |
-| 工具图片迁移 | `core/src/client.rs` | 先从 function output 移出图片，再捕获 baseline；保留 output array 形状和图片顺序 | incremental request shape tests |
-| Windows private desktop | `windows-sandbox-rs/src/desktop.rs`、`unified_exec/` | 仅复用相同账户和有效权限；非法名称、权限变化和并发创建需隔离 | `desktop_tests.rs`、unified exec tests |
+| 工具图片迁移 | `core/src/client/catalyst/host_http.rs` | 先从 function output 移出图片，再捕获 baseline；保留 output array 形状和图片顺序 | incremental request shape tests |
 
 ### 当前必须单独跟踪的补充能力
 
@@ -63,6 +63,8 @@ Runtime 装配补充证据：`runtime_composition.rs::image_capable_model_plans_
 | 标题 metadata gate | `core/src/session/session.rs`、`session/handlers.rs` | `metadata_mutation_gate_tests`；gate 由 Core 创建，不是 Runtime update-install 门禁 |
 
 ## 三、不要误判为 patch 的内容
+
+当前 `windows-sandbox-rs` 与 0.153.4 官方基线无差异，private desktop 作为上游平台能力维护，不再列为 Catalyst patch；这不代表已取得 Windows 运行验收。
 
 - `codex-rs/` 是上游实现和 fork 变化的混合目录。
 - `Cargo.lock`、协议类型、snapshot 和测试可能只是某个代码变化的构建或验证结果。
