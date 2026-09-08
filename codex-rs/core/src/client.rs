@@ -80,7 +80,6 @@ use codex_protocol::ThreadId;
 use codex_protocol::config_types::ReasoningSummary as ReasoningSummaryConfig;
 use codex_protocol::config_types::Verbosity as VerbosityConfig;
 use codex_protocol::models::ContentItem;
-use codex_protocol::models::FunctionCallOutputContentItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::openai_models::ReasoningEffort as ReasoningEffortConfig;
@@ -142,6 +141,11 @@ use codex_response_debug_context::extract_response_debug_context;
 use codex_response_debug_context::extract_response_debug_context_from_api_error;
 use codex_response_debug_context::telemetry_api_error_message;
 use codex_response_debug_context::telemetry_transport_error_message;
+
+mod host_http;
+
+use self::host_http::is_unknown_previous_response;
+use self::host_http::relocate_tool_output_images;
 
 pub const OPENAI_BETA_HEADER: &str = "OpenAI-Beta";
 pub const X_CODEX_INSTALLATION_ID_HEADER: &str = "x-codex-installation-id";
@@ -2138,85 +2142,6 @@ fn add_responses_lite_header(headers: &mut ApiHeaderMap, use_responses_lite: boo
 
 const RESPONSE_STREAM_CHANNEL_CAPACITY: usize = 1600;
 const STREAM_DROPPED_REASON: &str = "response stream dropped before provider terminal event";
-
-fn is_unknown_previous_response(error: &ApiError) -> bool {
-    let (status, body) = match error {
-        ApiError::Transport(TransportError::Http { status, body, .. }) => {
-            (*status, body.as_deref().unwrap_or_default())
-        }
-        ApiError::Api { status, message } => (*status, message.as_str()),
-        ApiError::InvalidRequest { message } => (StatusCode::BAD_REQUEST, message.as_str()),
-        _ => return false,
-    };
-    if status != StatusCode::BAD_REQUEST && status != StatusCode::NOT_FOUND {
-        return false;
-    }
-
-    if let Ok(value) = serde_json::from_str::<serde_json::Value>(body) {
-        let detail = value.get("error").unwrap_or(&value);
-        let code = detail
-            .get("code")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default()
-            .to_ascii_lowercase();
-        let param = detail
-            .get("param")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default();
-        let message = detail
-            .get("message")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default()
-            .to_ascii_lowercase();
-        if code.contains("previous_response") && code.contains("not_found") {
-            return true;
-        }
-        if param == "previous_response_id" && message.contains("not found") {
-            return true;
-        }
-    }
-
-    let body = body.to_ascii_lowercase();
-    body.contains("previous_response_id")
-        && (body.contains("not found") || body.contains("not_found"))
-}
-
-fn relocate_tool_output_images(input: &mut Vec<ResponseItem>) {
-    let mut relocated = Vec::with_capacity(input.len());
-    for mut item in std::mem::take(input) {
-        let images = match &mut item {
-            ResponseItem::FunctionCallOutput { output, .. } => output
-                .content_items_mut()
-                .map(|items| {
-                    let mut images = Vec::new();
-                    items.retain(|content| match content {
-                        FunctionCallOutputContentItem::InputImage { image_url, detail } => {
-                            images.push(ContentItem::InputImage {
-                                image_url: image_url.clone(),
-                                detail: *detail,
-                            });
-                            false
-                        }
-                        _ => true,
-                    });
-                    images
-                })
-                .unwrap_or_default(),
-            _ => Vec::new(),
-        };
-        relocated.push(item);
-        if !images.is_empty() {
-            relocated.push(ResponseItem::Message {
-                id: None,
-                role: "user".to_string(),
-                content: images,
-                phase: None,
-                internal_chat_message_metadata_passthrough: None,
-            });
-        }
-    }
-    *input = relocated;
-}
 
 fn map_response_stream(
     api_stream: codex_api::ResponseStream,

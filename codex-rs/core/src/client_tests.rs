@@ -11,7 +11,6 @@ use super::X_CODEX_PARENT_THREAD_ID_HEADER;
 use super::X_CODEX_TURN_METADATA_HEADER;
 use super::X_CODEX_WINDOW_ID_HEADER;
 use super::X_OPENAI_SUBAGENT_HEADER;
-use super::is_unknown_previous_response;
 use crate::AttestationContext;
 use crate::AttestationProvider;
 use crate::GenerateAttestationFuture;
@@ -1045,18 +1044,4 @@ async fn non_chatgpt_codex_endpoints_omit_attestation_generation() {
         None,
     );
     assert_eq!(attestation_calls.load(Ordering::Relaxed), 0);
-}
-
-#[test]
-fn recognizes_qwen_unknown_previous_response_error() {
-    let error = ApiError::Transport(TransportError::Http {
-        status: http::StatusCode::BAD_REQUEST,
-        url: None,
-        headers: None,
-        body: Some(
-            r#"{"code":"InvalidParameter","message":"Not found previous_response_id"}"#.to_string(),
-        ),
-    });
-
-    assert!(is_unknown_previous_response(&error));
 }

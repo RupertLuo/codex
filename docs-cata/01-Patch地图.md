@@ -87,3 +87,9 @@ git log --follow --oneline -- codex-rs/core/src/client.rs
 git blame <commit> -- codex-rs/core/src/thread_manager.rs
 git diff --check
 ```
+
+## HTTP 请求补丁的内部边界
+
+`core/src/client/host_http.rs` 只承担宿主 policy 启用的请求图片迁移与 previous response 失效识别；`client.rs` 保留 session baseline、delta 选择和重试顺序。迁移发生在保存 typed baseline 前，不改写持久化历史。公开 `ModelRuntimePolicy` 路径和 Runtime 注入接口不变。
+
+验证入口：fork `client::host_http::tests::recognizes_qwen_unknown_previous_response_error`，以及 Runtime `qwen_incremental_fallback::synthetic_policy_to_core_fallback_matrix`。

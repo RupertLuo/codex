@@ -37,7 +37,7 @@
 - App Server 扩展：`codex-rs/app-server/src/rpc_extension.rs`、`message_processor.rs` 和 `extensions.rs`。
 - Skill provider：`codex-rs/ext/skills/src/sources.rs` 及其 catalog/tool boundary。
 - Thread title：`codex-rs/thread-store/src/title_generator.rs`、`live_thread.rs`。
-- 增量请求和图片迁移：`codex-rs/core/src/client.rs`、`core/src/session/turn.rs`、`core/tests/suite/incremental_http.rs`。
+- 增量请求和图片迁移：`codex-rs/core/src/client.rs`、`core/src/client/host_http.rs`、`core/src/session/turn.rs`、`core/tests/suite/incremental_http.rs`。
 - Windows 隔离：`codex-rs/windows-sandbox-rs/src/desktop.rs` 及 unified-exec 调用方。
 
 宿主消费视角和治理优先级见 [`docs-cata/05-宿主消费与架构治理.md`](docs-cata/05-宿主消费与架构治理.md)。
