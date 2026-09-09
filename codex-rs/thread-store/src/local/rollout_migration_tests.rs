@@ -62,6 +62,7 @@ use crate::ListItemsParams;
 use crate::ListThreadsParams;
 use crate::ListTurnsParams;
 use crate::LoadThreadHistoryParams;
+use crate::ReadThreadParams;
 use crate::SortDirection;
 use crate::StoredTurnItemsView;
 use crate::ThreadMetadataPatch;
@@ -307,6 +308,125 @@ async fn list_active_summary_turns(store: &LocalThreadStore, thread_id: ThreadId
         })
         .await
         .expect("read projected turns")
+}
+
+#[tokio::test]
+async fn cold_backup_restores_legacy_history_in_an_independent_home() {
+    let home = TempDir::new().expect("create source Codex home");
+    let backup = TempDir::new().expect("create backup home");
+    let restored = TempDir::new().expect("create restored Codex home");
+    let thread_id = ThreadId::new();
+    let messages = vec![
+        user_message("Synthetic question preserved in backup"),
+        agent_message("Synthetic answer preserved in backup"),
+    ];
+    let rollout_path = write_rollout(home.path(), thread_id, SessionSource::Cli, messages.clone());
+    let relative_rollout_path = rollout_path
+        .strip_prefix(home.path())
+        .expect("local rollout");
+    let rollout_bytes = fs::read(&rollout_path).expect("read original rollout");
+    let params = ReadThreadParams {
+        thread_id,
+        include_archived: false,
+        include_history: true,
+    };
+    let store = indexed_store(home.path()).await;
+    let original = store
+        .read_thread(params.clone())
+        .await
+        .expect("read original history");
+    let original_history = original.history.expect("original history");
+    assert_eq!(
+        serde_json::to_value(&original_history.items[1..]).expect("serialize original messages"),
+        serde_json::to_value(&messages).expect("serialize expected messages")
+    );
+    store
+        .state_db()
+        .await
+        .expect("source state DB")
+        .close()
+        .await;
+    drop(store);
+
+    // Copy the entire synthetic home only after every database pool has closed.
+    let copy_home = |source: &Path, destination: &Path| {
+        let mut directories = vec![(source.to_path_buf(), destination.to_path_buf())];
+        while let Some((source, destination)) = directories.pop() {
+            fs::create_dir_all(&destination).expect("create copied directory");
+            for entry in fs::read_dir(source).expect("read synthetic directory") {
+                let entry = entry.expect("synthetic directory entry");
+                let target = destination.join(entry.file_name());
+                let file_type = entry.file_type().expect("synthetic entry type");
+                if file_type.is_dir() {
+                    directories.push((entry.path(), target));
+                } else {
+                    assert!(
+                        file_type.is_file(),
+                        "fixture must contain only files and directories"
+                    );
+                    fs::copy(entry.path(), target).expect("copy synthetic file");
+                }
+            }
+        }
+    };
+    copy_home(home.path(), backup.path());
+    let state_path = test_config(home.path()).sqlite.state_db_path();
+    let relative_state_path = state_path
+        .strip_prefix(home.path())
+        .expect("local state DB");
+    let backup_state_path = backup.path().join(relative_state_path);
+    let backup_state_bytes = fs::read(&backup_state_path).expect("read backed up state DB");
+    let corrupt_bytes = b"synthetic damaged state database";
+    fs::write(&state_path, corrupt_bytes).expect("damage source state DB");
+    fs::remove_file(&rollout_path).expect("remove source history");
+    let damaged = LocalThreadStore::new(test_config(home.path()), /*state_db*/ None);
+    damaged
+        .read_thread(params.clone())
+        .await
+        .expect_err("source history is unavailable");
+    drop(damaged);
+
+    copy_home(backup.path(), restored.path());
+    let restored_store = indexed_store(restored.path()).await;
+    let recovered = restored_store
+        .read_thread(params)
+        .await
+        .expect("read restored history");
+    assert_eq!(recovered.thread_id, thread_id);
+    assert_eq!(
+        recovered.rollout_path,
+        Some(restored.path().join(relative_rollout_path))
+    );
+    let recovered_history = recovered.history.expect("restored history");
+    assert_eq!(recovered_history.thread_id, original_history.thread_id);
+    assert_eq!(
+        serde_json::to_value(&recovered_history.items).expect("serialize recovered history"),
+        serde_json::to_value(&original_history.items).expect("serialize original history")
+    );
+    restored_store
+        .state_db()
+        .await
+        .expect("restored state DB")
+        .close()
+        .await;
+    drop(restored_store);
+
+    assert!(
+        !rollout_path.exists(),
+        "restoration must not recreate source history"
+    );
+    assert_eq!(
+        fs::read(state_path).expect("read damaged source DB"),
+        corrupt_bytes
+    );
+    assert_eq!(
+        fs::read(backup_state_path).expect("read retained backup DB"),
+        backup_state_bytes
+    );
+    assert_eq!(
+        fs::read(backup.path().join(relative_rollout_path)).expect("read retained backup rollout"),
+        rollout_bytes,
+    );
 }
 
 #[tokio::test]

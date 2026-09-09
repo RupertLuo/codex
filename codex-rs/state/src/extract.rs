@@ -770,11 +770,14 @@ mod tests {
         let item = codex_history::CompactedItem {
             message: "compacted summary".to_string(),
             replacement_history: None,
+            guardian_history: None,
             mcp_resource_origins: None,
             window_number: None,
             first_window_id: None,
             previous_window_id: None,
             window_id: None,
+            compaction_response_id: None,
+            latest_token_usage_record: None,
         };
         let item = RolloutItem::Compacted(item);
 
