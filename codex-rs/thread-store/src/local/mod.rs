@@ -2,6 +2,9 @@ mod archive_thread;
 mod create_thread;
 mod delete_thread;
 mod helpers;
+#[cfg(test)]
+#[path = "list_thread_origins_tests.rs"]
+mod list_thread_origins_tests;
 mod list_threads;
 mod live_writer;
 mod model_context;
