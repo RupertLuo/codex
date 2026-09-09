@@ -30,6 +30,7 @@ use tracing::warn;
 pub(crate) struct ConfigManager {
     codex_home: PathBuf,
     cli_overrides: Arc<RwLock<Vec<(String, TomlValue)>>>,
+    process_mcp_server_replacements: Arc<BTreeMap<String, TomlValue>>,
     runtime_feature_enablement: Arc<RwLock<BTreeMap<String, bool>>>,
     loader_overrides: LoaderOverrides,
     strict_config: bool,
@@ -51,6 +52,7 @@ impl ConfigManager {
         Self {
             codex_home,
             cli_overrides: Arc::new(RwLock::new(cli_overrides)),
+            process_mcp_server_replacements: Arc::new(BTreeMap::new()),
             runtime_feature_enablement: Arc::new(RwLock::new(BTreeMap::new())),
             loader_overrides,
             strict_config,
@@ -58,6 +60,14 @@ impl ConfigManager {
             arg0_paths,
             thread_config_loader,
         }
+    }
+
+    pub(crate) fn with_process_mcp_server_replacements(
+        mut self,
+        replacements: BTreeMap<String, TomlValue>,
+    ) -> Self {
+        self.process_mcp_server_replacements = Arc::new(replacements);
+        self
     }
 
     pub(crate) fn codex_home(&self) -> &Path {
@@ -144,6 +154,14 @@ impl ConfigManager {
         .await
     }
 
+    /// Loads system, user, and runtime settings without discovering a project
+    /// from the app-server process's working directory.
+    pub(crate) async fn load_non_project_config(&self) -> std::io::Result<Config> {
+        let mut manager = self.clone();
+        manager.loader_overrides.ignore_project_config = true;
+        manager.load_latest_config(/*fallback_cwd*/ None).await
+    }
+
     pub(crate) async fn load_latest_config_for_thread(
         &self,
         thread_config: &Config,
@@ -165,6 +183,7 @@ impl ConfigManager {
         let mut config = ConfigBuilder::default()
             .codex_home(self.codex_home.clone())
             .cli_overrides(self.current_cli_overrides())
+            .process_mcp_server_replacements(self.process_mcp_server_replacements.as_ref().clone())
             .loader_overrides(loader_overrides)
             .fallback_cwd(Some(self.codex_home.clone()))
             .cloud_config_bundle(CloudConfigBundleLoader::default())
@@ -233,6 +252,7 @@ impl ConfigManager {
         let mut config = codex_core::config::ConfigBuilder::default()
             .codex_home(self.codex_home.clone())
             .cli_overrides(merged_cli_overrides)
+            .process_mcp_server_replacements(self.process_mcp_server_replacements.as_ref().clone())
             .loader_overrides(self.loader_overrides.clone())
             .strict_config(self.strict_config)
             .harness_overrides(typesafe_overrides)
@@ -358,3 +378,7 @@ pub(crate) fn apply_runtime_feature_enablement(
         }
     }
 }
+
+#[cfg(test)]
+#[path = "catalyst/config_manager_tests.rs"]
+mod tests;

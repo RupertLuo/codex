@@ -45,13 +45,16 @@ use serde_json::json;
 use tempfile::TempDir;
 
 use super::LocalThreadStore;
+use super::RolloutMigrationFailureReason;
 use super::RolloutMigrationMode;
 use super::RolloutMigrationOptions;
+use super::RolloutMigrationPaths;
 use super::RolloutMigrationProgress;
 use super::RolloutMigrationStatus;
 #[cfg(unix)]
 use super::decompress_rollout_to_path;
 use super::migration_journal_path;
+use super::telemetry::RolloutMigrationTrigger;
 use super::thread_history;
 use super::write_migration_journal;
 use crate::ItemSortKey;
@@ -59,6 +62,7 @@ use crate::ListItemsParams;
 use crate::ListThreadsParams;
 use crate::ListTurnsParams;
 use crate::LoadThreadHistoryParams;
+use crate::ReadThreadParams;
 use crate::SortDirection;
 use crate::StoredTurnItemsView;
 use crate::ThreadMetadataPatch;
@@ -157,6 +161,7 @@ fn agent_message(text: &str) -> RolloutItem {
         phase: None,
         memory_citation: None,
         delivery: None,
+        questions: None,
     }))
 }
 
@@ -227,11 +232,14 @@ fn compacted(replacement_history: Vec<ResponseItem>) -> RolloutItem {
     RolloutItem::Compacted(CompactedItem {
         message: "checkpoint".to_string(),
         replacement_history: Some(replacement_history.into_iter().map(Into::into).collect()),
+        guardian_history: None,
         mcp_resource_origins: None,
         window_number: Some(1),
         first_window_id: None,
         previous_window_id: None,
         window_id: None,
+        compaction_response_id: None,
+        latest_token_usage_record: None,
     })
 }
 
@@ -263,6 +271,16 @@ fn apply_options() -> RolloutMigrationOptions {
     }
 }
 
+fn assert_failed_with_reason(
+    outcome: &super::RolloutMigrationOutcome,
+    failure_reason: RolloutMigrationFailureReason,
+) {
+    assert_eq!(
+        (outcome.status, outcome.failure_reason),
+        (RolloutMigrationStatus::Failed, Some(failure_reason))
+    );
+}
+
 async fn indexed_store(home: &Path) -> LocalThreadStore {
     let config = test_config(home);
     let rollout_config = RolloutConfig {
@@ -290,6 +308,125 @@ async fn list_active_summary_turns(store: &LocalThreadStore, thread_id: ThreadId
         })
         .await
         .expect("read projected turns")
+}
+
+#[tokio::test]
+async fn cold_backup_restores_legacy_history_in_an_independent_home() {
+    let home = TempDir::new().expect("create source Codex home");
+    let backup = TempDir::new().expect("create backup home");
+    let restored = TempDir::new().expect("create restored Codex home");
+    let thread_id = ThreadId::new();
+    let messages = vec![
+        user_message("Synthetic question preserved in backup"),
+        agent_message("Synthetic answer preserved in backup"),
+    ];
+    let rollout_path = write_rollout(home.path(), thread_id, SessionSource::Cli, messages.clone());
+    let relative_rollout_path = rollout_path
+        .strip_prefix(home.path())
+        .expect("local rollout");
+    let rollout_bytes = fs::read(&rollout_path).expect("read original rollout");
+    let params = ReadThreadParams {
+        thread_id,
+        include_archived: false,
+        include_history: true,
+    };
+    let store = indexed_store(home.path()).await;
+    let original = store
+        .read_thread(params.clone())
+        .await
+        .expect("read original history");
+    let original_history = original.history.expect("original history");
+    assert_eq!(
+        serde_json::to_value(&original_history.items[1..]).expect("serialize original messages"),
+        serde_json::to_value(&messages).expect("serialize expected messages")
+    );
+    store
+        .state_db()
+        .await
+        .expect("source state DB")
+        .close()
+        .await;
+    drop(store);
+
+    // Copy the entire synthetic home only after every database pool has closed.
+    let copy_home = |source: &Path, destination: &Path| {
+        let mut directories = vec![(source.to_path_buf(), destination.to_path_buf())];
+        while let Some((source, destination)) = directories.pop() {
+            fs::create_dir_all(&destination).expect("create copied directory");
+            for entry in fs::read_dir(source).expect("read synthetic directory") {
+                let entry = entry.expect("synthetic directory entry");
+                let target = destination.join(entry.file_name());
+                let file_type = entry.file_type().expect("synthetic entry type");
+                if file_type.is_dir() {
+                    directories.push((entry.path(), target));
+                } else {
+                    assert!(
+                        file_type.is_file(),
+                        "fixture must contain only files and directories"
+                    );
+                    fs::copy(entry.path(), target).expect("copy synthetic file");
+                }
+            }
+        }
+    };
+    copy_home(home.path(), backup.path());
+    let state_path = test_config(home.path()).sqlite.state_db_path();
+    let relative_state_path = state_path
+        .strip_prefix(home.path())
+        .expect("local state DB");
+    let backup_state_path = backup.path().join(relative_state_path);
+    let backup_state_bytes = fs::read(&backup_state_path).expect("read backed up state DB");
+    let corrupt_bytes = b"synthetic damaged state database";
+    fs::write(&state_path, corrupt_bytes).expect("damage source state DB");
+    fs::remove_file(&rollout_path).expect("remove source history");
+    let damaged = LocalThreadStore::new(test_config(home.path()), /*state_db*/ None);
+    damaged
+        .read_thread(params.clone())
+        .await
+        .expect_err("source history is unavailable");
+    drop(damaged);
+
+    copy_home(backup.path(), restored.path());
+    let restored_store = indexed_store(restored.path()).await;
+    let recovered = restored_store
+        .read_thread(params)
+        .await
+        .expect("read restored history");
+    assert_eq!(recovered.thread_id, thread_id);
+    assert_eq!(
+        recovered.rollout_path,
+        Some(restored.path().join(relative_rollout_path))
+    );
+    let recovered_history = recovered.history.expect("restored history");
+    assert_eq!(recovered_history.thread_id, original_history.thread_id);
+    assert_eq!(
+        serde_json::to_value(&recovered_history.items).expect("serialize recovered history"),
+        serde_json::to_value(&original_history.items).expect("serialize original history")
+    );
+    restored_store
+        .state_db()
+        .await
+        .expect("restored state DB")
+        .close()
+        .await;
+    drop(restored_store);
+
+    assert!(
+        !rollout_path.exists(),
+        "restoration must not recreate source history"
+    );
+    assert_eq!(
+        fs::read(state_path).expect("read damaged source DB"),
+        corrupt_bytes
+    );
+    assert_eq!(
+        fs::read(backup_state_path).expect("read retained backup DB"),
+        backup_state_bytes
+    );
+    assert_eq!(
+        fs::read(backup.path().join(relative_rollout_path)).expect("read retained backup rollout"),
+        rollout_bytes,
+    );
 }
 
 #[tokio::test]
@@ -428,6 +565,7 @@ async fn migration_preserves_image_generation_failure_metadata() {
             resets_at: Some(1_786_150_800),
         }),
         saved_path: None,
+        imagegen_request_id: None,
     };
     let image_completion =
         RolloutItem::EventMsg(EventMsg::ImageGenerationEnd(ImageGenerationEndEvent {
@@ -716,6 +854,10 @@ async fn migration_rolls_back_response_and_inter_agent_user_boundaries() {
         SessionSource::Cli,
         vec![
             rollout_response_item(input_response_message("user", "keep first boundary")),
+            rollout_response_item(input_response_message(
+                "developer",
+                "<managed_developer_instructions>context only</managed_developer_instructions>",
+            )),
             rollout_response_item(input_response_message(
                 "developer",
                 "<permissions instructions>context only</permissions instructions>",
@@ -1388,11 +1530,14 @@ async fn migration_compacts_subagent_prefix_and_does_not_project_it() {
             RolloutItem::Compacted(CompactedItem {
                 message: "superseded checkpoint".repeat(1024),
                 replacement_history: Some(Vec::new()),
+                guardian_history: None,
                 mcp_resource_origins: None,
                 window_number: Some(1),
                 first_window_id: None,
                 previous_window_id: None,
                 window_id: None,
+                compaction_response_id: None,
+                latest_token_usage_record: None,
             }),
             RolloutItem::Compacted(CompactedItem {
                 message: "latest checkpoint".to_string(),
@@ -1408,15 +1553,19 @@ async fn migration_compacts_subagent_prefix_and_does_not_project_it() {
                     }
                     .into(),
                 ]),
+                guardian_history: None,
                 mcp_resource_origins: None,
                 window_number: Some(2),
                 first_window_id: None,
                 previous_window_id: None,
                 window_id: None,
+                compaction_response_id: None,
+                latest_token_usage_record: None,
             }),
             started("child-turn"),
             RolloutItem::TurnContext(TurnContextItem {
                 turn_id: Some("child-turn".to_string()),
+                root_turn_id: None,
                 cwd: serde_json::from_value(json!(home.path())).expect("absolute cwd"),
                 workspace_roots: None,
                 current_date: None,
@@ -1435,6 +1584,7 @@ async fn migration_compacts_subagent_prefix_and_does_not_project_it() {
                 multi_agent_version: None,
                 multi_agent_mode: None,
                 realtime_active: None,
+                cyber_access_program: None,
                 effort: None,
                 summary: ReasoningSummary::Auto,
             }),
@@ -1769,6 +1919,37 @@ async fn migration_migrates_archived_rollouts_without_unarchiving_them() {
         .expect("read archived projected turns");
     assert_eq!(turns.turns.len(), 1);
     assert_eq!(turns.turns[0].items.len(), 2);
+}
+
+#[tokio::test]
+async fn migration_retries_a_rollout_moved_after_path_discovery() {
+    let home = TempDir::new().expect("create Codex home");
+    let thread_id = ThreadId::new();
+    let active_path = write_rollout(
+        home.path(),
+        thread_id,
+        SessionSource::Cli,
+        vec![user_message("question"), agent_message("answer")],
+    );
+    let store = indexed_store(home.path()).await;
+    let archived_path = move_to_archived(home.path(), active_path.clone());
+
+    let report = store
+        .migrate_rollouts_with_progress_for_trigger(
+            apply_options(),
+            |_| {},
+            RolloutMigrationTrigger::Startup,
+            RolloutMigrationPaths::Known(vec![active_path]),
+        )
+        .await
+        .expect("migrate moved rollout");
+
+    assert_eq!(report.outcomes[0].status, RolloutMigrationStatus::Migrated);
+    assert!(matches!(
+        &read_rollout(&archived_path)[0].item,
+        RolloutItem::SessionMeta(metadata)
+            if metadata.meta.history_mode == ThreadHistoryMode::Paginated
+    ));
 }
 
 #[tokio::test]
@@ -2245,6 +2426,57 @@ async fn migration_skips_empty_rollout_files() {
             .await
             .expect("read thread metadata")
             .is_none()
+    );
+}
+
+#[tokio::test]
+async fn migration_reports_missing_sqlite_metadata() {
+    let home = TempDir::new().expect("create Codex home");
+    let thread_id = ThreadId::new();
+    write_rollout(
+        home.path(),
+        thread_id,
+        SessionSource::Cli,
+        vec![user_message("question")],
+    );
+    let store = indexed_store(home.path()).await;
+    store
+        .state_db
+        .as_ref()
+        .expect("state db")
+        .delete_thread(thread_id)
+        .await
+        .expect("remove thread metadata");
+
+    let report = store
+        .migrate_rollouts(apply_options())
+        .await
+        .expect("inspect rollout with missing metadata");
+
+    assert_failed_with_reason(
+        &report.outcomes[0],
+        RolloutMigrationFailureReason::MissingSqliteMetadata,
+    );
+}
+
+#[tokio::test]
+async fn migration_reports_invalid_session_metadata() {
+    let home = TempDir::new().expect("create Codex home");
+    let thread_id = ThreadId::new();
+    let directory = home.path().join("sessions/2025/01/03");
+    fs::create_dir_all(&directory).expect("create rollout directory");
+    let path = directory.join(format!("rollout-2025-01-03T12-00-00-{thread_id}.jsonl"));
+    fs::write(path, "not a rollout record\n").expect("write malformed rollout");
+    let store = indexed_store(home.path()).await;
+
+    let report = store
+        .migrate_rollouts(apply_options())
+        .await
+        .expect("inspect rollout with invalid metadata");
+
+    assert_failed_with_reason(
+        &report.outcomes[0],
+        RolloutMigrationFailureReason::InvalidSessionMetadata,
     );
 }
 

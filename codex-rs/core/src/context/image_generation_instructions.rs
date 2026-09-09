@@ -1,3 +1,5 @@
+//! CATALYST: Bounded context hint for images produced by a host extension.
+
 use std::fmt::Display;
 
 const MAX_IMAGE_GENERATION_OUTPUT_HINT_BYTES: usize = 1024;

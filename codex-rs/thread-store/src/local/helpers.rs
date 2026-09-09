@@ -10,6 +10,7 @@ use std::time::SystemTime;
 use chrono::DateTime;
 use chrono::Utc;
 use codex_git_utils::GitSha;
+use codex_protocol::SanitizedGitUrl;
 use codex_protocol::ThreadId;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::protocol::AskForApproval;
@@ -163,8 +164,8 @@ pub(super) fn stored_thread_from_rollout_item(
             .model_provider
             .filter(|provider| !provider.is_empty())
             .unwrap_or_else(|| default_provider.to_string()),
-        model: None,
-        reasoning_effort: None,
+        model: item.model,
+        reasoning_effort: item.reasoning_effort,
         created_at,
         updated_at,
         recency_at,
@@ -218,6 +219,7 @@ pub(super) fn sqlite_thread_name(metadata: &ThreadMetadata) -> Option<String> {
         .map(str::trim)
         .filter(|name| !name.is_empty())
         .map(str::to_string)
+        .or_else(|| distinct_thread_metadata_title(metadata))
 }
 
 pub(super) async fn resolve_thread_section_metadata(
@@ -309,7 +311,7 @@ fn parse_legacy_sandbox_policy(value: &str) -> serde_json::Result<SandboxPolicy>
 pub(super) fn git_info_from_parts(
     sha: Option<String>,
     branch: Option<String>,
-    origin_url: Option<String>,
+    origin_url: Option<SanitizedGitUrl>,
 ) -> Option<GitInfo> {
     if sha.is_none() && branch.is_none() && origin_url.is_none() {
         return None;

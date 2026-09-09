@@ -1,0 +1,72 @@
+# 敏感值分层与 Cata 测试
+
+当前实现：Fork `c591ecb93a`、Runtime `5bcd93b8`，官方基线 `rust-v0.153.4`。本次分层保持凭据存储格式、工具 wire 名称及原生 Turn/session 生命周期。
+
+## 类型与模块职责
+
+| 模块 | 负责 | 不负责 |
+| --- | --- | --- |
+| `utils/sensitive-string` | `SensitiveString` 存储、显式读取、固定脱敏 Debug、Drop 时 zeroize | UI、Provider 策略、凭据有效性 |
+| `tui/src/catalyst/credentials.rs` | 凭据状态与操作结果的展示契约 | 凭据持久化与认证 |
+| `tui/src/catalyst/model_runtime.rs` | 模型 readiness、onboarding 的宿主接口 | 具体产品 Provider 实现 |
+| Runtime `tui_model_runtime.rs` | 领域结果到 TUI 契约的适配 | 再造模型请求或 Turn 生命周期 |
+| Runtime `tui_model_runtime_tests.rs` | 适配行为、错误映射和成熟 fixture | 真实远程 Provider 验证 |
+
+TUI 与 Runtime 共用同一个基础类型，`codex_tui::SensitiveInput` 保留为别名，不在适配边界复制敏感文本。Debug 保留 `SensitiveInput([REDACTED])` 以兼容既有诊断；类型没有 Clone、Display、Serialize 或 Deref。官方 `RedactedString` 的能力和 Drop 语义不同，不能作为等价替换。
+
+依赖方向：TUI → 敏感值基础类型；Runtime 凭据/Provider → 敏感值基础类型；Runtime TUI 适配 → 领域接口与 TUI 契约。基础 crate 不依赖 Core、TUI 或 Runtime。
+
+## Cata 测试与验收
+
+测试按能力和 owner 组织，复用已有用例，不增加只为重命名或字段常量服务的测试。
+
+| 层 | 具体行为 | 验收证据 |
+| --- | --- | --- |
+| 基础类型 | 已有脱敏 Debug 和显式读取行为在下沉后保留；使用 zeroize 的原实现 | 迁移原有测试并核验实现等价；不通过读取已释放内存测试 Drop |
+| Runtime credentials | 认证拒绝保留旧凭据、暂时失败保存未验证状态、警告不泄露候选值、环境覆盖拒绝修改 | 先精确运行认证拒绝用例，再运行剩余 credentials 单测，覆盖上述行为 |
+| Runtime TUI 适配 | 模型按 Provider 获取 readiness；凭据操作的结果与错误映射正确 | 运行 `tui_model_runtime::tests::` 全部 5 项适配用例 |
+| Fork TUI Cata 接入 | 待凭据准备完成后才提交模型 Turn；交互结果到达时仍遵守当前模型归属 | 复用现有 readiness 测试，新增按事件顺序执行的 stale-result 用例 |
+| 跨仓装配 | Runtime 实际装配仍向 Fork 注入对应服务 | TUI 入口装配用例精确运行；App Server runtime_composition 目标验证实际消费路径 |
+| 依赖边界 | provider-core 与 credentials 的依赖图不再到达 codex-tui | 用 Cargo metadata/tree 核验实际图，不能只检查两个 Cargo.toml 的文本 |
+
+依赖和锁文件同步后运行要求的 Bazel lock 更新；Bazel crate 接线随新增基础 crate 一起维护。不跑全 workspace 测试，不使用真实凭据或远程 Provider。
+
+## 实际迁移范围
+
+Runtime 共 7 个 crate 迁移敏感类型；provider-core、credentials、providers、Anthropic adapter、tool-search、app-server 六个纯类型消费者删除直接 TUI 依赖，catalyst-codex 保留真正的 TUI 装配依赖。Cargo resolved graph 已核验前五者无传递 TUI 路径；app-server 仍经 catalyst-codex 到达 TUI，未将整个 App Server 宣称为无 TUI 依赖。
+
+新增 Cata 测试 `stale_model_readiness_rechecks_current_model_before_submission`：A 的结果晚到时不能放行已切到 B 的提交，B 就绪后原文和远程图片完整提交一次，重复结果不重复提交。原生生产控制流未修改。基础类型迁移原脱敏测试；Runtime 适配测试保留原逻辑名称和 fixture。
+
+## 2026-09-08 验证记录
+
+两位子 agent 分别检查类型迁移与调用边界、Cata 测试与兼容性；集中 review 无 Blocker / Required。生产变更保持类型行为与公开 TUI 别名，新增测试验证旧模型结果晚到后重新检查当前模型，避免错误放行和重复提交。
+
+| 验证 | 结果 |
+| --- | --- |
+| Fork 最小集合：基础类型脱敏、新增模型切换竞态 | 2 passed |
+| Fork 扩大集合：Cata readiness、credentials、onboarding、敏感输入 | 23 passed，排除已运行的新竞态用例 |
+| Runtime credentials | 精确 1 + 其余 29 passed，无重复 |
+| Runtime TUI 适配 | 5 passed |
+| Runtime TUI 入口装配 | 1 passed |
+| Runtime App Server runtime_composition 全目标 | 18 passed，编译 3m07s、执行 5.68s |
+
+Fork 首次受影响编译 3m59s，扩大集合增量编译 2.03s、执行 0.21s；Runtime credentials 首次受影响编译 1m33s，适配测试编译 48.60s。编译耗时不计为用例执行耗时。
+
+依赖图来自两仓离线 Cargo metadata 的完整 resolved graph；两个仓库各自使用本地 target。Fork formatter、Runtime 改动文件 rustfmt 和 `just bazel-lock-update` 通过，后者未产生额外锁文件差异。未运行全 workspace、真实 Provider、GUI、Windows 或发布验证；Bazel lock 更新不等于 Bazel 构建通过。
+
+可复用的 Runtime 验证入口（仓库根目录，串行执行；整批重跑时 credentials 可一次运行全模块）：
+
+```bash
+cargo test --offline --locked -p catalyst-credentials --lib
+cargo test --offline --locked -p catalyst-codex --lib tui_model_runtime::tests::
+cargo test --offline --locked -p catalyst-codex --features test-support --bin catalyst-codex tests::catalyst_tui_assembly_preserves_runtime_extensions_and_optional_catalog -- --exact
+cargo test --offline --locked -p catalyst-app-server --test runtime_composition
+```
+
+Fork 最小入口（仓库根目录）：
+
+```bash
+CARGO_NET_OFFLINE=true just test --locked -p codex-utils-sensitive-string -p codex-tui --lib -E 'test(=tests::sensitive_string_debug_is_redacted) | test(=chatwidget::tests::composer_submission::stale_model_readiness_rechecks_current_model_before_submission)'
+```
+
+本批合计 79 个不同用例通过（Fork 25、Runtime 54）。两仓差异检查及文档相对链接检查通过，Workbench 未修改。

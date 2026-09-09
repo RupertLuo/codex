@@ -257,6 +257,7 @@ impl MemoryStartupContext {
             session_source.clone(),
             config_snapshot.originator,
             config.model_verbosity,
+            config.features.enabled(Feature::ContentItemKinds),
             config.features.enabled(Feature::EnableRequestCompression),
             config.features.enabled(Feature::RuntimeMetrics),
             /*beta_features_header*/ None,
@@ -268,6 +269,7 @@ impl MemoryStartupContext {
         let mut client_session = model_client.new_session();
         let window_id = format!("{}:0", self.thread_id);
         let responses_metadata = detached_memory_responses_metadata(
+            &self.thread_manager,
             installation_id,
             session_id_string,
             self.thread_id.to_string(),
@@ -295,7 +297,7 @@ impl MemoryStartupContext {
         let mut token_usage = None;
         while let Some(message) = stream.next().await.transpose()? {
             match message {
-                ResponseEvent::OutputTextDelta(delta) => result.push_str(&delta),
+                ResponseEvent::OutputTextDelta { delta, .. } => result.push_str(&delta),
                 ResponseEvent::OutputItemDone(item) => {
                     if result.is_empty()
                         && let codex_protocol::models::ResponseItem::Message { content, .. } = item

@@ -457,33 +457,6 @@ mod tests {
             }
         ));
     }
-
-    #[tokio::test]
-    async fn title_generator_round_trip() {
-        let store = InMemoryThreadStore::default();
-        assert!(store.title_generator().is_none());
-
-        #[derive(Debug)]
-        struct DummyGen;
-        impl crate::ThreadTitleGenerator for DummyGen {
-            fn generate_title<'a>(
-                &'a self,
-                _request: crate::ThreadTitleRequest,
-            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<String>> + Send + 'a>>
-            {
-                Box::pin(async { Some("test".to_string()) })
-            }
-        }
-
-        store.set_title_generator(std::sync::Arc::new(DummyGen));
-        assert!(store.title_generator().is_some());
-    }
-
-    #[test]
-    fn failed_append_may_become_durable_returns_false() {
-        let store = InMemoryThreadStore::default();
-        assert!(!store.failed_append_may_become_durable());
-    }
 }
 
 fn stores_guard() -> MutexGuard<'static, HashMap<String, Arc<InMemoryThreadStore>>> {

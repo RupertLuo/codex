@@ -21,7 +21,10 @@ async fn turn_timing_state_records_ttft_only_once_per_turn() {
     let state = TurnTimingState::default();
     assert_eq!(
         state
-            .record_ttft_for_response_event(&ResponseEvent::OutputTextDelta("hi".to_string()))
+            .record_ttft_for_response_event(&ResponseEvent::OutputTextDelta {
+                item_id: None,
+                delta: "hi".to_string(),
+            })
             .await,
         None
     );
@@ -35,13 +38,19 @@ async fn turn_timing_state_records_ttft_only_once_per_turn() {
     );
     assert!(
         state
-            .record_ttft_for_response_event(&ResponseEvent::OutputTextDelta("hi".to_string()))
+            .record_ttft_for_response_event(&ResponseEvent::OutputTextDelta {
+                item_id: None,
+                delta: "hi".to_string(),
+            })
             .await
             .is_some()
     );
     assert_eq!(
         state
-            .record_ttft_for_response_event(&ResponseEvent::OutputTextDelta("again".to_string()))
+            .record_ttft_for_response_event(&ResponseEvent::OutputTextDelta {
+                item_id: None,
+                delta: "again".to_string(),
+            })
             .await,
         None
     );
@@ -54,7 +63,10 @@ async fn turn_timing_state_records_ttfm_independently_of_ttft() {
 
     assert!(
         state
-            .record_ttft_for_response_event(&ResponseEvent::OutputTextDelta("hi".to_string()))
+            .record_ttft_for_response_event(&ResponseEvent::OutputTextDelta {
+                item_id: None,
+                delta: "hi".to_string(),
+            })
             .await
             .is_some()
     );
@@ -66,6 +78,7 @@ async fn turn_timing_state_records_ttfm_independently_of_ttft() {
                 phase: None,
                 memory_citation: None,
                 delivery: None,
+                questions: None,
             }))
             .await
             .is_some()
@@ -78,6 +91,7 @@ async fn turn_timing_state_records_ttfm_independently_of_ttft() {
                 phase: None,
                 memory_citation: None,
                 delivery: None,
+                questions: None,
             }))
             .await,
         None
@@ -192,7 +206,9 @@ fn response_item_records_turn_ttft_ignores_empty_non_output_items() {
     assert!(!response_item_records_turn_ttft(
         &ResponseItem::FunctionCallOutput {
             id: None,
-            call_id: "call-1".to_string(),
+            call_id: Some("call-1".to_string()),
+            name: None,
+            namespace: None,
             output: FunctionCallOutputPayload::from_text("ok".to_string()),
             internal_chat_message_metadata_passthrough: None,
         }

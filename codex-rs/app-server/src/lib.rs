@@ -4,7 +4,6 @@
 use codex_arg0::Arg0DispatchPaths;
 use codex_code_mode::CodeModeSessionProvider;
 use codex_code_mode::GrpcCodeModeSessionProvider;
-use codex_code_mode::WebSocketCodeModeSessionProvider;
 use codex_config::LoaderOverrides;
 use codex_config::NoopThreadConfigLoader;
 use codex_core::config::Config;
@@ -14,6 +13,7 @@ use codex_login::AuthManager;
 #[cfg(debug_assertions)]
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_cli::CliConfigOverrides;
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::io::ErrorKind;
@@ -22,6 +22,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::RwLock;
 use std::sync::atomic::AtomicBool;
+use toml::Value as TomlValue;
 
 use crate::analytics_utils::analytics_events_client_from_config;
 use crate::config_manager::ConfigManager;
@@ -32,6 +33,7 @@ use crate::outgoing_message::ConnectionId;
 use crate::outgoing_message::OutgoingEnvelope;
 use crate::outgoing_message::OutgoingMessageSender;
 use crate::outgoing_message::QueuedOutgoingMessage;
+use crate::plugin_config_reload::PluginStartupConfig;
 use crate::transport::CHANNEL_CAPACITY;
 use crate::transport::ConnectionOrigin;
 use crate::transport::ConnectionState;
@@ -84,6 +86,14 @@ use tracing_subscriber::util::SubscriberInitExt;
 
 const SQLITE_RECOVERY_CONFIG_WARNING_SUMMARY: &str = "Codex rebuilt its local database.";
 
+fn is_unsupported_untrusted_approval_policy_error(err: &std::io::Error) -> bool {
+    err.get_ref().is_some_and(
+        <dyn std::error::Error + Send + Sync + 'static>::is::<
+            UnsupportedUntrustedApprovalPolicyError,
+        >,
+    )
+}
+
 mod analytics_utils;
 mod app_info;
 mod app_server_tracing;
@@ -92,6 +102,7 @@ mod auth_mode;
 mod bespoke_event_handling;
 mod cli;
 mod code_mode_host;
+mod codex_home_metrics;
 mod command_exec;
 mod config_layer;
 mod config_manager;
@@ -114,10 +125,14 @@ mod mcp_refresh;
 mod message_processor;
 mod models;
 mod models_refresh_worker;
+mod notification_media;
 mod otel_reloader;
 mod outgoing_message;
+mod plugin_config_reload;
 mod request_processors;
 mod request_serialization;
+// CATALYST: host RPC contracts live separately; public re-exports below remain stable.
+#[path = "catalyst/rpc_extension.rs"]
 mod rpc_extension;
 mod server_request_error;
 mod skills_watcher;
@@ -457,10 +472,13 @@ impl Default for AppServerRuntimeOptions {
     }
 }
 
+/// CATALYST: process-scoped host injection into the native App Server.
+/// Product RPC implementations and model policy selection remain in Runtime.
 #[derive(Clone, Debug, Default)]
 pub struct AppServerProcessOverrides {
     thread_manager: ThreadManagerRuntimeOptions,
     rpc_extensions: Vec<Arc<dyn AppServerRpcExtension>>,
+    mcp_server_replacements: BTreeMap<String, TomlValue>,
 }
 
 impl AppServerProcessOverrides {
@@ -471,6 +489,14 @@ impl AppServerProcessOverrides {
 
     pub fn with_rpc_extension(mut self, value: Arc<dyn AppServerRpcExtension>) -> Self {
         self.rpc_extensions.push(value);
+        self
+    }
+
+    pub fn with_mcp_server_replacements(
+        mut self,
+        replacements: BTreeMap<String, TomlValue>,
+    ) -> Self {
+        self.mcp_server_replacements.extend(replacements);
         self
     }
 
@@ -522,6 +548,7 @@ pub async fn run_main_with_transport_options_and_overrides(
     let AppServerProcessOverrides {
         thread_manager,
         rpc_extensions,
+        mcp_server_replacements,
     } = process_overrides;
     let rpc_registry = Arc::new(
         rpc_extension::AppServerRpcRegistry::new(rpc_extensions)
@@ -559,7 +586,8 @@ pub async fn run_main_with_transport_options_and_overrides(
         Default::default(),
         arg0_paths.clone(),
         Arc::new(NoopThreadConfigLoader),
-    );
+    )
+    .with_process_mcp_server_replacements(mcp_server_replacements);
     match config_manager
         .load_latest_config(/*fallback_cwd*/ None)
         .await
@@ -575,13 +603,7 @@ pub async fn run_main_with_transport_options_and_overrides(
                 config.http_client_factory(),
             );
         }
-        Err(err)
-            if err.get_ref().is_some_and(
-                <dyn std::error::Error + Send + Sync + 'static>::is::<
-                    UnsupportedUntrustedApprovalPolicyError,
-                >,
-            ) =>
-        {
+        Err(err) if is_unsupported_untrusted_approval_policy_error(&err) => {
             return Err(err);
         }
         Err(err) => {
@@ -591,11 +613,15 @@ pub async fn run_main_with_transport_options_and_overrides(
         }
     };
     let mut config_warnings = Vec::new();
+    let mut plugin_startup_config = PluginStartupConfig::Current;
     let config = match config_manager
         .load_latest_config(/*fallback_cwd*/ None)
         .await
     {
         Ok(config) => config,
+        Err(err) if is_unsupported_untrusted_approval_policy_error(&err) => {
+            return Err(err);
+        }
         Err(err) => {
             if strict_config {
                 return Err(err);
@@ -603,6 +629,7 @@ pub async fn run_main_with_transport_options_and_overrides(
 
             let message = config_warning_from_error("Invalid configuration; using defaults.", &err);
             config_warnings.push(message);
+            plugin_startup_config = PluginStartupConfig::Defaults;
             config_manager.load_default_config().await.map_err(|e| {
                 std::io::Error::new(
                     ErrorKind::InvalidData,
@@ -615,20 +642,6 @@ pub async fn run_main_with_transport_options_and_overrides(
     let code_mode_session_provider: Option<Arc<dyn CodeModeSessionProvider>> =
         match &runtime_options.code_mode_host_transport {
             CodeModeHostTransport::Local => None,
-            CodeModeHostTransport::WebSocket(url) => {
-                if !config.features.enabled(Feature::CodeModeHost) {
-                    return Err(std::io::Error::new(
-                        ErrorKind::InvalidInput,
-                        "remote code-mode host requires the code_mode_host feature to be enabled",
-                    ));
-                }
-                Some(Arc::new(
-                    WebSocketCodeModeSessionProvider::with_http_client_factory(
-                        url.to_string(),
-                        config.http_client_factory(),
-                    ),
-                ))
-            }
             CodeModeHostTransport::Grpc(url) => {
                 if !config.features.enabled(Feature::CodeModeHost) {
                     return Err(std::io::Error::new(
@@ -899,6 +912,11 @@ pub async fn run_main_with_transport_options_and_overrides(
     }
     transport_accept_handles.push(remote_control_accept_handle);
 
+    // Only the standalone server measures its local home, not embedded/cloud runtimes.
+    if let Some(metrics) = otel.as_ref().and_then(codex_otel::OtelProvider::metrics) {
+        codex_home_metrics::spawn(&config, metrics.clone(), transport_shutdown_token.clone());
+    }
+
     let otel_reloader_handle = otel_reloader::spawn(
         otel,
         otel_logger_reload_handle,
@@ -990,7 +1008,11 @@ pub async fn run_main_with_transport_options_and_overrides(
             code_mode_session_provider,
             rpc_transport: analytics_rpc_transport(&transport),
             remote_control_handle: Some(remote_control_handle.clone()),
-            plugin_startup_tasks: runtime_options.plugin_startup_tasks,
+            plugin_startup_tasks: matches!(
+                runtime_options.plugin_startup_tasks,
+                PluginStartupTasks::Start
+            )
+            .then_some(plugin_startup_config),
             thread_manager_runtime_options: thread_manager,
             rpc_registry,
         }));
@@ -1250,11 +1272,11 @@ pub async fn run_main_with_transport_options_and_overrides(
             };
 
             if !shutdown_state.forced() {
-                futures::future::join_all(
-                    connections
-                        .values()
-                        .map(|connection_state| connection_state.session.rpc_gate.shutdown()),
-                )
+                futures::future::join_all(connections.iter().map(
+                    |(&connection_id, connection_state)| {
+                        processor.connection_closed(connection_id, &connection_state.session)
+                    },
+                ))
                 .await;
                 connection_cleanup_tasks.drain().await;
                 processor.drain_background_tasks().await;

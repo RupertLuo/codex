@@ -1,3 +1,5 @@
+//! CATALYST: Host credential UI integrated with the existing ChatWidget lifecycle.
+
 use super::*;
 use crate::bottom_pane::sensitive_prompt_view::SensitivePromptView;
 use crate::model_runtime::CredentialStatus;

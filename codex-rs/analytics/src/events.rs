@@ -25,6 +25,7 @@ use crate::facts::TurnStatus;
 use crate::facts::TurnSteerRejectionReason;
 use crate::facts::TurnSteerResult;
 use crate::facts::TurnSubmissionType;
+use crate::guardian_v2::GuardianV2EventRequest;
 use crate::now_unix_millis;
 use codex_app_server_protocol::CodexErrorInfo;
 use codex_app_server_protocol::CommandExecutionSource;
@@ -69,6 +70,7 @@ pub(crate) enum TrackEventRequest {
     ThreadInitialized(ThreadInitializedEvent),
     ThreadArchive(ThreadArchiveEvent),
     GuardianReview(Box<GuardianReviewEventRequest>),
+    GuardianV2(Box<GuardianV2EventRequest>),
     AppMentioned(CodexAppMentionedEventRequest),
     AppUsed(CodexAppUsedEventRequest),
     HookRun(CodexHookRunEventRequest),
@@ -264,6 +266,14 @@ pub(crate) struct ThreadArchiveEventParams {
     pub(crate) thread_id: String,
     pub(crate) action: ThreadArchiveAction,
     pub(crate) occurred_at_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) app_server_client: Option<CodexAppServerClientMetadata>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) runtime: Option<CodexRuntimeMetadata>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) thread_source: Option<ThreadSource>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) parent_thread_id: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -334,6 +344,9 @@ pub enum GuardianReviewedAction {
     UnifiedExec {
         sandbox_permissions: SandboxPermissions,
         additional_permissions: Option<AdditionalPermissionProfile>,
+        tty: bool,
+    },
+    WriteStdin {
         tty: bool,
     },
     Execve {
@@ -621,6 +634,7 @@ pub(crate) struct CodexToolItemEventBase {
     pub(crate) thread_id: String,
     pub(crate) session_id: String,
     pub(crate) turn_id: String,
+    pub(crate) root_turn_id: Option<String>,
     /// App-server ThreadItem.id. For tool-originated items this generally
     /// corresponds to the originating core call_id.
     pub(crate) item_id: String,
@@ -655,6 +669,7 @@ pub(crate) struct CodexToolItemEventBase {
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ReviewSubjectKind {
     CommandExecution,
+    WriteStdin,
     FileChange,
     McpToolCall,
     Permissions,
@@ -882,6 +897,8 @@ pub(crate) struct CodexImageGenerationEventParams {
     pub(crate) base: CodexToolItemEventBase,
     pub(crate) revised_prompt_present: bool,
     pub(crate) saved_path_present: bool,
+    pub(crate) transparent_background: Option<bool>,
+    pub(crate) imagegen_request_id: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -996,6 +1013,9 @@ pub(crate) struct CodexTurnEventParams {
     pub(crate) thread_id: String,
     pub(crate) session_id: String,
     pub(crate) turn_id: String,
+    pub(crate) root_turn_id: Option<String>,
+    pub(crate) turn_trigger: Option<String>,
+    pub(crate) codex_turn_source: Option<String>,
     // TODO(rhan-oai): Populate once queued/default submission type is plumbed from
     // the turn/start callsites instead of always being reported as None.
     pub(crate) submission_type: Option<TurnSubmissionType>,
@@ -1014,6 +1034,7 @@ pub(crate) struct CodexTurnEventParams {
     pub(crate) service_tier: String,
     pub(crate) approval_policy: String,
     pub(crate) approvals_reviewer: String,
+    pub(crate) guardian_v2_enabled: bool,
     pub(crate) sandbox_network_access: bool,
     pub(crate) collaboration_mode: Option<&'static str>,
     pub(crate) personality: Option<String>,
@@ -1396,6 +1417,7 @@ fn analytics_hook_event_name(event_name: HookEventName) -> &'static str {
         HookEventName::SubagentStart => "SubagentStart",
         HookEventName::SubagentStop => "SubagentStop",
         HookEventName::Stop => "Stop",
+        HookEventName::Interrupt => "Interrupt",
     }
 }
 
@@ -1433,15 +1455,15 @@ pub(crate) fn subagent_thread_started_event_request(
         session_id: input.session_id,
         app_server_client: CodexAppServerClientMetadata {
             product_client_id: input.product_client_id,
-            client_name: Some(input.client_name),
-            client_version: Some(input.client_version),
+            client_name: input.client_name,
+            client_version: input.client_version,
             rpc_transport: AppServerRpcTransport::InProcess,
             experimental_api_enabled: None,
         },
         runtime: current_runtime_metadata(),
         model: input.model,
         ephemeral: input.ephemeral,
-        thread_source: Some(ThreadSource::Subagent),
+        thread_source: input.thread_source,
         initialization_mode: ThreadInitializationMode::New,
         subagent_source: Some(subagent_source_name(&input.subagent_source)),
         parent_thread_id: input.parent_thread_id,

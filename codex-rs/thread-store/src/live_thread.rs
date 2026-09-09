@@ -537,3 +537,32 @@ fn sanitize_title(raw: &str) -> String {
     });
     trimmed.chars().take(30).collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::sanitize_title;
+
+    #[test]
+    fn sanitize_title_preserves_plain_text() {
+        assert_eq!(sanitize_title("Hello World"), "Hello World");
+    }
+
+    #[test]
+    fn sanitize_title_removes_quotes_and_punctuation() {
+        assert_eq!(sanitize_title("\"Hello World.\""), "Hello World");
+        assert_eq!(sanitize_title("「标题」"), "标题");
+        assert_eq!(sanitize_title("Test？"), "Test");
+    }
+
+    #[test]
+    fn sanitize_title_uses_first_nonempty_line_and_limits_length() {
+        assert_eq!(sanitize_title("\n\nHello\nWorld"), "Hello");
+        assert_eq!(sanitize_title(&"a".repeat(50)).chars().count(), 30);
+    }
+
+    #[test]
+    fn sanitize_title_returns_empty_for_empty_input() {
+        assert_eq!(sanitize_title("   "), "");
+        assert_eq!(sanitize_title(""), "");
+    }
+}

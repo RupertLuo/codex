@@ -26,9 +26,12 @@ use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
 use core_test_support::responses::ev_message_item_added;
 use core_test_support::responses::ev_output_text_delta;
+use core_test_support::responses::ev_output_text_delta_for_item;
 use core_test_support::responses::ev_reasoning_item;
 use core_test_support::responses::ev_reasoning_item_added;
+use core_test_support::responses::ev_reasoning_summary_part_added_for_item;
 use core_test_support::responses::ev_reasoning_summary_text_delta;
+use core_test_support::responses::ev_reasoning_summary_text_delta_for_item;
 use core_test_support::responses::ev_reasoning_text_delta;
 use core_test_support::responses::ev_response_created;
 use core_test_support::responses::ev_web_search_call_added_partial;
@@ -1001,6 +1004,146 @@ async fn reasoning_content_delta_has_item_metadata() -> anyhow::Result<()> {
     assert_eq!(delta_event.item_id, reasoning_item.id);
     assert_eq!(delta_event.delta, "step one");
 
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn output_text_delta_before_output_item_added_is_buffered() -> anyhow::Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+    let TestCodex { codex, .. } = test_codex().build(&server).await?;
+    mount_sse_once(
+        &server,
+        sse(vec![
+            ev_response_created("resp-1"),
+            ev_output_text_delta_for_item("message-1", "Hello "),
+            ev_message_item_added("message-1", ""),
+            ev_output_text_delta_for_item("message-1", "world"),
+            ev_assistant_message("message-1", "Hello world"),
+            ev_completed("resp-1"),
+        ]),
+    )
+    .await;
+
+    codex
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "hello".into(),
+            text_elements: Vec::new(),
+        }]))
+        .await?;
+
+    let mut deltas = Vec::new();
+    let mut completed = None;
+    loop {
+        match wait_for_event(&codex, |_| true).await {
+            EventMsg::AgentMessageContentDelta(event) => deltas.push(event.delta),
+            EventMsg::ItemCompleted(ItemCompletedEvent {
+                item: TurnItem::AgentMessage(item),
+                ..
+            }) => completed = Some(item),
+            EventMsg::TurnComplete(_) => break,
+            _ => {}
+        }
+    }
+
+    assert_eq!(deltas.concat(), "Hello world");
+    let completed_text: String = completed
+        .expect("assistant item completion")
+        .content
+        .iter()
+        .map(|entry| match entry {
+            AgentMessageContent::Text { text } => text.as_str(),
+        })
+        .collect();
+    assert_eq!(completed_text, "Hello world");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn interleaved_response_items_keep_delta_ownership() -> anyhow::Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+    let TestCodex { codex, .. } = test_codex().build(&server).await?;
+    mount_sse_once(
+        &server,
+        sse(vec![
+            ev_response_created("resp-1"),
+            ev_reasoning_item_added("reasoning-1", &[""]),
+            ev_reasoning_summary_part_added_for_item("reasoning-1", 0),
+            ev_reasoning_summary_text_delta_for_item("reasoning-1", 0, "step one"),
+            ev_message_item_added("message-1", ""),
+            ev_output_text_delta_for_item("message-1", "Hello "),
+            ev_reasoning_summary_part_added_for_item("reasoning-1", 1),
+            ev_reasoning_summary_text_delta_for_item("reasoning-1", 1, "step two"),
+            ev_reasoning_item("reasoning-1", &["step one", "step two"], &[]),
+            ev_output_text_delta_for_item("message-1", "world"),
+            ev_assistant_message("message-1", "Hello world"),
+            ev_completed("resp-1"),
+        ]),
+    )
+    .await;
+
+    codex
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "reason through it".into(),
+            text_elements: Vec::new(),
+        }]))
+        .await?;
+
+    let mut reasoning_deltas = Vec::new();
+    let mut sections = Vec::new();
+    let mut message_deltas = Vec::new();
+    let mut reasoning_completed = Vec::new();
+    let mut message_completed = Vec::new();
+    loop {
+        match wait_for_event(&codex, |_| true).await {
+            EventMsg::ReasoningContentDelta(event) => {
+                reasoning_deltas.push((event.item_id, event.delta, event.summary_index));
+            }
+            EventMsg::AgentReasoningSectionBreak(event) => {
+                sections.push((event.item_id, event.summary_index));
+            }
+            EventMsg::AgentMessageContentDelta(event) => {
+                message_deltas.push((event.item_id, event.delta));
+            }
+            EventMsg::ItemCompleted(ItemCompletedEvent {
+                item: TurnItem::Reasoning(item),
+                ..
+            }) => reasoning_completed.push(item.id),
+            EventMsg::ItemCompleted(ItemCompletedEvent {
+                item: TurnItem::AgentMessage(item),
+                ..
+            }) => message_completed.push(item.id),
+            EventMsg::TurnComplete(_) => break,
+            _ => {}
+        }
+    }
+
+    assert_eq!(
+        reasoning_deltas,
+        vec![
+            ("reasoning-1".to_string(), "step one".to_string(), 0),
+            ("reasoning-1".to_string(), "step two".to_string(), 1),
+        ]
+    );
+    assert_eq!(
+        sections,
+        vec![
+            ("reasoning-1".to_string(), 0),
+            ("reasoning-1".to_string(), 1)
+        ]
+    );
+    assert_eq!(
+        message_deltas,
+        vec![
+            ("message-1".to_string(), "Hello ".to_string()),
+            ("message-1".to_string(), "world".to_string()),
+        ]
+    );
+    assert_eq!(reasoning_completed, vec!["reasoning-1"]);
+    assert_eq!(message_completed, vec!["message-1"]);
     Ok(())
 }
 
