@@ -1595,7 +1595,46 @@ async fn view_image_tool_errors_when_file_missing() -> anyhow::Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn view_image_tool_returns_unsupported_message_for_text_only_model() -> anyhow::Result<()> {
+async fn view_image_tool_advertisement_matches_model_input_modalities() -> anyhow::Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    for input_modalities in [
+        vec![InputModality::Text, InputModality::Image],
+        vec![InputModality::Text],
+    ] {
+        let supports_images = input_modalities.contains(&InputModality::Image);
+        let server = start_mock_server().await;
+        let mut builder = test_codex()
+            .with_model_info_override("gpt-5.5", move |model_info| {
+                model_info.input_modalities = input_modalities.clone();
+            })
+            .with_config(|config| {
+                let _ = config.features.enable(Feature::ViewImage);
+            });
+        let test = builder.build_with_auto_env(&server).await?;
+        let mock = responses::mount_sse_once(
+            &server,
+            sse(vec![
+                ev_response_created("resp-1"),
+                ev_assistant_message("msg-1", "done"),
+                ev_completed("resp-1"),
+            ]),
+        )
+        .await;
+
+        test.submit_turn("Reply done.").await?;
+
+        let request = mock.single_request().body_json();
+        let tools = request["tools"].as_array().context("tools present")?;
+        let advertises_view_image = tools.iter().any(|tool| tool["name"] == "view_image");
+        assert_eq!(advertises_view_image, supports_images);
+    }
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn view_image_tool_rejects_unadvertised_call_for_text_only_model() -> anyhow::Result<()> {
     skip_if_no_network!(Ok(()));
 
     // Use MockServer directly (not start_mock_server) so the first /models request returns our
@@ -1714,14 +1753,15 @@ async fn view_image_tool_returns_unsupported_message_for_text_only_model() -> an
     )
     .await;
 
-    let output_text = mock
-        .single_request()
+    let request = mock.single_request();
+    let output_text = request
         .function_call_output_content_and_success(call_id)
         .and_then(|(content, _)| content)
         .expect("output text present");
-    assert_eq!(
-        output_text,
-        "view_image is not allowed because you do not support image inputs"
+    assert_eq!(output_text, "unsupported call: view_image");
+    assert!(
+        find_image_message(&request.body_json()).is_none(),
+        "an unadvertised tool call must not produce image input"
     );
 
     Ok(())
