@@ -219,6 +219,7 @@ pub(super) fn sqlite_thread_name(metadata: &ThreadMetadata) -> Option<String> {
         .map(str::trim)
         .filter(|name| !name.is_empty())
         .map(str::to_string)
+        .or_else(|| distinct_thread_metadata_title(metadata))
 }
 
 pub(super) async fn resolve_thread_section_metadata(

@@ -3,9 +3,16 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use codex_protocol::ThreadId;
+use codex_protocol::items::TurnItem;
+use codex_protocol::items::UserMessageItem;
 use codex_protocol::protocol::AgentMessageEvent;
+use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::ItemCompletedEvent;
+use codex_protocol::protocol::ThreadHistoryMode;
+use codex_protocol::user_input::UserInput;
 use codex_rollout::RolloutItem;
 use codex_state::StateRuntime;
+use pretty_assertions::assert_eq;
 use tempfile::TempDir;
 use tokio::sync::Mutex;
 use tokio::sync::Notify;
@@ -17,15 +24,22 @@ use tokio::time::timeout;
 use super::test_support::test_config;
 use super::tests::create_thread_params;
 use super::tests::user_message_item;
+use crate::ArchiveThreadParams;
+use crate::ListThreadsParams;
 use crate::LiveThread;
 use crate::LocalThreadStore;
+use crate::PersistContext;
+use crate::ReadThreadParams;
+use crate::SortDirection;
 use crate::ThreadMetadataMutationGate;
 use crate::ThreadMetadataMutationPermit;
 use crate::ThreadMetadataMutationPermitFuture;
 use crate::ThreadMetadataPatch;
+use crate::ThreadSortKey;
 use crate::ThreadStore;
 use crate::ThreadTitleGenerator;
 use crate::ThreadTitleRequest;
+use crate::UpdateThreadMetadataParams;
 
 #[derive(Debug)]
 struct ControlledTitleGenerator {
@@ -98,6 +112,7 @@ fn assistant_message_item(message: &str) -> RolloutItem {
             phase: None,
             memory_citation: None,
             delivery: None,
+            questions: None,
         },
     ))
 }
@@ -173,6 +188,116 @@ async fn llm_title_generation_is_detached_and_notifies_after_persist() {
         .expect("metadata read")
         .expect("metadata");
     assert_eq!(metadata.title, "Generated title");
+}
+
+#[tokio::test]
+async fn paginated_generated_title_survives_read_list_and_unarchive() {
+    let thread_id = ThreadId::default();
+    let (_home, runtime, store) = test_store().await;
+    let mut params = create_thread_params(thread_id);
+    params.history_mode = ThreadHistoryMode::Paginated;
+    let live_thread = LiveThread::create(store.clone(), params)
+        .await
+        .expect("create paginated live thread");
+    live_thread
+        .append_items(&[RolloutItem::EventMsg(EventMsg::ItemCompleted(
+            ItemCompletedEvent {
+                thread_id,
+                turn_id: "turn-1".to_string(),
+                item: TurnItem::UserMessage(UserMessageItem {
+                    id: "item-1".to_string(),
+                    client_id: None,
+                    content: vec![UserInput::Text {
+                        text: "first user request".to_string(),
+                        text_elements: Vec::new(),
+                    }],
+                }),
+                started_at_ms: Some(0),
+                completed_at_ms: 1,
+            },
+        ))])
+        .await
+        .expect("append");
+    live_thread
+        .persist(PersistContext::Standard)
+        .await
+        .expect("persist thread");
+    live_thread.shutdown().await.expect("release live writer");
+    // Title generation persists this patch; discovery must recover it without its live event.
+    store
+        .update_thread_metadata(UpdateThreadMetadataParams {
+            thread_id,
+            patch: ThreadMetadataPatch {
+                title: Some("Generated title".to_string()),
+                ..Default::default()
+            },
+            include_archived: false,
+        })
+        .await
+        .expect("persist generated title");
+
+    let metadata = runtime
+        .get_thread(thread_id)
+        .await
+        .expect("metadata read")
+        .expect("metadata");
+    assert_eq!(metadata.title, "Generated title");
+    assert_eq!(metadata.name, None);
+    assert_eq!(metadata.preview.as_deref(), Some("first user request"));
+
+    for expected_name in ["Generated title", "Manual title"] {
+        if expected_name == "Manual title" {
+            store
+                .update_thread_metadata(UpdateThreadMetadataParams {
+                    thread_id,
+                    patch: ThreadMetadataPatch {
+                        name: Some(Some(expected_name.to_string())),
+                        ..Default::default()
+                    },
+                    include_archived: false,
+                })
+                .await
+                .expect("explicit name overrides the generated title");
+        }
+        let thread = store
+            .read_thread(ReadThreadParams {
+                thread_id,
+                include_archived: false,
+                include_history: false,
+            })
+            .await
+            .expect("read thread");
+        assert_eq!(thread.name.as_deref(), Some(expected_name));
+        let page = store
+            .list_threads(ListThreadsParams {
+                page_size: 10,
+                cursor: None,
+                sort_key: ThreadSortKey::CreatedAt,
+                sort_direction: SortDirection::Desc,
+                allowed_sources: Vec::new(),
+                model_providers: None,
+                cwd_filters: None,
+                section: None,
+                project_id: None,
+                archived: false,
+                search_term: None,
+                relation_filter: None,
+                use_state_db_only: true,
+            })
+            .await
+            .expect("list thread");
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items[0].name.as_deref(), Some(expected_name));
+        store
+            .archive_thread(ArchiveThreadParams { thread_id })
+            .await
+            .expect("archive thread");
+        let restored = store
+            .unarchive_thread(ArchiveThreadParams { thread_id })
+            .await
+            .expect("unarchive thread");
+        assert_eq!(restored.name.as_deref(), Some(expected_name));
+    }
 }
 
 #[tokio::test]
