@@ -879,6 +879,7 @@ mod tests {
     use super::ProcessId;
     use super::ProcessSandboxType;
     use super::ShellInfo;
+    use super::WalkOptions;
     use codex_file_system::FileSystemSandboxContext;
     use codex_network_proxy::ManagedNetworkSandboxContext;
     use codex_network_proxy::NetworkProxyAuditMetadata;
@@ -1306,6 +1307,48 @@ mod tests {
         assert_eq!(
             (unknown.sandbox_type, unsandboxed.sandbox_type),
             (None, Some(ProcessSandboxType::None))
+        );
+    }
+    #[test]
+    fn filesystem_walk_filter_preserves_legacy_wire_compatibility() {
+        let legacy = serde_json::json!({
+            "maxDepth": 6,
+            "maxDirectories": 2000,
+            "maxEntries": 20000,
+            "followDirectorySymlinks": true,
+        });
+        let options: WalkOptions = serde_json::from_value(legacy.clone())
+            .expect("legacy options deserialize without a file filter");
+        assert_eq!(options.file_names, None);
+        assert_eq!(
+            serde_json::to_value(&options).expect("serialize legacy options"),
+            legacy
+        );
+
+        let filtered = WalkOptions {
+            file_names: Some(vec!["SKILL.md".to_string(), "openai.yaml".to_string()]),
+            ..options
+        };
+        let wire = serde_json::to_value(&filtered).expect("serialize filtered options");
+        assert_eq!(
+            serde_json::from_value::<WalkOptions>(wire.clone())
+                .expect("deserialize filtered options"),
+            filtered,
+        );
+        // An older exec-server has no fileNames field and serde ignores unknown fields.
+        #[derive(Debug, PartialEq, serde::Deserialize, serde::Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct LegacyWalkOptions {
+            max_depth: usize,
+            max_directories: usize,
+            max_entries: usize,
+            follow_directory_symlinks: bool,
+        }
+        let old_reader: LegacyWalkOptions =
+            serde_json::from_value(wire).expect("legacy reader ignores the new filter");
+        assert_eq!(
+            serde_json::to_value(old_reader).expect("legacy serialization"),
+            legacy
         );
     }
 }

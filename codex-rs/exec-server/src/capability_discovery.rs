@@ -110,6 +110,7 @@ async fn discover_root(
                 max_entries: MAX_ENTRIES_PER_ROOT,
                 follow_directory_symlinks: true,
                 prune_hidden_directories: false,
+                file_names: None,
             },
             sandbox,
         )

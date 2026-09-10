@@ -461,6 +461,7 @@ async fn file_system_walk_returns_a_bounded_tree(
                 max_entries: 10,
                 follow_directory_symlinks: false,
                 prune_hidden_directories: false,
+                file_names: None,
             },
             /*sandbox*/ None,
         )
@@ -507,6 +508,7 @@ async fn file_system_walk_returns_a_bounded_tree(
                 max_entries: 10,
                 follow_directory_symlinks: false,
                 prune_hidden_directories: false,
+                file_names: None,
             },
             /*sandbox*/ None,
         )
@@ -530,6 +532,7 @@ async fn file_system_walk_returns_a_bounded_tree(
                 max_entries: 10,
                 follow_directory_symlinks: false,
                 prune_hidden_directories: false,
+                file_names: None,
             },
             /*sandbox*/ None,
         )
@@ -553,6 +556,7 @@ async fn file_system_walk_returns_a_bounded_tree(
                 max_entries: 1,
                 follow_directory_symlinks: false,
                 prune_hidden_directories: false,
+                file_names: None,
             },
             /*sandbox*/ None,
         )
@@ -591,12 +595,13 @@ async fn file_system_walk_handles_invalid_roots_and_limits(
         max_entries: 100,
         follow_directory_symlinks: false,
         prune_hidden_directories: false,
+        file_names: None,
     };
 
     let outcome = file_system
         .walk(
             &PathUri::from_host_native_path(file_path)?,
-            options,
+            options.clone(),
             /*sandbox*/ None,
         )
         .await
@@ -604,7 +609,7 @@ async fn file_system_walk_handles_invalid_roots_and_limits(
     assert_eq!(outcome, WalkOutcome::default());
 
     let error = file_system
-        .walk(&missing, options, /*sandbox*/ None)
+        .walk(&missing, options.clone(), /*sandbox*/ None)
         .await
         .expect_err("a missing root must fail");
     assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
@@ -639,11 +644,11 @@ async fn file_system_walk_handles_invalid_roots_and_limits(
             max_depth,
             max_directories,
             max_entries,
-            ..options
+            ..options.clone()
         };
         // Invalid limits take precedence over the missing root.
         let error = file_system
-            .walk(&missing, options, /*sandbox*/ None)
+            .walk(&missing, options.clone(), /*sandbox*/ None)
             .await
             .expect_err("invalid walk limits must fail");
         assert_eq!(
@@ -681,6 +686,7 @@ async fn file_system_walk_honors_read_sandbox(
                 max_entries: 2,
                 follow_directory_symlinks: false,
                 prune_hidden_directories: false,
+                file_names: None,
             },
             Some(&sandbox),
         )
@@ -1138,5 +1144,126 @@ async fn file_system_copy_rejects_copying_directory_into_descendant(
         "fs/copy cannot copy a directory to itself or one of its descendants"
     );
 
+    Ok(())
+}
+
+#[test_case(FileSystemImplementation::Local ; "local")]
+#[test_case(FileSystemImplementation::Remote ; "remote")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn file_system_walk_filters_files_without_relaxing_traversal_limits(
+    implementation: FileSystemImplementation,
+) -> Result<()> {
+    let context = create_file_system_context(implementation).await?;
+    let file_system = context.file_system;
+    let tmp = TempDir::new()?;
+    let nested = tmp.path().join("z-nested");
+    std::fs::create_dir(&nested)?;
+    // File contents are never part of the walk response budget.
+    std::fs::File::create(tmp.path().join("a-resource.bin"))?.set_len(64 * 1024 * 1024)?;
+    std::fs::write(nested.join("SKILL.md"), "fixture")?;
+    let root = PathUri::from_host_native_path(tmp.path())?;
+    let directory_entry = WalkEntry {
+        path: root.join("z-nested")?,
+        kind: WalkEntryKind::Directory,
+    };
+    let options = WalkOptions {
+        max_depth: 2,
+        max_directories: 2,
+        max_entries: 3,
+        follow_directory_symlinks: false,
+        prune_hidden_directories: false,
+        file_names: Some(vec!["SKILL.md".to_string()]),
+    };
+    let complete = file_system
+        .walk(&root, options.clone(), /*sandbox*/ None)
+        .await?;
+    assert_eq!(
+        complete,
+        WalkOutcome {
+            entries: vec![
+                directory_entry.clone(),
+                WalkEntry {
+                    path: root.join("z-nested/SKILL.md")?,
+                    kind: WalkEntryKind::File,
+                }
+            ],
+            errors: Vec::new(),
+            truncated: false,
+        }
+    );
+    let resource_path = root.join("a-resource.bin")?;
+    let mut resource = file_system
+        .read_file_stream(&resource_path, /*sandbox*/ None)
+        .await?;
+    let first_chunk = resource
+        .try_next()
+        .await?
+        .expect("resource contents remain readable");
+    assert!(!first_chunk.is_empty());
+    assert!(first_chunk.iter().all(|byte| *byte == 0));
+    drop(resource);
+
+    for names in [
+        vec![String::new()],
+        vec!["sub\\SKILL.md".to_string()],
+        vec!["SKILL.md".to_string(); 33],
+        vec!["x".repeat(256)],
+        vec!["sub/SKILL.md".to_string()],
+    ] {
+        let error = file_system
+            .walk(
+                &root,
+                WalkOptions {
+                    file_names: Some(names),
+                    ..options.clone()
+                },
+                /*sandbox*/ None,
+            )
+            .await
+            .expect_err("invalid file filters must fail");
+        assert_eq!(
+            error.kind(),
+            std::io::ErrorKind::InvalidInput,
+            "mode={implementation}"
+        );
+    }
+    for (limits, expected) in [
+        (
+            WalkOptions {
+                max_entries: 1,
+                ..options.clone()
+            },
+            WalkOutcome {
+                entries: Vec::new(),
+                errors: Vec::new(),
+                truncated: true,
+            },
+        ),
+        (
+            WalkOptions {
+                max_directories: 1,
+                ..options.clone()
+            },
+            WalkOutcome {
+                entries: vec![directory_entry.clone()],
+                errors: Vec::new(),
+                truncated: true,
+            },
+        ),
+        (
+            WalkOptions {
+                max_depth: 0,
+                ..options.clone()
+            },
+            WalkOutcome {
+                entries: vec![directory_entry],
+                errors: Vec::new(),
+                truncated: false,
+            },
+        ),
+    ] {
+        let actual = file_system.walk(&root, limits, /*sandbox*/ None).await?;
+        assert_eq!(actual, expected, "mode={implementation}");
+    }
     Ok(())
 }

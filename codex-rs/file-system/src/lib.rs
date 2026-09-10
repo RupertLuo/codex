@@ -120,7 +120,7 @@ pub struct ReadDirectoryEntry {
 }
 
 /// Bounds for a recursive filesystem walk.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WalkOptions {
     /// Maximum directory depth below the root that may be traversed.
@@ -134,6 +134,13 @@ pub struct WalkOptions {
     /// Whether directories whose names start with `.` should be returned but not traversed.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub prune_hidden_directories: bool,
+    /// Optional exact file basenames to return. Directories are always returned and every
+    /// examined entry still counts toward `max_entries`, including filtered files.
+    /// At most 32 basenames of 1 to 255 bytes are accepted; an empty list returns only directories.
+    /// Older servers may ignore this filter, so callers must still handle unfiltered or
+    /// incomplete inventories. Omission preserves the unfiltered walk.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_names: Option<Vec<String>>,
 }
 
 /// Type of a filesystem entry returned by a walk.

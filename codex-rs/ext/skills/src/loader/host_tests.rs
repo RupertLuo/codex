@@ -706,3 +706,39 @@ async fn follows_directory_symlinks_except_for_system_scope() {
     assert_eq!(system_snapshot.errors, Vec::new());
     assert_eq!(system_snapshot.skills, Vec::new());
 }
+
+#[tokio::test]
+async fn reports_truncated_host_inventory_with_and_without_discovered_skills() {
+    let root = TempDir::new().expect("root temp dir");
+    let skill_path = write_skill(&root, "", "name: demo\ndescription: Demo skill");
+    for index in 0..super::super::MAX_SKILLS_DIRS_PER_ROOT {
+        fs::create_dir(root.path().join(format!("resource-{index:04}")))
+            .expect("create resource directory");
+    }
+    let canonical_root =
+        AbsolutePathBuf::from_absolute_path(fs::canonicalize(root.path()).expect("canonical root"))
+            .expect("absolute root");
+    let expected_errors = vec![codex_skills::SkillError {
+        path: canonical_root.clone(),
+        message: format!(
+            "skills scan reached its traversal limit (root: {})",
+            codex_utils_path_uri::PathUri::from_abs_path(&canonical_root),
+        ),
+    }];
+
+    let loaded = load_host_skill_root(root_for(&root, SkillScope::User)).await;
+    assert_eq!(loaded.errors, expected_errors);
+    assert_eq!(
+        loaded
+            .skills
+            .iter()
+            .map(|skill| skill.path_to_skills_md.clone())
+            .collect::<Vec<_>>(),
+        vec![skill_path.clone()],
+    );
+
+    fs::remove_file(skill_path.as_path()).expect("remove fixture skill");
+    let empty = load_host_skill_root(root_for(&root, SkillScope::User)).await;
+    assert_eq!(empty.skills, Vec::<SkillMetadata>::new());
+    assert_eq!(empty.errors, expected_errors);
+}

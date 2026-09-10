@@ -32,6 +32,7 @@ pub(super) struct RecordingFileSystem<'a> {
     read_files: Mutex<Vec<PathUri>>,
     metadata_files: Mutex<Vec<PathUri>>,
     pub(super) walks: AtomicUsize,
+    pub(super) ignore_walk_file_filter: bool,
     manifest_metadata_behavior: ManifestMetadataBehavior,
     skill_read_started: AtomicBool,
     skill_read_started_notify: Notify,
@@ -57,6 +58,7 @@ impl<'a> RecordingFileSystem<'a> {
             read_files: Mutex::new(Vec::new()),
             metadata_files: Mutex::new(Vec::new()),
             walks: AtomicUsize::new(/*v*/ 0),
+            ignore_walk_file_filter: false,
             manifest_metadata_behavior,
             skill_read_started: AtomicBool::new(/*v*/ false),
             skill_read_started_notify: Notify::new(),
@@ -180,9 +182,12 @@ impl ExecutorFileSystem for RecordingFileSystem<'_> {
     fn walk<'a>(
         &'a self,
         path: &'a PathUri,
-        options: WalkOptions,
+        mut options: WalkOptions,
         sandbox: Option<&'a FileSystemSandboxContext>,
     ) -> ExecutorFileSystemFuture<'a, WalkOutcome> {
+        if self.ignore_walk_file_filter {
+            options.file_names = None;
+        }
         self.walks.fetch_add(/*val*/ 1, Ordering::AcqRel);
         self.walk_started.notify_waiters();
         if self.blocked_walk_root.as_ref() != Some(path) {

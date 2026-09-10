@@ -176,11 +176,18 @@ async fn load_skills_under_root(
         },
     )
     .await;
-    for warning in warnings {
-        error!("{warning}");
-    }
+    let mut errors = warnings
+        .into_iter()
+        .map(|message| {
+            error!("{message}");
+            SkillError {
+                path: root.clone(),
+                message,
+            }
+        })
+        .collect::<Vec<_>>();
     if skills.is_empty() {
-        return (Vec::new(), Arc::default(), Vec::new());
+        return (Vec::new(), Arc::default(), errors);
     }
 
     let root_uri = PathUri::from_abs_path(root);
@@ -308,7 +315,6 @@ async fn load_skills_under_root(
 
     let mut loaded_skills = Vec::new();
     let mut skill_discovery_path_by_path = HashMap::new();
-    let mut errors = Vec::new();
     for (path, path_uri, discovery_path, result) in skill_results {
         let result = result.and_then(|mut skill| {
             skill.name = namespace_resolver
