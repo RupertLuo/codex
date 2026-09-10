@@ -786,6 +786,7 @@ async fn file_system_walk_handles_directory_symlinks(
                     max_entries: 8,
                     follow_directory_symlinks: false,
                     prune_hidden_directories: false,
+                    file_names: None,
                 },
                 /*sandbox*/ None,
             )
@@ -809,6 +810,7 @@ async fn file_system_walk_handles_directory_symlinks(
                     max_entries: 8,
                     follow_directory_symlinks: true,
                     prune_hidden_directories: false,
+                    file_names: None,
                 },
                 /*sandbox*/ None,
             )
@@ -872,6 +874,7 @@ async fn file_system_walk_reports_non_utf8_names(
                 max_entries: 1,
                 follow_directory_symlinks: false,
                 prune_hidden_directories: false,
+                file_names: None,
             },
             /*sandbox*/ None,
         )
@@ -918,6 +921,7 @@ async fn file_system_walk_prunes_hidden_directories_without_claiming_visible_ali
                 max_entries: 6,
                 follow_directory_symlinks: true,
                 prune_hidden_directories: true,
+                file_names: None,
             },
             /*sandbox*/ None,
         )

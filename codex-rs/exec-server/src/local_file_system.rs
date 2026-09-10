@@ -723,6 +723,18 @@ impl DirectFileSystem {
             ));
         }
 
+        if options.file_names.as_ref().is_some_and(|names| {
+            names.len() > 32
+                || names
+                    .iter()
+                    .any(|name| name.is_empty() || name.len() > 255 || name.contains(['/', '\\']))
+        }) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "filesystem walk file filter accepts at most 32 basenames of 1 to 255 bytes",
+            ));
+        }
+
         check_walk_cancelled(cancelled)?;
         let (root_metadata, root_is_symlink) = walk_metadata(root)?;
         if !root_metadata.is_dir() || (root_is_symlink && !options.follow_directory_symlinks) {
@@ -808,6 +820,16 @@ impl DirectFileSystem {
                 } else {
                     continue;
                 };
+                // Select output only after examining the entry so filtering cannot bypass
+                // traversal limits, error reporting, or directory symlink policy.
+                if kind == WalkEntryKind::File
+                    && options
+                        .file_names
+                        .as_ref()
+                        .is_some_and(|names| !names.contains(&file_name))
+                {
+                    continue;
+                }
                 if !reserve_walk_response_bytes(
                     &mut outcome,
                     &mut response_bytes,
@@ -1346,9 +1368,10 @@ mod walk_tests {
             max_entries: 1,
             follow_directory_symlinks: false,
             prune_hidden_directories: false,
+            file_names: None,
         };
         let direct_error = DirectFileSystem
-            .walk(&root, options, Some(&sandbox))
+            .walk(&root, options.clone(), Some(&sandbox))
             .await
             .expect_err("direct walk must reject sandbox contexts");
         let wrapper_error = UnsandboxedFileSystem::default()
@@ -1370,6 +1393,7 @@ mod walk_tests {
             max_entries: 1,
             follow_directory_symlinks: true,
             prune_hidden_directories: false,
+            file_names: None,
         };
         let cancelled = CancellationToken::new();
         let cancel_on_drop = cancelled.clone().drop_guard();

@@ -80,6 +80,10 @@ pub(super) async fn discover_skills(
                     options.hidden_directories,
                     HiddenDirectoryPolicy::Skip
                 ),
+                file_names: Some(vec![
+                    SKILLS_FILENAME.to_string(),
+                    SKILLS_METADATA_FILENAME.to_string(),
+                ]),
             },
             /*sandbox*/ None,
         )
