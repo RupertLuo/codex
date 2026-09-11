@@ -155,6 +155,12 @@ fn native_turn_gateway_unavailable() -> JSONRPCErrorError {
 pub trait AppServerRpcExtension: Debug + Send + Sync {
     fn methods(&self) -> &'static [&'static str];
 
+    /// Opt-in methods may await remote work without blocking the transport receive loop.
+    /// Implementations must bound concurrency and enforce their own authority ordering.
+    fn concurrent_methods(&self) -> &'static [&'static str] {
+        &[]
+    }
+
     fn handle<'a>(
         &'a self,
         context: AppServerRpcContext,

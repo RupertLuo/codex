@@ -801,18 +801,28 @@ impl MessageProcessor {
                             processor: Arc::clone(self),
                             session: Arc::clone(&session),
                         }));
-                    match extension
-                        .handle(rpc_context, &request_method, request.params.clone())
-                        .await
-                    {
-                        Ok(result) => {
-                            self.outgoing
-                                .send_json_response(request_id.clone(), result)
-                                .await;
+                    let concurrent = extension
+                        .concurrent_methods()
+                        .contains(&request_method.as_str());
+                    let outgoing = Arc::clone(&self.outgoing);
+                    let dispatch = async move {
+                        match extension
+                            .handle(rpc_context, &request_method, request.params)
+                            .await
+                        {
+                            Ok(result) => outgoing.send_json_response(request_id, result).await,
+                            Err(error) => outgoing.send_error(request_id, error).await,
                         }
-                        Err(error) => {
-                            self.outgoing.send_error(request_id.clone(), error).await;
-                        }
+                    };
+                    if concurrent {
+                        // Host opt-in keeps slow auxiliary work off the transport receive loop.
+                        tokio::spawn(Self::run_request_with_context(
+                            Arc::clone(&self.outgoing),
+                            request_context.clone(),
+                            dispatch,
+                        ));
+                    } else {
+                        dispatch.await;
                     }
                     return;
                 }

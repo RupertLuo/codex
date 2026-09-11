@@ -96,3 +96,7 @@ git diff --check
 `core/src/client/catalyst/host_http.rs` 只承担宿主 policy 启用的请求图片迁移与 previous response 失效识别；`client.rs` 保留 session baseline、delta 选择和重试顺序。迁移发生在保存 typed baseline 前，不改写持久化历史。公开 `ModelRuntimePolicy` 路径和 Runtime 注入接口不变。
 
 验证入口：fork `client::host_http::tests::recognizes_qwen_unknown_previous_response_error`，以及 Runtime `qwen_incremental_fallback::synthetic_policy_to_core_fallback_matrix`。
+
+### 长耗时宿主 RPC 显式并发分发
+
+`AppServerRpcExtension::concurrent_methods` 是 process-scoped 的宿主显式 opt-in，默认空集合保持原有分发顺序。Runtime 为受限后台推理及账号状态读取启用该声明；原生 MessageProcessor 在初始化门禁后投递独立请求任务，继续接收对话与文件请求。授权、并发上限、超时由 Runtime handler 保持。合并热点是 message_processor.rs 的宿主扩展分支；直接测试 slow_background_extension_does_not_block_following_native_reads 将后台 Future 挂起，再验证后续原生 thread/list 仍可返回，另保留初始化与错误契约测试。
